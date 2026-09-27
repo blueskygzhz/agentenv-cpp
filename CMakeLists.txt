@@ -71,6 +71,7 @@ endif()
 # Rust `src/lib.rs` module order (bottom-up):
 #   core → image → p2p → template → snapshot → sandbox → orchestrator → api
 add_subdirectory(src/core)
+add_subdirectory(src/managed-secret)
 add_subdirectory(src/image)
 add_subdirectory(src/p2p)
 add_subdirectory(src/overlaybd)

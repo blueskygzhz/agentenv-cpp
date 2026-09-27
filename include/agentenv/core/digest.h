@@ -73,6 +73,37 @@ std::string Sha256Hex(const std::string& data);
 std::string Sha256Digest(const void* data, std::size_t len);
 std::string Sha256Digest(const std::string& data);
 
+// ---- HMAC-SHA256 (Rust: the `hmac` crate over `sha2::Sha256`) -------------
+
+/// Rust `Hmac::<Sha256>::new_from_slice(key).chain_update(data).finalize()`.
+///
+/// The key is accepted at any length, matching the Rust call sites that rely
+/// on `new_from_slice` never failing (RFC 2104 hashes over-long keys and
+/// zero-pads short ones).
+std::array<uint8_t, 32> HmacSha256(const void* key, std::size_t key_len, const void* data,
+                                   std::size_t data_len);
+
+/// Lowercase hex form of `HmacSha256`.
+std::string HmacSha256Hex(const std::string& key, const std::string& data);
+
+/// Rust `Mac::verify_slice` — compares a 32-byte tag in constant time.
+///
+/// A byte-wise early return would leak the length of the matching prefix,
+/// which is enough to recover a tag one byte at a time.
+bool ConstantTimeEquals(const void* a, const void* b, std::size_t len);
+
+/// Rust `hex::decode_to_slice` — decodes exactly `out_len` bytes, so a short,
+/// long, or non-hex input is rejected rather than silently truncated.
+bool HexDecodeExact(const std::string& hex, uint8_t* out, std::size_t out_len);
+
+/// Rust `hex::encode`.
+std::string HexEncode(const void* data, std::size_t len);
+
+/// Rust `rand::rngs::SysRng::try_fill_bytes` — reads from the OS CSPRNG
+/// (`getrandom(2)`, falling back to `/dev/urandom`). Never a userspace PRNG:
+/// these bytes become long-lived secrets.
+Expected<Unit, std::string> FillSecureRandom(uint8_t* out, std::size_t len);
+
 }  // namespace core
 }  // namespace agentenv
 #endif  // AGENTENV_CORE_DIGEST_H_

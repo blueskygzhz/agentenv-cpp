@@ -6,6 +6,11 @@
 #include <cstring>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 namespace agentenv {
 namespace core {
 namespace {
@@ -195,6 +200,131 @@ std::string Sha256Digest(const void* data, std::size_t len) {
 
 std::string Sha256Digest(const std::string& data) {
     return Sha256Digest(data.data(), data.size());
+}
+
+// ---- HMAC-SHA256 ----------------------------------------------------------
+
+std::array<uint8_t, 32> HmacSha256(const void* key, std::size_t key_len, const void* data,
+                                   std::size_t data_len) {
+    // RFC 2104 with SHA-256's 64-byte block.
+    const std::size_t kBlock = 64;
+    uint8_t derived[kBlock];
+    std::memset(derived, 0, kBlock);
+
+    if (key_len > kBlock) {
+        // A key longer than the block is replaced by its own digest, which is
+        // why `new_from_slice` accepts any length on the Rust side.
+        const std::array<uint8_t, 32> hashed = Sha256Bytes(key, key_len);
+        std::memcpy(derived, hashed.data(), hashed.size());
+    } else if (key_len > 0) {
+        std::memcpy(derived, key, key_len);
+    }
+
+    uint8_t inner_pad[kBlock];
+    uint8_t outer_pad[kBlock];
+    for (std::size_t i = 0; i < kBlock; ++i) {
+        inner_pad[i] = static_cast<uint8_t>(derived[i] ^ 0x36);
+        outer_pad[i] = static_cast<uint8_t>(derived[i] ^ 0x5c);
+    }
+
+    uint8_t inner[32];
+    {
+        Sha256Ctx ctx;
+        ctx.Update(inner_pad, kBlock);
+        if (data_len > 0) {
+            ctx.Update(static_cast<const uint8_t*>(data), data_len);
+        }
+        ctx.Final(inner);
+    }
+
+    std::array<uint8_t, 32> out;
+    {
+        Sha256Ctx ctx;
+        ctx.Update(outer_pad, kBlock);
+        ctx.Update(inner, 32);
+        ctx.Final(out.data());
+    }
+
+    // The padded key is a secret; do not leave it on the stack for a later
+    // frame to read.
+    std::memset(derived, 0, kBlock);
+    std::memset(inner_pad, 0, kBlock);
+    std::memset(outer_pad, 0, kBlock);
+    return out;
+}
+
+std::string HmacSha256Hex(const std::string& key, const std::string& data) {
+    const std::array<uint8_t, 32> tag =
+        HmacSha256(key.data(), key.size(), data.data(), data.size());
+    return HexOf(tag.data(), tag.size());
+}
+
+bool ConstantTimeEquals(const void* a, const void* b, std::size_t len) {
+    const uint8_t* lhs = static_cast<const uint8_t*>(a);
+    const uint8_t* rhs = static_cast<const uint8_t*>(b);
+    uint8_t diff = 0;
+    for (std::size_t i = 0; i < len; ++i) {
+        diff = static_cast<uint8_t>(diff | (lhs[i] ^ rhs[i]));
+    }
+    return diff == 0;
+}
+
+bool HexDecodeExact(const std::string& hex, uint8_t* out, std::size_t out_len) {
+    if (hex.size() != out_len * 2) return false;
+    for (std::size_t i = 0; i < out_len; ++i) {
+        int nibbles[2];
+        for (int half = 0; half < 2; ++half) {
+            const char c = hex[i * 2 + half];
+            if (c >= '0' && c <= '9') {
+                nibbles[half] = c - '0';
+            } else if (c >= 'a' && c <= 'f') {
+                nibbles[half] = c - 'a' + 10;
+            } else if (c >= 'A' && c <= 'F') {
+                nibbles[half] = c - 'A' + 10;
+            } else {
+                return false;
+            }
+        }
+        out[i] = static_cast<uint8_t>((nibbles[0] << 4) | nibbles[1]);
+    }
+    return true;
+}
+
+std::string HexEncode(const void* data, std::size_t len) {
+    return HexOf(static_cast<const uint8_t*>(data), len);
+}
+
+Expected<Unit, std::string> FillSecureRandom(uint8_t* out, std::size_t len) {
+    if (len == 0) return Unit();
+
+    std::size_t filled = 0;
+#if defined(__linux__) && defined(SYS_getrandom)
+    while (filled < len) {
+        const long got = ::syscall(SYS_getrandom, out + filled, len - filled, 0);
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            // ENOSYS on pre-3.17 kernels, so fall through to /dev/urandom
+            // rather than failing outright.
+            break;
+        }
+        filled += static_cast<std::size_t>(got);
+    }
+    if (filled == len) return Unit();
+#endif
+
+    std::FILE* urandom = std::fopen("/dev/urandom", "rb");
+    if (urandom == NULL) {
+        return make_unexpected(std::string("open /dev/urandom: ") + std::strerror(errno));
+    }
+    const std::size_t want = len - filled;
+    const std::size_t read = std::fread(out + filled, 1, want, urandom);
+    std::fclose(urandom);
+    if (read != want) {
+        // A short read means the caller would otherwise use partly zeroed
+        // bytes as a secret.
+        return make_unexpected(std::string("read /dev/urandom: short read"));
+    }
+    return Unit();
 }
 
 Expected<FileDigest, std::string> DescribeFile(const std::string& path) {
