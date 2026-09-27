@@ -1,0 +1,2 @@
+/usr/bin/ar qc ../../lib/libagentenv-ublk.a "CMakeFiles/agentenv-ublk.dir/runner.cc.o" "CMakeFiles/agentenv-ublk.dir/ctrl.cc.o" "CMakeFiles/agentenv-ublk.dir/dev.cc.o" "CMakeFiles/agentenv-ublk.dir/io_buffer.cc.o" "CMakeFiles/agentenv-ublk.dir/impls.cc.o"
+/usr/bin/ranlib ../../lib/libagentenv-ublk.a

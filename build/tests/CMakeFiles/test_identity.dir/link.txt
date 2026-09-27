@@ -1,0 +1,1 @@
+/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_identity.dir/test_identity.cc.o -o ../bin/test_identity  ../lib/libagentenv-microtest.a ../lib/libagentenv-core.a -lpthread

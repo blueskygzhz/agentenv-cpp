@@ -1,0 +1,1 @@
+/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_snapshot_repository.dir/test_snapshot_repository.cc.o -o ../bin/test_snapshot_repository  ../lib/libagentenv-microtest.a ../lib/libagentenv-snapshot.a ../lib/libagentenv-sandbox.a ../lib/libagentenv-p2p.a ../lib/libagentenv-core.a -lpthread

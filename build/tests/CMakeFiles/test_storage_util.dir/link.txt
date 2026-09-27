@@ -1,0 +1,1 @@
+/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_storage_util.dir/test_storage_util.cc.o -o ../bin/test_storage_util  ../lib/libagentenv-microtest.a ../lib/libagentenv-storage-util.a ../lib/libagentenv-core.a -lpthread

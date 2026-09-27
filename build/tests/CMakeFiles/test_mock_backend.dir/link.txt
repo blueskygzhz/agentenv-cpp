@@ -1,0 +1,1 @@
+/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_mock_backend.dir/test_mock_backend.cc.o -o ../bin/test_mock_backend  ../lib/libagentenv-microtest.a ../lib/libagentenv-sandbox.a ../lib/libagentenv-core.a -lpthread

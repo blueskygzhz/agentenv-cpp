@@ -1,0 +1,2 @@
+/usr/bin/ar qc ../../lib/libagentenv-services-config.a "CMakeFiles/agentenv-services-config.dir/store.cc.o"
+/usr/bin/ranlib ../../lib/libagentenv-services-config.a

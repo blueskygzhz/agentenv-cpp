@@ -1,0 +1,1 @@
+/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_sandbox_process.dir/test_sandbox_process.cc.o -o ../bin/test_sandbox_process  ../lib/libagentenv-microtest.a ../lib/libagentenv-sandbox.a ../lib/libagentenv-core.a -lpthread

@@ -1,0 +1,1 @@
+/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_lsmt.dir/test_lsmt.cc.o -o ../bin/test_lsmt  ../lib/libagentenv-microtest.a ../lib/libagentenv-overlaybd.a ../lib/libagentenv-storage-util.a ../lib/libagentenv-core.a -lpthread

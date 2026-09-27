@@ -1,0 +1,1 @@
+/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_shell_util.dir/test_shell_util.cc.o -o ../bin/test_shell_util  ../lib/libagentenv-microtest.a ../lib/libagentenv-shell-util.a ../lib/libagentenv-core.a -lpthread

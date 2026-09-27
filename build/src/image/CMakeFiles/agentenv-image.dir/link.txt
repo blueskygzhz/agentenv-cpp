@@ -1,0 +1,2 @@
+/usr/bin/ar qc ../../lib/libagentenv-image.a "CMakeFiles/agentenv-image.dir/image.cc.o" "CMakeFiles/agentenv-image.dir/reference.cc.o" "CMakeFiles/agentenv-image.dir/metadata.cc.o" "CMakeFiles/agentenv-image.dir/layers.cc.o" "CMakeFiles/agentenv-image.dir/oci_image.cc.o" "CMakeFiles/agentenv-image.dir/commit_index.cc.o" "CMakeFiles/agentenv-image.dir/cache.cc.o"
+/usr/bin/ranlib ../../lib/libagentenv-image.a

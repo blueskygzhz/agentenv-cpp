@@ -1,0 +1,2 @@
+/usr/bin/ar qc ../../lib/libagentenv-p2p.a "CMakeFiles/agentenv-p2p.dir/types.cc.o" "CMakeFiles/agentenv-p2p.dir/error.cc.o" "CMakeFiles/agentenv-p2p.dir/config.cc.o" "CMakeFiles/agentenv-p2p.dir/discovery.cc.o" "CMakeFiles/agentenv-p2p.dir/mock.cc.o" "CMakeFiles/agentenv-p2p.dir/iroh.cc.o"
+/usr/bin/ranlib ../../lib/libagentenv-p2p.a

@@ -1,0 +1,2 @@
+/usr/bin/ar qc ../../lib/libagentenv-linuxcap.a "CMakeFiles/agentenv-linuxcap.dir/cap.cc.o"
+/usr/bin/ranlib ../../lib/libagentenv-linuxcap.a

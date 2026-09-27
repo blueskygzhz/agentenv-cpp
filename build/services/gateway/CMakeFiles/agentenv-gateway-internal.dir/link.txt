@@ -1,0 +1,2 @@
+/usr/bin/ar qc ../../lib/libagentenv-gateway-internal.a "CMakeFiles/agentenv-gateway-internal.dir/host_route.cc.o" "CMakeFiles/agentenv-gateway-internal.dir/schedule_hint.cc.o"
+/usr/bin/ranlib ../../lib/libagentenv-gateway-internal.a

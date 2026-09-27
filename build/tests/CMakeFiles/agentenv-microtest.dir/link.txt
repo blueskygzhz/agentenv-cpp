@@ -1,0 +1,2 @@
+/usr/bin/ar qc ../lib/libagentenv-microtest.a "CMakeFiles/agentenv-microtest.dir/microtest.cc.o"
+/usr/bin/ranlib ../lib/libagentenv-microtest.a

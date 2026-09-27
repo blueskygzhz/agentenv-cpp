@@ -1,0 +1,1 @@
+/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_orchestrator.dir/test_orchestrator.cc.o -o ../bin/test_orchestrator  ../lib/libagentenv-microtest.a ../lib/libagentenv-orchestrator.a ../lib/libagentenv-snapshot.a ../lib/libagentenv-sandbox.a ../lib/libagentenv-p2p.a ../lib/libagentenv-core.a -lpthread

@@ -1,0 +1,2 @@
+/usr/bin/ar qc ../../lib/libagentenv-storage-util.a "CMakeFiles/agentenv-storage-util.dir/types.cc.o" "CMakeFiles/agentenv-storage-util.dir/aligned_buffer.cc.o" "CMakeFiles/agentenv-storage-util.dir/id_allocator.cc.o" "CMakeFiles/agentenv-storage-util.dir/mmap_region.cc.o" "CMakeFiles/agentenv-storage-util.dir/compact_writer.cc.o" "CMakeFiles/agentenv-storage-util.dir/io_ring.cc.o"
+/usr/bin/ranlib ../../lib/libagentenv-storage-util.a
