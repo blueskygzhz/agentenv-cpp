@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "agentenv/core/expected.h"
+#include "agentenv/core/json.h"
 
 namespace agentenv {
 namespace storage {
@@ -58,6 +59,42 @@ struct UpperConfig {
 
 /// Rust `validate_upper_config`.
 core::Expected<bool, std::string> ValidateUpperConfig(const UpperConfig& upper);
+
+/// Rust struct `DownloadConfig` — background prefetch policy, written into the
+/// generated overlaybd global configs and (as `download`) into a tools image.
+///
+/// The defaults below are Rust's `impl Default`, which is *not* all-zero:
+/// a zero-initialised struct would silently disable throttling and retries.
+struct DownloadConfig {
+    bool enable = false;
+    int32_t delay = 300;
+    int32_t delay_extra = 30;
+    /// Rust `#[serde(rename = "maxMBps")]` — per-layer rate limit in MiB/s;
+    /// 0 disables throttling.
+    int32_t max_mbps = 100;
+    int32_t try_cnt = 5;
+    /// Background chunk size in bytes. Larger than the cache block size on
+    /// purpose: one source request covers many cache blocks, so background
+    /// throughput is high while foreground reads stay fine-grained.
+    uint32_t block_size = 16u * 1024u * 1024u;
+    std::size_t concurrency = 1;
+    /// Only the global value takes effect; a per-image override is kept for
+    /// serialization compatibility but never resizes the scheduler.
+    std::size_t max_inflight_blocks = 16;
+    std::size_t max_concurrent_files = 8;
+
+    bool operator==(const DownloadConfig& o) const;
+    bool operator!=(const DownloadConfig& o) const { return !(*this == o); }
+};
+
+/// Serializes to the camelCase shape serde produces, including the historical
+/// `maxMBps` spelling. Returns a `Json` value rather than text so callers can
+/// embed it in the larger global config they are building.
+core::Json DownloadConfigToJson(const DownloadConfig& config);
+
+/// Parses the same shape back. Missing keys keep their default, matching
+/// Rust's `#[serde(default)]`.
+core::Expected<DownloadConfig, std::string> ParseDownloadConfig(const core::Json& value);
 
 /// Serde spelling of `UpperMode` (`#[serde(rename_all = "camelCase")]`).
 const char* UpperModeToString(UpperMode mode);

@@ -138,6 +138,88 @@ const char* UpperModeToString(UpperMode mode) {
     return "logStructured";
 }
 
+bool DownloadConfig::operator==(const DownloadConfig& o) const {
+    return enable == o.enable && delay == o.delay && delay_extra == o.delay_extra &&
+           max_mbps == o.max_mbps && try_cnt == o.try_cnt && block_size == o.block_size &&
+           concurrency == o.concurrency && max_inflight_blocks == o.max_inflight_blocks &&
+           max_concurrent_files == o.max_concurrent_files;
+}
+
+core::Json DownloadConfigToJson(const DownloadConfig& config) {
+    core::JsonObject out;
+    out["enable"] = core::Json(config.enable);
+    out["delay"] = core::Json(static_cast<int64_t>(config.delay));
+    out["delayExtra"] = core::Json(static_cast<int64_t>(config.delay_extra));
+    // Rust `#[serde(rename = "maxMBps")]`, not the camelCase default.
+    out["maxMBps"] = core::Json(static_cast<int64_t>(config.max_mbps));
+    out["tryCnt"] = core::Json(static_cast<int64_t>(config.try_cnt));
+    out["blockSize"] = core::Json(static_cast<int64_t>(config.block_size));
+    out["concurrency"] = core::Json(static_cast<int64_t>(config.concurrency));
+    out["maxInflightBlocks"] = core::Json(static_cast<int64_t>(config.max_inflight_blocks));
+    out["maxConcurrentFiles"] = core::Json(static_cast<int64_t>(config.max_concurrent_files));
+    return core::Json(out);
+}
+
+core::Expected<DownloadConfig, std::string> ParseDownloadConfig(const core::Json& value) {
+    DownloadConfig config;  // starts at Rust's non-zero defaults
+    if (value.kind() == core::Json::Kind::Null) return config;
+    if (value.kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(std::string("field 'download' must be an object"));
+    }
+
+    core::Expected<core::Unit, std::string> step = ReadBool(value, "enable", &config.enable);
+    if (!step.ok()) return core::make_unexpected(step.take_error());
+
+    // The integer fields are read through a uint64 helper and then narrowed,
+    // so a negative or oversized value is rejected rather than wrapped.
+    uint64_t scratch = 0;
+    struct IntField {
+        const char* key;
+        int32_t* target;
+    };
+    const IntField int_fields[] = {
+        {"delay", &config.delay},
+        {"delayExtra", &config.delay_extra},
+        {"maxMBps", &config.max_mbps},
+        {"tryCnt", &config.try_cnt},
+    };
+    for (std::size_t i = 0; i < sizeof(int_fields) / sizeof(int_fields[0]); ++i) {
+        scratch = static_cast<uint64_t>(*int_fields[i].target);
+        step = ReadUint(value, int_fields[i].key, &scratch);
+        if (!step.ok()) return core::make_unexpected(step.take_error());
+        if (scratch > 0x7FFFFFFFu) {
+            return core::make_unexpected(std::string("field '") + int_fields[i].key +
+                                         "' is out of range");
+        }
+        *int_fields[i].target = static_cast<int32_t>(scratch);
+    }
+
+    scratch = config.block_size;
+    step = ReadUint(value, "blockSize", &scratch);
+    if (!step.ok()) return core::make_unexpected(step.take_error());
+    if (scratch > 0xFFFFFFFFu) {
+        return core::make_unexpected(std::string("field 'blockSize' is out of range"));
+    }
+    config.block_size = static_cast<uint32_t>(scratch);
+
+    struct SizeField {
+        const char* key;
+        std::size_t* target;
+    };
+    const SizeField size_fields[] = {
+        {"concurrency", &config.concurrency},
+        {"maxInflightBlocks", &config.max_inflight_blocks},
+        {"maxConcurrentFiles", &config.max_concurrent_files},
+    };
+    for (std::size_t i = 0; i < sizeof(size_fields) / sizeof(size_fields[0]); ++i) {
+        scratch = static_cast<uint64_t>(*size_fields[i].target);
+        step = ReadUint(value, size_fields[i].key, &scratch);
+        if (!step.ok()) return core::make_unexpected(step.take_error());
+        *size_fields[i].target = static_cast<std::size_t>(scratch);
+    }
+    return config;
+}
+
 core::Expected<UpperMode, std::string> UpperModeParse(const std::string& raw) {
     if (raw == "sparse") return UpperMode::Sparse;
     if (raw == "logStructured") return UpperMode::LogStructured;

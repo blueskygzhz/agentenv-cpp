@@ -20,5 +20,9 @@ target_link_libraries(agentenv-rootmod PUBLIC
     agentenv-core
     agentenv-p2p
     agentenv-ublk
+    # `setup/deps` reads AppConfig's resolved paths and emits overlaybd
+    # DownloadConfig into the generated global configs.
+    agentenv-cfg
+    agentenv-overlaybd
     Threads::Threads
 )
