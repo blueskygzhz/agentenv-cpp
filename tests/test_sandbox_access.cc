@@ -204,8 +204,8 @@ MT_TEST(tokens_differ_per_sandbox_and_per_seed) {
     const SandboxId subject = FixtureSandboxId();
     const SandboxId other = SandboxId::Fresh();
 
-    MT_EXPECT_TRUE(first.Generate(subject) != second.Generate(subject));
-    MT_EXPECT_TRUE(first.Generate(subject) != first.Generate(other));
+    MT_EXPECT_TRUE(first.Generate(subject).Expose() != second.Generate(subject).Expose());
+    MT_EXPECT_TRUE(first.Generate(subject).Expose() != first.Generate(other).Expose());
     // A token minted for one sandbox must not authenticate another.
     MT_EXPECT_TRUE(!first.Matches(other, first.Generate(subject).Expose()));
     MT_EXPECT_TRUE(!second.Matches(subject, first.Generate(subject).Expose()));
@@ -313,8 +313,8 @@ MT_TEST(managed_seed_is_private_and_stable) {
 
     const SandboxId subject = SandboxId::Fresh();
     MT_EXPECT_EQ(
-        sandbox::SandboxAccessTokenGenerator::New(first.value()).value().Generate(subject),
-        sandbox::SandboxAccessTokenGenerator::New(second.value()).value().Generate(subject));
+        sandbox::SandboxAccessTokenGenerator::New(first.value()).value().Generate(subject).Expose(),
+        sandbox::SandboxAccessTokenGenerator::New(second.value()).value().Generate(subject).Expose());
 }
 
 MT_TEST(empty_or_invalid_managed_seed_is_not_replaced) {
@@ -338,7 +338,7 @@ MT_TEST(empty_or_invalid_managed_seed_is_not_replaced) {
         MT_EXPECT_TRUE(resolved.error().find("64 lowercase hexadecimal") !=
                        std::string::npos);
         // The file is left exactly as it was.
-        MT_EXPECT_EQ(fs::Read(managed_path).value(), std::string(contents[i]));
+        MT_EXPECT_EQ(fs::ReadToString(managed_path).value(), std::string(contents[i]));
     }
 }
 
@@ -469,7 +469,8 @@ MT_TEST(load_or_create_mints_a_managed_seed_when_unconfigured) {
         sandbox::SandboxAccessTokenGenerator::LoadOrCreate(config, false);
     MT_EXPECT_TRUE(second.ok());
     const SandboxId subject = FixtureSandboxId();
-    MT_EXPECT_EQ(first.value().Generate(subject), second.value().Generate(subject));
+    MT_EXPECT_EQ(first.value().Generate(subject).Expose(),
+                 second.value().Generate(subject).Expose());
 }
 
 int main() { return microtest::RunAll(); }

@@ -12,4 +12,4 @@ add_library(agentenv-snapshot STATIC
     repository/backends.cc
 )
 target_include_directories(agentenv-snapshot PUBLIC ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(agentenv-snapshot PUBLIC agentenv-core agentenv-sandbox agentenv-p2p)
+target_link_libraries(agentenv-snapshot PUBLIC agentenv-core agentenv-sandbox agentenv-p2p agentenv-snapshot-startup-pack)
