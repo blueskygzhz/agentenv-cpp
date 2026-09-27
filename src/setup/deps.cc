@@ -17,6 +17,7 @@
 #include "agentenv/core/logging.h"
 #include "agentenv/core/process.h"
 #include "agentenv/core/toml.h"
+#include "agentenv/setup/overlaybd.h"
 
 namespace agentenv {
 namespace setup {
@@ -856,6 +857,207 @@ core::Expected<Unit, std::string> ExtractExt4FromGhcr(const std::string& regctl_
 
     fs::RemoveDirAll(tmp_dir.value());
     return result;
+}
+
+core::Expected<Unit, std::string> EnsureToolsVersion(const cfg::AppConfig& config,
+                                                     const std::string& deps_path,
+                                                     const Manifest& manifest,
+                                                     const std::string& version) {
+    const core::Expected<std::string, std::string> tools_path =
+        config.ResolvedToolsDrivePathForVersion(version);
+    if (!tools_path.ok()) return core::make_unexpected(tools_path.error());
+
+    // A configured local file only identifies the release declared beside it,
+    // so it is used for that version and no other.
+    if (version == config.ResolvedToolsVersion() && config.tools.drive_path.has_value()) {
+        return InstallExplicitToolsDrive(*config.tools.drive_path, tools_path.value(), version);
+    }
+
+    if (FileExistsNonEmpty(tools_path.value())) {
+        AGENTENV_DEBUG("tools drive already present path=" << tools_path.value());
+        return Unit();
+    }
+
+    const core::Optional<std::string> tools_dir = fs::Parent(tools_path.value());
+    if (!tools_dir.has_value()) {
+        return core::make_unexpected(std::string("resolved tools drive path has no parent"));
+    }
+    const core::Expected<Unit, std::string> made = fs::CreateDirAll(*tools_dir);
+    if (!made.ok()) return made;
+
+    const std::string url_template =
+        config.tools.url.has_value() ? *config.tools.url : manifest.tools_url;
+    std::vector<std::pair<std::string, std::string> > vars;
+    vars.push_back(std::make_pair(std::string("version"), version));
+    const std::string image = ResolveUrl(url_template, vars);
+
+    // Staged next to the destination so publishing is a rename on the same
+    // filesystem, never a partially visible file.
+    const core::Expected<std::string, std::string> staging =
+        fs::CreateTempDir("agentenv-tools-");
+    if (!staging.ok()) {
+        return core::make_unexpected(std::string("stage legacy tools download: ") +
+                                     staging.error());
+    }
+    const std::string staged_path = fs::Join(staging.value(), "tools.ext4");
+
+    core::Expected<Unit, std::string> result = ExtractExt4FromGhcr(
+        cfg::RegctlPath(deps_path), image, "tools.ext4", staged_path);
+    if (!result.ok()) {
+        fs::RemoveDirAll(staging.value());
+        return core::make_unexpected(std::string("download legacy tools drive version '") +
+                                     version + "': " + result.error());
+    }
+    if (!FileExistsNonEmpty(staged_path)) {
+        fs::RemoveDirAll(staging.value());
+        return core::make_unexpected(std::string("tools drive version '") + version +
+                                     "' is empty");
+    }
+
+    if (::rename(staged_path.c_str(), tools_path.value().c_str()) != 0) {
+        // Across filesystems a rename cannot work; fall back to a copy.
+        const core::Expected<Unit, std::string> copied =
+            fs::Copy(staged_path, tools_path.value());
+        if (!copied.ok()) {
+            fs::RemoveDirAll(staging.value());
+            return core::make_unexpected(std::string("publish downloaded tools drive: ") +
+                                         copied.error());
+        }
+    }
+    fs::RemoveDirAll(staging.value());
+    return Unit();
+}
+
+core::Expected<Unit, std::string> InstallToolsImage(const std::string& source,
+                                                    const std::string& destination) {
+    const core::Expected<storage::overlaybd::ImageConfig, std::string> loaded =
+        storage::overlaybd::LoadImageConfig(source);
+    if (!loaded.ok()) return core::make_unexpected(loaded.error());
+    storage::overlaybd::ImageConfig image = loaded.value();
+
+    const core::Optional<std::string> parent = fs::Parent(destination);
+    if (!parent.has_value()) {
+        return core::make_unexpected(std::string("tools image directory"));
+    }
+    const core::Expected<Unit, std::string> made = fs::CreateDirAll(*parent);
+    if (!made.ok()) return made;
+
+    // Tools always prefetch, independently of user disks and memory.
+    image.has_download_override = true;
+    image.download_override.enable = true;
+    image.download_override.delay = 0;
+    image.download_override.delay_extra = 1;
+
+    for (std::size_t i = 0; i < image.lowers.size(); ++i) {
+        storage::overlaybd::LayerConfig& layer = image.lowers[i];
+        if (layer.file.empty()) continue;  // external layer, stays by reference
+
+        // `sha256:abc` is not a usable filename, and the digest is what makes
+        // the name stable across re-installs.
+        std::string name = layer.digest;
+        for (std::size_t c = 0; c < name.size(); ++c) {
+            if (name[c] == ':') name[c] = '-';
+        }
+        name += ".commit";
+
+        const std::string installed = fs::Join(*parent, name);
+        if (!fs::Exists(installed) && !fs::HardLink(layer.file, installed).ok()) {
+            // Cross-device or a read-only source: copy instead.
+            const core::Expected<fs::TempFile, std::string> temporary =
+                fs::CreateTempFileIn(*parent, ".layer-");
+            if (!temporary.ok()) return core::make_unexpected(temporary.error());
+
+            const core::Expected<Unit, std::string> copied =
+                fs::Copy(layer.file, temporary.value().path);
+            if (!copied.ok()) {
+                fs::RemoveFile(temporary.value().path);
+                return core::make_unexpected(std::string("copy tools layer: ") +
+                                             copied.error());
+            }
+            const core::Expected<Unit, std::string> mode =
+                SetFileMode(temporary.value().path, 0644);
+            if (!mode.ok()) {
+                fs::RemoveFile(temporary.value().path);
+                return mode;
+            }
+            if (::rename(temporary.value().path.c_str(), installed.c_str()) != 0) {
+                fs::RemoveFile(temporary.value().path);
+                return core::make_unexpected(std::string("install tools layer"));
+            }
+        }
+        // Relative, so the whole dependency bundle stays relocatable.
+        layer.file = name;
+    }
+
+    const core::Expected<fs::TempFile, std::string> temporary =
+        fs::CreateTempFileIn(*parent, ".image-");
+    if (!temporary.ok()) return core::make_unexpected(temporary.error());
+
+    const core::Expected<Unit, std::string> written = fs::WriteFd(
+        temporary.value().fd.get(), storage::overlaybd::ImageConfigToJson(image));
+    if (!written.ok()) {
+        fs::RemoveFile(temporary.value().path);
+        return written;
+    }
+    const core::Expected<Unit, std::string> mode = SetFileMode(temporary.value().path, 0644);
+    if (!mode.ok()) {
+        fs::RemoveFile(temporary.value().path);
+        return mode;
+    }
+    if (::rename(temporary.value().path.c_str(), destination.c_str()) != 0) {
+        fs::RemoveFile(temporary.value().path);
+        return core::make_unexpected(std::string("cache tools image config"));
+    }
+    return Unit();
+}
+
+core::Expected<Unit, std::string> Ensure(const cfg::AppConfig& config,
+                                         const std::string& deps_path,
+                                         const Manifest& manifest) {
+    // Architecture is resolved once and reused across URL/path derivation.
+    const core::Expected<std::string, std::string> arch = DetectArch();
+    if (!arch.ok()) return core::make_unexpected(arch.error());
+
+    if (config.virtualization_mode == core::VirtualizationMode::Pvm &&
+        arch.value() != "x86_64") {
+        return core::make_unexpected(
+            std::string("PVM virtualization mode is only supported on x86_64 hosts"));
+    }
+
+    const core::Expected<Unit, std::string> made = fs::CreateDirAll(deps_path);
+    if (!made.ok()) return made;
+
+    core::Expected<Unit, std::string> step = EnsureFirecracker(config, manifest, arch.value());
+    if (!step.ok()) return step;
+    step = EnsureKernel(config, manifest, arch.value());
+    if (!step.ok()) return step;
+
+    // regctl backs all registry access, not just tools drive extraction, so it
+    // is provisioned unconditionally.
+    step = EnsureRegctl(deps_path, manifest);
+    if (!step.ok()) return step;
+
+    // The overlaybd CLI tools must exist before request-time image resolution:
+    // OCI -> overlaybd conversion shells out to overlaybd-create/apply/commit.
+    const std::string overlaybd_dir = fs::Join(deps_path, "overlaybd");
+    step = fs::CreateDirAll(overlaybd_dir);
+    if (!step.ok()) return step;
+
+    overlaybd::DependencyConfig overlaybd_config;
+    const cfg::OverlaybdDependencyConfig& source =
+        config.overlaybd.has_value() ? *config.overlaybd : manifest.overlaybd;
+    overlaybd_config.version = source.version;
+    overlaybd_config.url = source.url;
+    overlaybd_config.package_url = source.package_url;
+
+    step = overlaybd::EnsureReleaseTools(overlaybd_config, overlaybd_dir, arch.value());
+    if (!step.ok()) return step;
+
+    step = EnsureTools(config);
+    if (!step.ok()) return step;
+
+    AGENTENV_INFO("dependencies ready path=" << deps_path);
+    return Unit();
 }
 
 // ---------------------------------------------------------------------------

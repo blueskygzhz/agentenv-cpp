@@ -183,6 +183,29 @@ core::Expected<core::Unit, std::string> ExtractExt4FromGhcr(const std::string& r
                                                             const std::string& filename,
                                                             const std::string& destination);
 
+/// Rust `ensure_tools_version` — provisions one specific tools release,
+/// falling back to the legacy single-ext4 image when no overlaybd image is
+/// available.
+core::Expected<core::Unit, std::string> EnsureToolsVersion(const cfg::AppConfig& config,
+                                                           const std::string& deps_path,
+                                                           const Manifest& manifest,
+                                                           const std::string& version);
+
+/// Rust `install_tools_image` — rewrites a resolved overlaybd image config so
+/// it is self-contained under `destination`'s directory.
+///
+/// Two things happen that are easy to miss: background download is forced on
+/// (tools must prefetch independently of user disks), and every layer file is
+/// hard-linked in and rewritten to a *relative* name, so the installed release
+/// outlives image-cache eviction and the bundle stays relocatable.
+core::Expected<core::Unit, std::string> InstallToolsImage(const std::string& source,
+                                                          const std::string& destination);
+
+/// Rust `ensure` — the whole dependency provisioning pass.
+core::Expected<core::Unit, std::string> Ensure(const cfg::AppConfig& config,
+                                               const std::string& deps_path,
+                                               const Manifest& manifest);
+
 // ---------------------------------------------------------------------------
 // Generated overlaybd global configs
 // ---------------------------------------------------------------------------

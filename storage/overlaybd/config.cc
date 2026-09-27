@@ -229,6 +229,8 @@ core::Expected<UpperMode, std::string> UpperModeParse(const std::string& raw) {
 
 bool ImageConfig::operator==(const ImageConfig& other) const {
     if (repo_blob_url != other.repo_blob_url || result_file != other.result_file ||
+        has_download_override != other.has_download_override ||
+        (has_download_override && download_override != other.download_override) ||
         acceleration_layer != other.acceleration_layer ||
         record_trace_path != other.record_trace_path) {
         return false;
@@ -290,6 +292,11 @@ std::string ImageConfigToJson(const ImageConfig& config) {
     root["upper"] = core::Json(upper);
 
     root["resultFile"] = core::Json(config.result_file);
+    // Rust `#[serde(rename = "download", skip_serializing_if = "Option::is_none")]`:
+    // the key is `download`, and it is omitted entirely when unset.
+    if (config.has_download_override) {
+        root["download"] = DownloadConfigToJson(config.download_override);
+    }
     root["accelerationLayer"] = core::Json(config.acceleration_layer);
     root["recordTracePath"] = core::Json(config.record_trace_path);
 
@@ -315,6 +322,15 @@ core::Expected<ImageConfig, std::string> ParseImageConfig(const std::string& tex
     if (!step.ok()) return core::make_unexpected(step.take_error());
     step = ReadString(root, "recordTracePath", &config.record_trace_path);
     if (!step.ok()) return core::make_unexpected(step.take_error());
+    const core::Json* download = Field(root, "download");
+    if (download != NULL && download->kind() != core::Json::Kind::Null) {
+        const core::Expected<DownloadConfig, std::string> parsed_download =
+            ParseDownloadConfig(*download);
+        if (!parsed_download.ok()) return core::make_unexpected(parsed_download.error());
+        config.has_download_override = true;
+        config.download_override = parsed_download.value();
+    }
+
     step = ReadBool(root, "accelerationLayer", &config.acceleration_layer);
     if (!step.ok()) return core::make_unexpected(step.take_error());
 

@@ -111,6 +111,12 @@ struct ImageConfig {
     std::vector<LayerConfig> lowers;
     UpperConfig upper;
     std::string result_file;
+    /// Rust `#[serde(rename = "download", skip_serializing_if = "Option::is_none")]
+    /// download_override: Option<DownloadConfig>` — a per-image override of the
+    /// global download policy. Absent and present-but-default are distinct, so
+    /// the presence flag is tracked separately.
+    bool has_download_override = false;
+    DownloadConfig download_override;
     bool acceleration_layer = false;
     std::string record_trace_path;
 
