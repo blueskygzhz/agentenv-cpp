@@ -1,2 +1,0 @@
-/usr/bin/ar qc ../../lib/libagentenv-api.a "CMakeFiles/agentenv-api.dir/dto.cc.o" "CMakeFiles/agentenv-api.dir/server.cc.o" "CMakeFiles/agentenv-api.dir/proxy.cc.o" "CMakeFiles/agentenv-api.dir/impls.cc.o"
-/usr/bin/ranlib ../../lib/libagentenv-api.a

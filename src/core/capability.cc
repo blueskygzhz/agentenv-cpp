@@ -7,6 +7,7 @@
 #include <cstring>
 #include <sstream>
 
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 

@@ -7,7 +7,9 @@
 #ifndef AGENTENV_CORE_FS_H_
 #define AGENTENV_CORE_FS_H_
 
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -78,29 +80,29 @@ Expected<std::string, std::string> CreateTempDir(const std::string& prefix);
 // use the plain helpers above instead.
 // ---------------------------------------------------------------------------
 
-/// Owning file descriptor. Secret handling checks metadata on an already-open
-/// descriptor to avoid a path-based TOCTOU window, so descriptors outlive a
-/// single call and need real ownership.
+/// Owning file descriptor. Secret handling checks metadata on an *already-open*
+/// descriptor to avoid a path-based TOCTOU window, so descriptors outlive the
+/// call that produced them and need real ownership.
+///
+/// Ownership is shared rather than unique: `Expected<T, E>` and `Optional<T>`
+/// here are value-semantic containers that copy their payload, so a move-only
+/// descriptor could not be returned through them. A reference-counted handle
+/// keeps RAII (the fd closes exactly once, when the last copy dies) while
+/// staying copyable.
 class FileDescriptor {
  public:
-    FileDescriptor() : fd_(-1) {}
-    explicit FileDescriptor(int fd) : fd_(fd) {}
-    ~FileDescriptor();
+    FileDescriptor() {}
+    /// Takes ownership of `fd`. A negative value yields an empty handle.
+    explicit FileDescriptor(int fd);
 
-    // Move-only: two owners would double-close.
-    FileDescriptor(FileDescriptor&& other) : fd_(other.fd_) { other.fd_ = -1; }
-    FileDescriptor& operator=(FileDescriptor&& other);
-    FileDescriptor(const FileDescriptor&) = delete;
-    FileDescriptor& operator=(const FileDescriptor&) = delete;
+    bool valid() const { return holder_ && *holder_ >= 0; }
+    int get() const { return holder_ ? *holder_ : -1; }
 
-    bool valid() const { return fd_ >= 0; }
-    int get() const { return fd_; }
-    /// Relinquishes ownership without closing.
-    int release();
-    void reset();
+    /// Drops this reference; closes the descriptor if it was the last one.
+    void reset() { holder_.reset(); }
 
  private:
-    int fd_;
+    std::shared_ptr<int> holder_;
 };
 
 /// The subset of `stat(2)` the security checks need. Mirrors what Rust reads

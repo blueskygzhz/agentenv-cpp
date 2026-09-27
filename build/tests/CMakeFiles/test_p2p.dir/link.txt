@@ -1,1 +1,0 @@
-/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_p2p.dir/test_p2p.cc.o -o ../bin/test_p2p  ../lib/libagentenv-microtest.a ../lib/libagentenv-p2p.a ../lib/libagentenv-core.a -lpthread

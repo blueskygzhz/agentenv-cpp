@@ -1,1 +1,0 @@
-/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_scheduler.dir/test_scheduler.cc.o -o ../bin/test_scheduler  ../lib/libagentenv-microtest.a ../lib/libagentenv-scheduler-internal.a ../lib/libagentenv-core.a -lpthread

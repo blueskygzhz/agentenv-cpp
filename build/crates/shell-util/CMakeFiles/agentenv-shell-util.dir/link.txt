@@ -1,2 +1,0 @@
-/usr/bin/ar qc ../../lib/libagentenv-shell-util.a "CMakeFiles/agentenv-shell-util.dir/shell.cc.o"
-/usr/bin/ranlib ../../lib/libagentenv-shell-util.a

@@ -1,1 +1,0 @@
-/usr/lib64/ccache/c++ -O3 -DNDEBUG "CMakeFiles/agentenv-gateway.dir/main.cc.o" -o ../../bin/agentenv-gateway  ../../lib/libagentenv-gateway-internal.a ../../lib/libagentenv-core.a -lpthread

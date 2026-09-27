@@ -1,1 +1,0 @@
-/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_gateway.dir/test_gateway.cc.o -o ../bin/test_gateway  ../lib/libagentenv-microtest.a ../lib/libagentenv-gateway-internal.a ../lib/libagentenv-core.a -lpthread

@@ -1,1 +1,0 @@
-/usr/lib64/ccache/c++ -O3 -DNDEBUG "CMakeFiles/agentenv-ublk-daemon.dir/main.cc.o" -o ../../bin/agentenv-ublk-daemon  ../../lib/libagentenv-core.a ../../lib/libagentenv-ublk.a ../../lib/libagentenv-storage-util.a ../../lib/libagentenv-core.a -lpthread

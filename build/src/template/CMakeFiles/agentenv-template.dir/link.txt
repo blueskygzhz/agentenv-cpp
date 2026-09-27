@@ -1,2 +1,0 @@
-/usr/bin/ar qc ../../lib/libagentenv-template.a "CMakeFiles/agentenv-template.dir/engine.cc.o"
-/usr/bin/ranlib ../../lib/libagentenv-template.a

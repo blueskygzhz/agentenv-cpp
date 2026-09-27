@@ -1,2 +1,0 @@
-/usr/bin/ar qc ../../lib/libagentenv-scheduler-internal.a "CMakeFiles/agentenv-scheduler-internal.dir/strategy.cc.o" "CMakeFiles/agentenv-scheduler-internal.dir/filter.cc.o" "CMakeFiles/agentenv-scheduler-internal.dir/store.cc.o" "CMakeFiles/agentenv-scheduler-internal.dir/node_registry.cc.o"
-/usr/bin/ranlib ../../lib/libagentenv-scheduler-internal.a

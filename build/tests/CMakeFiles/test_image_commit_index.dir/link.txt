@@ -1,1 +1,0 @@
-/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_image_commit_index.dir/test_image_commit_index.cc.o -o ../bin/test_image_commit_index  ../lib/libagentenv-microtest.a ../lib/libagentenv-image.a ../lib/libagentenv-core.a -lpthread

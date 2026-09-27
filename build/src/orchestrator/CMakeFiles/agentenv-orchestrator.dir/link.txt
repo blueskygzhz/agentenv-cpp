@@ -1,2 +1,0 @@
-/usr/bin/ar qc ../../lib/libagentenv-orchestrator.a "CMakeFiles/agentenv-orchestrator.dir/service.cc.o" "CMakeFiles/agentenv-orchestrator.dir/persistence.cc.o" "CMakeFiles/agentenv-orchestrator.dir/types.cc.o" "CMakeFiles/agentenv-orchestrator.dir/store.cc.o" "CMakeFiles/agentenv-orchestrator.dir/metrics.cc.o" "CMakeFiles/agentenv-orchestrator.dir/launch_plan.cc.o" "CMakeFiles/agentenv-orchestrator.dir/proxy.cc.o"
-/usr/bin/ranlib ../../lib/libagentenv-orchestrator.a

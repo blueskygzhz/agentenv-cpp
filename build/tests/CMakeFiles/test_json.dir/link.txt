@@ -1,1 +1,0 @@
-/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_json.dir/test_json.cc.o -o ../bin/test_json  ../lib/libagentenv-microtest.a ../lib/libagentenv-core.a -lpthread

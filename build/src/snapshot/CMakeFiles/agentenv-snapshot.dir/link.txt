@@ -1,2 +1,0 @@
-/usr/bin/ar qc ../../lib/libagentenv-snapshot.a "CMakeFiles/agentenv-snapshot.dir/manager.cc.o" "CMakeFiles/agentenv-snapshot.dir/repository.cc.o" "CMakeFiles/agentenv-snapshot.dir/artifact_cache.cc.o" "CMakeFiles/agentenv-snapshot.dir/p2p.cc.o" "CMakeFiles/agentenv-snapshot.dir/runtime_support.cc.o" "CMakeFiles/agentenv-snapshot.dir/mock.cc.o" "CMakeFiles/agentenv-snapshot.dir/repository/errors.cc.o" "CMakeFiles/agentenv-snapshot.dir/repository/interfaces.cc.o" "CMakeFiles/agentenv-snapshot.dir/repository/backends.cc.o"
-/usr/bin/ranlib ../../lib/libagentenv-snapshot.a

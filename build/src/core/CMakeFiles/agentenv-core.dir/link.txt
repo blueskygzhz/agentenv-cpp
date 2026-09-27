@@ -1,2 +1,0 @@
-/usr/bin/ar qc ../../lib/libagentenv-core.a "CMakeFiles/agentenv-core.dir/identity.cc.o" "CMakeFiles/agentenv-core.dir/digest.cc.o" "CMakeFiles/agentenv-core.dir/logging.cc.o" "CMakeFiles/agentenv-core.dir/executor.cc.o" "CMakeFiles/agentenv-core.dir/config.cc.o" "CMakeFiles/agentenv-core.dir/json.cc.o"
-/usr/bin/ranlib ../../lib/libagentenv-core.a

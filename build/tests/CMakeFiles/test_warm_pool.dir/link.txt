@@ -1,1 +1,0 @@
-/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_warm_pool.dir/test_warm_pool.cc.o -o ../bin/test_warm_pool  ../lib/libagentenv-microtest.a ../lib/libagentenv-core.a -lpthread

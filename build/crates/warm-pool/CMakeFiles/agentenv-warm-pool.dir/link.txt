@@ -1,2 +1,0 @@
-/usr/bin/ar qc ../../lib/libagentenv-warm-pool.a "CMakeFiles/agentenv-warm-pool.dir/pool.cc.o"
-/usr/bin/ranlib ../../lib/libagentenv-warm-pool.a

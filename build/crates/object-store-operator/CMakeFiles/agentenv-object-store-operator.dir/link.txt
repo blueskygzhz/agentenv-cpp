@@ -1,2 +1,0 @@
-/usr/bin/ar qc ../../lib/libagentenv-object-store-operator.a "CMakeFiles/agentenv-object-store-operator.dir/operator.cc.o"
-/usr/bin/ranlib ../../lib/libagentenv-object-store-operator.a

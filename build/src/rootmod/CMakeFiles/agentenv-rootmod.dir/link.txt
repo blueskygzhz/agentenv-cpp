@@ -1,2 +1,0 @@
-/usr/bin/ar qc ../../lib/libagentenv-rootmod.a "CMakeFiles/agentenv-rootmod.dir/__/cfg.cc.o" "CMakeFiles/agentenv-rootmod.dir/__/privileges.cc.o" "CMakeFiles/agentenv-rootmod.dir/__/local_store.cc.o" "CMakeFiles/agentenv-rootmod.dir/__/proto.cc.o" "CMakeFiles/agentenv-rootmod.dir/__/setup.cc.o"
-/usr/bin/ranlib ../../lib/libagentenv-rootmod.a

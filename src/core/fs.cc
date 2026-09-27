@@ -240,30 +240,15 @@ Expected<std::string, std::string> CreateTempDir(const std::string& prefix) {
 // Unix security primitives
 // ---------------------------------------------------------------------------
 
-FileDescriptor::~FileDescriptor() { reset(); }
-
-FileDescriptor& FileDescriptor::operator=(FileDescriptor&& other) {
-    if (this != &other) {
-        reset();
-        fd_ = other.fd_;
-        other.fd_ = -1;
-    }
-    return *this;
-}
-
-int FileDescriptor::release() {
-    const int fd = fd_;
-    fd_ = -1;
-    return fd;
-}
-
-void FileDescriptor::reset() {
-    if (fd_ >= 0) {
-        // Retrying close() on EINTR is unsafe on Linux: the descriptor is
-        // already gone, so a retry could close an unrelated one.
-        ::close(fd_);
-        fd_ = -1;
-    }
+FileDescriptor::FileDescriptor(int fd) {
+    if (fd < 0) return;
+    // The deleter is what makes this RAII: the fd closes when the last copy of
+    // the handle goes away. close() is not retried on EINTR, because on Linux
+    // the descriptor is already gone and a retry could close an unrelated one.
+    holder_.reset(new int(fd), [](int* owned) {
+        if (*owned >= 0) ::close(*owned);
+        delete owned;
+    });
 }
 
 namespace {

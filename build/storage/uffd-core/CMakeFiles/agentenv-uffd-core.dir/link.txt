@@ -1,2 +1,0 @@
-/usr/bin/ar qc ../../lib/libagentenv-uffd-core.a "CMakeFiles/agentenv-uffd-core.dir/uffd.cc.o"
-/usr/bin/ranlib ../../lib/libagentenv-uffd-core.a

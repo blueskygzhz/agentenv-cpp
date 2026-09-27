@@ -1,0 +1,49 @@
+# ---- build output -----------------------------------------------------------
+# Never commit compiled artifacts: they are large, do not delta-compress, and
+# are reproducible from source.
+build/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+install_manifest.txt
+
+# Object files, libraries, executables
+*.o
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.lo
+*.la
+*.gch
+*.pch
+
+# ---- test / coverage --------------------------------------------------------
+Testing/
+*.gcda
+*.gcno
+*.gcov
+coverage/
+*.profraw
+*.profdata
+
+# ---- editor / OS ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ---- local scratch ----------------------------------------------------------
+*.log
+core
+core.*
+vgcore.*

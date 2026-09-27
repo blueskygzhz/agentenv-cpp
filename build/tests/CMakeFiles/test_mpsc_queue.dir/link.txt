@@ -1,1 +1,0 @@
-/usr/lib64/ccache/c++ -O3 -DNDEBUG CMakeFiles/test_mpsc_queue.dir/test_mpsc_queue.cc.o -o ../bin/test_mpsc_queue  ../lib/libagentenv-microtest.a ../lib/libagentenv-core.a -lpthread

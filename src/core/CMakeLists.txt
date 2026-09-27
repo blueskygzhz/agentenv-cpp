@@ -6,6 +6,7 @@ add_library(agentenv-core STATIC
     config.cc
     json.cc
     fs.cc
+    capability.cc
     toml.cc
     virtualization.cc
 )

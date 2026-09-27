@@ -1,2 +1,0 @@
-/usr/bin/ar qc ../../lib/libagentenv-overlaybd.a "CMakeFiles/agentenv-overlaybd.dir/layer_reader.cc.o" "CMakeFiles/agentenv-overlaybd.dir/index_tree.cc.o" "CMakeFiles/agentenv-overlaybd.dir/config.cc.o" "CMakeFiles/agentenv-overlaybd.dir/lsmt.cc.o" "CMakeFiles/agentenv-overlaybd.dir/zfile.cc.o" "CMakeFiles/agentenv-overlaybd.dir/layer.cc.o" "CMakeFiles/agentenv-overlaybd.dir/prefetch.cc.o" "CMakeFiles/agentenv-overlaybd.dir/download_gate.cc.o"
-/usr/bin/ranlib ../../lib/libagentenv-overlaybd.a

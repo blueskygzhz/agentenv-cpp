@@ -1,2 +1,0 @@
-/usr/bin/ar qc ../../lib/libagentenv-observability.a "CMakeFiles/agentenv-observability.dir/metrics.cc.o" "CMakeFiles/agentenv-observability.dir/tracing.cc.o"
-/usr/bin/ranlib ../../lib/libagentenv-observability.a

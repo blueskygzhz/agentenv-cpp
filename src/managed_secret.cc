@@ -262,7 +262,7 @@ core::Expected<CreateOutcome, std::string> Create(const std::string& path,
 
     CreateOutcome outcome;
     outcome.kind = CreateOutcome::Kind::Existing;
-    outcome.existing = core::fs::FileDescriptor(existing.value().release());
+    outcome.existing = existing.value();
     return outcome;
 }
 
