@@ -7,6 +7,7 @@ add_library(agentenv-core STATIC
     json.cc
     fs.cc
     capability.cc
+    process.cc
     toml.cc
     virtualization.cc
 )
