@@ -1,0 +1,62 @@
+[firecracker.kvm]
+version = "1.15.1-patch-v1"
+url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/firecracker-{version}-{arch}.tgz"
+
+[firecracker.pvm]
+version = "v1.17.0-next.1"
+url = "https://github.com/kvcache-ai/firecracker-next/releases/download/{version}/firecracker-next-{version}-{arch}.tgz"
+
+[kernel.kvm]
+version = "vmlinux-6.1.175"
+url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/{version}-{arch}"
+
+[kernel.pvm]
+version = "6.12.33-pvm"
+url = "https://github.com/kvcache-ai/linux/releases/download/pvm-kernel-6.12.33/vmlinux-guest-6.12.33-pvm"
+
+[tools]
+version = "0.1.1"
+url = "ghcr.io/kvcache-ai/agentenv-tools:{version}"
+
+[overlaybd]
+version = "v1.0.18-aenv.1"
+package_url = "https://github.com/kvcache-ai/overlaybd/releases/download/static-{version}/overlaybd-tools-{version}-linux-{arch}.tar.gz"
+
+[regclient]
+version = "v0.11.5"
+url = "https://github.com/regclient/regclient/releases/download/{version}/regctl-linux-{arch}"
+
+[protoc]
+version = "33.4"
+url = "https://github.com/protocolbuffers/protobuf/releases/download/v{version}/protoc-{version}-{platform}.zip"
+
+[packages.runtime]
+# Package-only requirements without a stable command-line executable to probe.
+# Command-bearing requirements live in [packages.runtime_commands] below.
+# NOTE: since 85120b97ce9ddc1cc1edb0e3bdb373b4a304c9d4, the Dockerfile no longer
+# parses this manifest at build time; the runtime package list is hardcoded in
+# `deploy/docker/Dockerfile.agentenv` (runtime-base stage). Keep that list in
+# sync whenever you add/remove entries here.
+common = [
+  "ca-certificates",
+]
+ubuntu = []
+debian = []
+centos = []
+rhel = []
+arch = []
+
+[packages.runtime_commands]
+# NOTE: same as [packages.runtime] above, this list is not read by the
+# Dockerfile; update `deploy/docker/Dockerfile.agentenv` manually to match.
+curl = { default = "curl" }
+"debugfs" = { default = "e2fsprogs" }
+"ip" = { default = "iproute2", centos = "iproute", rhel = "iproute" }
+"iptables-restore" = { default = "iptables" }
+"iptables-save" = { default = "iptables" }
+jq = { default = "jq" }
+"mkfs.ext4" = { default = "e2fsprogs" }
+"resize2fs" = { default = "e2fsprogs" }
+sudo = { default = "sudo" }
+umoci = { default = "umoci" }
+zstd = { default = "zstd" }

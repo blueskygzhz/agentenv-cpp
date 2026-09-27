@@ -160,6 +160,66 @@ Expected<TomlValue, std::string> ParseArray(const std::string& raw) {
     return TomlValue::Array(elements);
 }
 
+/// One `key = value` pair lifted out of an inline table, with both sides still
+/// unparsed.
+struct InlineField {
+    std::string key;
+    std::string value_text;
+};
+
+/// Splits `{ a = "x", b = "y" }` into its fields.
+///
+/// TOML requires an inline table to fit on one line, so there is no
+/// continuation handling here. Nested inline tables are rejected rather than
+/// silently mis-parsed, since nothing in AgentENV's configs uses them.
+Expected<std::vector<InlineField>, std::string> SplitInlineTable(const std::string& raw) {
+    if (raw.size() < 2 || raw.front() != '{' || raw.back() != '}') {
+        return make_unexpected(std::string("malformed inline table: ") + raw);
+    }
+    std::string inner = raw.substr(1, raw.size() - 2);
+    TrimInPlace(&inner);
+
+    std::vector<InlineField> fields;
+    if (inner.empty()) return fields;  // `{}` is a valid empty inline table
+
+    std::size_t cursor = 0;
+    while (cursor < inner.size()) {
+        const std::size_t comma = FindTopLevelComma(inner, cursor);
+        std::string chunk = inner.substr(
+            cursor, comma == std::string::npos ? std::string::npos : comma - cursor);
+        TrimInPlace(&chunk);
+
+        if (!chunk.empty()) {
+            const std::size_t eq = chunk.find('=');
+            if (eq == std::string::npos) {
+                return make_unexpected(std::string("inline table field needs `key = value`: ") +
+                                       chunk);
+            }
+            InlineField field;
+            field.key = chunk.substr(0, eq);
+            field.value_text = chunk.substr(eq + 1);
+            TrimInPlace(&field.key);
+            TrimInPlace(&field.value_text);
+
+            if (field.key.size() >= 2 && field.key.front() == '"' && field.key.back() == '"') {
+                field.key = field.key.substr(1, field.key.size() - 2);
+            }
+            if (field.key.empty()) {
+                return make_unexpected(std::string("inline table field has an empty key"));
+            }
+            if (!field.value_text.empty() && field.value_text.front() == '{') {
+                return make_unexpected(
+                    std::string("nested inline tables are not supported: ") + chunk);
+            }
+            fields.push_back(field);
+        }
+
+        if (comma == std::string::npos) break;
+        cursor = comma + 1;
+    }
+    return fields;
+}
+
 Expected<TomlValue, std::string> ParseValue(const std::string& raw) {
     if (raw.empty()) return make_unexpected(std::string("empty value"));
 
@@ -380,6 +440,33 @@ Expected<TomlTable, std::string> TomlTable::ParseString(const std::string& text)
             }
         }
 
+        const std::string dotted = section.empty() ? key : section + "." + key;
+
+        // An inline table contributes one flattened entry per field, plus a
+        // record of its own name so the caller can iterate it back (see
+        // `InlineTableKeys`).
+        if (!value_text.empty() && value_text.front() == '{') {
+            const Expected<std::vector<InlineField>, std::string> fields =
+                SplitInlineTable(value_text);
+            if (!fields.has_value()) {
+                std::ostringstream oss;
+                oss << "toml line " << lineno << ": " << fields.error();
+                return make_unexpected(oss.str());
+            }
+            for (std::size_t i = 0; i < fields.value().size(); ++i) {
+                const InlineField& field = fields.value()[i];
+                Expected<TomlValue, std::string> value = ParseValue(field.value_text);
+                if (!value.has_value()) {
+                    std::ostringstream oss;
+                    oss << "toml line " << lineno << ": " << value.error();
+                    return make_unexpected(oss.str());
+                }
+                table.entries_[dotted + "." + field.key] = value.value();
+            }
+            table.inline_tables_[section].push_back(key);
+            continue;
+        }
+
         Expected<TomlValue, std::string> parsed = ParseValue(value_text);
         if (!parsed.has_value()) {
             std::ostringstream oss;
@@ -387,7 +474,6 @@ Expected<TomlTable, std::string> TomlTable::ParseString(const std::string& text)
             return make_unexpected(oss.str());
         }
 
-        const std::string dotted = section.empty() ? key : section + "." + key;
         table.entries_[dotted] = parsed.value();
     }
 
@@ -402,6 +488,12 @@ Expected<TomlTable, std::string> TomlTable::ParseFile(const std::string& path) {
     std::ostringstream oss;
     oss << in.rdbuf();
     return ParseString(oss.str());
+}
+
+std::vector<std::string> TomlTable::InlineTableKeys(const std::string& prefix) const {
+    std::map<std::string, std::vector<std::string> >::const_iterator it =
+        inline_tables_.find(prefix);
+    return it == inline_tables_.end() ? std::vector<std::string>() : it->second;
 }
 
 const TomlValue* TomlTable::Find(const std::string& dotted_key) const {

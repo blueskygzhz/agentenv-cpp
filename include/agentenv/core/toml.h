@@ -15,9 +15,12 @@
 //   - values: basic strings (with \" \\ \n \r \t \0 escapes), integers
 //     (decimal, `_` separators, optional sign), floats, `true`/`false`
 //   - single-line arrays of the above, plus multi-line arrays
+//   - single-line inline tables (`k = { a = "x", b = "y" }`), needed by
+//     `config/deps_manifest.toml`'s `[packages.runtime_commands]`
 //
 // Not supported (unused by AgentENV configs): array-of-tables (`[[x]]`),
-// inline tables, datetimes, literal/multi-line strings, hex/oct/bin ints.
+// nested inline tables, datetimes, literal/multi-line strings, hex/oct/bin
+// ints.
 #ifndef AGENTENV_CORE_TOML_H_
 #define AGENTENV_CORE_TOML_H_
 
@@ -86,10 +89,24 @@ class TomlTable {
     /// but every field defaulted" (`Some(T::default())`).
     bool HasTable(const std::string& prefix) const;
 
+    /// Names of the inline tables declared directly under `prefix`, in source
+    /// order.
+    ///
+    /// This exists because an inline table's *name* can itself contain a dot:
+    /// `"mkfs.ext4" = { default = "e2fsprogs" }` flattens to the key
+    /// `...mkfs.ext4.default`, which is indistinguishable from a table `mkfs`
+    /// holding `ext4.default`. Keeping the original names lets a caller iterate
+    /// the entries unambiguously — it recombines `prefix + name + field` the
+    /// same way the parser split it. Rust has no such problem because it
+    /// deserializes straight into `BTreeMap<String, _>`.
+    std::vector<std::string> InlineTableKeys(const std::string& prefix) const;
+
     const std::map<std::string, TomlValue>& entries() const { return entries_; }
 
  private:
     std::map<std::string, TomlValue> entries_;
+    /// prefix -> inline table names declared under it.
+    std::map<std::string, std::vector<std::string> > inline_tables_;
 };
 
 }  // namespace core

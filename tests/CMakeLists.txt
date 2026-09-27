@@ -23,6 +23,7 @@ agentenv_add_test(test_template_spec       test_template_spec.cc       agentenv-
 agentenv_add_test(test_secrets             test_secrets.cc             agentenv-rootmod)
 agentenv_add_test(test_local_store         test_local_store.cc         agentenv-rootmod)
 agentenv_add_test(test_setup               test_setup.cc               agentenv-rootmod)
+agentenv_add_test(test_packages            test_packages.cc            agentenv-rootmod)
 agentenv_add_test(test_mpsc_queue          test_mpsc_queue.cc          agentenv-core)
 agentenv_add_test(test_dto                 test_dto.cc                 agentenv-api)
 agentenv_add_test(test_mock_backend        test_mock_backend.cc        agentenv-sandbox)
