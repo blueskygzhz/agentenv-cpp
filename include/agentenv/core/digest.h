@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <string>
 
+#include "agentenv/core/expected.h"
+
 namespace agentenv {
 namespace core {
 
@@ -37,6 +39,26 @@ class Digest {
  private:
     std::array<uint8_t, 32> bytes_;
 };
+
+/// Rust struct `FileDigest` — content identity for a local file.
+///
+/// `size` is counted from the *same stream* used for hashing, not from a
+/// separate `stat`: a file that changes between the two calls would otherwise
+/// yield a size and digest that never coexisted.
+struct FileDigest {
+    uint64_t size = 0;
+    /// `sha256:<hex>`.
+    std::string sha256;
+
+    bool operator==(const FileDigest& o) const {
+        return size == o.size && sha256 == o.sha256;
+    }
+    bool operator!=(const FileDigest& o) const { return !(*this == o); }
+};
+
+/// Rust `FileDigest::describe_blocking` — streams the file, so memory use is
+/// bounded regardless of file size.
+Expected<FileDigest, std::string> DescribeFile(const std::string& path);
 
 // ---- Free functions mirroring Rust `src/digest.rs` ----
 

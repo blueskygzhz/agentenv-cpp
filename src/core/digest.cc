@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 #include "agentenv/core/digest.h"
 
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace agentenv {
 namespace core {
@@ -192,6 +195,46 @@ std::string Sha256Digest(const void* data, std::size_t len) {
 
 std::string Sha256Digest(const std::string& data) {
     return Sha256Digest(data.data(), data.size());
+}
+
+Expected<FileDigest, std::string> DescribeFile(const std::string& path) {
+    // Rust `DIGEST_BUFFER_SIZE`.
+    const std::size_t kBufferSize = 128 * 1024;
+
+    std::FILE* file = std::fopen(path.c_str(), "rb");
+    if (file == NULL) {
+        return make_unexpected(std::string("open ") + path + ": " + std::strerror(errno));
+    }
+
+    Sha256Ctx ctx;
+    std::vector<uint8_t> buffer(kBufferSize);
+    uint64_t size = 0;
+    while (true) {
+        const std::size_t read = std::fread(&buffer[0], 1, buffer.size(), file);
+        if (read > 0) {
+            ctx.Update(&buffer[0], read);
+            size += read;
+        }
+        if (read < buffer.size()) {
+            // Short read: distinguish a real error from a clean EOF, or a
+            // truncated read would silently produce a digest of partial data.
+            if (std::ferror(file) != 0) {
+                const std::string error = std::strerror(errno);
+                std::fclose(file);
+                return make_unexpected(std::string("read ") + path + ": " + error);
+            }
+            break;
+        }
+    }
+    std::fclose(file);
+
+    uint8_t out[32];
+    ctx.Final(out);
+
+    FileDigest digest;
+    digest.size = size;
+    digest.sha256 = "sha256:" + HexOf(out, 32);
+    return digest;
 }
 
 }  // namespace core
