@@ -12,6 +12,7 @@
 #include "agentenv/core/digest.h"
 #include "agentenv/core/expected.h"
 #include "agentenv/core/identity.h"
+#include "agentenv/core/json.h"
 #include "agentenv/core/optional.h"
 
 namespace agentenv {
@@ -67,9 +68,45 @@ struct CommandContext {
     std::vector<std::string> volumes;
     std::map<std::string, std::string> labels;
 
+    /// Rust `CommandContext::new` — normalises the workdir, so a blank value
+    /// from an image config becomes `/` rather than an empty `cd` target.
+    static CommandContext New(const std::map<std::string, std::string>& env_vars,
+                              const std::string& workdir);
+
+    /// Rust `CommandContext::from_env_and_workdir`.
+    static CommandContext FromEnvAndWorkdir(
+        const std::map<std::string, std::string>& env_vars,
+        const core::Optional<std::string>& workdir);
+
+    // Rust's `with_*` builders consume and return `self`; these mutate in
+    // place and return a reference so a chain reads the same way without a
+    // copy per step.
+    CommandContext& WithEnvVar(const std::string& key, const std::string& value);
+    CommandContext& WithEnvOverrides(const std::map<std::string, std::string>& overrides);
+    CommandContext& WithWorkdir(const std::string& workdir);
+    CommandContext& WithUser(const core::Optional<std::string>& user);
+    CommandContext& WithExposedPorts(const std::vector<std::string>& ports);
+    CommandContext& WithEntrypoint(const core::Optional<std::vector<std::string> >& entrypoint);
+    CommandContext& WithCmd(const core::Optional<std::vector<std::string> >& cmd);
+    CommandContext& WithVolumes(const std::vector<std::string>& volumes);
+    CommandContext& WithLabels(const std::map<std::string, std::string>& labels);
+
+    /// Rust `CommandContext::effective_start_cmd`.
+    ///
+    /// Entrypoint and cmd concatenated and shell-quoted, suitable for
+    /// `bash -lc`. Absent when both are empty, which is how the caller tells
+    /// "no start command" from "an empty one".
+    core::Optional<std::string> EffectiveStartCmd() const;
+
+    core::Json ToJson() const;
+    static core::Expected<CommandContext, std::string> FromJson(const core::Json& json);
+
     bool operator==(const CommandContext& o) const;
     bool operator!=(const CommandContext& o) const { return !(*this == o); }
 };
+
+/// Rust `normalize_workdir`.
+std::string NormalizeWorkdir(const std::string& workdir);
 
 /// Rust struct `TemplateBuildErrorReason` — a build failure message plus the
 /// optional client-visible step that produced it.
@@ -85,6 +122,14 @@ struct TemplateBuildErrorReason {
     /// Rust `impl Display` — the message only; the step is carried separately
     /// so the API can surface it as its own field.
     const std::string& ToString() const { return message; }
+
+    core::Json ToJson() const;
+
+    /// Rust's hand-written `Deserialize` accepts two shapes: the structured
+    /// object, and a bare string from records written before `step` existed.
+    /// Dropping the legacy form would make those records unreadable.
+    static core::Expected<TemplateBuildErrorReason, std::string> FromJson(
+        const core::Json& json);
 
     bool operator==(const TemplateBuildErrorReason& o) const;
     bool operator!=(const TemplateBuildErrorReason& o) const { return !(*this == o); }

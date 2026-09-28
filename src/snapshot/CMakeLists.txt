@@ -4,6 +4,8 @@ add_library(agentenv-snapshot STATIC
     types.cc
     version.cc
     acr_manifest.cc
+    drive.cc
+    record.cc
     repository.cc
     artifact_cache.cc
     p2p.cc
@@ -15,4 +17,14 @@ add_library(agentenv-snapshot STATIC
     repository/posixfs/layout.cc
 )
 target_include_directories(agentenv-snapshot PUBLIC ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(agentenv-snapshot PUBLIC agentenv-core agentenv-sandbox agentenv-p2p agentenv-snapshot-startup-pack)
+# `CommandContext::EffectiveStartCmd` shell-quotes each argument before it
+# reaches `bash -lc`.
+target_link_libraries(agentenv-snapshot PUBLIC
+    agentenv-core
+    agentenv-sandbox
+    agentenv-p2p
+    agentenv-snapshot-startup-pack
+    agentenv-shell-util
+    # `SnapshotVolume` carries a `VolumeMode`.
+    agentenv-volume-record
+)

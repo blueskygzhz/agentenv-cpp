@@ -71,6 +71,10 @@ endif()
 # Rust `src/lib.rs` module order (bottom-up):
 #   core → image → p2p → template → snapshot → sandbox → orchestrator → api
 add_subdirectory(src/core)
+# `snapshot::CommandContext` shell-quotes start commands, so this must be
+# configured before the modules that link it.
+add_subdirectory(crates/shell-util)
+add_subdirectory(src/volume-record)
 add_subdirectory(src/managed-secret)
 add_subdirectory(src/privileges-lib)
 add_subdirectory(src/snapshot-startup-pack)
@@ -101,7 +105,6 @@ add_subdirectory(storage/ublk-daemon)
 add_subdirectory(storage/uffd-core)
 
 add_subdirectory(crates/linux-cap)
-add_subdirectory(crates/shell-util)
 add_subdirectory(crates/observability)
 add_subdirectory(crates/object-store-operator)
 add_subdirectory(crates/warm-pool)

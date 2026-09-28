@@ -59,6 +59,15 @@ class TaggedUuid {
     explicit TaggedUuid(Uuid u) : inner_(u) {}
     const Uuid& inner() const { return inner_; }
     static TaggedUuid Fresh() { return TaggedUuid(Uuid::GenV7()); }
+    /// Rust `SnapshotId::parse`. Fails rather than yielding a nil id, because
+    /// callers use the failure to decide a string is an alias instead.
+    static Expected<TaggedUuid, std::string> Parse(const std::string& text) {
+        Uuid parsed;
+        if (!Uuid::Parse(text, &parsed)) {
+            return make_unexpected(std::string("invalid id '") + text + "'");
+        }
+        return TaggedUuid(parsed);
+    }
     bool operator==(const TaggedUuid& o) const { return inner_ == o.inner_; }
     bool operator!=(const TaggedUuid& o) const { return !(*this == o); }
     bool operator<(const TaggedUuid& o) const  { return inner_ < o.inner_; }

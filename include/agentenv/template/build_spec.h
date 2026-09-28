@@ -51,6 +51,11 @@ class ImageConfigs {
     bool operator==(const ImageConfigs& o) const { return entries_ == o.entries_; }
     bool operator!=(const ImageConfigs& o) const { return !(*this == o); }
 
+    /// Rust `#[serde(transparent)]`: the newtype serialises as its inner
+    /// `Vec`, so this is a bare array rather than an object wrapping one.
+    core::Json ToJson() const;
+    static core::Expected<ImageConfigs, std::string> FromJson(const core::Json& json);
+
  private:
     std::vector<ImageConfigEntry> entries_;
 };

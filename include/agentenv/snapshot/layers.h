@@ -20,6 +20,8 @@
 #include <string>
 #include <vector>
 
+#include "agentenv/core/expected.h"
+#include "agentenv/core/json.h"
 #include "agentenv/core/optional.h"
 
 namespace agentenv {
@@ -101,6 +103,26 @@ struct OverlaybdLayerRef {
 /// on (`record.backing_layers == remote.backing_layers`).
 bool LayerRefsEqual(const std::vector<OverlaybdLayerRef>& left,
                     const std::vector<OverlaybdLayerRef>& right);
+
+// ---- serialisation -------------------------------------------------------
+//
+// Rust derives serde on the enum without a `tag` attribute, so it uses the
+// externally tagged representation: `{"Managed": {..}}` / `{"External": {..}}`.
+// The field names are the Rust identifiers, not camelCase, because these
+// structs carry no `rename_all`.
+
+core::Json ManagedLayerToJson(const ManagedLayer& layer);
+core::Expected<ManagedLayer, std::string> ManagedLayerFromJson(const core::Json& json);
+
+core::Json ExternalLayerToJson(const ExternalLayer& layer);
+core::Expected<ExternalLayer, std::string> ExternalLayerFromJson(const core::Json& json);
+
+core::Json LayerRefToJson(const OverlaybdLayerRef& layer);
+core::Expected<OverlaybdLayerRef, std::string> LayerRefFromJson(const core::Json& json);
+
+core::Json LayerRefsToJson(const std::vector<OverlaybdLayerRef>& layers);
+core::Expected<std::vector<OverlaybdLayerRef>, std::string> LayerRefsFromJson(
+    const core::Json& json);
 
 }  // namespace snapshot
 }  // namespace agentenv

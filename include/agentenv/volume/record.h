@@ -88,6 +88,12 @@ struct VolumeRecord {
     /// catalog against illegal transitions. Returns the upstream error text.
     core::Expected<core::Unit, std::string> ValidateCatalogUpdate(const VolumeRecord& next) const;
 
+    /// `backing_image_config` is `#[serde(skip)]`: it is a node-local cache
+    /// path, so writing it into the durable record would make the catalog
+    /// node-specific.
+    core::Json ToJson() const;
+    static core::Expected<VolumeRecord, std::string> FromJson(const core::Json& json);
+
     bool operator==(const VolumeRecord& other) const;
     bool operator!=(const VolumeRecord& other) const { return !(*this == other); }
 };
