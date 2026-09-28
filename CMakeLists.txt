@@ -74,6 +74,7 @@ add_subdirectory(src/core)
 # `snapshot::CommandContext` shell-quotes start commands, so this must be
 # configured before the modules that link it.
 add_subdirectory(crates/shell-util)
+add_subdirectory(src/template-image-configs)
 add_subdirectory(src/volume-record)
 add_subdirectory(src/managed-secret)
 add_subdirectory(src/privileges-lib)

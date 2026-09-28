@@ -6,6 +6,8 @@ add_library(agentenv-snapshot STATIC
     acr_manifest.cc
     drive.cc
     record.cc
+    source_registry.cc
+    image_export_target.cc
     repository.cc
     artifact_cache.cc
     p2p.cc
@@ -15,6 +17,7 @@ add_library(agentenv-snapshot STATIC
     repository/interfaces.cc
     repository/backends.cc
     repository/posixfs/layout.cc
+    repository/posixfs/catalog.cc
 )
 target_include_directories(agentenv-snapshot PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # `CommandContext::EffectiveStartCmd` shell-quotes each argument before it
@@ -27,4 +30,6 @@ target_link_libraries(agentenv-snapshot PUBLIC
     agentenv-shell-util
     # `SnapshotVolume` carries a `VolumeMode`.
     agentenv-volume-record
+    # `CommittedSnapshot` carries an `ImageConfigs`.
+    agentenv-template-image-configs
 )

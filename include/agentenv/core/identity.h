@@ -9,6 +9,7 @@
 #include <ostream>
 #include <string>
 
+#include "agentenv/core/expected.h"
 #include "agentenv/core/optional.h"
 
 namespace agentenv {

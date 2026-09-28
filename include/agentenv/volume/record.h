@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "agentenv/core/expected.h"
+#include "agentenv/core/json.h"
 #include "agentenv/core/optional.h"
 #include "agentenv/snapshot/layers.h"
 
