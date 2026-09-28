@@ -12,6 +12,24 @@ RepositoryError RepositoryError::InvalidRequest(std::string reason) {
 RepositoryError RepositoryError::SnapshotNotFound(std::string lookup) {
     RepositoryError e; e.kind = RepositoryErrorKind::SnapshotNotFound; e.message = std::move(lookup); return e;
 }
+RepositoryError RepositoryError::VolumeNotFound(std::string lookup) {
+    RepositoryError e; e.kind = RepositoryErrorKind::VolumeNotFound; e.message = std::move(lookup); return e;
+}
+RepositoryError RepositoryError::VolumeNameConflict(std::string name) {
+    RepositoryError e; e.kind = RepositoryErrorKind::VolumeNameConflict; e.message = std::move(name); return e;
+}
+RepositoryError RepositoryError::ArtifactNotFound(std::string artifact) {
+    RepositoryError e; e.kind = RepositoryErrorKind::ArtifactNotFound; e.artifact = std::move(artifact); return e;
+}
+RepositoryError RepositoryError::ManagedLayerNotFound(std::string digest) {
+    RepositoryError e; e.kind = RepositoryErrorKind::ManagedLayerNotFound; e.message = std::move(digest); return e;
+}
+RepositoryError RepositoryError::IntegrityMismatch(std::string artifact, std::string expected,
+                                                   std::string actual) {
+    RepositoryError e; e.kind = RepositoryErrorKind::IntegrityMismatch;
+    e.artifact = std::move(artifact); e.expected = std::move(expected); e.actual = std::move(actual);
+    return e;
+}
 RepositoryError RepositoryError::AliasNotFound(std::string alias) {
     RepositoryError e; e.kind = RepositoryErrorKind::AliasNotFound; e.alias = std::move(alias); return e;
 }
@@ -26,6 +44,14 @@ RepositoryError RepositoryError::Unsupported(std::string feature) {
 RepositoryError RepositoryError::Backend(std::string message) {
     RepositoryError e; e.kind = RepositoryErrorKind::Backend; e.message = std::move(message); return e;
 }
+RepositoryError RepositoryError::Backend(std::string message, const std::string& source) {
+    // Rust keeps the cause as an `#[source]` chain; flattening it into the
+    // message is what keeps the underlying errno text visible here.
+    RepositoryError e;
+    e.kind = RepositoryErrorKind::Backend;
+    e.message = source.empty() ? std::move(message) : std::move(message) + ": " + source;
+    return e;
+}
 
 std::string RepositoryError::ToString() const {
     switch (kind) {
@@ -33,6 +59,10 @@ std::string RepositoryError::ToString() const {
             return "invalid repository request: " + message;
         case RepositoryErrorKind::SnapshotNotFound:
             return "snapshot not found: " + message;
+        case RepositoryErrorKind::VolumeNotFound:
+            return "volume not found: " + message;
+        case RepositoryErrorKind::VolumeNameConflict:
+            return "volume name already exists: " + message;
         case RepositoryErrorKind::AliasNotFound:
             return "snapshot alias not found: " + alias;
         case RepositoryErrorKind::AliasConflict:

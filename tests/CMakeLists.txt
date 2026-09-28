@@ -55,3 +55,4 @@ agentenv_add_test(test_snapshot_repository test_snapshot_repository.cc agentenv-
 agentenv_add_test(test_shell_util          test_shell_util.cc  agentenv-shell-util)
 agentenv_add_test(test_warm_pool    test_warm_pool.cc           agentenv-core)
 agentenv_add_test(test_api_pagination     test_api_pagination.cc      agentenv-api agentenv-snapshot)
+agentenv_add_test(test_posixfs_layout     test_posixfs_layout.cc      agentenv-snapshot)

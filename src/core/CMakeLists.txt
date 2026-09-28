@@ -10,6 +10,7 @@ add_library(agentenv-core STATIC
     process.cc
     credentials.cc
     base64.cc
+    file_lock.cc
     dns.cc
     time.cc
     url.cc
