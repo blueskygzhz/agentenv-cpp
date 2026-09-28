@@ -4,31 +4,12 @@
 
 #include <sstream>
 
+#include "agentenv/core/dns.h"
+
 namespace agentenv {
 namespace cfg {
 
 const char* const kFixedNetworkVmLinkCidr = "169.254.0.20/30";
-
-namespace {
-
-bool IsDnsAlnum(char c) {
-    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
-}
-
-/// Rust `is_valid_dns_label`.
-bool IsValidDnsLabel(const std::string& label) {
-    const std::size_t kMaxDnsLabelLen = 63;
-    if (label.empty() || label.size() > kMaxDnsLabelLen) return false;
-    if (!IsDnsAlnum(label[0]) || !IsDnsAlnum(label[label.size() - 1])) return false;
-    // Rust skips the first byte and takes len-2, i.e. the interior only.
-    for (std::size_t i = 1; i + 1 < label.size(); ++i) {
-        const char c = label[i];
-        if (!IsDnsAlnum(c) && c != '-') return false;
-    }
-    return true;
-}
-
-}  // namespace
 
 NetworkEgressConfig::NetworkEgressConfig() {
     // Rust `#[config(default = [...])]`, in upstream order.
@@ -50,32 +31,13 @@ bool Ipv4CidrOverlaps(const sandbox::network::Ipv4Cidr& left, const sandbox::net
 }
 
 bool IsValidDnsName(const std::string& domain) {
-    const std::size_t kMaxDnsNameLen = 253;
-    if (domain.empty() || domain.size() > kMaxDnsNameLen) return false;
-
-    // Rust `domain.split('.').all(is_valid_dns_label)` — note that split yields
-    // an empty label for a trailing dot, which then fails validation.
-    std::size_t cursor = 0;
-    while (true) {
-        const std::size_t dot = domain.find('.', cursor);
-        const std::string label =
-            domain.substr(cursor, dot == std::string::npos ? std::string::npos : dot - cursor);
-        if (!IsValidDnsLabel(label)) return false;
-        if (dot == std::string::npos) break;
-        cursor = dot + 1;
-    }
-    return true;
+    return core::IsValidDnsName(domain);
 }
 
 core::Optional<std::string> NormalizeDnsName(const std::string& domain) {
-    std::string lowered = domain;
-    for (std::size_t i = 0; i < lowered.size(); ++i) {
-        if (lowered[i] >= 'A' && lowered[i] <= 'Z') {
-            lowered[i] = static_cast<char>(lowered[i] - 'A' + 'a');
-        }
-    }
-    if (!IsValidDnsName(lowered)) return core::Optional<std::string>();
-    return lowered;
+    // Implementation moved to `core::dns` so `sandbox::network::policy` can
+    // share it; see the note in that header.
+    return core::NormalizeDnsName(domain);
 }
 
 core::Expected<ResolvedNetworkInternalConfig, std::string> NetworkConfig::ResolvedInternal(

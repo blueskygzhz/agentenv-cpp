@@ -2,6 +2,8 @@ add_library(agentenv-snapshot STATIC
     manager.cc
     layers.cc
     types.cc
+    version.cc
+    acr_manifest.cc
     repository.cc
     artifact_cache.cc
     p2p.cc

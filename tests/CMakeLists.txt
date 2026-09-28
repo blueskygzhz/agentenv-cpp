@@ -33,6 +33,8 @@ agentenv_add_test(test_mock_backend        test_mock_backend.cc        agentenv-
 agentenv_add_test(test_sandbox_process     test_sandbox_process.cc     agentenv-sandbox)
 agentenv_add_test(test_sandbox_envd        test_sandbox_envd.cc        agentenv-sandbox)
 agentenv_add_test(test_sandbox_access      test_sandbox_access.cc      agentenv-sandbox agentenv-cfg)
+agentenv_add_test(test_sandbox_manifest    test_sandbox_manifest.cc    agentenv-sandbox)
+agentenv_add_test(test_sandbox_network_policy test_sandbox_network_policy.cc agentenv-sandbox)
 agentenv_add_test(test_sandbox_firecracker test_sandbox_firecracker.cc agentenv-sandbox Threads::Threads)
 agentenv_add_test(test_sandbox_fc_pool     test_sandbox_fc_pool.cc   agentenv-sandbox)
 agentenv_add_test(test_sandbox_fc_instance test_sandbox_fc_instance.cc agentenv-sandbox Threads::Threads)
@@ -52,3 +54,4 @@ agentenv_add_test(test_gateway             test_gateway.cc             agentenv-
 agentenv_add_test(test_snapshot_repository test_snapshot_repository.cc agentenv-snapshot)
 agentenv_add_test(test_shell_util          test_shell_util.cc  agentenv-shell-util)
 agentenv_add_test(test_warm_pool    test_warm_pool.cc           agentenv-core)
+agentenv_add_test(test_api_pagination     test_api_pagination.cc      agentenv-api agentenv-snapshot)

@@ -1,5 +1,6 @@
 add_library(agentenv-api STATIC
     dto.cc
+    pagination.cc
     server.cc
     proxy.cc
     impls.cc

@@ -8,28 +8,15 @@
 #include <vector>
 
 #include "agentenv/core/expected.h"
+#include "agentenv/sandbox/network/policy.h"
 
 namespace agentenv {
 namespace sandbox {
 namespace network {
 
-/// Rust struct `SandboxNetworkEgressPolicy`.
-struct SandboxNetworkEgressPolicy {
-    // Simplified: allow/deny CIDR lists.
-    std::vector<std::string> allow_cidrs;
-    std::vector<std::string> deny_cidrs;
-};
-
-/// Rust struct `BaseSandboxNetworkPolicy`.
-struct BaseSandboxNetworkPolicy {
-    bool                      internet_egress = true;
-    SandboxNetworkEgressPolicy egress;
-};
-
-/// Rust struct `SandboxNetworkPolicy`.
-struct SandboxNetworkPolicy {
-    BaseSandboxNetworkPolicy base;
-};
+// `SandboxNetworkPolicy`, `SandboxNetworkEgressPolicy` and
+// `BaseSandboxNetworkPolicy` live in `network/policy.h` (Rust:
+// src/sandbox/network/policy.rs), included above.
 
 /// Rust struct `AddressPlan` — deterministic per-slot address allocation.
 struct AddressPlan {
@@ -106,13 +93,8 @@ class NetworkAddressPlan {
     Ipv4Cidr vm_link_;
 };
 
-/// iptables helpers — Rust src/sandbox/network/iptables_util.rs.
-namespace iptables {
-core::Expected<core::Unit, std::string>
-    ApplyRule(const std::string& chain, const std::string& rule);
-core::Expected<core::Unit, std::string>
-    ClearChain(const std::string& chain);
-}
+// iptables helpers live in `network/iptables_util.h` (Rust:
+// src/sandbox/network/iptables_util.rs).
 
 }  // namespace network
 }  // namespace sandbox

@@ -120,16 +120,6 @@ core::Expected<core::Unit, std::string> PrepareRuntime() {
     return core::Unit{};
 }
 
-namespace iptables {
-core::Expected<core::Unit, std::string>
-ApplyRule(const std::string&, const std::string&) {
-    return core::Unit{};  // TODO: shell out to `iptables`.
-}
-core::Expected<core::Unit, std::string> ClearChain(const std::string&) {
-    return core::Unit{};
-}
-}
-
 }  // namespace network
 }  // namespace sandbox
 }  // namespace agentenv
