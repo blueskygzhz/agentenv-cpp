@@ -84,8 +84,21 @@ class NetworkAddressPlan {
     uint8_t  VmLinkPrefix() const { return vm_link_.prefix; }
     const Ipv4Cidr& HostInteractionCidr() const { return host_interaction_; }
 
+    /// Rust `vm_link_mask()` — the VM-link netmask in dotted form, which is
+    /// what the guest's `ip=` boot argument expects (a prefix length there
+    /// would not parse).
+    uint32_t VmLinkMask() const;
+
     /// Rust `internal_egress_denied_cidrs()`.
     std::vector<std::string> InternalEgressDeniedCidrs() const;
+
+    /// Rust `conflict_patterns()` — octet-prefix substrings used to spot other
+    /// programs occupying our address space in `ip`/`iptables-save` output.
+    ///
+    /// A best-effort warning heuristic, not an overlap proof: a
+    /// non-octet-aligned CIDR can be under- or over-matched. Allocation itself
+    /// uses exact CIDR math.
+    std::vector<std::string> ConflictPatterns() const;
 
  private:
     Ipv4Cidr host_interaction_;

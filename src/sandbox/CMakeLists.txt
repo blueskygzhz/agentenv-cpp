@@ -10,6 +10,8 @@ add_library(agentenv-sandbox STATIC
     manifest.cc
     network/iptables_util.cc
     network/policy.cc
+    network/slot.cc
+    network/manager.cc
     custom_extension.cc
     ublk.cc
     # firecracker sub-module (Rust: src/sandbox/firecracker/*.rs)
@@ -23,6 +25,7 @@ add_library(agentenv-sandbox STATIC
 target_include_directories(agentenv-sandbox PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-sandbox PUBLIC
     agentenv-core
+    agentenv-cfg
     agentenv-managed-secret
     agentenv-snapshot-startup-pack
     agentenv-privileges

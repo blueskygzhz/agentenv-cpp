@@ -106,6 +106,44 @@ uint32_t NetworkAddressPlan::TapIp() const {
     return NetworkIpAt(vm_link_, 2).value();
 }
 
+// Rust `vm_link_mask` — `vm_link_cidr.mask()`.
+uint32_t NetworkAddressPlan::VmLinkMask() const {
+    // A /0 would shift by 32, which is undefined for uint32_t.
+    if (vm_link_.prefix == 0) return 0;
+    return 0xFFFFFFFFu << (32 - vm_link_.prefix);
+}
+
+namespace {
+
+// Rust `network_conflict_pattern` — keep only as many leading octets as the
+// prefix length makes meaningful.
+std::string NetworkConflictPattern(const Ipv4Cidr& cidr) {
+    const uint32_t a = (cidr.network >> 24) & 0xFFu;
+    const uint32_t b = (cidr.network >> 16) & 0xFFu;
+    const uint32_t c = (cidr.network >> 8) & 0xFFu;
+
+    std::ostringstream os;
+    if (cidr.prefix <= 8) {
+        os << a << ".";
+    } else if (cidr.prefix <= 16) {
+        os << a << "." << b << ".";
+    } else {
+        os << a << "." << b << "." << c << ".";
+    }
+    return os.str();
+}
+
+}  // namespace
+
+// Rust `conflict_patterns`.
+std::vector<std::string> NetworkAddressPlan::ConflictPatterns() const {
+    std::vector<std::string> out;
+    out.push_back(NetworkConflictPattern(host_interaction_));
+    out.push_back(NetworkConflictPattern(veth_));
+    out.push_back(NetworkConflictPattern(vm_link_));
+    return out;
+}
+
 std::vector<std::string> NetworkAddressPlan::InternalEgressDeniedCidrs() const {
     std::vector<std::string> out;
     out.push_back(host_interaction_.ToString());
