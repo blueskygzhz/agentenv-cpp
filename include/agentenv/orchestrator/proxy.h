@@ -20,7 +20,12 @@ struct ProxyTarget {
     // Dotted IPv4 string form, e.g. "10.0.0.42". Kept as string for zero-dep.
     std::string ip;
     ProxyTarget() {}
+    /// Rust `ProxyTarget::new(host_interaction_ip)`.
     explicit ProxyTarget(std::string ipv4) : ip(std::move(ipv4)) {}
+
+    // Rust `#[derive(PartialEq, Eq)]`.
+    bool operator==(const ProxyTarget& o) const { return ip == o.ip; }
+    bool operator!=(const ProxyTarget& o) const { return !(*this == o); }
 };
 
 /// Rust enum `ProxyLookupResult`.
@@ -34,9 +39,19 @@ enum class ProxyLookupKind {
 
 struct ProxyLookupResult {
     ProxyLookupKind kind = ProxyLookupKind::NotFound;
-    ProxyTarget     target;
+    ProxyTarget     target;                   // when kind == Ready
     bool            auto_resume = false;      // when kind == Paused
-    LifecyclePhase  unavailable_state = LifecyclePhase::Created;
+    /// Rust `Unavailable(SandboxState)`.
+    SandboxState    unavailable_state = SandboxState::Creating;
+
+    static ProxyLookupResult Ready(ProxyTarget t);
+    static ProxyLookupResult NotFound();
+    static ProxyLookupResult Paused(bool auto_resume);
+    static ProxyLookupResult Unavailable(SandboxState state);
+    static ProxyLookupResult RouteMissing();
+
+    bool operator==(const ProxyLookupResult& o) const;
+    bool operator!=(const ProxyLookupResult& o) const { return !(*this == o); }
 };
 
 /// Rust struct `ProxyRoute`.
@@ -49,9 +64,14 @@ struct ProxyRoute {
 /// Rust struct `ProxyRouteTable`.
 class ProxyRouteTable {
  public:
+    /// Rust `upsert`.
     ProxyRoute Upsert(const core::SandboxId& id, ProxyTarget target, uint64_t version);
+    /// Rust `remove`.
     core::Optional<ProxyRoute> Remove(const core::SandboxId& id);
+    /// Rust `route`.
     core::Optional<ProxyRoute> Route(const core::SandboxId& id) const;
+    /// Rust `#[cfg(test)] proxy_target`.
+    core::Optional<ProxyTarget> ProxyTargetOf(const core::SandboxId& id) const;
 
  private:
     mutable std::mutex mu_;

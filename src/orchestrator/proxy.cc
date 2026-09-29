@@ -12,6 +12,52 @@ static int64_t now_ms() {
     return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
+// ---- ProxyLookupResult constructors (Rust enum variants) ------------------
+
+ProxyLookupResult ProxyLookupResult::Ready(ProxyTarget t) {
+    ProxyLookupResult r;
+    r.kind   = ProxyLookupKind::Ready;
+    r.target = std::move(t);
+    return r;
+}
+ProxyLookupResult ProxyLookupResult::NotFound() {
+    ProxyLookupResult r;
+    r.kind = ProxyLookupKind::NotFound;
+    return r;
+}
+ProxyLookupResult ProxyLookupResult::Paused(bool auto_resume) {
+    ProxyLookupResult r;
+    r.kind        = ProxyLookupKind::Paused;
+    r.auto_resume = auto_resume;
+    return r;
+}
+ProxyLookupResult ProxyLookupResult::Unavailable(SandboxState state) {
+    ProxyLookupResult r;
+    r.kind              = ProxyLookupKind::Unavailable;
+    r.unavailable_state = state;
+    return r;
+}
+ProxyLookupResult ProxyLookupResult::RouteMissing() {
+    ProxyLookupResult r;
+    r.kind = ProxyLookupKind::RouteMissing;
+    return r;
+}
+
+// Rust `#[derive(PartialEq, Eq)]` — only the active variant's payload counts.
+bool ProxyLookupResult::operator==(const ProxyLookupResult& o) const {
+    if (kind != o.kind) return false;
+    switch (kind) {
+        case ProxyLookupKind::Ready:       return target == o.target;
+        case ProxyLookupKind::Paused:      return auto_resume == o.auto_resume;
+        case ProxyLookupKind::Unavailable: return unavailable_state == o.unavailable_state;
+        case ProxyLookupKind::NotFound:
+        case ProxyLookupKind::RouteMissing: return true;
+    }
+    return false;
+}
+
+// ---- ProxyRouteTable -------------------------------------------------------
+
 ProxyRoute ProxyRouteTable::Upsert(const core::SandboxId& id,
                                    ProxyTarget target,
                                    uint64_t version) {
@@ -38,6 +84,15 @@ core::Optional<ProxyRoute> ProxyRouteTable::Route(const core::SandboxId& id) con
     auto it = routes_.find(id.ToString());
     if (it == routes_.end()) return core::Optional<ProxyRoute>();
     return core::Optional<ProxyRoute>(it->second);
+}
+
+// Rust `#[cfg(test)] fn proxy_target`.
+core::Optional<ProxyTarget> ProxyRouteTable::ProxyTargetOf(
+    const core::SandboxId& id) const {
+    std::lock_guard<std::mutex> g(mu_);
+    auto it = routes_.find(id.ToString());
+    if (it == routes_.end()) return core::Optional<ProxyTarget>();
+    return core::Optional<ProxyTarget>(it->second.target);
 }
 
 }  // namespace orchestrator

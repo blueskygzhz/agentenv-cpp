@@ -64,8 +64,10 @@ std::unique_ptr<Server> MakeServer() {
 #endif
 }
 
-void RegisterOrchestratorRoutes(Server* /*server*/, orchestrator::Service* /*svc*/) {
-    // Skeleton: real wiring goes here once orchestrator::Service handlers exist.
+void RegisterOrchestratorRoutes(Server* /*server*/,
+                                orchestrator::Orchestrator* /*svc*/) {
+    // Skeleton: real wiring goes here once the Rust `src/api/impls/*` handlers
+    // are ported onto the Orchestrator surface.
 }
 
 }  // namespace api

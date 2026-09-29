@@ -9,6 +9,7 @@
 #include "agentenv/core/identity.h"
 #include "agentenv/orchestrator/store.h"
 #include "agentenv/orchestrator/types.h"
+#include "agentenv/sandbox/types.h"
 
 namespace agentenv {
 namespace orchestrator {
@@ -36,10 +37,10 @@ struct CreateLaunchPlan {
 
 /// Rust struct `ResumeLaunchPlan`.
 struct ResumeLaunchPlan {
-    core::SandboxId sandbox_id;
-    NewTimeout      timeout;
-    uint32_t        cpu_count = 1;
-    uint32_t        memory_mib = 128;
+    core::SandboxId           sandbox_id;
+    NewTimeout                timeout;
+    /// Rust `resources: SandboxResources` — replaces the split cpu/mem fields.
+    sandbox::SandboxResources resources;
 };
 
 /// Rust enum `LaunchPlan`.
@@ -61,12 +62,18 @@ struct LaunchPlan {
 
     static LaunchPlan ForResume(core::SandboxId id,
                                 NewTimeout timeout,
-                                uint32_t cpu_count,
-                                uint32_t memory_mib);
+                                const sandbox::SandboxResources& resources);
 
-    core::SandboxId    SandboxId() const;
-    LifecyclePhase     TransitionalState() const;
-    NewTimeout         Timeout() const;
+    /// Rust `sandbox_id()`.
+    core::SandboxId SandboxId() const;
+    /// Rust `transitional_state()` — Create yields Creating, Resume yields Resuming.
+    SandboxState    TransitionalState() const;
+    /// Rust `transitional_metadata()` — only a Create plan carries metadata.
+    const SandboxMetadata* TransitionalMetadata() const;
+    /// Rust `timeout()`.
+    NewTimeout      Timeout() const;
+    /// Rust `resources()`.
+    sandbox::SandboxResources Resources() const;
 };
 
 }  // namespace orchestrator

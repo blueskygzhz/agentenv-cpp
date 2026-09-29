@@ -14,7 +14,7 @@
 #include "agentenv/core/expected.h"
 
 namespace agentenv {
-namespace orchestrator { class Service; }
+namespace orchestrator { class Orchestrator; }
 
 namespace api {
 
@@ -53,8 +53,8 @@ class Server {
 std::unique_ptr<Server> MakeServer();
 
 /// Convenience: register all `/sandboxes*` routes onto the given server,
-/// dispatching to the given orchestrator::Service.
-void RegisterOrchestratorRoutes(Server* server, orchestrator::Service* svc);
+/// dispatching to the given orchestrator::Orchestrator.
+void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc);
 
 }  // namespace api
 }  // namespace agentenv

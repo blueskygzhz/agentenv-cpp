@@ -16,7 +16,7 @@ namespace api {
 /// Rust struct `ApiImpl` — glues API DTOs to orchestrator/snapshot/template.
 class ApiImpl {
  public:
-    explicit ApiImpl(std::shared_ptr<orchestrator::Service> svc)
+    explicit ApiImpl(std::shared_ptr<orchestrator::Orchestrator> svc)
         : svc_(std::move(svc)) {}
 
     // Sandbox handlers (Rust: src/api/impls/sandbox.rs).
@@ -40,7 +40,7 @@ class ApiImpl {
         ListTemplates();
 
  private:
-    std::shared_ptr<orchestrator::Service> svc_;
+    std::shared_ptr<orchestrator::Orchestrator> svc_;
 };
 
 }  // namespace api

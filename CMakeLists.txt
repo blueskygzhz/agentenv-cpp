@@ -107,6 +107,9 @@ add_subdirectory(storage/uffd-core)
 
 add_subdirectory(crates/linux-cap)
 add_subdirectory(crates/observability)
+# Rust `src/observability/` — node-level observability (host/machine/model).
+# Distinct from `crates/observability` (the metrics/tracing facade).
+add_subdirectory(src/observability)
 add_subdirectory(crates/object-store-operator)
 add_subdirectory(crates/warm-pool)
 add_subdirectory(crates/aenv)
@@ -137,6 +140,7 @@ target_link_libraries(agentenv-lib INTERFACE
     agentenv-linuxcap
     agentenv-shell-util
     agentenv-observability
+    agentenv-observability-node
     agentenv-object-store-operator
     agentenv-warm-pool
     agentenv-services-config

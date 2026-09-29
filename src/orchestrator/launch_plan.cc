@@ -37,15 +37,13 @@ LaunchPlan LaunchPlan::ForCreateFresh(core::SandboxId id,
 
 LaunchPlan LaunchPlan::ForResume(core::SandboxId id,
                                  NewTimeout timeout,
-                                 uint32_t cpu_count,
-                                 uint32_t memory_mib) {
+                                 const sandbox::SandboxResources& resources) {
     LaunchPlan p;
     p.kind = LaunchPlanKind::Resume;
     p.resume.reset(new ResumeLaunchPlan);
     p.resume->sandbox_id = id;
-    p.resume->timeout = timeout;
-    p.resume->cpu_count = cpu_count;
-    p.resume->memory_mib = memory_mib;
+    p.resume->timeout    = timeout;
+    p.resume->resources  = resources;
     return p;
 }
 
@@ -54,14 +52,31 @@ core::SandboxId LaunchPlan::SandboxId() const {
     return resume->sandbox_id;
 }
 
-LifecyclePhase LaunchPlan::TransitionalState() const {
-    return kind == LaunchPlanKind::Create ? LifecyclePhase::Booting
-                                          : LifecyclePhase::Booting;
+// Rust `transitional_state`:
+//   Create => SandboxState::Creating
+//   Resume => SandboxState::Resuming
+SandboxState LaunchPlan::TransitionalState() const {
+    return kind == LaunchPlanKind::Create ? SandboxState::Creating
+                                          : SandboxState::Resuming;
+}
+
+// Rust `transitional_metadata` — only Create carries metadata.
+const SandboxMetadata* LaunchPlan::TransitionalMetadata() const {
+    if (kind == LaunchPlanKind::Create) return &create->metadata;
+    return nullptr;
 }
 
 NewTimeout LaunchPlan::Timeout() const {
     if (kind == LaunchPlanKind::Create) return create->timeout;
     return resume->timeout;
+}
+
+// Rust `resources`:
+//   Create => plan.metadata.resources
+//   Resume => plan.resources
+sandbox::SandboxResources LaunchPlan::Resources() const {
+    if (kind == LaunchPlanKind::Create) return create->metadata.resources;
+    return resume->resources;
 }
 
 }  // namespace orchestrator

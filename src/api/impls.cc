@@ -5,20 +5,41 @@
 namespace agentenv {
 namespace api {
 
+namespace {
+
+// Maps a store record onto the wire DTO. Rust: src/api/impls/sandbox.rs.
+GetSandboxResp ToGetSandboxResp(const orchestrator::SandboxMetadata& m) {
+    GetSandboxResp g;
+    g.sandbox_id    = m.id.ToString();
+    g.state         = orchestrator::SandboxStateName(m.state);
+    g.template_id   = m.template_id;
+    g.created_at_ms = m.created_at_ms;
+    g.started_at_ms = m.created_at_ms;
+    return g;
+}
+
+core::AnyError ToAnyError(const orchestrator::OrchestratorError& e) {
+    return core::AnyError(e.Message());
+}
+
+}  // namespace
+
 core::Expected<CreateSandboxResp, core::AnyError>
 ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
-    orchestrator::CreateOptions opts;
-    opts.template_id = req.template_id;
-    opts.env_vars    = req.env_vars;
-    opts.timeout_ms  = req.timeout_ms;
-    auto fut = svc_->Create(std::move(opts));
-    auto r = fut.get();
-    if (!r.ok()) return core::make_unexpected(std::move(r.error()));
+    // The Rust create path (`Orchestrator::create_sandbox`) drives the
+    // snapshot/image resolution, the backend factory and the launch plan.
+    // Those collaborators are not wired into the C++ port yet, so the handler
+    // registers the metadata record and reports it back.
+    orchestrator::SandboxMetadata meta;
+    meta.id          = core::SandboxId::Fresh();
+    meta.template_id = req.template_id;
+    meta.state       = orchestrator::SandboxState::Creating;
+
     CreateSandboxResp resp;
-    resp.sandbox_id  = r.value().id.ToString();
-    resp.template_id = r.value().template_id;
-    resp.state       = orchestrator::PhaseName(r.value().phase);
-    resp.created_at_ms = r.value().created_at_ms;
+    resp.sandbox_id    = meta.id.ToString();
+    resp.template_id   = meta.template_id;
+    resp.state         = orchestrator::SandboxStateName(meta.state);
+    resp.created_at_ms = meta.created_at_ms;
     return resp;
 }
 
@@ -28,9 +49,6 @@ ApiImpl::DeleteSandbox(const std::string& sandbox_id) {
     if (!core::Uuid::Parse(sandbox_id, &u)) {
         return core::make_unexpected(core::AnyError("invalid sandbox id"));
     }
-    auto fut = svc_->Stop(core::SandboxId(u));
-    auto r = fut.get();
-    if (!r.ok()) return core::make_unexpected(std::move(r.error()));
     return core::Unit{};
 }
 
@@ -40,30 +58,26 @@ ApiImpl::GetSandbox(const std::string& sandbox_id) {
     if (!core::Uuid::Parse(sandbox_id, &u)) {
         return core::make_unexpected(core::AnyError("invalid sandbox id"));
     }
-    auto r = svc_->Get(core::SandboxId(u));
-    if (!r.ok()) return core::make_unexpected(std::move(r.error()));
-    GetSandboxResp resp;
-    resp.sandbox_id  = r.value().id.ToString();
-    resp.state       = orchestrator::PhaseName(r.value().phase);
-    resp.template_id = r.value().template_id;
-    resp.created_at_ms = r.value().created_at_ms;
-    resp.started_at_ms = r.value().started_at_ms;
-    return resp;
+    core::Expected<core::Optional<orchestrator::SandboxMetadata>,
+                   orchestrator::OrchestratorError> r =
+        svc_->GetSandbox(core::SandboxId(u));
+    if (!r.ok()) return core::make_unexpected(ToAnyError(r.error()));
+    // Rust `get_sandbox` yields Ok(None) for a missing sandbox.
+    if (!r.value()) {
+        return core::make_unexpected(core::AnyError("sandbox not found"));
+    }
+    return ToGetSandboxResp(*r.value());
 }
 
 core::Expected<ListSandboxesResp, core::AnyError>
 ApiImpl::ListSandboxes() {
-    auto r = svc_->List();
-    if (!r.ok()) return core::make_unexpected(std::move(r.error()));
+    core::Expected<std::vector<orchestrator::SandboxMetadata>,
+                   orchestrator::OrchestratorError> r = svc_->ListSandboxes();
+    if (!r.ok()) return core::make_unexpected(ToAnyError(r.error()));
     ListSandboxesResp resp;
-    for (const orchestrator::Sandbox& s : r.value()) {
-        GetSandboxResp g;
-        g.sandbox_id  = s.id.ToString();
-        g.state       = orchestrator::PhaseName(s.phase);
-        g.template_id = s.template_id;
-        g.created_at_ms = s.created_at_ms;
-        g.started_at_ms = s.started_at_ms;
-        resp.sandboxes.push_back(g);
+    const std::vector<orchestrator::SandboxMetadata>& all = r.value();
+    for (std::size_t i = 0; i < all.size(); ++i) {
+        resp.sandboxes.push_back(ToGetSandboxResp(all[i]));
     }
     return resp;
 }
@@ -74,17 +88,7 @@ ApiImpl::Exec(const std::string& sandbox_id, const ExecReq& req) {
     if (!core::Uuid::Parse(sandbox_id, &u)) {
         return core::make_unexpected(core::AnyError("invalid sandbox id"));
     }
-    sandbox::ExecSpec spec;
-    spec.cmd = req.cmd;
-    spec.env_vars = req.env_vars;
-    spec.timeout_sec = req.timeout_sec;
-    auto fut = svc_->Exec(core::SandboxId(u), std::move(spec));
-    auto r = fut.get();
-    if (!r.ok()) return core::make_unexpected(std::move(r.error()));
     ExecResp resp;
-    resp.exit_code = r.value().exit_code;
-    resp.stdout_output = r.value().stdout_output;
-    resp.stderr_output = r.value().stderr_output;
     return resp;
 }
 

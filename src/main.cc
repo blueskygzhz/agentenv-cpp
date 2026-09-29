@@ -28,11 +28,15 @@ int main(int argc, char** argv) {
         static_cast<ae::core::LogLevel>(cfg.log_level));
 
     // 2) Wire dependencies.
-    auto backend   = std::shared_ptr<ae::sandbox::Backend>(
-                        ae::sandbox::MakeBackend(cfg.sandbox_backend).release());
-    auto persister = std::shared_ptr<ae::orchestrator::Persister>(
-                        ae::orchestrator::MakePersister("memory", cfg.data_dir).release());
-    ae::orchestrator::Service svc(backend, persister);
+    //
+    // Rust `Orchestrator::with_file_backed_store_and_factory` builds the
+    // in-memory metadata store plus a file-backed persister; the C++ port
+    // currently wires the store and the backend.
+    auto backend = std::shared_ptr<ae::sandbox::Backend>(
+                       ae::sandbox::MakeBackend(cfg.sandbox_backend).release());
+    auto store   = std::shared_ptr<ae::orchestrator::MetadataStore>(
+                       new ae::orchestrator::InMemoryMetadataStore());
+    ae::orchestrator::Orchestrator svc(store, backend);
 
     // 3) HTTP server.
     auto server = ae::api::MakeServer();
