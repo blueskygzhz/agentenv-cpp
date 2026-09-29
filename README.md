@@ -112,6 +112,8 @@ Legend: 🟩 behaviourally aligned + tested · 🟨 main path real, some branche
 | `snapshot/artifact_cache` | `src/snapshot/artifact_cache.rs` | `LocalArtifactCache` (ref-counted LRU cache, concurrent deduplication with per-key mutex+condvar, `EnsureCached` / `PinLocalFile`), `CacheArtifactLease` |
 | `snapshot/runtime_support` | `src/snapshot/runtime_support.rs` | `RuntimeImageMaterializer` (derives node-local overlaybd image configs from committed layer refs), `OverlaybdLayerStore` trait, `HydrateRuntimeManifest`, `LoadFirecrackerManifestFromPath` |
 | `snapshot/repository/posixfs/runtime` | `src/snapshot/repository/backends/posixfs/runtime.rs` | `PosixFsRuntimeResolver` (resolves committed snapshots to runnable paths: materializes memory/rootfs/drive image configs, resolves attached drives, hydrates runtime manifest) |
+| `snapshot/repository/posixfs/backend` | `src/snapshot/repository/backends/posixfs/backend.rs` | `PosixFsBackend` (integrates catalog, artifacts, runtime resolver into a complete repository + resolver bundle) |
+| `orchestrator/persistence` (simplified) | `src/orchestrator/persistence/file_backed.rs` | `FileBackedSandboxPersister` framework (core structure implemented; full serialization pending `SandboxMetadata::ToJson` + `SandboxBackendFactory::DecodePausedState`) |
 
 ### Per-module state
 

@@ -22,6 +22,8 @@ add_library(agentenv-snapshot STATIC
     repository/posixfs/artifacts.cc
     # Rust: src/snapshot/repository/backends/posixfs/runtime.rs
     repository/posixfs/runtime.cc
+    # Rust: src/snapshot/repository/backends/posixfs/backend.rs
+    repository/posixfs/backend.cc
 )
 target_include_directories(agentenv-snapshot PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # `CommandContext::EffectiveStartCmd` shell-quotes each argument before it

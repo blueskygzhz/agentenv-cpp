@@ -356,5 +356,270 @@ InMemoryMetadataStore::ListIds() const {
     return out;
 }
 
+// ---- SandboxMetadata serialisation -----------------------------------------
+//
+// Rust derives `Serialize`/`Deserialize`. `paused_state` carries
+// `#[serde(skip)]`, so it is neither written nor restored here; the caller
+// re-attaches it from the backend factory.
+
+namespace {
+
+const char* TimeoutActionName(SandboxTimeoutAction action) {
+    return action == SandboxTimeoutAction::Delete ? "Delete" : "Pause";
+}
+
+core::Expected<SandboxTimeoutAction, std::string> ParseTimeoutAction(
+    const std::string& raw) {
+    if (raw == "Pause" || raw == "pause") return SandboxTimeoutAction::Pause;
+    if (raw == "Delete" || raw == "delete") return SandboxTimeoutAction::Delete;
+    return core::make_unexpected(std::string("unknown timeout action `") + raw + "`");
+}
+
+core::Expected<SandboxState, std::string> ParseSandboxState(const std::string& raw) {
+    if (raw == "creating")     return SandboxState::Creating;
+    if (raw == "resuming")     return SandboxState::Resuming;
+    if (raw == "running")      return SandboxState::Running;
+    if (raw == "snapshotting") return SandboxState::Snapshotting;
+    if (raw == "forking")      return SandboxState::Forking;
+    if (raw == "pausing")      return SandboxState::Pausing;
+    if (raw == "paused")       return SandboxState::Paused;
+    if (raw == "killing")      return SandboxState::Killing;
+    return core::make_unexpected(std::string("unknown sandbox state `") + raw + "`");
+}
+
+core::Json StringMapToJson(const std::unordered_map<std::string, std::string>& values) {
+    core::JsonObject object;
+    for (std::unordered_map<std::string, std::string>::const_iterator it = values.begin();
+         it != values.end(); ++it) {
+        object[it->first] = core::Json(it->second);
+    }
+    return core::Json(object);
+}
+
+core::Expected<std::unordered_map<std::string, std::string>, std::string>
+StringMapFromJson(const core::Json& json, const char* field) {
+    if (json.kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(std::string("field `") + field + "` must be an object");
+    }
+    std::unordered_map<std::string, std::string> values;
+    const core::JsonObject& object = json.as_object();
+    for (core::JsonObject::const_iterator it = object.begin(); it != object.end(); ++it) {
+        if (it->second.kind() != core::Json::Kind::String) {
+            return core::make_unexpected(std::string("field `") + field +
+                                         "` must contain strings");
+        }
+        values[it->first] = it->second.as_string();
+    }
+    return values;
+}
+
+}  // namespace
+
+core::Json SandboxMetadata::ToJson() const {
+    core::JsonObject object;
+    object["id"]                  = core::Json(id.ToString());
+    object["templateBuilder"]     = core::Json(template_builder);
+    object["snapshotId"]          = core::Json(snapshot_id);
+    if (snapshot_alias.has_value()) {
+        object["snapshotAlias"]   = core::Json(*snapshot_alias);
+    }
+    object["state"]               = core::Json(std::string(SandboxStateName(state)));
+    object["createdAt"]           = core::Json(created_at_ms);
+    if (timeout_ms.has_value()) {
+        object["timeout"]         = core::Json(*timeout_ms);
+    }
+    object["timeoutAction"]       = core::Json(std::string(TimeoutActionName(timeout_action)));
+    if (expires_at_ms.has_value()) {
+        object["expiresAt"]       = core::Json(*expires_at_ms);
+    }
+    object["autoResume"]          = core::Json(auto_resume);
+    object["virtualizationMode"]  =
+        core::Json(std::string(core::VirtualizationModeToString(virtualization_mode)));
+    object["runtimeVersions"]     = runtime_versions.ToJson();
+
+    core::JsonObject res;
+    res["cpuCount"]              = core::Json(static_cast<int64_t>(resources.cpu_count));
+    res["memoryMib"]             = core::Json(static_cast<int64_t>(resources.memory_mib));
+    res["diskSizeMib"]           = core::Json(static_cast<int64_t>(resources.disk_size_mib));
+    object["resources"]          = core::Json(res);
+
+    object["context"]            = context.ToJson();
+    object["imageConfigs"]       = image_configs.ToJson();
+    if (!template_id.empty())    object["templateId"] = core::Json(template_id);
+    if (!user_metadata.empty())  object["userMetadata"] = StringMapToJson(user_metadata);
+    object["networkPolicy"]      = network_policy.ToJson();
+    if (custom_extension_params.has_value()) {
+        object["customExtensionParams"] = core::Json(custom_extension_params->json_bytes);
+    }
+    object["secure"]             = core::Json(secure);
+    if (!volume_mounts.empty())  object["volumeMounts"] = StringMapToJson(volume_mounts);
+    return core::Json(object);
+}
+
+core::Expected<SandboxMetadata, std::string>
+SandboxMetadata::FromJson(const core::Json& json) {
+    if (json.kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(std::string("sandbox metadata must be an object"));
+    }
+    const core::JsonObject& fields = json.as_object();
+    SandboxMetadata meta;
+
+    core::JsonObject::const_iterator it = fields.find("id");
+    if (it == fields.end() || it->second.kind() != core::Json::Kind::String) {
+        return core::make_unexpected(std::string("missing field `id`"));
+    }
+    core::Expected<core::SandboxId, std::string> parsed_id =
+        core::SandboxId::Parse(it->second.as_string());
+    if (!parsed_id.ok()) return core::make_unexpected(parsed_id.error());
+    meta.id = parsed_id.value();
+
+    it = fields.find("templateBuilder");
+    if (it != fields.end() && it->second.kind() == core::Json::Kind::Bool) {
+        meta.template_builder = it->second.as_bool();
+    }
+
+    it = fields.find("snapshotId");
+    if (it == fields.end() || it->second.kind() != core::Json::Kind::String) {
+        return core::make_unexpected(std::string("missing field `snapshotId`"));
+    }
+    meta.snapshot_id = it->second.as_string();
+
+    it = fields.find("snapshotAlias");
+    if (it != fields.end() && it->second.kind() == core::Json::Kind::String) {
+        meta.snapshot_alias = core::Optional<std::string>(it->second.as_string());
+    }
+
+    it = fields.find("state");
+    if (it == fields.end() || it->second.kind() != core::Json::Kind::String) {
+        return core::make_unexpected(std::string("missing field `state`"));
+    }
+    core::Expected<SandboxState, std::string> parsed_state =
+        ParseSandboxState(it->second.as_string());
+    if (!parsed_state.ok()) return core::make_unexpected(parsed_state.error());
+    meta.state = parsed_state.value();
+
+    it = fields.find("createdAt");
+    if (it == fields.end() || it->second.kind() != core::Json::Kind::Int) {
+        return core::make_unexpected(std::string("missing field `createdAt`"));
+    }
+    meta.created_at_ms = it->second.as_int();
+
+    it = fields.find("timeout");
+    if (it != fields.end() && it->second.kind() == core::Json::Kind::Int) {
+        meta.timeout_ms = core::Optional<int64_t>(it->second.as_int());
+    }
+
+    it = fields.find("timeoutAction");
+    if (it != fields.end() && it->second.kind() == core::Json::Kind::String) {
+        core::Expected<SandboxTimeoutAction, std::string> parsed =
+            ParseTimeoutAction(it->second.as_string());
+        if (!parsed.ok()) return core::make_unexpected(parsed.error());
+        meta.timeout_action = parsed.value();
+    }
+
+    it = fields.find("expiresAt");
+    if (it != fields.end() && it->second.kind() == core::Json::Kind::Int) {
+        meta.expires_at_ms = core::Optional<int64_t>(it->second.as_int());
+    }
+
+    it = fields.find("autoResume");
+    if (it != fields.end() && it->second.kind() == core::Json::Kind::Bool) {
+        meta.auto_resume = it->second.as_bool();
+    }
+
+    it = fields.find("virtualizationMode");
+    if (it != fields.end() && it->second.kind() == core::Json::Kind::String) {
+        core::Expected<core::VirtualizationMode, std::string> parsed =
+            core::VirtualizationModeParse(it->second.as_string());
+        if (!parsed.ok()) return core::make_unexpected(parsed.error());
+        meta.virtualization_mode = parsed.value();
+    }
+
+    it = fields.find("runtimeVersions");
+    if (it != fields.end()) {
+        core::Expected<snapshot::SnapshotRuntimeVersions, std::string> parsed =
+            snapshot::SnapshotRuntimeVersions::FromJson(it->second);
+        if (!parsed.ok()) return core::make_unexpected(parsed.error());
+        meta.runtime_versions = parsed.value();
+    }
+
+    it = fields.find("resources");
+    if (it != fields.end() && it->second.kind() == core::Json::Kind::Object) {
+        const core::JsonObject& res = it->second.as_object();
+        core::JsonObject::const_iterator field = res.find("cpuCount");
+        if (field != res.end() && field->second.kind() == core::Json::Kind::Int) {
+            meta.resources.cpu_count = static_cast<uint32_t>(field->second.as_int());
+        }
+        field = res.find("memoryMib");
+        if (field != res.end() && field->second.kind() == core::Json::Kind::Int) {
+            meta.resources.memory_mib = static_cast<uint32_t>(field->second.as_int());
+        }
+        field = res.find("diskSizeMib");
+        if (field != res.end() && field->second.kind() == core::Json::Kind::Int) {
+            meta.resources.disk_size_mib = static_cast<uint32_t>(field->second.as_int());
+        }
+    }
+
+    it = fields.find("context");
+    if (it != fields.end()) {
+        core::Expected<snapshot::CommandContext, std::string> parsed =
+            snapshot::CommandContext::FromJson(it->second);
+        if (!parsed.ok()) return core::make_unexpected(parsed.error());
+        meta.context = parsed.value();
+    }
+
+    it = fields.find("imageConfigs");
+    if (it != fields.end()) {
+        core::Expected<tpl::ImageConfigs, std::string> parsed =
+            tpl::ImageConfigs::FromJson(it->second);
+        if (!parsed.ok()) return core::make_unexpected(parsed.error());
+        meta.image_configs = parsed.value();
+    }
+
+    it = fields.find("templateId");
+    if (it != fields.end() && it->second.kind() == core::Json::Kind::String) {
+        meta.template_id = it->second.as_string();
+    }
+
+    it = fields.find("userMetadata");
+    if (it != fields.end()) {
+        core::Expected<std::unordered_map<std::string, std::string>, std::string> parsed =
+            StringMapFromJson(it->second, "userMetadata");
+        if (!parsed.ok()) return core::make_unexpected(parsed.error());
+        meta.user_metadata = parsed.value();
+    }
+
+    it = fields.find("networkPolicy");
+    if (it != fields.end()) {
+        core::Expected<sandbox::network::SandboxNetworkPolicy, std::string> parsed =
+            sandbox::network::SandboxNetworkPolicy::FromJson(it->second);
+        if (!parsed.ok()) return core::make_unexpected(parsed.error());
+        meta.network_policy = parsed.value();
+    }
+
+    it = fields.find("customExtensionParams");
+    if (it != fields.end() && it->second.kind() == core::Json::Kind::String) {
+        sandbox::custom_extension::Params params;
+        params.json_bytes = it->second.as_string();
+        meta.custom_extension_params =
+            core::Optional<sandbox::custom_extension::Params>(params);
+    }
+
+    it = fields.find("secure");
+    if (it != fields.end() && it->second.kind() == core::Json::Kind::Bool) {
+        meta.secure = it->second.as_bool();
+    }
+
+    it = fields.find("volumeMounts");
+    if (it != fields.end()) {
+        core::Expected<std::unordered_map<std::string, std::string>, std::string> parsed =
+            StringMapFromJson(it->second, "volumeMounts");
+        if (!parsed.ok()) return core::make_unexpected(parsed.error());
+        meta.volume_mounts = parsed.value();
+    }
+
+    return meta;
+}
+
 }  // namespace orchestrator
 }  // namespace agentenv

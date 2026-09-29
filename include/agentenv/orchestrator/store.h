@@ -16,6 +16,7 @@
 
 #include "agentenv/core/expected.h"
 #include "agentenv/core/identity.h"
+#include "agentenv/core/json.h"
 #include "agentenv/core/optional.h"
 #include "agentenv/core/time.h"
 #include "agentenv/core/virtualization.h"
@@ -124,6 +125,11 @@ struct SandboxMetadata {
 
     /// Rust `fn is_expired(&self, now: SystemTime) -> bool`.
     bool IsExpired(int64_t now_ms) const;
+
+    /// Serialisation — mirrors Rust `serde` derive on `SandboxMetadata`.
+    /// `paused_state` is `#[serde(skip)]` and is never written/read.
+    core::Json ToJson() const;
+    static core::Expected<SandboxMetadata, std::string> FromJson(const core::Json& json);
 };
 
 /// Rust `pub type SandboxForkOutcome = Result<SandboxMetadata, OrchestratorError>`

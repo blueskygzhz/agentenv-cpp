@@ -178,11 +178,11 @@ MaterializeImageConfigError(const std::string& label,
 
 repository::RepositoryResult<sandbox::SandboxSnapshotManifest>
 ParseFirecrackerManifest(const std::string& bytes, const std::string& manifest_ref) {
-    core::Expected<core::Json, std::string> json_result = core::Json::Parse(bytes);
+    core::Expected<core::Json, core::AnyError> json_result = core::Json::Parse(bytes);
     if (!json_result.ok()) {
         return core::make_unexpected(repository::RepositoryError::Backend(
             std::string("parse firecracker manifest '") + manifest_ref + "'",
-            json_result.error()));
+            json_result.error().chain()));
     }
     core::Expected<sandbox::SandboxSnapshotManifest, std::string> manifest =
         sandbox::SandboxSnapshotManifest::FromJson(json_result.value());
