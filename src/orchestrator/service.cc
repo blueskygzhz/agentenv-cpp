@@ -68,7 +68,13 @@ Orchestrator::Orchestrator(std::shared_ptr<MetadataStore> store,
       is_shutting_down_(false),
       // Rust reads config.orchestrator.default_sandbox_timeout_secs; callers
       // override via SetDefaultSandboxTimeoutMs once config is wired.
-      default_sandbox_timeout_ms_(15 * 60 * 1000) {}
+      default_sandbox_timeout_ms_(15 * 60 * 1000),
+      virtualization_mode_(core::VirtualizationModeDefault()),
+      has_access_tokens_(false) {
+    // Rust `default_fresh_sandbox_resources` leaves the disk size to be filled
+    // from the backend's runtime info after the rootfs device is created.
+    default_fresh_resources_.disk_size_mib = 0;
+}
 
 Orchestrator::Orchestrator(std::shared_ptr<MetadataStore> store,
                            std::shared_ptr<sandbox::SandboxBackendFactory> factory,
@@ -78,7 +84,11 @@ Orchestrator::Orchestrator(std::shared_ptr<MetadataStore> store,
       persister_(std::move(persister)),
       next_proxy_route_version_(1),   // Rust: AtomicU64::new(1)
       is_shutting_down_(false),
-      default_sandbox_timeout_ms_(15 * 60 * 1000) {}
+      default_sandbox_timeout_ms_(15 * 60 * 1000),
+      virtualization_mode_(core::VirtualizationModeDefault()),
+      has_access_tokens_(false) {
+    default_fresh_resources_.disk_size_mib = 0;
+}
 
 Orchestrator::~Orchestrator() {}
 
@@ -890,6 +900,576 @@ Orchestrator::LaunchSandbox(const LaunchPlan& plan) {
 
     AGENTENV_INFO("sandbox launch completed");
     return final_metadata;
+}
+
+// ---- create ----------------------------------------------------------------
+
+// Rust `create_sandbox`.
+OrchestratorResult<SandboxMetadata>
+Orchestrator::CreateSandbox(const CreateSandboxRequest& request) {
+    return CreateSandboxInner(core::SandboxId::Fresh(), request, false);
+}
+
+// Rust `create_template_builder`.
+OrchestratorResult<SandboxMetadata>
+Orchestrator::CreateTemplateBuilder(const core::SandboxId& build_id,
+                                    const CreateSandboxRequest& request) {
+    return CreateSandboxInner(build_id, request, true);
+}
+
+// Rust `create_sandbox_inner`.
+OrchestratorResult<SandboxMetadata>
+Orchestrator::CreateSandboxInner(const core::SandboxId& sandbox_id,
+                                 const CreateSandboxRequest& request,
+                                 bool template_builder) {
+    OrchestratorResult<core::Unit> accepting = EnsureAcceptingLifecycleOperations();
+    if (!accepting.ok()) {
+        counters_.RecordCreateFail(1);
+        return core::make_unexpected(accepting.error());
+    }
+
+    const core::Optional<sandbox::EnvdAccessToken> envd_access_token =
+        (request.secure && has_access_tokens_)
+            ? core::Optional<sandbox::EnvdAccessToken>(
+                  access_tokens_.Generate(sandbox_id))
+            : core::Optional<sandbox::EnvdAccessToken>();
+
+    AGENTENV_INFO("creating sandbox " << sandbox_id.ToString());
+
+    const SandboxLaunchSource& source = request.source;
+
+    // Rust builds the launch config and the transitional metadata per source
+    // variant, then funnels both into `launch_sandbox`.
+    sandbox::SandboxLaunchConfig launch_config;
+    launch_config.sandbox_id              = sandbox_id;
+    launch_config.env_vars                = request.env_vars;
+    launch_config.envd_access_token       = envd_access_token;
+    launch_config.extra_drives_in_snapshot = request.extra_drives_in_snapshot;
+
+    SandboxMetadata metadata;
+    metadata.id               = sandbox_id;
+    metadata.template_builder = template_builder;
+    metadata.state            = SandboxState::Creating;
+    metadata.created_at_ms    = core::SystemTime::Now().unix_nanos / 1000000;
+    metadata.timeout_action   = request.timeout_action;
+    metadata.auto_resume      = request.auto_resume;
+    metadata.user_metadata    = request.user_metadata;
+    metadata.network_policy   = request.network_policy;
+    metadata.volume_mounts    = request.volume_mounts;
+    metadata.secure           = request.secure;
+    metadata.context          = source.context;
+    metadata.image_configs    = source.image_configs;
+
+    // Rust `network_policy.runtime_policy()` — empty when nothing must be
+    // installed in the guest.
+    if (request.network_policy.RuntimePolicy()) {
+        launch_config.network = core::Optional<std::string>(std::string("policy"));
+    }
+
+    LaunchPlan plan;
+
+    if (source.kind == SandboxLaunchSource::Kind::Snapshot) {
+        // A snapshot pins the virtualization mode it was captured under.
+        if (source.snapshot_virtualization_mode != virtualization_mode_) {
+            counters_.RecordCreateFail(1);
+            return core::make_unexpected(
+                OrchestratorError::VirtualizationModeMismatch(
+                    "snapshot " + source.snapshot_id,
+                    source.snapshot_virtualization_mode, virtualization_mode_));
+        }
+
+        // Effective custom config: a launch-provided value overrides the one
+        // persisted in the source snapshot; otherwise inherit it. Storing the
+        // effective value keeps the inherited config when a snapshot is later
+        // published from this sandbox instead of dropping it.
+        const core::Optional<sandbox::custom_extension::Params> effective_params =
+            request.custom_extension_params
+                ? request.custom_extension_params
+                : source.snapshot_custom_extension_params;
+
+        launch_config.snapshot_id = source.snapshot_id;
+        launch_config.extra_drives.clear();
+        for (std::size_t i = 0; i < request.extra_drives.size(); ++i) {
+            launch_config.extra_drives.push_back(request.extra_drives[i].drive_id);
+        }
+        if (effective_params) {
+            launch_config.custom_extension_params =
+                core::Optional<std::string>(effective_params->json_bytes);
+        }
+
+        metadata.snapshot_id             = source.snapshot_id;
+        metadata.snapshot_alias          = source.snapshot_alias;
+        metadata.virtualization_mode     = source.snapshot_virtualization_mode;
+        metadata.runtime_versions        = source.snapshot_runtime_versions;
+        metadata.resources               = source.snapshot_resources;
+        metadata.startup                 = source.snapshot_startup;
+        metadata.custom_extension_params = effective_params;
+
+        plan = LaunchPlan::ForCreateFromSnapshot(
+            sandbox_id, source.snapshot_id, launch_config, metadata,
+            NewTimeout::Set(request.timeout_ms ? *request.timeout_ms
+                                               : default_sandbox_timeout_ms_));
+    } else {
+        // Rust: `extra_drives.extend(launch_extra_drives)` — the image's own
+        // drives come first, then the launch-time ones.
+        std::vector<sandbox::ExtraDrive> extra_drives = source.extra_drives;
+        for (std::size_t i = 0; i < request.extra_drives.size(); ++i) {
+            extra_drives.push_back(request.extra_drives[i]);
+        }
+        // Rust `resources.unwrap_or_else(default_fresh_sandbox_resources)`.
+        const sandbox::SandboxResources resources =
+            source.image_resources ? *source.image_resources
+                                   : default_fresh_resources_;
+
+        launch_config.snapshot_id = source.image_ref;
+        launch_config.extra_drives.clear();
+        for (std::size_t i = 0; i < extra_drives.size(); ++i) {
+            launch_config.extra_drives.push_back(extra_drives[i].drive_id);
+        }
+        // Rust's fresh path does NOT inherit anything: the request's value is
+        // the only source.
+        if (request.custom_extension_params) {
+            launch_config.custom_extension_params =
+                core::Optional<std::string>(
+                    request.custom_extension_params->json_bytes);
+        }
+        // Rust `extra_drives_in_snapshot` is hardcoded false on a fresh boot.
+        launch_config.extra_drives_in_snapshot = false;
+
+        sandbox::FreshSandboxBuildSpec build_spec;
+        build_spec.image_config_path = source.overlaybd_config_path;
+        build_spec.resources         = resources;
+        build_spec.extra_boot_args   = source.extra_boot_args;
+        for (std::size_t i = 0; i < extra_drives.size(); ++i) {
+            build_spec.extra_drives.push_back(extra_drives[i].image_config_path);
+        }
+
+        metadata.snapshot_id             = source.image_ref;
+        metadata.virtualization_mode     = virtualization_mode_;
+        metadata.resources               = resources;
+        metadata.custom_extension_params = request.custom_extension_params;
+
+        plan = LaunchPlan::ForCreateFresh(
+            sandbox_id, build_spec, launch_config, metadata,
+            NewTimeout::Set(request.timeout_ms ? *request.timeout_ms
+                                               : default_sandbox_timeout_ms_));
+    }
+
+    OrchestratorResult<SandboxMetadata> result = LaunchSandbox(plan);
+    if (!result.ok()) {
+        counters_.RecordCreateFail(1);
+        return result;
+    }
+    counters_.RecordCreateSuccess(1);
+    PublishSandboxEvent(SandboxLifecycleEventType::Create, result.value().id,
+                        result.value().resources);
+    return result;
+}
+
+// ---- pause -----------------------------------------------------------------
+
+// Rust `join_concurrent_pause`.
+OrchestratorResult<core::Unit>
+Orchestrator::JoinConcurrentPause(const core::SandboxId& id) {
+    AGENTENV_DEBUG("concurrent pause in progress, waiting for completion");
+    OrchestratorResult<SandboxMetadata> waited =
+        WaitForTransition(id, SandboxState::Pausing);
+    if (!waited.ok()) return core::make_unexpected(waited.error());
+
+    switch (waited.value().state) {
+        case SandboxState::Paused:
+            AGENTENV_DEBUG("concurrent pause succeeded");
+            return core::Unit();
+        case SandboxState::Running:
+            AGENTENV_INFO("concurrent pause failed; sandbox returned to running state");
+            return core::make_unexpected(
+                OrchestratorError::InvalidSandboxState(id, SandboxState::Running));
+        case SandboxState::Killing:
+            AGENTENV_INFO("sandbox is being deleted after concurrent pause attempt");
+            return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+        default:
+            AGENTENV_INFO("unexpected state after waiting for concurrent pause: "
+                          << SandboxStateName(waited.value().state));
+            return core::make_unexpected(OrchestratorError::InvalidSandboxState(
+                id, waited.value().state));
+    }
+}
+
+// Rust `pause_sandbox`.
+OrchestratorResult<core::Unit>
+Orchestrator::PauseSandbox(const core::SandboxId& id) {
+    return PauseSandboxInner(id);
+}
+
+// Rust `pause_sandbox_inner`.
+OrchestratorResult<core::Unit>
+Orchestrator::PauseSandboxInner(const core::SandboxId& id) {
+    AGENTENV_INFO("pausing sandbox " << id.ToString());
+
+    std::vector<SandboxState> running;
+    running.push_back(SandboxState::Running);
+    core::Expected<SandboxState, StoreError> claimed =
+        store_->UpdateStateIfState(id, SandboxState::Pausing, running);
+
+    if (!claimed.ok()) {
+        const StoreError error = claimed.error();
+        if (error.kind != StoreError::Kind::StateConflict) {
+            if (error.kind == StoreError::Kind::SandboxNotFound) {
+                return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+            }
+            return core::make_unexpected(
+                OrchestratorError::StoreOperationFailed(error.Message()));
+        }
+        switch (error.actual_state) {
+            case SandboxState::Pausing:
+                // Another task is already performing the pause.
+                return JoinConcurrentPause(id);
+            case SandboxState::Paused:
+                return core::Unit();
+            case SandboxState::Killing:
+                AGENTENV_INFO("sandbox is being deleted while pausing");
+                return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+            default:
+                AGENTENV_INFO("cannot pause sandbox in current state "
+                              << SandboxStateName(error.actual_state));
+                return core::make_unexpected(OrchestratorError::InvalidSandboxState(
+                    id, error.actual_state));
+        }
+    }
+
+    return PauseSandboxImpl(id);
+}
+
+// Rust `pause_sandbox_impl`.
+//
+// Deviation: Rust first pins the paused runtime artifacts via
+// `protect_image_refs(RuntimeImageOwner::PausedSandbox(..))` and restores
+// Running if that fails. The runtime image-ref subsystem is not ported, so
+// that guard (and its matching `release_image_refs` calls) has no counterpart.
+OrchestratorResult<core::Unit>
+Orchestrator::PauseSandboxImpl(const core::SandboxId& id) {
+    // Allocate persistence space while the running handle and route are still
+    // attached. Allocation does not mutate the backend, so a failure only has
+    // to restore the metadata.
+    core::Optional<std::string> artifact_root;
+    if (persister_) {
+        PersistenceResult<core::Optional<std::string> > allocated =
+            persister_->AllocateArtifactRoot(id);
+        if (!allocated.ok()) {
+            AGENTENV_WARN("failed to allocate paused sandbox artifact root: "
+                          << allocated.error().Message());
+            std::vector<SandboxState> pausing;
+            pausing.push_back(SandboxState::Pausing);
+            store_->UpdateStateIfState(id, SandboxState::Running, pausing);
+            return core::make_unexpected(
+                OrchestratorError::SandboxPersistenceFailed(
+                    allocated.error().Message()));
+        }
+        artifact_root = allocated.value();
+    }
+
+    SandboxHandlePtr           handle;
+    core::Optional<ProxyRoute> removed_proxy_route;
+    DetachSandboxHandleAndRoute(id, &handle, &removed_proxy_route);
+
+    if (!handle) {
+        AGENTENV_WARN("sandbox handle not found while pausing, removing from store");
+        core::Expected<core::Optional<SandboxMetadata>, StoreError> got =
+            store_->Get(id);
+        if (!got.ok()) {
+            return core::make_unexpected(
+                OrchestratorError::StoreOperationFailed(got.error().Message()));
+        }
+        if (got.value()) FinalizeTerminalVolumes(*got.value());
+        core::Expected<core::Optional<SandboxMetadata>, StoreError> removed =
+            store_->Remove(id);
+        if (!removed.ok()) {
+            return core::make_unexpected(
+                OrchestratorError::StoreOperationFailed(removed.error().Message()));
+        }
+        return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+    }
+
+    // Pause the sandbox and capture the state needed to resume it later.
+    sandbox::SandboxCaptureResult<std::shared_ptr<sandbox::PausedSandboxState> >
+        paused_state_result = core::make_unexpected(
+            sandbox::SandboxCaptureError::Recoverable(""));
+    {
+        SandboxHandle::Guard sandbox = handle->Lock();
+        paused_state_result = sandbox->Pause(artifact_root);
+    }
+
+    if (!paused_state_result.ok()) {
+        const sandbox::SandboxCaptureError error = paused_state_result.error();
+        AGENTENV_WARN("failed to pause sandbox: " << error.Message());
+        if (error.IsTerminal()) {
+            // The handle was already detached before `Pause()`. Do not
+            // reinsert it: the live runtime may have been mutated and is no
+            // longer safe to keep serving as a running sandbox.
+            {
+                SandboxHandle::Guard sandbox = handle->Lock();
+                core::Expected<core::Unit, core::AnyError> stopped = sandbox->Stop();
+                if (!stopped.ok()) {
+                    AGENTENV_WARN("failed to stop sandbox after terminal pause "
+                                  "failure: " << stopped.error().chain());
+                }
+            }
+            core::Expected<core::Optional<SandboxMetadata>, StoreError> got =
+                store_->Get(id);
+            if (!got.ok()) {
+                return core::make_unexpected(
+                    OrchestratorError::StoreOperationFailed(got.error().Message()));
+            }
+            if (got.value()) FinalizeTerminalVolumes(*got.value());
+            core::Expected<core::Optional<SandboxMetadata>, StoreError> removed =
+                store_->Remove(id);
+            if (!removed.ok()) {
+                return core::make_unexpected(
+                    OrchestratorError::StoreOperationFailed(removed.error().Message()));
+            }
+        } else {
+            RegisterSandboxHandle(id, handle);
+            RestoreProxyRoute(id, removed_proxy_route);
+            std::vector<SandboxState> pausing;
+            pausing.push_back(SandboxState::Pausing);
+            store_->UpdateStateIfState(id, SandboxState::Running, pausing);
+        }
+        return core::make_unexpected(OrchestratorError::SandboxOperationFailed(
+            id, SandboxOperation::Pause, error.Message()));
+    }
+
+    std::shared_ptr<sandbox::PausedSandboxState> paused_state =
+        paused_state_result.value();
+
+    core::Expected<core::Optional<SandboxMetadata>, StoreError> got = store_->Get(id);
+    if (!got.ok()) {
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(got.error().Message()));
+    }
+    if (!got.value()) {
+        return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+    }
+    SandboxMetadata persisted_metadata = *got.value();
+    persisted_metadata.state        = SandboxState::Paused;
+    persisted_metadata.paused_state = paused_state;
+
+    if (persister_) {
+        PersistenceResult<core::Unit> persisted = persister_->PersistPaused(
+            persisted_metadata, artifact_root, paused_state.get());
+        if (!persisted.ok()) {
+            AGENTENV_WARN("failed to persist paused sandbox state: "
+                          << persisted.error().Message());
+            // Try to bring the sandbox back; if even that fails the runtime is
+            // unusable and the record has to go.
+            bool resumed_ok = true;
+            {
+                SandboxHandle::Guard sandbox = handle->Lock();
+                core::Expected<core::Unit, core::AnyError> resumed = sandbox->Resume();
+                if (!resumed.ok()) {
+                    resumed_ok = false;
+                    AGENTENV_WARN("failed to resume sandbox after pause failure: "
+                                  << resumed.error().chain());
+                }
+            }
+            if (!resumed_ok) {
+                {
+                    SandboxHandle::Guard sandbox = handle->Lock();
+                    core::Expected<core::Unit, core::AnyError> stopped = sandbox->Stop();
+                    if (!stopped.ok()) {
+                        AGENTENV_WARN("failed to stop sandbox after pause failure: "
+                                      << stopped.error().chain());
+                    }
+                }
+                core::Expected<core::Optional<SandboxMetadata>, StoreError> current =
+                    store_->Get(id);
+                if (current.ok() && current.value()) {
+                    FinalizeTerminalVolumes(*current.value());
+                }
+                core::Expected<core::Optional<SandboxMetadata>, StoreError> removed =
+                    store_->Remove(id);
+                if (!removed.ok()) {
+                    AGENTENV_WARN("failed to remove sandbox after pause failure: "
+                                  << removed.error().Message());
+                }
+            } else {
+                RegisterSandboxHandle(id, handle);
+                RestoreProxyRoute(id, removed_proxy_route);
+                std::vector<SandboxState> pausing;
+                pausing.push_back(SandboxState::Pausing);
+                store_->UpdateStateIfState(id, SandboxState::Running, pausing);
+            }
+            return core::make_unexpected(OrchestratorError::InternalError(
+                "failed to persist paused sandbox state: " +
+                persisted.error().Message()));
+        }
+    }
+
+    const sandbox::SandboxResources resources = persisted_metadata.resources;
+    core::Expected<core::Unit, StoreError> updated =
+        store_->Update(persisted_metadata);
+    if (!updated.ok()) {
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(updated.error().Message()));
+    }
+
+    // Stop the sandbox to free up resources. Rust only warns on failure: the
+    // pause itself already succeeded and is recorded.
+    {
+        SandboxHandle::Guard sandbox = handle->Lock();
+        core::Expected<core::Unit, core::AnyError> stopped = sandbox->Stop();
+        if (!stopped.ok()) {
+            AGENTENV_WARN("failed to stop sandbox after pausing: "
+                          << stopped.error().chain());
+        }
+    }
+    PublishSandboxEvent(SandboxLifecycleEventType::Pause, id, resources);
+    AGENTENV_INFO("sandbox paused");
+    return core::Unit();
+}
+
+// ---- resume ----------------------------------------------------------------
+
+// Rust `join_concurrent_resume`.
+OrchestratorResult<SandboxMetadata>
+Orchestrator::JoinConcurrentResume(const core::SandboxId& id, NewTimeout timeout) {
+    AGENTENV_DEBUG("concurrent resume in progress, waiting for completion");
+    OrchestratorResult<SandboxMetadata> waited =
+        WaitForTransition(id, SandboxState::Resuming);
+    if (!waited.ok()) return core::make_unexpected(waited.error());
+
+    switch (waited.value().state) {
+        case SandboxState::Running:
+            return MaybeUpdateRunningTimeout(id, timeout);
+        case SandboxState::Paused:
+            AGENTENV_INFO("concurrent resume failed; sandbox returned to paused state");
+            return core::make_unexpected(
+                OrchestratorError::InvalidSandboxState(id, SandboxState::Paused));
+        case SandboxState::Killing:
+            AGENTENV_INFO("sandbox is being deleted while resuming");
+            return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+        default:
+            AGENTENV_INFO("unexpected state after waiting for concurrent resume: "
+                          << SandboxStateName(waited.value().state));
+            return core::make_unexpected(OrchestratorError::InvalidSandboxState(
+                id, waited.value().state));
+    }
+}
+
+// Rust `resume_sandbox`.
+OrchestratorResult<SandboxMetadata>
+Orchestrator::ResumeSandbox(const core::SandboxId& id, NewTimeout timeout) {
+    return ResumeSandboxInner(id, timeout);
+}
+
+// Rust `resume_sandbox_inner`.
+OrchestratorResult<SandboxMetadata>
+Orchestrator::ResumeSandboxInner(const core::SandboxId& id, NewTimeout timeout) {
+    OrchestratorResult<core::Unit> accepting = EnsureAcceptingLifecycleOperations();
+    if (!accepting.ok()) return core::make_unexpected(accepting.error());
+
+    AGENTENV_INFO("resuming sandbox " << id.ToString());
+
+    core::Expected<core::Optional<SandboxMetadata>, StoreError> got = store_->Get(id);
+    if (!got.ok()) {
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(got.error().Message()));
+    }
+    if (!got.value()) {
+        return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+    }
+    SandboxMetadata metadata = *got.value();
+
+    // If another resume is in progress, wait for it and re-evaluate.
+    if (metadata.state == SandboxState::Resuming) {
+        OrchestratorResult<SandboxMetadata> waited =
+            WaitForTransition(id, SandboxState::Resuming);
+        if (!waited.ok()) return core::make_unexpected(waited.error());
+        metadata = waited.value();
+    }
+
+    switch (metadata.state) {
+        case SandboxState::Killing:
+            return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+        case SandboxState::Running:
+            // Already running — just apply the timeout and return.
+            return MaybeUpdateRunningTimeout(id, timeout);
+        case SandboxState::Paused:
+            break;
+        default:
+            return core::make_unexpected(
+                OrchestratorError::InvalidSandboxState(id, metadata.state));
+    }
+
+    if (metadata.virtualization_mode != virtualization_mode_) {
+        return core::make_unexpected(OrchestratorError::VirtualizationModeMismatch(
+            "paused sandbox " + id.ToString(), metadata.virtualization_mode,
+            virtualization_mode_));
+    }
+
+    std::vector<SandboxState> paused;
+    paused.push_back(SandboxState::Paused);
+    core::Expected<SandboxState, StoreError> claimed =
+        store_->UpdateStateIfState(id, SandboxState::Resuming, paused);
+    if (!claimed.ok()) {
+        const StoreError error = claimed.error();
+        if (error.kind != StoreError::Kind::StateConflict) {
+            if (error.kind == StoreError::Kind::SandboxNotFound) {
+                return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+            }
+            return core::make_unexpected(
+                OrchestratorError::StoreOperationFailed(error.Message()));
+        }
+        switch (error.actual_state) {
+            case SandboxState::Running:
+                // Another task already completed the resume.
+                return MaybeUpdateRunningTimeout(id, timeout);
+            case SandboxState::Resuming:
+                // A second concurrent resume snuck in between our state read
+                // and the CAS. Wait for it and return its outcome.
+                return JoinConcurrentResume(id, timeout);
+            case SandboxState::Killing:
+                AGENTENV_INFO("sandbox is being deleted while resuming");
+                return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+            default:
+                AGENTENV_INFO("cannot resume sandbox in current state "
+                              << SandboxStateName(error.actual_state));
+                return core::make_unexpected(OrchestratorError::InvalidSandboxState(
+                    id, error.actual_state));
+        }
+    }
+
+    if (persister_) {
+        PersistenceResult<core::Unit> marked = persister_->MarkResuming(id);
+        if (!marked.ok()) {
+            AGENTENV_WARN("failed to mark persisted sandbox record as resuming: "
+                          << marked.error().Message());
+            std::vector<SandboxState> resuming;
+            resuming.push_back(SandboxState::Resuming);
+            store_->UpdateStateIfState(id, SandboxState::Paused, resuming);
+            return core::make_unexpected(OrchestratorError::InternalError(
+                "failed to mark persisted sandbox record as resuming: " +
+                marked.error().Message()));
+        }
+    }
+
+    if (!metadata.paused_state) {
+        AGENTENV_WARN("missing paused state while resuming");
+        // Rust returns InternalError via `ok_or_else`, leaving the sandbox in
+        // Resuming for the caller to reconcile. The port keeps that behaviour.
+        return core::make_unexpected(
+            OrchestratorError::InternalError("missing paused state"));
+    }
+
+    OrchestratorResult<SandboxMetadata> resumed = LaunchSandbox(LaunchPlan::ForResume(
+        id, metadata.paused_state, timeout, metadata.resources,
+        (metadata.secure && has_access_tokens_)
+            ? core::Optional<sandbox::EnvdAccessToken>(access_tokens_.Generate(id))
+            : core::Optional<sandbox::EnvdAccessToken>()));
+    if (resumed.ok()) {
+        PublishSandboxEvent(SandboxLifecycleEventType::Resume, resumed.value().id,
+                            resumed.value().resources);
+    }
+    return resumed;
 }
 
 // ---- delete ----------------------------------------------------------------

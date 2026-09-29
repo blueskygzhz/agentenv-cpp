@@ -61,9 +61,14 @@ class SandboxPersister {
         AllocateArtifactRoot(const core::SandboxId& id) = 0;
 
     /// Rust `persist_paused` — metadata plus runtime state for a paused sandbox.
+    ///
+    /// `paused_state` is the backend's opaque capture; Rust passes it
+    /// alongside the metadata so the record and the runtime state are written
+    /// together.
     virtual PersistenceResult<core::Unit>
         PersistPaused(const SandboxMetadata& metadata,
-                      const core::Optional<std::string>& artifact_root) = 0;
+                      const core::Optional<std::string>& artifact_root,
+                      const sandbox::PausedSandboxState* paused_state) = 0;
 
     /// Rust `mark_resuming`.
     virtual PersistenceResult<core::Unit> MarkResuming(const core::SandboxId& id) = 0;
@@ -85,7 +90,8 @@ class DisabledSandboxPersister : public SandboxPersister {
         AllocateArtifactRoot(const core::SandboxId& id) override;
     PersistenceResult<core::Unit>
         PersistPaused(const SandboxMetadata& metadata,
-                      const core::Optional<std::string>& artifact_root) override;
+                      const core::Optional<std::string>& artifact_root,
+                      const sandbox::PausedSandboxState* paused_state) override;
     PersistenceResult<core::Unit> MarkResuming(const core::SandboxId& id) override;
     PersistenceResult<core::Unit> RollbackResuming(const core::SandboxId& id) override;
     PersistenceResult<core::Unit> DeleteRecord(const core::SandboxId& id) override;

@@ -8,10 +8,20 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "agentenv/core/identity.h"
+#include "agentenv/core/optional.h"
+#include "agentenv/core/virtualization.h"
+#include "agentenv/sandbox/custom_extension.h"
+#include "agentenv/sandbox/extra_drive.h"
+#include "agentenv/sandbox/network/policy.h"
 #include "agentenv/sandbox/types.h"
+#include "agentenv/snapshot/record.h"
+#include "agentenv/snapshot/types.h"
+#include "agentenv/snapshot/version.h"
+#include "agentenv/template/build_spec.h"
 
 namespace agentenv {
 namespace orchestrator {
@@ -34,6 +44,92 @@ enum class SandboxState {
 
 /// Rust `impl Display for SandboxState` — lowercase names ("creating", ...).
 const char* SandboxStateName(SandboxState s);
+
+/// Rust enum `SandboxTimeoutAction` (declared in store/metadata.rs).
+///
+/// Hoisted here because `CreateSandboxRequest` below needs it and `store.h`
+/// includes this header; see the note in `store.h`.
+enum class SandboxTimeoutAction {
+    Pause,
+    Delete,
+};
+
+/// Rust enum `SandboxLaunchSource` (types.rs).
+///
+/// Deviation: Rust's `Snapshot` variant holds `Box<RunnableSnapshot>`, whose
+/// loader is not ported. The variant therefore carries the fields
+/// `create_sandbox_inner` actually reads off the snapshot's committed record,
+/// so the inheritance rules (custom params, image configs, context, ...) port
+/// faithfully; only resolving a snapshot id into those fields is out of scope.
+struct SandboxLaunchSource {
+    enum class Kind { Snapshot, Image };
+
+    Kind kind = Kind::Image;
+
+    // ---- Kind::Snapshot ----
+    /// Rust `snapshot.record().id`.
+    std::string snapshot_id;
+    /// Rust `snapshot.record().alias`.
+    core::Optional<std::string> snapshot_alias;
+    /// Rust `snapshot.committed().virtualization_mode`.
+    core::VirtualizationMode snapshot_virtualization_mode = core::VirtualizationMode::Kvm;
+    /// Rust `snapshot.committed().runtime_versions`.
+    snapshot::SnapshotRuntimeVersions snapshot_runtime_versions;
+    /// Rust `snapshot.committed().startup`.
+    core::Optional<snapshot::StartupCommand> snapshot_startup;
+    /// Rust `snapshot.committed().custom_extension_params` — inherited unless
+    /// the create request overrides it.
+    core::Optional<sandbox::custom_extension::Params> snapshot_custom_extension_params;
+    /// Rust `*snapshot.resources()`.
+    sandbox::SandboxResources snapshot_resources;
+
+    // ---- Kind::Image ----
+    /// Rust `image_ref`.
+    std::string image_ref;
+    /// Rust `overlaybd_config_path`.
+    std::string overlaybd_config_path;
+    /// Rust `resources: Option<SandboxResources>` — unset means the node's
+    /// configured defaults (`default_fresh_sandbox_resources`).
+    core::Optional<sandbox::SandboxResources> image_resources;
+    /// Rust `extra_boot_args`.
+    core::Optional<std::string> extra_boot_args;
+
+    // ---- shared by both variants ----
+    /// Rust `context` (Image) / `committed().context` (Snapshot).
+    snapshot::CommandContext context;
+    /// Rust `image_configs` (Image) / `committed().image_configs` (Snapshot).
+    tpl::ImageConfigs image_configs;
+    /// Rust `extra_drives` on the Image variant; the Snapshot variant takes
+    /// its drives from the request only.
+    std::vector<sandbox::ExtraDrive> extra_drives;
+
+    static SandboxLaunchSource FromSnapshot(const std::string& snapshot_id);
+    static SandboxLaunchSource FromImage(const std::string& image_ref,
+                                         const std::string& overlaybd_config_path);
+};
+
+/// Rust struct `CreateSandboxRequest` (types.rs).
+struct CreateSandboxRequest {
+    SandboxLaunchSource source;
+    /// Launch-time drives that are not part of the source snapshot.
+    std::vector<sandbox::ExtraDrive> extra_drives;
+    /// Whether `extra_drives` already occupy reserved slots in the source
+    /// Firecracker state. Restored volume snapshots can be bound before load;
+    /// newly requested volumes must replace placeholders after load.
+    bool extra_drives_in_snapshot = false;
+    /// Rust `timeout: Option<Duration>` — unset applies the node default.
+    core::Optional<int64_t> timeout_ms;
+    SandboxTimeoutAction timeout_action = SandboxTimeoutAction::Pause;
+    bool auto_resume = false;
+    std::unordered_map<std::string, std::string> user_metadata;
+    std::unordered_map<std::string, std::string> env_vars;
+    sandbox::network::SandboxNetworkPolicy network_policy;
+    bool secure = false;
+    /// Opaque user-provided JSON passed through to the custom extension hooks.
+    core::Optional<sandbox::custom_extension::Params> custom_extension_params;
+    /// Volume mounts requested for this sandbox, keyed by guest path.
+    std::unordered_map<std::string, std::string> volume_mounts;
+};
 
 /// Rust enum `SandboxLifecycleEventType` (types.rs).
 enum class SandboxLifecycleEventType {
@@ -83,6 +179,7 @@ const char* SandboxOperationName(SandboxOperation op);
 /// enum variants.
 enum class OrchestratorErrorKind {
     ConfigLoadFailed,
+    VirtualizationModeMismatch,
     ShuttingDown,
     SandboxNotFound,
     InvalidSandboxState,
@@ -104,8 +201,16 @@ struct OrchestratorError {
     SandboxOperation      operation = SandboxOperation::Build;  // op variants
     std::string           detail;          // source/message/timeout string
 
+    /// `VirtualizationModeMismatch { resource, resource_mode, node_mode }` —
+    /// `detail` carries `resource`.
+    core::VirtualizationMode resource_mode = core::VirtualizationMode::Kvm;
+    core::VirtualizationMode node_mode     = core::VirtualizationMode::Kvm;
+
     // Constructors mirroring the Rust variants.
     static OrchestratorError ConfigLoadFailed(std::string source);
+    static OrchestratorError VirtualizationModeMismatch(
+        std::string resource, core::VirtualizationMode resource_mode,
+        core::VirtualizationMode node_mode);
     static OrchestratorError ShuttingDown();
     static OrchestratorError SandboxNotFound(core::SandboxId id);
     static OrchestratorError InvalidSandboxState(core::SandboxId id, SandboxState st);

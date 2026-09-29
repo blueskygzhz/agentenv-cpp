@@ -7,6 +7,24 @@
 namespace agentenv {
 namespace orchestrator {
 
+// Rust `SandboxLaunchSource::Snapshot { .. }`.
+SandboxLaunchSource SandboxLaunchSource::FromSnapshot(const std::string& snapshot_id) {
+    SandboxLaunchSource s;
+    s.kind = Kind::Snapshot;
+    s.snapshot_id = snapshot_id;
+    return s;
+}
+
+// Rust `SandboxLaunchSource::Image { .. }`.
+SandboxLaunchSource SandboxLaunchSource::FromImage(
+    const std::string& image_ref, const std::string& overlaybd_config_path) {
+    SandboxLaunchSource s;
+    s.kind = Kind::Image;
+    s.image_ref = image_ref;
+    s.overlaybd_config_path = overlaybd_config_path;
+    return s;
+}
+
 // Rust `impl Display for SandboxState` — lowercase.
 const char* SandboxStateName(SandboxState s) {
     switch (s) {
@@ -65,6 +83,16 @@ OrchestratorError OrchestratorError::ConfigLoadFailed(std::string source) {
     OrchestratorError e;
     e.kind = OrchestratorErrorKind::ConfigLoadFailed;
     e.detail = std::move(source);
+    return e;
+}
+OrchestratorError OrchestratorError::VirtualizationModeMismatch(
+    std::string resource, core::VirtualizationMode resource_mode,
+    core::VirtualizationMode node_mode) {
+    OrchestratorError e;
+    e.kind = OrchestratorErrorKind::VirtualizationModeMismatch;
+    e.detail = std::move(resource);
+    e.resource_mode = resource_mode;
+    e.node_mode = node_mode;
     return e;
 }
 OrchestratorError OrchestratorError::ShuttingDown() {
@@ -137,6 +165,14 @@ std::string OrchestratorError::Message() const {
     switch (kind) {
         case OrchestratorErrorKind::ConfigLoadFailed:
             return "failed to load sandbox config";
+        case OrchestratorErrorKind::VirtualizationModeMismatch:
+            // Rust: "{resource} uses virtualization mode '{resource_mode}',
+            //        but this node runs in mode '{node_mode}'"
+            os << detail << " uses virtualization mode '"
+               << core::VirtualizationModeToString(resource_mode)
+               << "', but this node runs in mode '"
+               << core::VirtualizationModeToString(node_mode) << "'";
+            return os.str();
         case OrchestratorErrorKind::ShuttingDown:
             return "orchestrator is shutting down";
         case OrchestratorErrorKind::SandboxNotFound:

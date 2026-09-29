@@ -18,8 +18,15 @@
 #include "agentenv/core/identity.h"
 #include "agentenv/core/optional.h"
 #include "agentenv/core/time.h"
+#include "agentenv/core/virtualization.h"
 #include "agentenv/orchestrator/types.h"
+#include "agentenv/sandbox/custom_extension.h"
+#include "agentenv/sandbox/network/policy.h"
 #include "agentenv/sandbox/types.h"
+#include "agentenv/snapshot/record.h"
+#include "agentenv/snapshot/types.h"
+#include "agentenv/snapshot/version.h"
+#include "agentenv/template/build_spec.h"
 
 namespace agentenv {
 namespace sandbox {
@@ -30,11 +37,13 @@ class PausedSandboxState;
 
 namespace orchestrator {
 
-/// Rust enum `SandboxTimeoutAction` (store/metadata.rs).
-enum class SandboxTimeoutAction {
-    Pause,
-    Delete,
-};
+// NOTE: `SandboxTimeoutAction` is declared in `types.h`, not here.
+//
+// Rust puts it in `store/metadata.rs` and lets `types.rs` reach back for it
+// via `super::SandboxTimeoutAction` — the two modules reference each other,
+// which Rust permits but C++ headers do not. Since `store.h` already includes
+// `types.h`, hoisting this one enum breaks the cycle and every user still sees
+// it through either header.
 
 /// Rust enum `NewTimeout` (store/metadata.rs).
 ///
@@ -52,12 +61,10 @@ struct NewTimeout {
     static NewTimeout None()                          { NewTimeout t; t.kind = Kind::None;          return t; }
 };
 
-/// Rust struct `SandboxMetadata` (store/metadata.rs).
-///
-/// Fields align with the Rust struct field-for-field; fields not yet used by
-/// the C++ service implementations carry their zero/default values.
+/// Rust struct `SandboxMetadata` (store/metadata.rs) — field for field.
 struct SandboxMetadata {
     core::SandboxId  id;
+    /// Server-owned template builder, excluded from public sandbox APIs.
     bool             template_builder = false;
     std::string      snapshot_id;
     core::Optional<std::string> snapshot_alias;
@@ -67,9 +74,34 @@ struct SandboxMetadata {
     SandboxTimeoutAction    timeout_action = SandboxTimeoutAction::Pause;
     core::Optional<int64_t> expires_at_ms;     // Rust `expires_at: Option<SystemTime>`
     bool             auto_resume    = false;
+
+    /// Rust `virtualization_mode` — fixed for the sandbox's entire lifecycle.
+    core::VirtualizationMode virtualization_mode = core::VirtualizationMode::Kvm;
+    /// Rust `runtime_versions: SnapshotRuntimeVersions`.
+    snapshot::SnapshotRuntimeVersions runtime_versions;
+
     sandbox::SandboxResources resources;       // replaces cpu_count/memory_mib/disk_size_mib
+
+    /// Rust `context: CommandContext`.
+    snapshot::CommandContext context;
+    /// Rust `startup: Option<StartupCommand>`.
+    core::Optional<snapshot::StartupCommand> startup;
+    /// Rust `image_configs: ImageConfigs`.
+    tpl::ImageConfigs image_configs;
+
     std::string      template_id;              // carried over from port's scaffold
     std::unordered_map<std::string, std::string> user_metadata;
+
+    /// Rust `network_policy: SandboxNetworkPolicy`.
+    sandbox::network::SandboxNetworkPolicy network_policy;
+
+    /// Rust `custom_extension_params: Option<CustomExtensionParams>` — opaque
+    /// user JSON forwarded to the custom extension hooks. Persisted into
+    /// committed snapshots so template launches inherit it unless overridden
+    /// at create time.
+    core::Optional<sandbox::custom_extension::Params> custom_extension_params;
+
+    /// Whether envd requires the access token derived from this sandbox's ID.
     bool             secure = false;
 
     /// Rust `volume_mounts: HashMap<String, String>` — requested volume mounts

@@ -81,7 +81,8 @@ DisabledSandboxPersister::AllocateArtifactRoot(const core::SandboxId&) {
 
 PersistenceResult<core::Unit>
 DisabledSandboxPersister::PersistPaused(const SandboxMetadata&,
-                                        const core::Optional<std::string>&) {
+                                        const core::Optional<std::string>&,
+                                        const sandbox::PausedSandboxState*) {
     return core::Unit{};
 }
 

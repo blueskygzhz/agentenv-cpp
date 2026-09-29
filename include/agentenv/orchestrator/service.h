@@ -273,6 +273,48 @@ class Orchestrator {
     DeleteProgress DeletionProgress(const core::SandboxId& id) const;
     void SetDeletionProgress(const core::SandboxId& id, DeleteProgress progress);
 
+    // ---- create / pause / resume -----------------------------------------
+
+    /// Rust `create_sandbox` — allocates a fresh id and launches it.
+    OrchestratorResult<SandboxMetadata>
+        CreateSandbox(const CreateSandboxRequest& request);
+
+    /// Rust `create_template_builder` — same path with `template_builder` set,
+    /// for the server-owned build workers excluded from the public APIs.
+    OrchestratorResult<SandboxMetadata>
+        CreateTemplateBuilder(const core::SandboxId& build_id,
+                              const CreateSandboxRequest& request);
+
+    /// Rust `pause_sandbox` — snapshots the sandbox and stops its VM.
+    ///
+    /// When another pause is already in flight (`Pausing`), this waits for it
+    /// and reports that outcome instead of duplicating the work.
+    OrchestratorResult<core::Unit> PauseSandbox(const core::SandboxId& id);
+
+    /// Rust `resume_sandbox` — relaunches a paused sandbox from its captured
+    /// state. Joins a concurrent resume rather than duplicating it.
+    OrchestratorResult<SandboxMetadata>
+        ResumeSandbox(const core::SandboxId& id, NewTimeout timeout);
+
+    /// Rust `default_fresh_sandbox_resources` — the node's configured machine
+    /// shape. `disk_size_mib` stays 0 and is filled from the backend's runtime
+    /// info once the rootfs device exists.
+    void SetDefaultFreshResources(const sandbox::SandboxResources& resources) {
+        default_fresh_resources_ = resources;
+    }
+
+    /// Rust `ConfigManager::global_config().virtualization_mode`.
+    void SetVirtualizationMode(core::VirtualizationMode mode) {
+        virtualization_mode_ = mode;
+    }
+    core::VirtualizationMode VirtualizationMode() const { return virtualization_mode_; }
+
+    /// Rust `access_tokens: SandboxAccessTokenGenerator`.
+    void SetAccessTokenGenerator(sandbox::SandboxAccessTokenGenerator generator) {
+        access_tokens_ = generator;
+        has_access_tokens_ = true;
+    }
+
     // ---- delete (Rust: delete_sandbox and its three phases) --------------
 
     /// Rust `delete_sandbox` — stops the sandbox, releases its volumes and
@@ -366,6 +408,30 @@ class Orchestrator {
                              const SandboxHandlePtr& handle,
                              FailedLaunchStage stage);
 
+    /// Rust `create_sandbox_inner`.
+    OrchestratorResult<SandboxMetadata>
+        CreateSandboxInner(const core::SandboxId& sandbox_id,
+                           const CreateSandboxRequest& request,
+                           bool template_builder);
+
+    /// Rust `pause_sandbox_inner` — claims `Pausing` from `Running`.
+    OrchestratorResult<core::Unit> PauseSandboxInner(const core::SandboxId& id);
+
+    /// Rust `pause_sandbox_impl` — the actual pause, also reached by the
+    /// auto-eviction sweep once it has claimed `Pausing`.
+    OrchestratorResult<core::Unit> PauseSandboxImpl(const core::SandboxId& id);
+
+    /// Rust `join_concurrent_pause`.
+    OrchestratorResult<core::Unit> JoinConcurrentPause(const core::SandboxId& id);
+
+    /// Rust `resume_sandbox_inner`.
+    OrchestratorResult<SandboxMetadata>
+        ResumeSandboxInner(const core::SandboxId& id, NewTimeout timeout);
+
+    /// Rust `join_concurrent_resume`.
+    OrchestratorResult<SandboxMetadata>
+        JoinConcurrentResume(const core::SandboxId& id, NewTimeout timeout);
+
     /// Rust `delete_sandbox_inner` — claims `Killing`, waiting out any
     /// transitional state, then runs the three phases.
     OrchestratorResult<core::Unit> DeleteSandboxInner(const core::SandboxId& id);
@@ -428,6 +494,14 @@ class Orchestrator {
 
     /// Rust `default_sandbox_timeout`.
     int64_t default_sandbox_timeout_ms_;
+
+    /// Rust `default_fresh_sandbox_resources()`, read from config.machine.
+    sandbox::SandboxResources default_fresh_resources_;
+    /// Rust `ConfigManager::global_config().virtualization_mode`.
+    core::VirtualizationMode  virtualization_mode_;
+    /// Rust `access_tokens: SandboxAccessTokenGenerator`.
+    sandbox::SandboxAccessTokenGenerator access_tokens_;
+    bool                                 has_access_tokens_;
 };
 
 }  // namespace orchestrator
