@@ -315,6 +315,82 @@ class Orchestrator {
         has_access_tokens_ = true;
     }
 
+    // ---- fork ---------------------------------------------------------------
+
+    /// Rust `fork_sandbox` — creates `count` child sandboxes from a running one,
+    /// each with a fresh ID and no volume mounts. Rejects sandboxes that have
+    /// volume mounts (they need `ForkSandboxWithSpecs`).
+    OrchestratorResult<std::vector<SandboxForkOutcome> >
+        ForkSandbox(const core::SandboxId& source_id,
+                    uint32_t count,
+                    NewTimeout timeout);
+
+    /// Rust `fork_sandbox_with_specs` — fork with per-child control over IDs,
+    /// volume mounts, extra drives, and drive replacements.
+    OrchestratorResult<std::vector<SandboxForkOutcome> >
+        ForkSandboxWithSpecs(const core::SandboxId& source_id,
+                             const std::vector<SandboxForkChildSpec>& child_specs,
+                             NewTimeout timeout);
+
+    // ---- token helpers ------------------------------------------------------
+
+    /// Rust `get_envd_access_token` — returns a token iff `metadata.secure`.
+    core::Optional<sandbox::EnvdAccessToken>
+        GetEnvdAccessToken(const SandboxMetadata& metadata) const;
+
+    /// Rust `validate_envd_access_token`.
+    bool ValidateEnvdAccessToken(const core::SandboxId& id,
+                                  const std::string& candidate) const;
+
+    /// Rust `traffic_access_token`.
+    std::string TrafficAccessToken(const core::SandboxId& id) const;
+
+    /// Rust `validate_traffic_access_token`.
+    bool ValidateTrafficAccessToken(const core::SandboxId& id,
+                                     const std::string& candidate) const;
+
+    // ---- snapshot operations ------------------------------------------------
+
+    /// Rust `capture_snapshot` — claims `Snapshotting`, calls `Snapshot()` on
+    /// the backend, returns the captured snapshot id and the sandbox metadata.
+    OrchestratorResult<SnapshotCaptureResult>
+        CaptureSnapshot(const core::SandboxId& id);
+
+    /// Rust `snapshot_volume_mounts` — seals writable persistent-volume uppers
+    /// without capturing the VM state.
+    OrchestratorResult<core::Unit>
+        SnapshotVolumeMounts(const core::SandboxId& id);
+
+    // ---- hot-update operations ----------------------------------------------
+
+    /// Rust `replace_sandbox_network_policy` — updates the network policy on a
+    /// running sandbox's backend and persists the new value.
+    OrchestratorResult<core::Unit>
+        ReplaceSandboxNetworkPolicy(
+            const core::SandboxId& id,
+            const sandbox::network::SandboxNetworkPolicy& policy);
+
+    /// Rust `patch_sandbox_custom_extension_params` — calls the custom
+    /// extension's `hook_patch_params` and stores the approved result.
+    ///
+    /// Deviation: the Rust implementation contacts an out-of-process extension
+    /// server via `CustomExtensionClient::global()`. The C++ port calls the
+    /// same method but wraps the client lookup with an optional injection point
+    /// (`SetCustomExtensionClient`) so unit tests can drive it without a server.
+    OrchestratorResult<core::Optional<sandbox::custom_extension::Params> >
+        PatchSandboxCustomExtensionParams(
+            const core::SandboxId& id,
+            const sandbox::custom_extension::Params& patch);
+
+    /// Inject a custom extension client for testing.  When unset (the default),
+    /// `PatchSandboxCustomExtensionParams` returns
+    /// `SandboxOperationFailed` with a "not configured" message, which is the
+    /// same behaviour as Rust when `CustomExtensionClient::global()` is None.
+    void SetCustomExtensionClient(
+        std::shared_ptr<sandbox::custom_extension::Client> client) {
+        custom_extension_client_ = std::move(client);
+    }
+
     // ---- delete (Rust: delete_sandbox and its three phases) --------------
 
     /// Rust `delete_sandbox` — stops the sandbox, releases its volumes and
@@ -442,6 +518,38 @@ class Orchestrator {
                           SandboxState previous_state,
                           DeleteProgress* progress);
 
+    /// Rust `fork_sandbox_inner`.
+    OrchestratorResult<std::vector<SandboxForkOutcome> >
+        ForkSandboxInner(const core::SandboxId& source_id,
+                         const std::vector<SandboxForkChildSpec>& child_specs,
+                         NewTimeout timeout);
+
+    /// Rust `fork_child_error`.
+    static OrchestratorError ForkChildError(const core::SandboxId& id,
+                                            const std::string& source);
+
+    /// Rust `stop_failed_fork` — best-effort stop of a child that could not be
+    /// registered.
+    static void StopFailedFork(std::unique_ptr<sandbox::SandboxBackend> backend,
+                                const core::SandboxId& id);
+
+    /// Rust `begin_snapshot_operation` — claims `Snapshotting` and returns the
+    /// live handle, removing the record if the handle has gone missing.
+    OrchestratorResult<SandboxHandlePtr>
+        BeginSnapshotOperation(const core::SandboxId& id);
+
+    /// Rust `fail_snapshot_operation` — terminal failures stop and remove the
+    /// sandbox; recoverable ones restore `Running`.
+    OrchestratorError
+        FailSnapshotOperation(const core::SandboxId& id,
+                              const SandboxHandlePtr& handle,
+                              const sandbox::SandboxCaptureError& error,
+                              SandboxOperation operation);
+
+    /// Rust `finish_snapshot_operation` — CAS back to `Running`.
+    OrchestratorResult<core::Unit>
+        FinishSnapshotOperation(const core::SandboxId& id);
+
     /// Rust `remove_deleted_sandbox` — removes metadata, publishes the Delete
     /// event, drops persisted state and forgets the delete progress.
     OrchestratorResult<core::Unit> RemoveDeletedSandbox(const core::SandboxId& id);
@@ -502,6 +610,10 @@ class Orchestrator {
     /// Rust `access_tokens: SandboxAccessTokenGenerator`.
     sandbox::SandboxAccessTokenGenerator access_tokens_;
     bool                                 has_access_tokens_;
+
+    /// Rust `CustomExtensionClient::global()`; injected here instead of a
+    /// process-wide singleton so tests can supply one.
+    std::shared_ptr<sandbox::custom_extension::Client> custom_extension_client_;
 };
 
 }  // namespace orchestrator

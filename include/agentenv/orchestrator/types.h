@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "agentenv/core/identity.h"
@@ -106,6 +107,16 @@ struct SandboxLaunchSource {
     static SandboxLaunchSource FromSnapshot(const std::string& snapshot_id);
     static SandboxLaunchSource FromImage(const std::string& image_ref,
                                          const std::string& overlaybd_config_path);
+};
+
+/// Rust struct `SandboxForkChildSpec` (types.rs).
+struct SandboxForkChildSpec {
+    core::SandboxId sandbox_id;
+    /// Volume mounts the child gets, keyed by guest path.
+    std::unordered_map<std::string, std::string> volume_mounts;
+    std::vector<sandbox::ExtraDrive> extra_drives;
+    /// Pairs of `(source_drive_id, replacement_drive_id)`.
+    std::vector<std::pair<std::string, std::string> > replace_drive_ids;
 };
 
 /// Rust struct `CreateSandboxRequest` (types.rs).

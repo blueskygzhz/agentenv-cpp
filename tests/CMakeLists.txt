@@ -64,3 +64,4 @@ agentenv_add_test(test_orchestrator_proxy test_orchestrator_proxy.cc agentenv-or
 agentenv_add_test(test_orchestrator_lifecycle test_orchestrator_lifecycle.cc agentenv-orchestrator Threads::Threads)
 agentenv_add_test(test_orchestrator_launch test_orchestrator_launch.cc agentenv-orchestrator)
 agentenv_add_test(test_orchestrator_delete test_orchestrator_delete.cc agentenv-orchestrator Threads::Threads)
+agentenv_add_test(test_orchestrator_fork_snapshot test_orchestrator_fork_snapshot.cc agentenv-orchestrator)

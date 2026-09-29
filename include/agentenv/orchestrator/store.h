@@ -126,6 +126,18 @@ struct SandboxMetadata {
     bool IsExpired(int64_t now_ms) const;
 };
 
+/// Rust `pub type SandboxForkOutcome = Result<SandboxMetadata, OrchestratorError>`
+/// (mod.rs) — a per-child result, so one failed child does not fail the batch.
+using SandboxForkOutcome = core::Expected<SandboxMetadata, OrchestratorError>;
+
+/// Rust struct `SnapshotCaptureResult` — the sandbox metadata as of the
+/// capture plus the backend's snapshot identifier.
+struct SnapshotCaptureResult {
+    SandboxMetadata metadata;
+    /// Rust `captured_snapshot` — the backend's opaque snapshot id.
+    std::string     captured_snapshot;
+};
+
 /// Rust struct `SandboxListFilter` (store/mod.rs).
 struct SandboxListFilter {
     core::Optional<std::vector<SandboxState>> states;

@@ -73,6 +73,12 @@ class RecordingClient : public custom_extension::Client {
         if (event == custom_extension::hook::kStop) ++stop_calls;
         return agentenv::core::Unit{};
     }
+    agentenv::core::Expected<agentenv::core::Optional<custom_extension::Params>,
+                              agentenv::core::AnyError>
+    HookPatchParams(const agentenv::core::SandboxId&,
+                    const custom_extension::Params&) override {
+        return agentenv::core::Optional<custom_extension::Params>();
+    }
 };
 }  // namespace
 

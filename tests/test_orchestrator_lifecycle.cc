@@ -373,11 +373,22 @@ MT_TEST(evict_expired_sandboxes_claims_by_timeout_action) {
     core::Expected<std::vector<core::SandboxId>, OrchestratorError> r =
         f.orch->EvictExpiredSandboxes();
     MT_EXPECT_TRUE(r.ok());
-    MT_EXPECT_EQ(r.value().size(), static_cast<std::size_t>(2));
 
-    MT_EXPECT_TRUE(f.store->Get(to_delete.id).value()->state == SandboxState::Killing);
-    MT_EXPECT_TRUE(f.store->Get(to_pause.id).value()->state  == SandboxState::Pausing);
-    MT_EXPECT_TRUE(f.store->Get(fresh.id).value()->state     == SandboxState::Running);
+    // Rust: after claiming, the orchestrator executes the timeout action.
+    // With no live handle registered (sandboxes added directly to the store),
+    // the delete path succeeds (no handle → skip stop, still removes record),
+    // but the pause path finds no handle and returns SandboxNotFound, which the
+    // evict loop treats as a failure, logs, and skips — so only the delete
+    // sandbox ends up in the evicted list.
+    MT_EXPECT_EQ(r.value().size(), static_cast<std::size_t>(1));
+    MT_EXPECT_TRUE(r.value()[0] == to_delete.id);
+
+    // Both records are gone: delete cleaned up normally; pause removed the
+    // record too because `pause_sandbox_impl` always removes a sandbox whose
+    // handle is missing.
+    MT_EXPECT_TRUE(!f.store->Get(to_delete.id).value().has_value());
+    MT_EXPECT_TRUE(!f.store->Get(to_pause.id).value().has_value());
+    MT_EXPECT_TRUE(f.store->Get(fresh.id).value()->state == SandboxState::Running);
 }
 
 MT_TEST(evict_expired_sandboxes_skips_while_shutting_down) {

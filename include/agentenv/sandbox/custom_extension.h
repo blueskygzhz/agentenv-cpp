@@ -5,8 +5,10 @@
 
 #include <string>
 
+#include "agentenv/core/error.h"
 #include "agentenv/core/expected.h"
 #include "agentenv/core/identity.h"
+#include "agentenv/core/optional.h"
 
 namespace agentenv {
 namespace sandbox {
@@ -42,6 +44,14 @@ class Client {
     virtual ~Client() {}
     virtual core::Expected<core::Unit, std::string>
         Notify(const std::string& event, const Params& params) = 0;
+
+    /// Rust `hook_patch_params` — the extension receives the caller's patch
+    /// document and returns the full, approved params (`None` = empty params).
+    ///
+    /// The orchestrator treats the returned value as authoritative: it is what
+    /// gets pushed to the backend and persisted, not the caller's patch.
+    virtual core::Expected<core::Optional<Params>, core::AnyError>
+        HookPatchParams(const core::SandboxId& sandbox_id, const Params& patch) = 0;
 };
 
 /// Rust struct `CustomExtensionHookGuard` — RAII: fires the stop hook (best

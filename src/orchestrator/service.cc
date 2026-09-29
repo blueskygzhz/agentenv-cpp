@@ -500,6 +500,29 @@ Orchestrator::EvictExpiredSandboxes() {
         }
         if (!claimed.value()) continue;
 
+        // Rust: after claiming, execute the timeout action.
+        if (metadata.timeout_action == SandboxTimeoutAction::Pause) {
+            // Rust `pause_sandbox_impl` — the Pausing CAS was already done by
+            // `claim_expired_running_sandbox`.
+            OrchestratorResult<core::Unit> paused = PauseSandboxImpl(metadata.id);
+            if (!paused.ok()) {
+                AGENTENV_WARN("failed to auto-evict (pause) expired sandbox "
+                              << metadata.id.ToString() << ": "
+                              << paused.error().Message());
+                continue;
+            }
+        } else {
+            // Rust `delete_sandbox_impl(id, Running, &mut progress)`.
+            DeleteProgress progress = DeletionProgress(metadata.id);
+            OrchestratorResult<core::Unit> deleted =
+                DeleteSandboxImpl(metadata.id, SandboxState::Running, &progress);
+            if (!deleted.ok()) {
+                AGENTENV_WARN("failed to auto-evict (delete) expired sandbox "
+                              << metadata.id.ToString() << ": "
+                              << deleted.error().Message());
+                continue;
+            }
+        }
         evicted.push_back(metadata.id);
     }
 
@@ -1470,6 +1493,574 @@ Orchestrator::ResumeSandboxInner(const core::SandboxId& id, NewTimeout timeout) 
                             resumed.value().resources);
     }
     return resumed;
+}
+
+// ---- fork ------------------------------------------------------------------
+
+// Rust `fork_child_error`.
+OrchestratorError Orchestrator::ForkChildError(const core::SandboxId& id,
+                                               const std::string& source) {
+    return OrchestratorError::SandboxOperationFailed(
+        id, SandboxOperation::Fork, source);
+}
+
+// Rust `stop_failed_fork` — the backend is consumed, so a failure only warns.
+void Orchestrator::StopFailedFork(
+    std::unique_ptr<sandbox::SandboxBackend> backend,
+    const core::SandboxId& id) {
+    if (!backend) return;
+    core::Expected<core::Unit, core::AnyError> stopped = backend->Stop();
+    if (!stopped.ok()) {
+        AGENTENV_WARN("failed to stop unsuccessful fork " << id.ToString()
+                      << ": " << stopped.error().chain());
+    }
+}
+
+// Rust `fork_sandbox`.
+OrchestratorResult<std::vector<SandboxForkOutcome> >
+Orchestrator::ForkSandbox(const core::SandboxId& source_id, uint32_t count,
+                          NewTimeout timeout) {
+    // Rust refuses the simple form when the source has volume mounts: the
+    // children would silently share the parent's volumes.
+    core::Expected<core::Optional<SandboxMetadata>, StoreError> source =
+        store_->Get(source_id);
+    if (!source.ok()) {
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(source.error().Message()));
+    }
+    if (source.value() && !source.value()->volume_mounts.empty()) {
+        return core::make_unexpected(OrchestratorError::InternalError(
+            "fork with volume mounts requires volume-aware child specs"));
+    }
+
+    std::vector<SandboxForkChildSpec> child_specs;
+    for (uint32_t i = 0; i < count; ++i) {
+        SandboxForkChildSpec spec;
+        spec.sandbox_id = core::SandboxId::Fresh();
+        child_specs.push_back(spec);
+    }
+    return ForkSandboxWithSpecs(source_id, child_specs, timeout);
+}
+
+// Rust `fork_sandbox_with_specs`.
+OrchestratorResult<std::vector<SandboxForkOutcome> >
+Orchestrator::ForkSandboxWithSpecs(
+    const core::SandboxId& source_id,
+    const std::vector<SandboxForkChildSpec>& child_specs,
+    NewTimeout timeout) {
+    return ForkSandboxInner(source_id, child_specs, timeout);
+}
+
+// Rust `fork_sandbox_inner`.
+OrchestratorResult<std::vector<SandboxForkOutcome> >
+Orchestrator::ForkSandboxInner(
+    const core::SandboxId& source_id,
+    const std::vector<SandboxForkChildSpec>& child_specs,
+    NewTimeout timeout) {
+    OrchestratorResult<core::Unit> accepting = EnsureAcceptingLifecycleOperations();
+    if (!accepting.ok()) return core::make_unexpected(accepting.error());
+
+    const uint32_t count = static_cast<uint32_t>(child_specs.size());
+
+    // Every child id must be unique, differ from the source, and not already
+    // exist in the store.
+    std::set<std::string> seen;
+    for (std::size_t i = 0; i < child_specs.size(); ++i) {
+        const core::SandboxId& child_id = child_specs[i].sandbox_id;
+        if (child_id == source_id || !seen.insert(child_id.ToString()).second) {
+            return core::make_unexpected(OrchestratorError::InternalError(
+                "fork child sandbox IDs must be unique and differ from the source"));
+        }
+        core::Expected<core::Optional<SandboxMetadata>, StoreError> existing =
+            store_->Get(child_id);
+        if (!existing.ok()) {
+            return core::make_unexpected(
+                OrchestratorError::StoreOperationFailed(existing.error().Message()));
+        }
+        if (existing.value()) {
+            return core::make_unexpected(OrchestratorError::InternalError(
+                "fork child sandbox " + child_id.ToString() + " already exists"));
+        }
+    }
+
+    AGENTENV_INFO("forking sandboxes from " << source_id.ToString());
+
+    SandboxHandlePtr source_handle = SandboxHandleFor(source_id);
+    if (!source_handle) {
+        return core::make_unexpected(OrchestratorError::SandboxNotFound(source_id));
+    }
+
+    // Claim Forking from Running; Rust keeps the *previous* record as the
+    // template for every child.
+    std::vector<SandboxState> running;
+    running.push_back(SandboxState::Running);
+    core::Expected<MetadataUpdateResult, StoreError> claimed = store_->UpdateIfState(
+        source_id, running,
+        [](SandboxMetadata* m) { m->state = SandboxState::Forking; });
+    if (!claimed.ok()) {
+        const StoreError error = claimed.error();
+        if (error.kind == StoreError::Kind::StateConflict) {
+            if (error.actual_state == SandboxState::Killing) {
+                return core::make_unexpected(
+                    OrchestratorError::SandboxNotFound(source_id));
+            }
+            return core::make_unexpected(OrchestratorError::InvalidSandboxState(
+                source_id, error.actual_state));
+        }
+        if (error.kind == StoreError::Kind::SandboxNotFound) {
+            return core::make_unexpected(OrchestratorError::SandboxNotFound(source_id));
+        }
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(error.Message()));
+    }
+    const SandboxMetadata source_metadata = claimed.value().previous;
+
+    std::vector<sandbox::SandboxForkSpec> backend_specs;
+    for (std::size_t i = 0; i < child_specs.size(); ++i) {
+        sandbox::SandboxForkSpec spec;
+        spec.sandbox_id = child_specs[i].sandbox_id;
+        if (source_metadata.secure && has_access_tokens_) {
+            spec.envd_access_token = core::Optional<sandbox::EnvdAccessToken>(
+                access_tokens_.Generate(child_specs[i].sandbox_id));
+        }
+        spec.extra_drives.clear();
+        for (std::size_t d = 0; d < child_specs[i].extra_drives.size(); ++d) {
+            spec.extra_drives.push_back(child_specs[i].extra_drives[d].drive_id);
+        }
+        spec.replace_drive_ids = child_specs[i].replace_drive_ids;
+        backend_specs.push_back(spec);
+    }
+
+    // One backend call returns a per-child result vector.
+    sandbox::SandboxCaptureResult<std::vector<sandbox::SandboxForkResult> >
+        fork_result = core::make_unexpected(
+            sandbox::SandboxCaptureError::Recoverable(""));
+    {
+        SandboxHandle::Guard sandbox = source_handle->Lock();
+        fork_result = sandbox->Fork(backend_specs);
+    }
+
+    if (!fork_result.ok()) {
+        const sandbox::SandboxCaptureError error = fork_result.error();
+        AGENTENV_WARN("failed to fork sandbox: " << error.Message());
+        counters_.RecordCreateFail(count);
+        if (error.IsTerminal()) {
+            // The source runtime is no longer trustworthy.
+            SandboxHandlePtr           detached;
+            core::Optional<ProxyRoute> route;
+            DetachSandboxHandleAndRoute(source_id, &detached, &route);
+            {
+                SandboxHandle::Guard sandbox = source_handle->Lock();
+                sandbox->Stop();
+            }
+            FinalizeTerminalVolumes(source_metadata);
+            core::Expected<core::Optional<SandboxMetadata>, StoreError> removed =
+                store_->Remove(source_id);
+            if (!removed.ok()) {
+                return core::make_unexpected(
+                    OrchestratorError::StoreOperationFailed(removed.error().Message()));
+            }
+        } else {
+            std::vector<SandboxState> forking;
+            forking.push_back(SandboxState::Forking);
+            store_->UpdateStateIfState(source_id, SandboxState::Running, forking);
+        }
+        return core::make_unexpected(OrchestratorError::SandboxOperationFailed(
+            source_id, SandboxOperation::Fork, error.Message()));
+    }
+
+    // Restore the source sandbox to Running; Rust only warns on failure.
+    {
+        std::vector<SandboxState> forking;
+        forking.push_back(SandboxState::Forking);
+        core::Expected<SandboxState, StoreError> restored =
+            store_->UpdateStateIfState(source_id, SandboxState::Running, forking);
+        if (!restored.ok()) {
+            AGENTENV_WARN("failed to restore source sandbox metadata after fork: "
+                          << restored.error().Message());
+        }
+    }
+
+    std::vector<sandbox::SandboxForkResult>& forked = fork_result.value();
+    std::vector<SandboxForkOutcome> outcomes;
+    uint64_t successes = 0;
+    const int64_t now_ms = core::SystemTime::Now().unix_nanos / 1000000;
+
+    for (std::size_t i = 0; i < child_specs.size() && i < forked.size(); ++i) {
+        const core::SandboxId child_id = child_specs[i].sandbox_id;
+        if (!forked[i].ok()) {
+            AGENTENV_WARN("failed to start forked sandbox " << child_id.ToString()
+                          << ": " << forked[i].error().chain());
+            outcomes.push_back(core::make_unexpected(
+                ForkChildError(child_id, forked[i].error().chain())));
+            continue;
+        }
+        std::unique_ptr<sandbox::SandboxBackend> backend =
+            std::move(forked[i].value());
+
+        // Rust clones the source record and overrides the per-child fields.
+        SandboxMetadata metadata = source_metadata;
+        metadata.id            = child_id;
+        metadata.state         = SandboxState::Running;
+        metadata.created_at_ms = now_ms;
+        metadata.paused_state.reset();
+        metadata.volume_mounts = child_specs[i].volume_mounts;
+        metadata.UpdateTimeout(timeout);
+
+        OrchestratorResult<ProxyTarget> target =
+            ProxyTargetFromSandbox(*backend);
+        if (!target.ok()) {
+            StopFailedFork(std::move(backend), child_id);
+            outcomes.push_back(core::make_unexpected(
+                ForkChildError(child_id, target.error().Message())));
+            continue;
+        }
+
+        core::Expected<core::Unit, StoreError> added = store_->Add(metadata);
+        if (!added.ok()) {
+            AGENTENV_WARN("failed to register forked sandbox " << child_id.ToString()
+                          << ": " << added.error().Message());
+            StopFailedFork(std::move(backend), child_id);
+            outcomes.push_back(core::make_unexpected(
+                ForkChildError(child_id, added.error().Message())));
+            continue;
+        }
+
+        RegisterSandboxHandle(child_id,
+                              SandboxHandlePtr(new SandboxHandle(std::move(backend))));
+        UpsertProxyRoute(child_id, target.value());
+        PublishSandboxEvent(SandboxLifecycleEventType::Fork, metadata.id,
+                            metadata.resources);
+        ++successes;
+        outcomes.push_back(metadata);
+    }
+
+    counters_.RecordCreateSuccess(successes);
+    counters_.RecordCreateFail(static_cast<uint64_t>(count) - successes);
+    return outcomes;
+}
+
+// ---- token helpers ---------------------------------------------------------
+
+// Rust `get_envd_access_token` — `metadata.secure.then(|| ..)`.
+core::Optional<sandbox::EnvdAccessToken>
+Orchestrator::GetEnvdAccessToken(const SandboxMetadata& metadata) const {
+    if (!metadata.secure || !has_access_tokens_) {
+        return core::Optional<sandbox::EnvdAccessToken>();
+    }
+    return core::Optional<sandbox::EnvdAccessToken>(
+        access_tokens_.Generate(metadata.id));
+}
+
+// Rust `validate_envd_access_token`.
+bool Orchestrator::ValidateEnvdAccessToken(const core::SandboxId& id,
+                                            const std::string& candidate) const {
+    if (!has_access_tokens_) return false;
+    return access_tokens_.Matches(id, candidate);
+}
+
+// Rust `traffic_access_token`.
+std::string Orchestrator::TrafficAccessToken(const core::SandboxId& id) const {
+    if (!has_access_tokens_) return std::string();
+    return access_tokens_.GenerateTraffic(id);
+}
+
+// Rust `validate_traffic_access_token`.
+bool Orchestrator::ValidateTrafficAccessToken(const core::SandboxId& id,
+                                               const std::string& candidate) const {
+    if (!has_access_tokens_) return false;
+    return access_tokens_.MatchesTraffic(id, candidate);
+}
+
+// ---- snapshot operations ---------------------------------------------------
+
+// Rust `begin_snapshot_operation`.
+OrchestratorResult<SandboxHandlePtr>
+Orchestrator::BeginSnapshotOperation(const core::SandboxId& id) {
+    OrchestratorResult<core::Unit> accepting = EnsureAcceptingLifecycleOperations();
+    if (!accepting.ok()) return core::make_unexpected(accepting.error());
+
+    std::vector<SandboxState> running;
+    running.push_back(SandboxState::Running);
+    core::Expected<SandboxState, StoreError> claimed =
+        store_->UpdateStateIfState(id, SandboxState::Snapshotting, running);
+    if (!claimed.ok()) {
+        const StoreError error = claimed.error();
+        if (error.kind == StoreError::Kind::StateConflict) {
+            if (error.actual_state == SandboxState::Killing) {
+                return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+            }
+            return core::make_unexpected(
+                OrchestratorError::InvalidSandboxState(id, error.actual_state));
+        }
+        if (error.kind == StoreError::Kind::SandboxNotFound) {
+            return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+        }
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(error.Message()));
+    }
+
+    SandboxHandlePtr handle = SandboxHandleFor(id);
+    if (handle) return handle;
+
+    // The record claims the sandbox is running but no handle is registered.
+    AGENTENV_WARN("sandbox handle not found while snapshotting, removing from store");
+    SandboxHandlePtr           detached;
+    core::Optional<ProxyRoute> route;
+    DetachSandboxHandleAndRoute(id, &detached, &route);
+
+    core::Expected<core::Optional<SandboxMetadata>, StoreError> got = store_->Get(id);
+    if (!got.ok()) {
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(got.error().Message()));
+    }
+    if (got.value()) FinalizeTerminalVolumes(*got.value());
+    core::Expected<core::Optional<SandboxMetadata>, StoreError> removed =
+        store_->Remove(id);
+    if (!removed.ok()) {
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(removed.error().Message()));
+    }
+    return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+}
+
+// Rust `fail_snapshot_operation`.
+OrchestratorError
+Orchestrator::FailSnapshotOperation(const core::SandboxId& id,
+                                    const SandboxHandlePtr& handle,
+                                    const sandbox::SandboxCaptureError& error,
+                                    SandboxOperation operation) {
+    AGENTENV_WARN("sandbox snapshot operation " << SandboxOperationName(operation)
+                  << " failed: " << error.Message());
+    if (error.IsTerminal()) {
+        SandboxHandlePtr           detached;
+        core::Optional<ProxyRoute> route;
+        DetachSandboxHandleAndRoute(id, &detached, &route);
+        if (handle) {
+            SandboxHandle::Guard sandbox = handle->Lock();
+            core::Expected<core::Unit, core::AnyError> stopped = sandbox->Stop();
+            if (!stopped.ok()) {
+                AGENTENV_WARN("failed to stop sandbox after terminal snapshot "
+                              "failure: " << stopped.error().chain());
+            }
+        }
+        core::Expected<core::Optional<SandboxMetadata>, StoreError> got =
+            store_->Get(id);
+        if (got.ok() && got.value()) FinalizeTerminalVolumes(*got.value());
+        store_->Remove(id);
+    } else {
+        std::vector<SandboxState> snapshotting;
+        snapshotting.push_back(SandboxState::Snapshotting);
+        store_->UpdateStateIfState(id, SandboxState::Running, snapshotting);
+    }
+    return OrchestratorError::SandboxOperationFailed(id, operation, error.Message());
+}
+
+// Rust `finish_snapshot_operation`.
+OrchestratorResult<core::Unit>
+Orchestrator::FinishSnapshotOperation(const core::SandboxId& id) {
+    std::vector<SandboxState> snapshotting;
+    snapshotting.push_back(SandboxState::Snapshotting);
+    core::Expected<SandboxState, StoreError> restored =
+        store_->UpdateStateIfState(id, SandboxState::Running, snapshotting);
+    if (!restored.ok()) {
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(restored.error().Message()));
+    }
+    return core::Unit();
+}
+
+// Rust `snapshot_volume_mounts` / `snapshot_volume_mounts_inner`.
+OrchestratorResult<core::Unit>
+Orchestrator::SnapshotVolumeMounts(const core::SandboxId& id) {
+    OrchestratorResult<SandboxHandlePtr> handle = BeginSnapshotOperation(id);
+    if (!handle.ok()) return core::make_unexpected(handle.error());
+
+    sandbox::SandboxCaptureResult<core::Unit> result = core::Unit();
+    {
+        SandboxHandle::Guard sandbox = handle.value()->Lock();
+        result = sandbox->SnapshotVolumes();
+    }
+    if (!result.ok()) {
+        return core::make_unexpected(FailSnapshotOperation(
+            id, handle.value(), result.error(), SandboxOperation::SnapshotVolumes));
+    }
+    return FinishSnapshotOperation(id);
+}
+
+// Rust `capture_snapshot` / `capture_snapshot_inner`.
+OrchestratorResult<SnapshotCaptureResult>
+Orchestrator::CaptureSnapshot(const core::SandboxId& id) {
+    AGENTENV_INFO("capturing sandbox snapshot for " << id.ToString());
+
+    OrchestratorResult<SandboxHandlePtr> handle = BeginSnapshotOperation(id);
+    if (!handle.ok()) return core::make_unexpected(handle.error());
+
+    sandbox::SandboxCaptureResult<std::string> result =
+        core::make_unexpected(sandbox::SandboxCaptureError::Recoverable(""));
+    {
+        SandboxHandle::Guard sandbox = handle.value()->Lock();
+        result = sandbox->Snapshot();
+    }
+    if (!result.ok()) {
+        return core::make_unexpected(FailSnapshotOperation(
+            id, handle.value(), result.error(), SandboxOperation::Snapshot));
+    }
+
+    OrchestratorResult<core::Unit> finished = FinishSnapshotOperation(id);
+    if (!finished.ok()) return core::make_unexpected(finished.error());
+
+    core::Expected<core::Optional<SandboxMetadata>, StoreError> got = store_->Get(id);
+    if (!got.ok()) {
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(got.error().Message()));
+    }
+    if (!got.value()) {
+        AGENTENV_WARN("sandbox disappeared after snapshotting");
+        return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+    }
+
+    AGENTENV_INFO("snapshot captured");
+    SnapshotCaptureResult captured;
+    captured.metadata          = *got.value();
+    captured.captured_snapshot = result.value();
+    return captured;
+}
+
+// ---- hot-update operations -------------------------------------------------
+
+// Rust `replace_sandbox_network_policy` / `_inner`.
+OrchestratorResult<core::Unit>
+Orchestrator::ReplaceSandboxNetworkPolicy(
+    const core::SandboxId& id,
+    const sandbox::network::SandboxNetworkPolicy& policy) {
+    core::Expected<core::Optional<SandboxMetadata>, StoreError> got = store_->Get(id);
+    if (!got.ok()) {
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(got.error().Message()));
+    }
+    if (!got.value()) {
+        return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+    }
+    const SandboxMetadata metadata = *got.value();
+    if (metadata.state != SandboxState::Running) {
+        return core::make_unexpected(
+            OrchestratorError::InvalidSandboxState(id, metadata.state));
+    }
+
+    // Rust: `allow_public_traffic` is not user-updatable — it is fixed at
+    // create time, so the stored value always wins.
+    sandbox::network::SandboxNetworkPolicy effective = policy;
+    effective.allow_public_traffic = metadata.network_policy.allow_public_traffic;
+
+    SandboxHandlePtr handle = SandboxHandleFor(id);
+    if (!handle) {
+        return core::make_unexpected(OrchestratorError::SandboxOperationConflict(
+            id, SandboxOperation::UpdateNetwork));
+    }
+
+    // Rust passes `runtime_policy()` (empty when nothing needs installing).
+    core::Optional<std::string> runtime_policy;
+    if (effective.RuntimePolicy()) {
+        runtime_policy = core::Optional<std::string>(std::string("policy"));
+    }
+
+    core::Expected<core::Unit, core::AnyError> updated =
+        core::make_unexpected(core::err(""));
+    {
+        SandboxHandle::Guard sandbox = handle->Lock();
+        updated = sandbox->UpdateNetworkPolicy(runtime_policy);
+    }
+    if (!updated.ok()) {
+        return core::make_unexpected(OrchestratorError::SandboxOperationFailed(
+            id, SandboxOperation::UpdateNetwork, updated.error().chain()));
+    }
+
+    std::vector<SandboxState> running;
+    running.push_back(SandboxState::Running);
+    core::Expected<MetadataUpdateResult, StoreError> stored = store_->UpdateIfState(
+        id, running,
+        [effective](SandboxMetadata* m) { m->network_policy = effective; });
+    if (!stored.ok()) {
+        if (stored.error().kind == StoreError::Kind::StateConflict) {
+            return core::make_unexpected(OrchestratorError::InvalidSandboxState(
+                id, stored.error().actual_state));
+        }
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(stored.error().Message()));
+    }
+    return core::Unit();
+}
+
+// Rust `patch_sandbox_custom_extension_params` / `_inner`.
+OrchestratorResult<core::Optional<sandbox::custom_extension::Params> >
+Orchestrator::PatchSandboxCustomExtensionParams(
+    const core::SandboxId& id,
+    const sandbox::custom_extension::Params& patch) {
+    core::Expected<core::Optional<SandboxMetadata>, StoreError> got = store_->Get(id);
+    if (!got.ok()) {
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(got.error().Message()));
+    }
+    if (!got.value()) {
+        return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+    }
+    if (got.value()->state != SandboxState::Running) {
+        return core::make_unexpected(
+            OrchestratorError::InvalidSandboxState(id, got.value()->state));
+    }
+
+    SandboxHandlePtr handle = SandboxHandleFor(id);
+    if (!handle) {
+        return core::make_unexpected(OrchestratorError::SandboxOperationConflict(
+            id, SandboxOperation::PatchCustomExtensionParams));
+    }
+
+    // Rust `CustomExtensionClient::global().ok_or_else(..)`.
+    if (!custom_extension_client_) {
+        return core::make_unexpected(OrchestratorError::SandboxOperationFailed(
+            id, SandboxOperation::PatchCustomExtensionParams,
+            "custom extension is not configured ([custom_extension].url is unset)"));
+    }
+
+    // The sandbox lock is deliberately NOT held across the hook call so that
+    // pause/stop are not blocked on extension latency.
+    core::Expected<core::Optional<sandbox::custom_extension::Params>, core::AnyError>
+        hooked = custom_extension_client_->HookPatchParams(id, patch);
+    if (!hooked.ok()) {
+        return core::make_unexpected(OrchestratorError::SandboxOperationFailed(
+            id, SandboxOperation::PatchCustomExtensionParams,
+            hooked.error().chain()));
+    }
+    const core::Optional<sandbox::custom_extension::Params> new_params =
+        hooked.value();
+
+    {
+        SandboxHandle::Guard sandbox = handle->Lock();
+        sandbox->UpdateCustomExtensionParams(
+            new_params ? core::Optional<std::string>(new_params->json_bytes)
+                       : core::Optional<std::string>());
+    }
+
+    // NOTE: a concurrent pause may have transitioned the sandbox since the
+    // entry check, so this may fail. Rust accepts that: extension state is
+    // transient, like the network policy.
+    std::vector<SandboxState> running;
+    running.push_back(SandboxState::Running);
+    core::Expected<MetadataUpdateResult, StoreError> stored = store_->UpdateIfState(
+        id, running,
+        [new_params](SandboxMetadata* m) { m->custom_extension_params = new_params; });
+    if (!stored.ok()) {
+        // Lost a race against a concurrent state transition (e.g. pause):
+        // report it as a conflict instead of a 500.
+        if (stored.error().kind == StoreError::Kind::StateConflict) {
+            return core::make_unexpected(OrchestratorError::InvalidSandboxState(
+                id, stored.error().actual_state));
+        }
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(stored.error().Message()));
+    }
+    return new_params;
 }
 
 // ---- delete ----------------------------------------------------------------
