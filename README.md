@@ -109,6 +109,9 @@ Legend: 🟩 behaviourally aligned + tested · 🟨 main path real, some branche
 | `storage/overlaybd` LSMT index | `storage/overlaybd/src/lsmt/index.rs` | **fixed** `zeroed` vs `has_physical_range` conflation: backed zeros now keep their physical range through `mend`/`forward_offset_to`/`can_merge_with`, and `ReadOnlyIndex::new` normalizes placeholder offsets |
 | `storage/overlaybd` LSMT B+ tree | `storage/overlaybd/src/lsmt/index.rs` | `BptConfig` (u64/u32 fan-outs) + `LinearizedBptree` + `IndexLBPT`; verified differentially against the binary-search `ReadOnlyIndex` over a randomized sweep |
 | `sandbox/network/egress_proxy` | `src/sandbox/network/egress_proxy.rs` | preface inspection (HTTP `Host`, TLS SNI reassembled across record boundaries), `normalize_host`, `select_upstream` / `resolve_trusted_upstream` (CIDR grants checked before a hostname is required; resolved addresses re-checked against policy), `SO_ORIGINAL_DST`, and the prepare/activate/discard policy staging state machine |
+| `snapshot/artifact_cache` | `src/snapshot/artifact_cache.rs` | `LocalArtifactCache` (ref-counted LRU cache, concurrent deduplication with per-key mutex+condvar, `EnsureCached` / `PinLocalFile`), `CacheArtifactLease` |
+| `snapshot/runtime_support` | `src/snapshot/runtime_support.rs` | `RuntimeImageMaterializer` (derives node-local overlaybd image configs from committed layer refs), `OverlaybdLayerStore` trait, `HydrateRuntimeManifest`, `LoadFirecrackerManifestFromPath` |
+| `snapshot/repository/posixfs/runtime` | `src/snapshot/repository/backends/posixfs/runtime.rs` | `PosixFsRuntimeResolver` (resolves committed snapshots to runnable paths: materializes memory/rootfs/drive image configs, resolves attached drives, hydrates runtime manifest) |
 
 ### Per-module state
 
