@@ -35,7 +35,10 @@ void Segment::BackwardEndTo(uint64_t x) {
 // ---------------- SegmentMapping ----------------
 void SegmentMapping::ForwardOffsetTo(uint64_t x) {
     uint64_t delta = segment.ForwardOffsetTo(x);
-    if (!zeroed && delta > 0) {
+    // Rust advances the physical cursor only when there *is* one. Keying this
+    // off `!zeroed` would corrupt a backed zero's offset and would also
+    // increment the unbacked sentinel into a bogus real offset.
+    if (HasPhysicalRange() && delta > 0) {
         moffset += delta;
     }
 }
@@ -49,13 +52,7 @@ size_t CompressRawIndex(std::vector<SegmentMapping>* mapping) {
     for (size_t j = 1; j < n; ++j) {
         const SegmentMapping m_i = v[i];
         const SegmentMapping m_j = v[j];
-        bool can_merge = m_i.End() == m_j.Offset() &&
-                         m_i.MEnd() == m_j.moffset &&
-                         m_i.zeroed == m_j.zeroed &&
-                         m_i.tag == m_j.tag &&
-                         (static_cast<uint64_t>(m_i.Length()) +
-                          static_cast<uint64_t>(m_j.Length())) <=
-                             static_cast<uint64_t>(Segment::kMaxLength);
+        const bool can_merge = m_i.CanMergeWith(m_j);
         if (can_merge) {
             v[i].segment.length += m_j.Length();
         } else {
@@ -75,13 +72,7 @@ size_t CompressRawIndexPredict(const std::vector<SegmentMapping>& mapping) {
     SegmentMapping m = mapping[0];
     for (size_t k = 1; k < n; ++k) {
         const SegmentMapping& item = mapping[k];
-        bool can_merge = m.End() == item.Offset() &&
-                         m.MEnd() == item.moffset &&
-                         m.tag == item.tag &&
-                         m.zeroed == item.zeroed &&
-                         (static_cast<uint64_t>(m.Length()) +
-                          static_cast<uint64_t>(item.Length())) <=
-                             static_cast<uint64_t>(Segment::kMaxLength);
+        const bool can_merge = m.CanMergeWith(item);
         if (can_merge) {
             m.segment.length += item.Length();
         } else {
@@ -93,6 +84,18 @@ size_t CompressRawIndexPredict(const std::vector<SegmentMapping>& mapping) {
 }
 
 // ---------------- ReadOnlyIndex ----------------
+ReadOnlyIndex::ReadOnlyIndex(std::vector<SegmentMapping> mappings)
+    : mappings_(std::move(mappings)) {
+    // Rust `ReadOnlyIndex::new`: a read-only layer never lends physical space
+    // to a writable upper, so normalize placeholder offsets on zeroed entries
+    // before lookup/merge can mistake them for backed zeros.
+    for (size_t i = 0; i < mappings_.size(); ++i) {
+        if (mappings_[i].zeroed) {
+            mappings_[i].moffset = kNoPhysicalOffset;
+        }
+    }
+}
+
 ReadOnlyIndex ReadOnlyIndex::Merge(const std::vector<const ReadOnlyIndex*>& indexes) {
     MutableIndex mi;
     // Iterate newest-first in reverse so lower (older) layers are inserted first;

@@ -70,10 +70,17 @@ core::Expected<uint32_t, std::string> NetworkIpAt(const Ipv4Cidr& net, uint32_t 
 }  // namespace
 
 NetworkAddressPlan NetworkAddressPlan::Default() {
-    // Mirrors Rust NetworkConfig::default internal pools.
-    Ipv4Cidr host_interaction = Ipv4Cidr::Parse("10.0.0.0/16").value();
-    Ipv4Cidr veth= Ipv4Cidr::Parse("10.1.0.0/16").value();
-    Ipv4Cidr vm_link          = Ipv4Cidr::Parse("169.254.0.0/30").value();
+    // Rust `#[cfg(test)] NetworkAddressPlan::default()` is literally
+    // `from_config(&NetworkConfig::default())`, so these three values must be
+    // the `NetworkInternalConfig` defaults plus `FIXED_NETWORK_VM_LINK_CIDR`.
+    //
+    // The VM link CIDR is part of the snapshot ABI: a fresh boot passes this
+    // link through the kernel `ip=` argument and snapshot resume does not
+    // re-run boot args, so VmIp()/TapIp() must land on .21/.22 — not on the
+    // .1/.2 that a 169.254.0.0/30 base would produce.
+    Ipv4Cidr host_interaction = Ipv4Cidr::Parse("10.11.0.0/16").value();
+    Ipv4Cidr veth             = Ipv4Cidr::Parse("10.12.0.0/16").value();
+    Ipv4Cidr vm_link          = Ipv4Cidr::Parse("169.254.0.20/30").value();
     return NetworkAddressPlan(host_interaction, veth, vm_link);
 }
 

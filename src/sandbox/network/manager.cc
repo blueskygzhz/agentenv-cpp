@@ -2,6 +2,7 @@
 // Rust: src/sandbox/network/manager.rs
 #include "agentenv/sandbox/network/manager.h"
 
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <algorithm>
@@ -52,6 +53,12 @@ void NetworkManagerExitHook() {
 
 /// Runs `command` under `capabilities` and returns its stdout, or false when
 /// it could not be run or exited non-zero. Rust `run_command`.
+///
+/// This forks directly instead of going through `privileges::SpawnScoped`:
+/// that helper runs its pre-exec hook on a launcher thread in the *parent*,
+/// before forking, so redirecting stdout there would rewire this process's
+/// own stdout rather than the child's. The `dup2` has to happen after the
+/// fork, in the child.
 bool RunCommandCapturingStdout(const std::string& command,
                                const std::vector<std::string>& args,
                                const std::vector<int>& capabilities,
@@ -59,28 +66,47 @@ bool RunCommandCapturingStdout(const std::string& command,
     int pipefd[2];
     if (::pipe(pipefd) != 0) return false;
 
-    privileges::ScopedSpawnRequest request;
-    request.argv.push_back(command);
-    for (std::size_t i = 0; i < args.size(); ++i) request.argv.push_back(args[i]);
-    request.capabilities = capabilities;
-    const int write_fd = pipefd[1];
-    request.before_capability_scope = [write_fd]() -> std::string {
-        // Point the child's stdout at the pipe before its privileges change.
-        if (::dup2(write_fd, STDOUT_FILENO) < 0) {
-            return std::string("failed to redirect stdout: ") + std::strerror(errno);
-        }
-        return std::string();
-    };
-
-    core::Expected<pid_t, std::string> spawned = privileges::SpawnScoped(request);
-    ::close(pipefd[1]);
-    if (!spawned.ok()) {
+    const pid_t pid = ::fork();
+    if (pid < 0) {
         ::close(pipefd[0]);
-        AGENTENV_DEBUG("failed to inspect host networking state via " << command
-                       << ": " << spawned.error());
+        ::close(pipefd[1]);
+        AGENTENV_DEBUG("failed to fork for host networking inspection via "
+                       << command);
         return false;
     }
 
+    if (pid == 0) {
+        // Child: wire stdout to the pipe, drop to the requested capabilities
+        // and exec. Diagnostics only, so any failure just exits non-zero.
+        ::close(pipefd[0]);
+        if (::dup2(pipefd[1], STDOUT_FILENO) < 0) ::_exit(127);
+        ::close(pipefd[1]);
+        // Stderr would otherwise interleave into the caller's log.
+        const int devnull = ::open("/dev/null", O_WRONLY);
+        if (devnull >= 0) {
+            ::dup2(devnull, STDERR_FILENO);
+            ::close(devnull);
+        }
+
+        if (!capabilities.empty()) {
+            const core::Expected<core::Unit, std::string> configured =
+                core::cap::ConfigureCurrentProcessCapabilities(capabilities);
+            if (!configured.ok()) ::_exit(127);
+        }
+
+        std::vector<char*> argv;
+        argv.push_back(const_cast<char*>(command.c_str()));
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            argv.push_back(const_cast<char*>(args[i].c_str()));
+        }
+        argv.push_back(NULL);
+        ::execvp(argv[0], &argv[0]);
+        ::_exit(127);
+    }
+
+    // Parent: drain the pipe, then reap. Reading before waiting avoids
+    // deadlocking on a child that outruns the pipe buffer.
+    ::close(pipefd[1]);
     std::string captured;
     char        buf[4096];
     ssize_t     n = 0;
@@ -90,7 +116,7 @@ bool RunCommandCapturingStdout(const std::string& command,
     ::close(pipefd[0]);
 
     int status = 0;
-    ::waitpid(spawned.value(), &status, 0);
+    if (::waitpid(pid, &status, 0) < 0) return false;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         AGENTENV_DEBUG("network conflict inspection command " << command
                        << " exited unsuccessfully");

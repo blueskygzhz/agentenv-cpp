@@ -137,6 +137,27 @@ struct TemplateBuildErrorReason {
 
 std::ostream& operator<<(std::ostream& os, const TemplateBuildErrorReason& reason);
 
+/// Rust `struct SnapshotArtifactLayoutSpec` (src/snapshot/types/artifacts.rs).
+///
+/// The fixed file names inside a snapshot directory. Every backend derives its
+/// paths from this one table so the on-disk shape cannot diverge between the
+/// writer and the resolver — these names are effectively an on-disk ABI for
+/// already-published snapshots.
+struct SnapshotArtifactLayoutSpec {
+    const char* firecracker_manifest;
+    const char* vm_state;
+    const char* memory_dump;
+    const char* memory_image_config;
+    const char* rootfs_dir;
+    const char* drives_dir;
+    const char* drive_layers_dir;
+    const char* rootfs_image_config;
+    const char* overlaybd_image_config_file;
+};
+
+/// Rust `pub const SNAPSHOT_ARTIFACT_LAYOUT`.
+extern const SnapshotArtifactLayoutSpec kSnapshotArtifactLayout;
+
 }  // namespace snapshot
 }  // namespace agentenv
 #endif  // AGENTENV_SNAPSHOT_TYPES_H_

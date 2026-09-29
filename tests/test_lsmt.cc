@@ -108,12 +108,112 @@ MT_TEST(index_compress) {
 }
 
 // Rust: test_compress_with_zeroed_segments
+//
+// Note the sentinel: an *unbacked* zero carries kNoPhysicalOffset, not 0.
+// moffset == 0 would be a legitimate physical offset, i.e. a backed zero.
 MT_TEST(compress_zeroed) {
     std::vector<SegmentMapping> m;
-    m.push_back(SegmentMapping(0, 10, 0, true, 0));
-    m.push_back(SegmentMapping(10, 10, 0, true, 0));
+    m.push_back(SegmentMapping(0, 10, kNoPhysicalOffset, true, 0));
+    m.push_back(SegmentMapping(10, 10, kNoPhysicalOffset, true, 0));
+    MT_EXPECT_EQ(static_cast<int>(CompressRawIndexPredict(m)), 1);
     MT_EXPECT_EQ(static_cast<int>(CompressRawIndex(&m)), 1);
-    MT_EXPECT_TRUE(m[0] == SegmentMapping(0, 20, 0, true, 0));
+    MT_EXPECT_TRUE(m[0] == SegmentMapping(0, 20, kNoPhysicalOffset, true, 0));
+}
+
+// Rust: test_compress_backed_zeros_requires_contiguous_physical_ranges
+//
+// A `zeroed` mapping that still owns a physical range may only merge with a
+// neighbour whose physical range is contiguous with it. Treating `zeroed` as
+// "no physical range" would wrongly merge all of these.
+MT_TEST(compress_backed_zeros_requires_contiguous_physical_ranges) {
+    const SegmentMapping first(0, 10, 100, true, 0);
+    struct Case {
+        SegmentMapping second;
+        int expected_len;
+    };
+    const Case cases[] = {
+        // physically contiguous (100 + 10 == 110) -> merges
+        { SegmentMapping(10, 10, 110, true, 0), 1 },
+        // same physical offset -> not contiguous
+        { SegmentMapping(10, 10, 100, true, 0), 2 },
+        // physical gap
+        { SegmentMapping(10, 10, 200, true, 0), 2 },
+        // zeroed flag differs
+        { SegmentMapping(10, 10, 110, false, 0), 2 },
+        // tag differs
+        { SegmentMapping(10, 10, 110, true, 1), 2 },
+        // backed zero must not absorb an unbacked zero
+        { SegmentMapping(10, 10, kNoPhysicalOffset, true, 0), 2 },
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        std::vector<SegmentMapping> m;
+        m.push_back(first);
+        m.push_back(cases[i].second);
+        MT_EXPECT_EQ(static_cast<int>(CompressRawIndexPredict(m)), cases[i].expected_len);
+        MT_EXPECT_EQ(static_cast<int>(CompressRawIndex(&m)), cases[i].expected_len);
+    }
+
+    // A physical end that happens to equal the sentinel must not let a backed
+    // zero merge with an adjacent unbacked zero.
+    std::vector<SegmentMapping> edge;
+    edge.push_back(SegmentMapping(0, 1, kNoPhysicalOffset - 1, true, 0));
+    edge.push_back(SegmentMapping(1, 1, kNoPhysicalOffset, true, 0));
+    MT_EXPECT_EQ(static_cast<int>(CompressRawIndexPredict(edge)), 2);
+    MT_EXPECT_EQ(static_cast<int>(CompressRawIndex(&edge)), 2);
+}
+
+// has_physical_range is independent of `zeroed`.
+MT_TEST(has_physical_range_is_independent_of_zeroed) {
+    // unbacked zero
+    MT_EXPECT_TRUE(!SegmentMapping(0, 4, kNoPhysicalOffset, true, 0).HasPhysicalRange());
+    // backed zero: zeroed for reads, but still owns space
+    MT_EXPECT_TRUE(SegmentMapping(0, 4, 100, true, 0).HasPhysicalRange());
+    // ordinary data
+    MT_EXPECT_TRUE(SegmentMapping(0, 4, 0, false, 0).HasPhysicalRange());
+
+    // mend() follows has_physical_range, not zeroed.
+    MT_EXPECT_TRUE(SegmentMapping(0, 4, 100, true, 0).MEnd() == 104);
+    MT_EXPECT_TRUE(SegmentMapping(0, 4, kNoPhysicalOffset, true, 0).MEnd() == kNoPhysicalOffset);
+}
+
+// forward_offset_to advances the physical cursor only when there is one.
+MT_TEST(forward_offset_to_respects_physical_range) {
+    SegmentMapping backed(10, 10, 100, true, 0);
+    backed.ForwardOffsetTo(13);
+    MT_EXPECT_TRUE(backed.Offset() == 13);
+    MT_EXPECT_TRUE(backed.Length() == 7);
+    MT_EXPECT_TRUE(backed.moffset == 103);
+
+    SegmentMapping unbacked(10, 10, kNoPhysicalOffset, true, 0);
+    unbacked.ForwardOffsetTo(13);
+    MT_EXPECT_TRUE(unbacked.Offset() == 13);
+    MT_EXPECT_TRUE(unbacked.Length() == 7);
+    // The sentinel must stay the sentinel, not become kNoPhysicalOffset + 3.
+    MT_EXPECT_TRUE(unbacked.moffset == kNoPhysicalOffset);
+    MT_EXPECT_TRUE(!unbacked.HasPhysicalRange());
+}
+
+// ReadOnlyIndex::new normalizes placeholder offsets on zeroed entries.
+MT_TEST(readonly_index_normalizes_zeroed_offsets) {
+    std::vector<SegmentMapping> src;
+    src.push_back(SegmentMapping(0, 10, 0, true, 0));     // legacy placeholder
+    src.push_back(SegmentMapping(10, 10, 999, true, 0));  // arbitrary placeholder
+    src.push_back(SegmentMapping(20, 10, 42, false, 0));  // real data, untouched
+    ReadOnlyIndex idx(src);
+
+    MT_EXPECT_TRUE(idx.Mappings()[0].moffset == kNoPhysicalOffset);
+    MT_EXPECT_TRUE(!idx.Mappings()[0].HasPhysicalRange());
+    MT_EXPECT_TRUE(idx.Mappings()[1].moffset == kNoPhysicalOffset);
+    MT_EXPECT_TRUE(idx.Mappings()[2].moffset == 42);
+    MT_EXPECT_TRUE(idx.Mappings()[2].HasPhysicalRange());
+}
+
+// The on-disk encoding round-trips the sentinel (55-bit moffset field).
+MT_TEST(disk_mapping_round_trips_no_physical_offset) {
+    const SegmentMapping original(7, 9, kNoPhysicalOffset, true, 3);
+    const SegmentMapping decoded = DiskSegmentMapping::FromMemory(original).ToMemory();
+    MT_EXPECT_TRUE(decoded == original);
+    MT_EXPECT_TRUE(!decoded.HasPhysicalRange());
 }
 
 // Rust: test_index_merge (Case 1: merge idx0 over idx1)
@@ -161,10 +261,27 @@ MT_TEST(segment_mapping_boundary) {
     MT_EXPECT_EQ(static_cast<int>(m.Length()), 15);
     MT_EXPECT_EQ(static_cast<int>(m.moffset), 105);
 
+    // A backed zero clips its physical range just like ordinary data.
     SegmentMapping m2(10, 20, 100, true, 0);
-    MT_EXPECT_EQ(static_cast<int>(m2.MEnd()), 100);
+    MT_EXPECT_TRUE(m2.HasPhysicalRange());
+    MT_EXPECT_EQ(static_cast<int>(m2.MEnd()), 120);
     m2.ForwardOffsetTo(15);
-    MT_EXPECT_EQ(static_cast<int>(m2.moffset), 100);
+    MT_EXPECT_EQ(static_cast<int>(m2.moffset), 105);
+    m2.BackwardEndTo(20);
+    MT_EXPECT_EQ(static_cast<int>(m2.Length()), 5);
+    MT_EXPECT_EQ(static_cast<int>(m2.MEnd()), 110);
+
+    // An unbacked zero never does arithmetic on the marker.
+    SegmentMapping m3(10, 20, kNoPhysicalOffset, true, 0);
+    MT_EXPECT_TRUE(!m3.HasPhysicalRange());
+    m3.ForwardOffsetTo(15);
+    m3.BackwardEndTo(20);
+    MT_EXPECT_EQ(static_cast<int>(m3.Length()), 5);
+    MT_EXPECT_TRUE(m3.moffset == kNoPhysicalOffset);
+    MT_EXPECT_TRUE(m3.MEnd() == kNoPhysicalOffset);
+    m3.ForwardOffsetTo(static_cast<uint64_t>(-1));
+    MT_EXPECT_EQ(static_cast<int>(m3.Length()), 0);
+    MT_EXPECT_TRUE(m3.moffset == kNoPhysicalOffset);
 }
 
 // format.rs: magic + bit packing round-trip
@@ -299,7 +416,11 @@ uint8_t rec[16];
     MT_EXPECT_EQ(static_cast<int>(out.size()), 3);
     MT_EXPECT_TRUE(out[0] == SM(0, 10, 2));
   MT_EXPECT_TRUE(out[1] == SM(20, 5, 100));
-    MT_EXPECT_TRUE(out[2] == SegmentMapping(30, 8, 0, true, 0));
+    // The zeroed entry was persisted with a placeholder moffset of 0;
+    // ReadOnlyIndex::new normalizes it to the sentinel on load, so lookup can
+    // never mistake it for a backed zero.
+    MT_EXPECT_TRUE(out[2] == SegmentMapping(30, 8, kNoPhysicalOffset, true, 0));
+    MT_EXPECT_TRUE(!out[2].HasPhysicalRange());
 
     std::remove(path.c_str());
 }

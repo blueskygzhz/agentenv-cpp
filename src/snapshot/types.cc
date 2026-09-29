@@ -369,5 +369,18 @@ core::Expected<CommandContext, std::string> CommandContext::FromJson(const core:
     return context;
 }
 
+// Rust `SNAPSHOT_ARTIFACT_LAYOUT`, verbatim and in declaration order.
+const SnapshotArtifactLayoutSpec kSnapshotArtifactLayout = {
+    /* firecracker_manifest        */ "firecracker-manifest.json",
+    /* vm_state                    */ "vm_state.bin",
+    /* memory_dump                 */ "mem.bin",
+    /* memory_image_config         */ "mem_image.json",
+    /* rootfs_dir                  */ "rootfs",
+    /* drives_dir                  */ "drives",
+    /* drive_layers_dir            */ "drives/layers",
+    /* rootfs_image_config         */ "rootfs/image.json",
+    /* overlaybd_image_config_file */ "image.json",
+};
+
 }  // namespace snapshot
 }  // namespace agentenv

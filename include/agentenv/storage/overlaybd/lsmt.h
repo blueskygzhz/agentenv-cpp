@@ -33,6 +33,17 @@ struct Segment {
     void BackwardEndTo(uint64_t x);
 };
 
+/// Rust `format.rs :: NO_PHYSICAL_OFFSET` == `DiskSegmentMapping::MOFFSET_MASK`.
+///
+/// A zero mapping without physical backing. Physical offsets occupy 55 bits on
+/// disk, so the all-ones value is reserved as the "no backing" sentinel both in
+/// memory and on disk.
+///
+/// This is deliberately NOT the same predicate as `zeroed`: a mapping can be
+/// `zeroed` *and* still own a physical range (a "backed zero"), which RW replay
+/// must preserve across reopen.
+static const uint64_t kNoPhysicalOffset = (1ULL << 55) - 1;
+
 // ==== Rust: lsmt/index.rs :: SegmentMapping ====
 struct SegmentMapping {
     Segment  segment;
@@ -47,18 +58,37 @@ struct SegmentMapping {
     uint64_t Offset() const { return segment.offset; }
     uint32_t Length() const { return segment.length; }
     uint64_t End() const { return segment.End(); }
-    /// Rust `mend`.
+
+    /// Rust `has_physical_range` — whether this mapping retains a physical
+    /// range. It does NOT imply the range is readable data: `zeroed` controls
+    /// read visibility, this controls space ownership.
+    bool HasPhysicalRange() const { return moffset != kNoPhysicalOffset; }
+
+    /// Rust `mend` — physical end, or the sentinel for an unbacked zero.
     uint64_t MEnd() const {
-        return zeroed ? moffset : moffset + static_cast<uint64_t>(segment.length);
+        return HasPhysicalRange() ? moffset + static_cast<uint64_t>(segment.length)
+                                  : kNoPhysicalOffset;
     }
     void ForwardOffsetTo(uint64_t x);
     void BackwardEndTo(uint64_t x) { segment.BackwardEndTo(x); }
+
+    /// Rust private `can_merge_with`.
+    bool CanMergeWith(const SegmentMapping& next) const {
+        return End() == next.Offset() &&
+               zeroed == next.zeroed &&
+               tag == next.tag &&
+               HasPhysicalRange() == next.HasPhysicalRange() &&
+               MEnd() == next.moffset &&
+               (static_cast<uint64_t>(Length()) + static_cast<uint64_t>(next.Length())) <=
+                   static_cast<uint64_t>(Segment::kMaxLength);
+    }
 
     bool operator==(const SegmentMapping& o) const {
         return segment.offset == o.segment.offset &&
                segment.length == o.segment.length &&
                moffset == o.moffset && zeroed == o.zeroed && tag == o.tag;
     }
+    bool operator!=(const SegmentMapping& o) const { return !(*this == o); }
 };
 
 /// Rust `compress_raw_index` — in-place merge of adjacent compatible mappings.
@@ -78,8 +108,14 @@ class LogIndex {
 class ReadOnlyIndex : public LogIndex {
  public:
     ReadOnlyIndex() {}
-    explicit ReadOnlyIndex(std::vector<SegmentMapping> mappings)
-        : mappings_(std::move(mappings)) {}
+    /// Rust `ReadOnlyIndex::new`.
+    ///
+    /// Normalizes every `zeroed` mapping to `kNoPhysicalOffset`: lower layers
+    /// never lend physical space to a writable upper, and legacy zero offsets
+    /// are arbitrary placeholders that lookup/merge would otherwise interpret
+    /// as backed zeros. RW replay must NOT go through here, since it has to
+    /// preserve backed-zero offsets across reopen.
+    explicit ReadOnlyIndex(std::vector<SegmentMapping> mappings);
 
     /// Rust `merge` — combine indexes newest-first; assigns tag by layer index.
     static ReadOnlyIndex Merge(const std::vector<const ReadOnlyIndex*>& indexes);

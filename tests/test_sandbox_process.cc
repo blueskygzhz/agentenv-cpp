@@ -103,31 +103,39 @@ MT_TEST(address_plan_slot_ips) {
     uint32_t hi = 0, vh = 0, vv = 0;
     auto r0 = plan.SlotIps(0, &hi, &vh, &vv);
     MT_EXPECT_TRUE(r0.ok());
-    MT_EXPECT_TRUE(network::Ipv4ToString(hi) == "10.0.0.0");
-    MT_EXPECT_TRUE(network::Ipv4ToString(vh) == "10.1.0.0");
-    MT_EXPECT_TRUE(network::Ipv4ToString(vv) == "10.1.0.1");
+    // Defaults come from Rust `NetworkInternalConfig` (10.11/10.12), not from
+    // an arbitrary 10.0/10.1 pair.
+    MT_EXPECT_TRUE(network::Ipv4ToString(hi) == "10.11.0.0");
+    MT_EXPECT_TRUE(network::Ipv4ToString(vh) == "10.12.0.0");
+    MT_EXPECT_TRUE(network::Ipv4ToString(vv) == "10.12.0.1");
 
     auto r5 = plan.SlotIps(5, &hi, &vh, &vv);
     MT_EXPECT_TRUE(r5.ok());
-    MT_EXPECT_TRUE(network::Ipv4ToString(hi) == "10.0.0.5");
+    MT_EXPECT_TRUE(network::Ipv4ToString(hi) == "10.11.0.5");
     // veth offset = 5*2 = 10, 11
-    MT_EXPECT_TRUE(network::Ipv4ToString(vh) == "10.1.0.10");
-    MT_EXPECT_TRUE(network::Ipv4ToString(vv) == "10.1.0.11");
+    MT_EXPECT_TRUE(network::Ipv4ToString(vh) == "10.12.0.10");
+    MT_EXPECT_TRUE(network::Ipv4ToString(vv) == "10.12.0.11");
 }
 
 MT_TEST(address_plan_vm_tap_ip) {
     network::NetworkAddressPlan plan = network::NetworkAddressPlan::Default();
-    // vm_link 169.254.0.0/30 -> vm=+1, tap=+2
-    MT_EXPECT_TRUE(network::Ipv4ToString(plan.VmIp()) == "169.254.0.1");
-    MT_EXPECT_TRUE(network::Ipv4ToString(plan.TapIp()) == "169.254.0.2");
+    // FIXED_NETWORK_VM_LINK_CIDR is 169.254.0.20/30, so vm=+1 and tap=+2 land
+    // on .21/.22. These two values are part of the snapshot ABI (they are
+    // baked into the guest `ip=` boot argument), so they must not drift.
+    MT_EXPECT_TRUE(network::Ipv4ToString(plan.VmIp()) == "169.254.0.21");
+    MT_EXPECT_TRUE(network::Ipv4ToString(plan.TapIp()) == "169.254.0.22");
+    // /30 -> 255.255.255.252
+    MT_EXPECT_TRUE(network::Ipv4ToString(plan.VmLinkMask()) == "255.255.255.252");
+    MT_EXPECT_TRUE(plan.VmLinkPrefix() == 30);
 }
 
 MT_TEST(address_plan_denied_cidrs) {
     network::NetworkAddressPlan plan = network::NetworkAddressPlan::Default();
     std::vector<std::string> denied = plan.InternalEgressDeniedCidrs();
     MT_EXPECT_EQ(static_cast<int>(denied.size()), 3);
-    MT_EXPECT_TRUE(denied[0] == "10.0.0.0/16");
-    MT_EXPECT_TRUE(denied[2] == "169.254.0.0/30");
+    MT_EXPECT_TRUE(denied[0] == "10.11.0.0/16");
+    MT_EXPECT_TRUE(denied[1] == "10.12.0.0/16");
+    MT_EXPECT_TRUE(denied[2] == "169.254.0.20/30");
 }
 
 MT_MAIN

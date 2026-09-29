@@ -93,7 +93,22 @@ Optional features (turned OFF by default; each enables a real backend):
 
 ## Status matrix
 
-Legend: 🟩 header complete · 🟨 header + stubbed cpp · ⬜ TODO
+Legend: 🟩 behaviourally aligned + tested · 🟨 main path real, some branches missing · 🟧 skeleton / types only · ⬜ not started
+
+### Recently brought to strict alignment
+
+| Module | Rust source | Notes |
+|---|---|---|
+| `p2p` interface layer | `src/p2p/{error,types,transport,mock,discovery}.rs` | 5-variant error set with verbatim `thiserror` strings; `P2pFetchOptions` (default `advertise=true`); the trait's provided methods (`lookup`/`fetch`/`fetch_bytes`/`shutdown`); `DisabledP2pTransport`; mock `unpublish` bookkeeping + delay injection; `peers_for_key` now issues a keyed lookup RPC instead of serving the refresh cache |
+| `observability/prometheus` | `src/observability/prometheus.rs` | route/method/status label normalization (bounded cardinality), `MetricGuard` with drop⇒`canceled`, `SandboxStageTimer`, inflight gauge |
+| `observability/reporter` | `src/observability/reporter.rs` | `ReporterConfig::resolve`, heartbeat + sandbox-event wire projection, backoff schedule with 60 s cap, "no heartbeat ever succeeded ⇒ skip unregister" |
+| `observability/service` | `src/observability/service.rs` | `node_snapshot` projection, `take_cpu_config_json` take-once semantics |
+| `sandbox/network/resolver` | `src/sandbox/network/resolver.rs` | host-netns-pinned DNS worker, bounded queue, 100 ms stop-poll so shutdown/cancel stay responsive, idempotent shutdown |
+| `sandbox/network/address_plan` | `src/sandbox/network/address_plan.rs` | added `from_config`; **fixed** default pools (`10.11`/`10.12`/`169.254.0.20/30`) — the previous defaults put the guest `ip=` boot argument on the wrong addresses |
+| `snapshot/repository/posixfs/artifacts` | `.../posixfs/artifacts.rs` | managed-layer import (descriptor-trusting vs content-hashed), idempotent content-addressed store with size-mismatch refusal, hard-link-or-verified-copy, `SNAPSHOT_ARTIFACT_LAYOUT` table |
+| `storage/overlaybd` LSMT index | `storage/overlaybd/src/lsmt/index.rs` | **fixed** `zeroed` vs `has_physical_range` conflation: backed zeros now keep their physical range through `mend`/`forward_offset_to`/`can_merge_with`, and `ReadOnlyIndex::new` normalizes placeholder offsets |
+
+### Per-module state
 
 | Module                        | Header | Stub cpp | Notes                                       |
 |-------------------------------|:------:|:--------:|---------------------------------------------|
