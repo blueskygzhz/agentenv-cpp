@@ -2,48 +2,63 @@
 // Rust: src/orchestrator/launch_plan.rs
 #include "agentenv/orchestrator/launch_plan.h"
 
+#include <utility>
+
 namespace agentenv {
 namespace orchestrator {
 
-LaunchPlan LaunchPlan::ForCreateFromSnapshot(core::SandboxId id,
-                                             std::string snapshot_id,
-                                             SandboxMetadata meta,
-                                             NewTimeout timeout) {
+LaunchPlan LaunchPlan::ForCreateFromSnapshot(
+    core::SandboxId id,
+    std::string snapshot_id,
+    sandbox::SandboxLaunchConfig launch_config,
+    SandboxMetadata meta,
+    NewTimeout timeout) {
     LaunchPlan p;
     p.kind = LaunchPlanKind::Create;
     p.create.reset(new CreateLaunchPlan);
     p.create->sandbox_id = id;
     p.create->source.kind = CreateLaunchSourceKind::Snapshot;
     p.create->source.snapshot_id = std::move(snapshot_id);
+    p.create->launch_config = std::move(launch_config);
     p.create->metadata = std::move(meta);
     p.create->timeout = timeout;
     return p;
 }
 
-LaunchPlan LaunchPlan::ForCreateFresh(core::SandboxId id,
-                                      std::string image_ref,
-                                      SandboxMetadata meta,
-                                      NewTimeout timeout) {
+LaunchPlan LaunchPlan::ForCreateFresh(
+    core::SandboxId id,
+    sandbox::FreshSandboxBuildSpec build_spec,
+    sandbox::SandboxLaunchConfig launch_config,
+    SandboxMetadata meta,
+    NewTimeout timeout) {
     LaunchPlan p;
     p.kind = LaunchPlanKind::Create;
     p.create.reset(new CreateLaunchPlan);
     p.create->sandbox_id = id;
     p.create->source.kind = CreateLaunchSourceKind::Fresh;
-    p.create->source.image_ref = std::move(image_ref);
+    // Rust boxes the spec inside the enum variant.
+    p.create->source.build_spec.reset(
+        new sandbox::FreshSandboxBuildSpec(std::move(build_spec)));
+    p.create->launch_config = std::move(launch_config);
     p.create->metadata = std::move(meta);
     p.create->timeout = timeout;
     return p;
 }
 
-LaunchPlan LaunchPlan::ForResume(core::SandboxId id,
-                                 NewTimeout timeout,
-                                 const sandbox::SandboxResources& resources) {
+LaunchPlan LaunchPlan::ForResume(
+    core::SandboxId id,
+    std::shared_ptr<sandbox::PausedSandboxState> paused_state,
+    NewTimeout timeout,
+    const sandbox::SandboxResources& resources,
+    const core::Optional<sandbox::EnvdAccessToken>& envd_access_token) {
     LaunchPlan p;
     p.kind = LaunchPlanKind::Resume;
     p.resume.reset(new ResumeLaunchPlan);
-    p.resume->sandbox_id = id;
-    p.resume->timeout    = timeout;
-    p.resume->resources  = resources;
+    p.resume->sandbox_id        = id;
+    p.resume->paused_state      = std::move(paused_state);
+    p.resume->timeout           = timeout;
+    p.resume->resources         = resources;
+    p.resume->envd_access_token = envd_access_token;
     return p;
 }
 

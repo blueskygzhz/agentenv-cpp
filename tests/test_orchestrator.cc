@@ -227,12 +227,17 @@ MT_TEST(restore_proxy_route_with_none_removes_entry) {
 MT_TEST(failed_launch_stage_rollback_expected_state) {
     SandboxMetadata m;
     m.id = core::SandboxId::Fresh();
+    sandbox::FreshSandboxBuildSpec build_spec;
+    build_spec.image_config_path = "alpine";
     LaunchPlan create_plan =
-        LaunchPlan::ForCreateFresh(m.id, "alpine", m, NewTimeout::None());
+        LaunchPlan::ForCreateFresh(m.id, build_spec, sandbox::SandboxLaunchConfig(),
+                                   m, NewTimeout::None());
 
     sandbox::SandboxResources res;
     LaunchPlan resume_plan =
-        LaunchPlan::ForResume(m.id, NewTimeout::UseExisting(), res);
+        LaunchPlan::ForResume(m.id, std::shared_ptr<sandbox::PausedSandboxState>(),
+                              NewTimeout::UseExisting(), res,
+                              core::Optional<sandbox::EnvdAccessToken>());
 
     // Registered: nothing was persisted, so there is nothing to roll back to.
     MT_EXPECT_TRUE(!RollbackExpectedState(FailedLaunchStage::Registered,

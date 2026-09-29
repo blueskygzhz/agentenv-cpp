@@ -27,19 +27,19 @@ class FirecrackerBackend final : public Backend {
     explicit FirecrackerBackend(Config cfg);
     ~FirecrackerBackend() override;
 
-    std::future<core::Expected<Handle, core::AnyError>>
+    core::Expected<Handle, core::AnyError>
         Boot(LaunchPlan plan) override;
-    std::future<core::Expected<core::Unit, core::AnyError>>
+    core::Expected<core::Unit, core::AnyError>
         Shutdown(core::SandboxId id) override;
-    std::future<core::Expected<core::Unit, core::AnyError>>
+    core::Expected<core::Unit, core::AnyError>
         Pause(core::SandboxId id) override;
-    std::future<core::Expected<core::Unit, core::AnyError>>
+    core::Expected<core::Unit, core::AnyError>
         Resume(core::SandboxId id) override;
-    std::future<core::Expected<std::string, core::AnyError>>
+    core::Expected<std::string, core::AnyError>
         Snapshot(core::SandboxId id, const std::string& out_dir) override;
-    std::future<core::Expected<Handle, core::AnyError>>
+    core::Expected<Handle, core::AnyError>
         Restore(LaunchPlan plan, const std::string& snapshot_dir) override;
-    std::future<core::Expected<ExecResult, core::AnyError>>
+    core::Expected<ExecResult, core::AnyError>
         Exec(core::SandboxId id, ExecSpec spec) override;
 
  private:

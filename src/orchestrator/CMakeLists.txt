@@ -12,4 +12,7 @@ target_link_libraries(agentenv-orchestrator PUBLIC
     agentenv-core
     agentenv-sandbox
     agentenv-snapshot
+    # Rust `volume_manager: Option<Arc<VolumeManager>>` — the delete path
+    # publishes / fails / releases volume backings through it.
+    agentenv-volume
 )

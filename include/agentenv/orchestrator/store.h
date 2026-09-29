@@ -3,9 +3,13 @@
 #ifndef AGENTENV_ORCHESTRATOR_STORE_H_
 #define AGENTENV_ORCHESTRATOR_STORE_H_
 
+#include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -18,6 +22,12 @@
 #include "agentenv/sandbox/types.h"
 
 namespace agentenv {
+namespace sandbox {
+/// Declared in agentenv/sandbox/backend.h. Only held behind a shared_ptr here,
+/// which does not require the complete type.
+class PausedSandboxState;
+}  // namespace sandbox
+
 namespace orchestrator {
 
 /// Rust enum `SandboxTimeoutAction` (store/metadata.rs).
@@ -51,7 +61,6 @@ struct SandboxMetadata {
     bool             template_builder = false;
     std::string      snapshot_id;
     core::Optional<std::string> snapshot_alias;
-    /// Rust `state: SandboxState` — uses the Rust-aligned enum, not LifecyclePhase.
     SandboxState     state          = SandboxState::Creating;
     int64_t          created_at_ms  = 0;
     core::Optional<int64_t> timeout_ms;        // Rust `timeout: Option<Duration>`
@@ -62,6 +71,16 @@ struct SandboxMetadata {
     std::string      template_id;              // carried over from port's scaffold
     std::unordered_map<std::string, std::string> user_metadata;
     bool             secure = false;
+
+    /// Rust `volume_mounts: HashMap<String, String>` — requested volume mounts
+    /// keyed by guest path, valued by volume id.
+    std::unordered_map<std::string, std::string> volume_mounts;
+
+    /// Rust `paused_state: Option<Arc<dyn PausedSandboxState>>`.
+    ///
+    /// Set while the sandbox is Paused; the orchestrator treats it as opaque
+    /// and hands it back to the backend factory on resume.
+    std::shared_ptr<sandbox::PausedSandboxState> paused_state;
 
     // ---- Rust `SandboxMetadata::set_timeout` / `update_timeout` / `is_expired` ----
 
@@ -140,6 +159,29 @@ class MetadataStore {
     virtual core::Expected<std::vector<core::SandboxId>, StoreError>
         ListIds() const = 0;
 
+    /// Rust `update_if_state` — atomically mutates the stored record via the
+    /// callback when the current state is one of `expected_states`.
+    ///
+    /// Rust documents the callback as synchronous by design because
+    /// implementations may run it while holding the metadata lock; the same
+    /// constraint applies here.
+    virtual core::Expected<MetadataUpdateResult, StoreError>
+        UpdateIfState(const core::SandboxId& id,
+                      const std::vector<SandboxState>& expected_states,
+                      const std::function<void(SandboxMetadata*)>& update) = 0;
+
+    /// Rust `wait_while_in_states` — blocks until the sandbox leaves every one
+    /// of `transitional_states`, then returns its metadata. Yields an unset
+    /// optional when the sandbox is removed while waiting or never existed.
+    ///
+    /// `timeout_ms <= 0` waits indefinitely. A timeout yields
+    /// `StoreError::Backend("wait timed out")`, which the orchestrator maps
+    /// onto `InvalidSandboxState` (Rust does this via `tokio::time::timeout`).
+    virtual core::Expected<core::Optional<SandboxMetadata>, StoreError>
+        WaitWhileInStates(const core::SandboxId& id,
+                          const std::vector<SandboxState>& transitional_states,
+                          int64_t timeout_ms) = 0;
+
     // --- kept for backward compat with scaffold code using old interface ---
     /// Legacy: maps onto Add().
     virtual core::Expected<core::Unit, StoreError>
@@ -165,11 +207,23 @@ class InMemoryMetadataStore : public MetadataStore {
     core::Expected<std::vector<SandboxMetadata>, StoreError>
         ListExpired(int64_t now_ms) const override;
     core::Expected<std::vector<core::SandboxId>, StoreError> ListIds() const override;
+    core::Expected<MetadataUpdateResult, StoreError>
+        UpdateIfState(const core::SandboxId& id,
+                      const std::vector<SandboxState>& expected_states,
+                      const std::function<void(SandboxMetadata*)>& update) override;
+    core::Expected<core::Optional<SandboxMetadata>, StoreError>
+        WaitWhileInStates(const core::SandboxId& id,
+                          const std::vector<SandboxState>& transitional_states,
+                          int64_t timeout_ms) override;
 
  private:
     bool MatchesFilter_(const SandboxMetadata& m, const SandboxListFilter& f) const;
 
     mutable std::mutex mu_;
+    /// Rust uses one `watch` channel per sandbox; a single condition variable
+    /// broadcast on every state change is the synchronous equivalent. Waiters
+    /// re-check their own predicate on each wake, so sharing it is sound.
+    mutable std::condition_variable state_cv_;
     std::map<std::string, SandboxMetadata> items_;
 };
 

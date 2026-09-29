@@ -67,6 +67,7 @@ enum class SandboxOperation {
     Pause,
     Resume,
     Snapshot,
+    SnapshotVolumes,
     Fork,
     UpdateNetwork,
     PatchCustomExtensionParams,
@@ -120,41 +121,6 @@ struct OrchestratorError {
 
     /// Reproduces the Rust `Display`/`#[error(...)]` message.
     std::string Message() const;
-};
-
-// ---------------------------------------------------------------------------
-// Transitional C++-internal boot phase + record.
-//
-// NOTE: `LifecyclePhase` / `Sandbox` / `PhaseName` are the port's earlier
-// (non-Rust-aligned) scaffolding still used by the current `Service`, store,
-// metrics, launch_plan, proxy and api impls. They will be replaced by the
-// Rust-aligned `Orchestrator` + `SandboxState` + `SandboxMetadata` flow in a
-// later pass. Kept so downstream keeps compiling while the type layer aligns.
-// ---------------------------------------------------------------------------
-
-enum class LifecyclePhase {
-    Created,
-    Reserved,
-    Booting,
-    Ready,
-    Running,
-    Snapshotting,
-    Stopping,
-    Stopped,
-    Failed,
-};
-
-const char* PhaseName(LifecyclePhase p);
-
-struct Sandbox {
-    core::SandboxId  id;
-    std::string      template_id;
-    LifecyclePhase   phase = LifecyclePhase::Created;
-    int64_t          created_at_ms = 0;
-    int64_t          started_at_ms = 0;
-    int64_t          stopped_at_ms = 0;
-    sandbox::Handle  handle;
-    std::string      last_error;
 };
 
 }  // namespace orchestrator

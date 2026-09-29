@@ -61,3 +61,6 @@ agentenv_add_test(test_posixfs_catalog    test_posixfs_catalog.cc     agentenv-s
 agentenv_add_test(test_image_export_target test_image_export_target.cc agentenv-snapshot)
 agentenv_add_test(test_observability_host test_observability_host.cc agentenv-observability-node)
 agentenv_add_test(test_orchestrator_proxy test_orchestrator_proxy.cc agentenv-orchestrator)
+agentenv_add_test(test_orchestrator_lifecycle test_orchestrator_lifecycle.cc agentenv-orchestrator Threads::Threads)
+agentenv_add_test(test_orchestrator_launch test_orchestrator_launch.cc agentenv-orchestrator)
+agentenv_add_test(test_orchestrator_delete test_orchestrator_delete.cc agentenv-orchestrator Threads::Threads)

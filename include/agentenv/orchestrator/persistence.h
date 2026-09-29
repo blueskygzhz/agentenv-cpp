@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Rust: src/orchestrator/persistence/  — pluggable storage of Sandbox records.
+// Rust: src/orchestrator/persistence/{mod,file_backed}.rs
 #ifndef AGENTENV_ORCHESTRATOR_PERSISTENCE_H_
 #define AGENTENV_ORCHESTRATOR_PERSISTENCE_H_
 
@@ -7,27 +7,97 @@
 #include <string>
 #include <vector>
 
-#include "agentenv/core/error.h"
 #include "agentenv/core/expected.h"
-#include "agentenv/orchestrator/types.h"
+#include "agentenv/core/identity.h"
+#include "agentenv/core/optional.h"
+#include "agentenv/orchestrator/store.h"
 
 namespace agentenv {
 namespace orchestrator {
 
-class Persister {
- public:
-    virtual ~Persister() = default;
+/// Rust enum `SandboxPersistenceError` (persistence/mod.rs).
+struct SandboxPersistenceError {
+    enum class Kind { Io, InvalidRecord, RuntimeState, Store };
 
-    virtual core::Expected<core::Unit, core::AnyError> Put(const Sandbox& s) = 0;
-    virtual core::Expected<Sandbox, core::AnyError>    Get(core::SandboxId id) = 0;
-    virtual core::Expected<std::vector<Sandbox>, core::AnyError> List() = 0;
-    virtual core::Expected<core::Unit, core::AnyError> Delete(core::SandboxId id) = 0;
+    Kind        kind      = Kind::Io;
+    std::string operation;  // Io / Store
+    std::string path;       // Io
+    std::string reason;     // InvalidRecord / RuntimeState
+    std::string source;     // underlying error text
+
+    /// Rust `SandboxPersistenceError::io`.
+    static SandboxPersistenceError Io(const std::string& operation,
+                                      const std::string& path,
+                                      const std::string& source);
+    /// Rust `SandboxPersistenceError::store`.
+    static SandboxPersistenceError Store(const std::string& operation,
+                                         const std::string& source);
+    static SandboxPersistenceError InvalidRecord(const std::string& reason,
+                                                 const std::string& source);
+    static SandboxPersistenceError RuntimeState(const std::string& reason);
+
+    /// Reproduces the Rust `#[error(...)]` format strings.
+    std::string Message() const;
 };
 
-/// "memory" — in-process map (used by tests + skeleton main).
-/// "rocksdb" — RocksDB-backed (compiled when AGENTENV_WITH_ROCKSDB=ON).
-std::unique_ptr<Persister> MakePersister(const std::string& kind,
-                                          const std::string& path);
+/// Rust `type PersistenceResult<T>`.
+template <typename T>
+using PersistenceResult = core::Expected<T, SandboxPersistenceError>;
+
+/// Rust trait `SandboxPersister` (persistence/mod.rs).
+///
+/// The Rust trait is generic over `SandboxBackendFactory` in `load_all`; the
+/// factory is not yet ported, so the C++ signature drops that parameter.
+class SandboxPersister {
+ public:
+    virtual ~SandboxPersister() {}
+
+    /// Rust `load_all` — every persisted sandbox record from the last run.
+    virtual PersistenceResult<std::vector<SandboxMetadata> > LoadAll() = 0;
+
+    /// Rust `allocate_artifact_root` — an unset result means persistence is
+    /// disabled and the backend owns its temporary artifacts' lifecycle.
+    virtual PersistenceResult<core::Optional<std::string> >
+        AllocateArtifactRoot(const core::SandboxId& id) = 0;
+
+    /// Rust `persist_paused` — metadata plus runtime state for a paused sandbox.
+    virtual PersistenceResult<core::Unit>
+        PersistPaused(const SandboxMetadata& metadata,
+                      const core::Optional<std::string>& artifact_root) = 0;
+
+    /// Rust `mark_resuming`.
+    virtual PersistenceResult<core::Unit> MarkResuming(const core::SandboxId& id) = 0;
+    /// Rust `rollback_resuming` — undoes the mark after a failed resume.
+    virtual PersistenceResult<core::Unit> RollbackResuming(const core::SandboxId& id) = 0;
+    /// Rust `delete_record`.
+    virtual PersistenceResult<core::Unit> DeleteRecord(const core::SandboxId& id) = 0;
+    /// Rust `delete_record_and_artifacts`.
+    virtual PersistenceResult<core::Unit>
+        DeleteRecordAndArtifacts(const core::SandboxId& id) = 0;
+};
+
+/// Rust struct `DisabledSandboxPersister` — every operation is a no-op and
+/// `load_all` yields nothing.
+class DisabledSandboxPersister : public SandboxPersister {
+ public:
+    PersistenceResult<std::vector<SandboxMetadata> > LoadAll() override;
+    PersistenceResult<core::Optional<std::string> >
+        AllocateArtifactRoot(const core::SandboxId& id) override;
+    PersistenceResult<core::Unit>
+        PersistPaused(const SandboxMetadata& metadata,
+                      const core::Optional<std::string>& artifact_root) override;
+    PersistenceResult<core::Unit> MarkResuming(const core::SandboxId& id) override;
+    PersistenceResult<core::Unit> RollbackResuming(const core::SandboxId& id) override;
+    PersistenceResult<core::Unit> DeleteRecord(const core::SandboxId& id) override;
+    PersistenceResult<core::Unit>
+        DeleteRecordAndArtifacts(const core::SandboxId& id) override;
+};
+
+/// "disabled" — Rust `DisabledSandboxPersister`.
+/// "file"     — Rust `FileBackedSandboxPersister` (not yet ported; falls back
+///              to the disabled persister so wiring stays valid).
+std::unique_ptr<SandboxPersister> MakePersister(const std::string& kind,
+                                                const std::string& path);
 
 }  // namespace orchestrator
 }  // namespace agentenv

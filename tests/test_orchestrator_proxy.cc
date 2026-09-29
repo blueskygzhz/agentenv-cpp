@@ -77,8 +77,11 @@ MT_TEST(launch_plan_create_reports_creating_state) {
     meta.resources.cpu_count  = 4;
     meta.resources.memory_mib = 512;
 
+    sandbox::FreshSandboxBuildSpec build_spec;
+    build_spec.image_config_path = "docker.io/library/alpine";
     LaunchPlan p = LaunchPlan::ForCreateFresh(
-        meta.id, "docker.io/library/alpine", meta, NewTimeout::Set(30 * 1000));
+        meta.id, build_spec, sandbox::SandboxLaunchConfig(), meta,
+        NewTimeout::Set(30 * 1000));
 
     // Rust: Create => SandboxState::Creating (previously mis-mapped to Booting).
     MT_EXPECT_TRUE(p.TransitionalState() == SandboxState::Creating);
@@ -97,7 +100,10 @@ MT_TEST(launch_plan_resume_reports_resuming_state) {
     res.cpu_count  = 2;
     res.memory_mib = 256;
 
-    LaunchPlan p = LaunchPlan::ForResume(id, NewTimeout::UseExisting(), res);
+    LaunchPlan p = LaunchPlan::ForResume(
+        id, std::shared_ptr<sandbox::PausedSandboxState>(),
+        NewTimeout::UseExisting(), res,
+        core::Optional<sandbox::EnvdAccessToken>());
 
     // Rust: Resume => SandboxState::Resuming.
     MT_EXPECT_TRUE(p.TransitionalState() == SandboxState::Resuming);
@@ -116,7 +122,8 @@ MT_TEST(launch_plan_create_from_snapshot) {
     meta.resources.cpu_count = 1;
 
     LaunchPlan p = LaunchPlan::ForCreateFromSnapshot(
-        meta.id, "snap-abc", meta, NewTimeout::None());
+        meta.id, "snap-abc", sandbox::SandboxLaunchConfig(), meta,
+        NewTimeout::None());
 
     MT_EXPECT_TRUE(p.TransitionalState() == SandboxState::Creating);
     MT_EXPECT_TRUE(p.kind == LaunchPlanKind::Create);

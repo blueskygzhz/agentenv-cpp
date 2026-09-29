@@ -120,12 +120,17 @@ InMemoryMetadataStore::Add(SandboxMetadata meta) {
 
 core::Expected<core::Unit, StoreError>
 InMemoryMetadataStore::Update(SandboxMetadata meta) {
-    std::lock_guard<std::mutex> g(mu_);
-    auto it = items_.find(meta.id.ToString());
-    if (it == items_.end()) {
-        return core::make_unexpected(StoreError::SandboxNotFound(meta.id));
+    bool state_changed = false;
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        auto it = items_.find(meta.id.ToString());
+        if (it == items_.end()) {
+            return core::make_unexpected(StoreError::SandboxNotFound(meta.id));
+        }
+        state_changed = (it->second.state != meta.state);
+        it->second = meta;
     }
-    it->second = meta;
+    if (state_changed) state_cv_.notify_all();
     return core::Unit{};
 }
 
@@ -134,21 +139,110 @@ InMemoryMetadataStore::UpdateStateIfState(
     const core::SandboxId& id,
     SandboxState new_state,
     const std::vector<SandboxState>& expected_states) {
-    std::lock_guard<std::mutex> g(mu_);
-    auto it = items_.find(id.ToString());
-    if (it == items_.end()) {
-        return core::make_unexpected(StoreError::SandboxNotFound(id));
-    }
-    SandboxMetadata& m = it->second;
-    for (std::size_t i = 0; i < expected_states.size(); ++i) {
-        if (m.state == expected_states[i]) {
-            SandboxState prev = m.state;
-            m.state = new_state;
-            return prev;
+    SandboxState prev;
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        auto it = items_.find(id.ToString());
+        if (it == items_.end()) {
+            return core::make_unexpected(StoreError::SandboxNotFound(id));
         }
+        SandboxMetadata& m = it->second;
+        bool matched = false;
+        for (std::size_t i = 0; i < expected_states.size(); ++i) {
+            if (m.state == expected_states[i]) { matched = true; break; }
+        }
+        if (!matched) {
+            return core::make_unexpected(
+                StoreError::StateConflict(id, expected_states, m.state));
+        }
+        prev    = m.state;
+        m.state = new_state;
+        changed = (prev != new_state);
     }
-    return core::make_unexpected(
-        StoreError::StateConflict(id, expected_states, m.state));
+    // Rust notifies *after* releasing the write lock, so a woken waiter always
+    // observes the state that triggered the notification (or a newer one).
+    if (changed) state_cv_.notify_all();
+    return prev;
+}
+
+// Rust `update_if_state`.
+core::Expected<MetadataUpdateResult, StoreError>
+InMemoryMetadataStore::UpdateIfState(
+    const core::SandboxId& id,
+    const std::vector<SandboxState>& expected_states,
+    const std::function<void(SandboxMetadata*)>& update) {
+    MetadataUpdateResult result;
+    bool state_changed = false;
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        auto it = items_.find(id.ToString());
+        if (it == items_.end()) {
+            return core::make_unexpected(StoreError::SandboxNotFound(id));
+        }
+        SandboxMetadata& record = it->second;
+        bool matched = false;
+        for (std::size_t i = 0; i < expected_states.size(); ++i) {
+            if (record.state == expected_states[i]) { matched = true; break; }
+        }
+        if (!matched) {
+            return core::make_unexpected(
+                StoreError::StateConflict(id, expected_states, record.state));
+        }
+
+        result.previous = record;
+        if (update) update(&record);
+        result.current = record;
+
+        state_changed = (result.previous.state != result.current.state);
+    }
+    if (state_changed) state_cv_.notify_all();
+    return result;
+}
+
+// Rust `wait_while_in_states`.
+core::Expected<core::Optional<SandboxMetadata>, StoreError>
+InMemoryMetadataStore::WaitWhileInStates(
+    const core::SandboxId& id,
+    const std::vector<SandboxState>& transitional_states,
+    int64_t timeout_ms) {
+    const std::string key = id.ToString();
+    std::unique_lock<std::mutex> lk(mu_);
+
+    // Rust subscribes to the record's watch channel and returns Ok(None) when
+    // there is no channel — i.e. the sandbox was removed or never existed.
+    if (items_.find(key) == items_.end()) {
+        return core::Optional<SandboxMetadata>(core::nullopt);
+    }
+
+    // Predicate mirrors the Rust closure: satisfied when the sandbox is gone
+    // (deleted) OR its state is no longer one of `transitional_states`.
+    auto stable_or_gone = [this, &key, &transitional_states]() {
+        auto it = items_.find(key);
+        if (it == items_.end()) return true;  // deleted
+        for (std::size_t i = 0; i < transitional_states.size(); ++i) {
+            if (it->second.state == transitional_states[i]) return false;
+        }
+        return true;
+    };
+
+    if (timeout_ms > 0) {
+        const bool ok = state_cv_.wait_for(
+            lk, std::chrono::milliseconds(timeout_ms), stable_or_gone);
+        if (!ok) {
+            // Rust maps the elapsed timeout onto InvalidSandboxState at the
+            // orchestrator layer; the store reports it as a backend error.
+            return core::make_unexpected(StoreError::Backend("wait timed out"));
+        }
+    } else {
+        state_cv_.wait(lk, stable_or_gone);
+    }
+
+    auto it = items_.find(key);
+    if (it == items_.end()) {
+        return core::Optional<SandboxMetadata>(core::nullopt);
+    }
+    return core::Optional<SandboxMetadata>(it->second);
 }
 
 core::Expected<core::Optional<SandboxMetadata>, StoreError>
@@ -163,13 +257,18 @@ InMemoryMetadataStore::Get(const core::SandboxId& id) const {
 
 core::Expected<core::Optional<SandboxMetadata>, StoreError>
 InMemoryMetadataStore::Remove(const core::SandboxId& id) {
-    std::lock_guard<std::mutex> g(mu_);
-    auto it = items_.find(id.ToString());
-    if (it == items_.end()) {
-        return core::Optional<SandboxMetadata>(core::nullopt);
+    SandboxMetadata meta;
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        auto it = items_.find(id.ToString());
+        if (it == items_.end()) {
+            return core::Optional<SandboxMetadata>(core::nullopt);
+        }
+        meta = it->second;
+        items_.erase(it);
     }
-    SandboxMetadata meta = it->second;
-    items_.erase(it);
+    // Rust sends `None` through the watch channel so waiters see the deletion.
+    state_cv_.notify_all();
     return core::Optional<SandboxMetadata>(meta);
 }
 

@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 
 #include <string>
+#include <utility>
 
 namespace agentenv {
 namespace sandbox {
@@ -39,16 +40,12 @@ FirecrackerBackend::~FirecrackerBackend() = default;
 
 namespace {
 template <typename T>
-std::future<core::Expected<T, core::AnyError>> ready_err(const std::string& msg) {
-    std::promise<core::Expected<T, core::AnyError>> p;
-    p.set_value(core::make_unexpected(core::err(msg)));
-    return p.get_future();
+core::Expected<T, core::AnyError> ready_err(const std::string& msg) {
+    return core::make_unexpected(core::err(msg));
 }
 template <typename T>
-std::future<core::Expected<T, core::AnyError>> ready_ok(T value) {
-    std::promise<core::Expected<T, core::AnyError>> p;
-    p.set_value(core::Expected<T, core::AnyError>(std::move(value)));
-    return p.get_future();
+core::Expected<T, core::AnyError> ready_ok(T value) {
+    return core::Expected<T, core::AnyError>(std::move(value));
 }
 bool is_file(const std::string& p) {
     struct stat st;
@@ -60,7 +57,7 @@ bool exists(const std::string& p) {
 }
 }  // namespace
 
-std::future<core::Expected<Handle, core::AnyError>>
+core::Expected<Handle, core::AnyError>
 FirecrackerBackend::Boot(LaunchPlan plan) {
     // --- pre-boot validation (this part is real and testable) ---
     CommonConfig common;
@@ -86,27 +83,27 @@ FirecrackerBackend::Boot(LaunchPlan plan) {
         "(api socket would be ") + impl_->ApiSocketPath(plan.sandbox_id) + ")");
 }
 
-std::future<core::Expected<core::Unit, core::AnyError>>
+core::Expected<core::Unit, core::AnyError>
 FirecrackerBackend::Shutdown(core::SandboxId /*id*/) {
     return ready_err<core::Unit>("firecracker Shutdown: no live VM in this build");
 }
-std::future<core::Expected<core::Unit, core::AnyError>>
+core::Expected<core::Unit, core::AnyError>
 FirecrackerBackend::Pause(core::SandboxId /*id*/) {
     return ready_err<core::Unit>("firecracker Pause: no live VM in this build");
 }
-std::future<core::Expected<core::Unit, core::AnyError>>
+core::Expected<core::Unit, core::AnyError>
 FirecrackerBackend::Resume(core::SandboxId /*id*/) {
     return ready_err<core::Unit>("firecracker Resume: no live VM in this build");
 }
-std::future<core::Expected<std::string, core::AnyError>>
+core::Expected<std::string, core::AnyError>
 FirecrackerBackend::Snapshot(core::SandboxId /*id*/, const std::string& /*out_dir*/) {
     return ready_err<std::string>("firecracker Snapshot: no live VM in this build");
 }
-std::future<core::Expected<Handle, core::AnyError>>
+core::Expected<Handle, core::AnyError>
 FirecrackerBackend::Restore(LaunchPlan /*plan*/, const std::string& /*snapshot_dir*/) {
     return ready_err<Handle>("firecracker Restore: no live VM in this build");
 }
-std::future<core::Expected<ExecResult, core::AnyError>>
+core::Expected<ExecResult, core::AnyError>
 FirecrackerBackend::Exec(core::SandboxId /*id*/, ExecSpec /*spec*/) {
     return ready_err<ExecResult>("firecracker Exec: no live VM in this build");
 }

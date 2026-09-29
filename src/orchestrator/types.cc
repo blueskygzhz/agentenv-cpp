@@ -50,6 +50,7 @@ const char* SandboxOperationName(SandboxOperation op) {
         case SandboxOperation::Pause:                      return "Pause";
         case SandboxOperation::Resume:                     return "Resume";
         case SandboxOperation::Snapshot:                   return "Snapshot";
+        case SandboxOperation::SnapshotVolumes:            return "SnapshotVolumes";
         case SandboxOperation::Fork:                       return "Fork";
         case SandboxOperation::UpdateNetwork:              return "UpdateNetwork";
         case SandboxOperation::PatchCustomExtensionParams: return "PatchCustomExtensionParams";
@@ -168,22 +169,6 @@ std::string OrchestratorError::Message() const {
             return os.str();
     }
     return "unknown orchestrator error";
-}
-
-// --- Transitional PhaseName (see types.h note) -----------------------------
-const char* PhaseName(LifecyclePhase p) {
-    switch (p) {
-        case LifecyclePhase::Created:      return "created";
-        case LifecyclePhase::Reserved:     return "reserved";
-        case LifecyclePhase::Booting:      return "booting";
-        case LifecyclePhase::Ready:        return "ready";
-        case LifecyclePhase::Running:      return "running";
-        case LifecyclePhase::Snapshotting: return "snapshotting";
-        case LifecyclePhase::Stopping:     return "stopping";
-        case LifecyclePhase::Stopped:      return "stopped";
-        case LifecyclePhase::Failed:       return "failed";
-    }
-    return "?";
 }
 
 }  // namespace orchestrator

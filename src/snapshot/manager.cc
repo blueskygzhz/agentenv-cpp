@@ -12,19 +12,16 @@ core::Expected<SnapshotMeta, core::AnyError>
 Manager::Create(core::SandboxId sandbox_id, const std::string& template_id) {
     if (!backend_) return core::make_unexpected(core::err("no backend"));
     // Pause the sandbox.
-    auto pause_fut = backend_->Pause(sandbox_id);
-    auto pause_res = pause_fut.get();
+    auto pause_res = backend_->Pause(sandbox_id);
     if (!pause_res.ok()) return core::make_unexpected(pause_res.take_error());
 
     // Ask backend to dump snapshot files.
     const std::string out_dir = "/tmp/agentenv_snap_" + sandbox_id.ToString();
-    auto snap_fut = backend_->Snapshot(sandbox_id, out_dir);
-    auto snap_res = snap_fut.get();
+    auto snap_res = backend_->Snapshot(sandbox_id, out_dir);
     if (!snap_res.ok()) return core::make_unexpected(snap_res.take_error());
 
     // Resume the sandbox (best-effort).
-    auto resume_fut = backend_->Resume(sandbox_id);
-    resume_fut.wait();
+    backend_->Resume(sandbox_id);
 
     SnapshotMeta meta;
     meta.id = core::SnapshotId::Fresh();
@@ -50,8 +47,7 @@ Manager::Restore(core::SnapshotId snapshot_id, const std::string& template_id) {
     sandbox::LaunchPlan plan;
     plan.sandbox_id = core::SandboxId::Fresh();
     plan.template_id = template_id;
-    auto fut = backend_->Restore(std::move(plan), mem_file);
-    auto res = fut.get();
+    auto res = backend_->Restore(std::move(plan), mem_file);
     if (!res.ok()) return core::make_unexpected(res.take_error());
     return res.take_value();
 }

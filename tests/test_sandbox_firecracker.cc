@@ -172,8 +172,7 @@ MT_TEST(firecracker_boot_rejects_missing_binary) {
     agentenv::sandbox::LaunchPlan plan;
     plan.sandbox_id = agentenv::core::SandboxId::Fresh();
     plan.kernel_path = "/bin/sh";
-    auto fut = be.Boot(plan);
-    auto r = fut.get();
+    auto r = be.Boot(plan);
     MT_EXPECT_TRUE(!r.ok());
     MT_EXPECT_TRUE(std::string(r.error().chain()).find("firecracker binary not found")
                    != std::string::npos);
