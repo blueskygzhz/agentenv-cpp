@@ -14,6 +14,8 @@ add_library(agentenv-sandbox STATIC
     network/manager.cc
     # Rust: src/sandbox/network/resolver.rs — host-namespace DNS worker.
     network/resolver.cc
+    # Rust: src/sandbox/network/egress_proxy.rs — preface inspection + policy staging.
+    network/egress_proxy.cc
     custom_extension.cc
     ublk.cc
     # firecracker sub-module (Rust: src/sandbox/firecracker/*.rs)

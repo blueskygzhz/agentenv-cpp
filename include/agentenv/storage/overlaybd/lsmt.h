@@ -127,6 +127,92 @@ class ReadOnlyIndex : public LogIndex {
     std::vector<SegmentMapping> mappings_;
 };
 
+// ==== Rust: lsmt/index.rs :: BptConfig / LinearizedBptree / IndexLBPT ====
+//
+// A cache-friendly B+ tree flattened into one array. Rust expresses the two
+// key widths as `impl BptConfig for u64 / u32`; C++11 gets the same via traits
+// structs, so `LinearizedBptree<BptU64>` and `<BptU32>` are distinct types
+// with the same per-node fan-out constants.
+
+/// Rust `impl BptConfig for u64` — 8 keys per node, 10 levels.
+struct BptU64 {
+    typedef uint64_t Key;
+    static const size_t kKeysPerNode = 8;
+    static const size_t kMaxLevel = 10;
+    static const size_t* NodesPerLevel();
+    static const size_t* LevelStartId();
+    static Key FromOffset(uint64_t offset) { return offset; }
+    static uint64_t ToOffset(Key k) { return k; }
+};
+
+/// Rust `impl BptConfig for u32` — 16 keys per node, 7 levels.
+///
+/// The narrower key halves the node footprint, so a node spans fewer cache
+/// lines; it only works while every offset fits in 32 bits.
+struct BptU32 {
+    typedef uint32_t Key;
+    static const size_t kKeysPerNode = 16;
+    static const size_t kMaxLevel = 7;
+    static const size_t* NodesPerLevel();
+    static const size_t* LevelStartId();
+    /// Rust `offset as u32` — a deliberate truncating cast.
+    static Key FromOffset(uint64_t offset) { return static_cast<Key>(offset); }
+    static uint64_t ToOffset(Key k) { return static_cast<uint64_t>(k); }
+};
+
+/// Rust `struct LinearizedBptree<K: BptConfig>`.
+template <typename Cfg>
+class LinearizedBptree {
+ public:
+    typedef typename Cfg::Key Key;
+
+    LinearizedBptree() : depth_(-1) {}
+
+    /// Rust `build` — returns false with `*err` set, matching `bail!`.
+    ///
+    /// Picks the shallowest level whose capacity covers `mapping`, lays the
+    /// leaf keys out at that level's start, then fills interior levels bottom
+    /// up. Unused slots hold the all-ones sentinel so `inner_search` counts
+    /// them as "greater than any query".
+    bool Build(const std::vector<SegmentMapping>& mapping, std::string* err);
+
+    /// Rust `search(x_val)` — index of the first mapping that may contain
+    /// `x_val`. Never out of range; callers still re-check `end() <= offset`.
+    size_t Search(uint64_t x_val) const;
+
+    int depth() const { return depth_; }
+    const std::vector<Key>& nodes() const { return node_; }
+
+ private:
+    /// Rust `inner_search` — popcount of the "key <= x" bitmask over one node.
+    /// Branch-free on purpose: this is the hot path.
+    static size_t InnerSearch(const Key* base, size_t available, Key x);
+
+    std::vector<Key> node_;
+    int depth_;
+};
+
+/// Rust `struct IndexLBPT<K: BptConfig>` — a `ReadOnlyIndex` whose lookup goes
+/// through the linearized tree instead of a binary search.
+template <typename Cfg>
+class IndexLBPT : public LogIndex {
+ public:
+    /// Rust `IndexLBPT::new` — `build` failure is an `expect` upstream; here it
+    /// leaves `depth == -1`, which `Lookup` handles by falling back to the
+    /// partition-point scan (same branch Rust takes for `depth == -1`).
+    IndexLBPT(std::vector<SegmentMapping> mappings, uint64_t virtual_size);
+
+    size_t Lookup(Segment query, std::vector<SegmentMapping>* dst) const override;
+
+    const std::vector<SegmentMapping>& Mappings() const { return mappings_; }
+    uint64_t virtual_size() const { return virtual_size_; }
+
+ private:
+    std::vector<SegmentMapping> mappings_;
+    LinearizedBptree<Cfg>       lbpt_;
+    uint64_t                    virtual_size_;
+};
+
 /// Rust `MutableIndex` — a BTreeSet keyed by offset, with overlap resolution.
 class MutableIndex : public LogIndex {
  public:
@@ -256,6 +342,170 @@ bool CompactTo(const std::string& path,
                const std::vector<SegmentMapping>& mappings,
    uint64_t virtual_size,
          std::string* err);
+
+// ==== LinearizedBptree / IndexLBPT template definitions ====================
+//
+// These live in the header because the two instantiations (BptU64 / BptU32)
+// are selected by callers. The bodies are a line-by-line port of
+// `lsmt/index.rs`; the index arithmetic is reproduced verbatim rather than
+// "cleaned up", because it is what makes the flattened layout addressable.
+
+template <typename Cfg>
+bool LinearizedBptree<Cfg>::Build(const std::vector<SegmentMapping>& mapping,
+                                  std::string* err) {
+    if (mapping.empty()) {
+        if (err) *err = "empty mapping";
+        return false;
+    }
+
+    const size_t mapping_size = mapping.size();
+    depth_ = -1;
+
+    // Rust: first level whose node capacity covers the mapping count.
+    const size_t* nodes_per_level = Cfg::NodesPerLevel();
+    for (size_t i = 0; i < Cfg::kMaxLevel; ++i) {
+        if (nodes_per_level[i] >= mapping_size) {
+            depth_ = static_cast<int>(i + 1);
+            break;
+        }
+    }
+    if (depth_ == -1) {
+        if (err) *err = "too many mappings";
+        return false;
+    }
+
+    const size_t* level_start_id = Cfg::LevelStartId();
+    const size_t depth_idx = static_cast<size_t>(depth_ - 1);
+    const size_t keys_per_node = Cfg::kKeysPerNode;
+
+    // Rust rounds *down* to a whole number of nodes after adding
+    // keys_per_node - 1; keep the same expression so `n` matches exactly.
+    const size_t n_raw = level_start_id[depth_idx] + mapping_size + keys_per_node - 1;
+    const size_t n = (n_raw / keys_per_node) * keys_per_node;
+
+    // The sentinel must compare greater than every real key, so that empty
+    // slots never pull a search left.
+    node_.assign(n, Cfg::FromOffset(static_cast<uint64_t>(-1)));
+
+    const size_t leaf_start = level_start_id[depth_idx];
+    for (size_t k = 0; k < mapping_size && leaf_start + k < n; ++k) {
+        node_[leaf_start + k] = Cfg::FromOffset(mapping[k].Offset());
+    }
+
+    // Fill interior levels bottom-up: each interior slot copies the key of the
+    // subtree boundary below it.
+    size_t g = keys_per_node;
+    const size_t leaf_size = nodes_per_level[depth_idx];
+    for (int level = depth_ - 1; level >= 1; --level) {
+        const size_t lvl_idx = static_cast<size_t>(level);
+        size_t pos = level_start_id[lvl_idx - 1];
+        const size_t step = g * (keys_per_node + 1);
+
+        size_t i = 0;
+        while (i < leaf_size) {
+            for (size_t j = 1; j <= keys_per_node; ++j) {
+                const size_t lower_id = leaf_start + i + g * j;
+                if (pos >= n) break;
+                node_[pos] = (lower_id < n) ? node_[lower_id]
+                                            : Cfg::FromOffset(static_cast<uint64_t>(-1));
+                ++pos;
+            }
+            i += step;
+        }
+        g *= (keys_per_node + 1);
+    }
+    return true;
+}
+
+template <typename Cfg>
+size_t LinearizedBptree<Cfg>::InnerSearch(const Key* base, size_t available, Key x) {
+    uint32_t mask = 0;
+    const size_t limit = available < Cfg::kKeysPerNode ? available : Cfg::kKeysPerNode;
+    for (size_t i = 0; i < limit; ++i) {
+        if (base[i] <= x) mask |= (1u << i);
+    }
+    // Rust `mask.count_ones()`.
+    size_t count = 0;
+    while (mask) {
+        mask &= (mask - 1);
+        ++count;
+    }
+    return count;
+}
+
+template <typename Cfg>
+size_t LinearizedBptree<Cfg>::Search(uint64_t x_val) const {
+    if (depth_ <= 0) return 0;
+
+    const Key x = Cfg::FromOffset(x_val);
+    size_t res = 0;
+    const size_t keys = Cfg::kKeysPerNode;
+    const size_t* level_start = Cfg::LevelStartId();
+    const size_t n = node_.size();
+
+    // Descend one level per iteration. Rust iterates `(2..=depth).rev()`,
+    // i.e. depth-1 times.
+    for (int i = depth_; i >= 2; --i) {
+        if (res >= n) return 0;
+        const size_t c = InnerSearch(&node_[res], n - res, x);
+        // Verbatim from the C++ original: res = (KEYS+1)*res + (c+1)*KEYS.
+        res = (keys + 1) * res + (c + 1) * keys;
+    }
+
+    if (res >= n) return 0;
+    res += InnerSearch(&node_[res], n - res, x);
+
+    if (res > 0) {
+        const size_t start_id = level_start[static_cast<size_t>(depth_ - 1)];
+        if (res > start_id) return res - start_id - 1;
+    }
+    return 0;
+}
+
+template <typename Cfg>
+IndexLBPT<Cfg>::IndexLBPT(std::vector<SegmentMapping> mappings, uint64_t virtual_size)
+    : mappings_(std::move(mappings)), virtual_size_(virtual_size) {
+    std::string err;
+    lbpt_.Build(mappings_, &err);
+}
+
+template <typename Cfg>
+size_t IndexLBPT<Cfg>::Lookup(Segment query, std::vector<SegmentMapping>* dst) const {
+    // Rust guards on all three: a zero-length query, no mappings, or a
+    // zero virtual size all mean "nothing to read".
+    if (query.length == 0 || mappings_.empty() || virtual_size_ == 0) return 0;
+
+    const size_t start_len = dst->size();
+
+    size_t idx = 0;
+    if (lbpt_.depth() != -1) {
+        idx = lbpt_.Search(query.offset);
+        // The tree lands on a candidate, not necessarily an overlapping one.
+        if (idx < mappings_.size() && mappings_[idx].End() <= query.offset) ++idx;
+    } else {
+        // Rust `partition_point(|m| m.end() <= query.offset)`.
+        size_t lo = 0, hi = mappings_.size();
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo) / 2;
+            if (mappings_[mid].End() <= query.offset) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        idx = lo;
+    }
+
+    const uint64_t end_offset = query.End();
+    for (size_t k = idx; k < mappings_.size(); ++k) {
+        if (mappings_[k].Offset() >= end_offset) break;
+        SegmentMapping mp = mappings_[k];
+        if (mp.Offset() < query.offset) mp.ForwardOffsetTo(query.offset);
+        if (mp.End() > end_offset) mp.BackwardEndTo(end_offset);
+        if (mp.Length() > 0) dst->push_back(mp);
+    }
+    return dst->size() - start_len;
+}
 
 }  // namespace lsmt
 }  // namespace overlaybd

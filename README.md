@@ -107,6 +107,8 @@ Legend: 🟩 behaviourally aligned + tested · 🟨 main path real, some branche
 | `sandbox/network/address_plan` | `src/sandbox/network/address_plan.rs` | added `from_config`; **fixed** default pools (`10.11`/`10.12`/`169.254.0.20/30`) — the previous defaults put the guest `ip=` boot argument on the wrong addresses |
 | `snapshot/repository/posixfs/artifacts` | `.../posixfs/artifacts.rs` | managed-layer import (descriptor-trusting vs content-hashed), idempotent content-addressed store with size-mismatch refusal, hard-link-or-verified-copy, `SNAPSHOT_ARTIFACT_LAYOUT` table |
 | `storage/overlaybd` LSMT index | `storage/overlaybd/src/lsmt/index.rs` | **fixed** `zeroed` vs `has_physical_range` conflation: backed zeros now keep their physical range through `mend`/`forward_offset_to`/`can_merge_with`, and `ReadOnlyIndex::new` normalizes placeholder offsets |
+| `storage/overlaybd` LSMT B+ tree | `storage/overlaybd/src/lsmt/index.rs` | `BptConfig` (u64/u32 fan-outs) + `LinearizedBptree` + `IndexLBPT`; verified differentially against the binary-search `ReadOnlyIndex` over a randomized sweep |
+| `sandbox/network/egress_proxy` | `src/sandbox/network/egress_proxy.rs` | preface inspection (HTTP `Host`, TLS SNI reassembled across record boundaries), `normalize_host`, `select_upstream` / `resolve_trusted_upstream` (CIDR grants checked before a hostname is required; resolved addresses re-checked against policy), `SO_ORIGINAL_DST`, and the prepare/activate/discard policy staging state machine |
 
 ### Per-module state
 

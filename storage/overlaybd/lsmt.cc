@@ -83,6 +83,37 @@ size_t CompressRawIndexPredict(const std::vector<SegmentMapping>& mapping) {
     return i + 1;
 }
 
+// ---------------- BptConfig tables ----------------
+// Rust `impl BptConfig for u64` — capacity and level-start tables for an
+// 8-key node. Both are precomputed rather than derived at runtime because
+// `Search` indexes them on the hot path.
+const size_t* BptU64::NodesPerLevel() {
+    static const size_t kTable[BptU64::kMaxLevel] = {
+        8, 72, 648, 5832, 52488, 472392, 4251528, 38263752, 344373768, 3099363912ULL,
+    };
+    return kTable;
+}
+const size_t* BptU64::LevelStartId() {
+    static const size_t kTable[BptU64::kMaxLevel] = {
+        0, 8, 80, 728, 6560, 59048, 531440, 4782968, 43046720, 387420488,
+    };
+    return kTable;
+}
+
+// Rust `impl BptConfig for u32` — 16-key node.
+const size_t* BptU32::NodesPerLevel() {
+    static const size_t kTable[BptU32::kMaxLevel] = {
+        16, 272, 4624, 78608, 1336336, 22717712, 386200304,
+    };
+    return kTable;
+}
+const size_t* BptU32::LevelStartId() {
+    static const size_t kTable[BptU32::kMaxLevel] = {
+        0, 16, 288, 4912, 83520, 1419856, 24137568,
+    };
+    return kTable;
+}
+
 // ---------------- ReadOnlyIndex ----------------
 ReadOnlyIndex::ReadOnlyIndex(std::vector<SegmentMapping> mappings)
     : mappings_(std::move(mappings)) {
