@@ -71,8 +71,14 @@ class MetricGuard {
     /// operation that ran to completion and returned an error.
     ~MetricGuard();
 
-    /// Test hook: the status this guard did record (empty until recorded).
-    const char* recorded_status() const { return recorded_ ? status_ : ""; }
+    /// Test hook: the status actually emitted (empty until recorded).
+    ///
+    /// Deliberately distinct from `status_`: Rust's `finish` assigns
+    /// `self.status` *before* calling `record()`, and `record()` early-returns
+    /// when it already fired. So a second `finish(true)` after a
+    /// `finish(false)` mutates the field but must NOT change the recorded
+    /// sample. This accessor reports the sample, not the field.
+    const char* recorded_status() const { return recorded_ ? recorded_status_ : ""; }
 
  private:
     enum class LabelKind { Operation, OperationArtifact, Stage };
@@ -88,6 +94,7 @@ class MetricGuard {
     const char* stage_;
     int64_t     start_ns_;
     const char* status_;
+    const char* recorded_status_;
     bool        recorded_;
 };
 

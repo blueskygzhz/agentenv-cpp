@@ -153,7 +153,7 @@ MetricGuard::MetricGuard(const char* metric, LabelKind kind, const char* operati
       stage_(stage), start_ns_(NowNanos()),
       // Rust seeds the status with "canceled": a guard dropped before finish()
       // is a cancellation, not a failure.
-      status_("canceled"), recorded_(false) {}
+      status_("canceled"), recorded_status_(""), recorded_(false) {}
 
 MetricGuard MetricGuard::Operation(const char* metric, const char* operation) {
     return MetricGuard(metric, LabelKind::Operation, operation, "", "");
@@ -176,6 +176,7 @@ void MetricGuard::Finish(bool ok) {
 void MetricGuard::Record() {
     if (recorded_) return;  // Rust: early return when already recorded
     recorded_ = true;
+    recorded_status_ = status_;
     const double elapsed = ElapsedSecs(start_ns_);
     std::vector<std::pair<const char*, const char*> > labels;
     switch (kind_) {

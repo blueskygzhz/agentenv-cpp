@@ -61,6 +61,16 @@ struct NetworkConfig {
     core::Expected<core::Unit, std::string> LoadFrom(const core::TomlTable& table);
 };
 
+/// Rust `NetworkAddressPlan::from_config` (src/sandbox/network/address_plan.rs).
+///
+/// Lives here rather than on the class because the address plan is declared in
+/// `sandbox/network.h`, which this header already includes; putting the
+/// config-dependent constructor on the class would make the dependency
+/// circular. Behaviour is identical: resolve the internal pools, then build
+/// the plan from the three resolved CIDRs.
+core::Expected<sandbox::network::NetworkAddressPlan, std::string>
+    NetworkAddressPlanFromConfig(const NetworkConfig& config);
+
 /// Rust `normalize_dns_name` — lowercases and returns nothing when invalid.
 core::Optional<std::string> NormalizeDnsName(const std::string& domain);
 

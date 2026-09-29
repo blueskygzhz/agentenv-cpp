@@ -30,6 +30,17 @@ bool Ipv4CidrOverlaps(const sandbox::network::Ipv4Cidr& left, const sandbox::net
     return (left.network & mask) == (right.network & mask);
 }
 
+core::Expected<sandbox::network::NetworkAddressPlan, std::string>
+NetworkAddressPlanFromConfig(const NetworkConfig& config) {
+    // Rust: `let internal = NetworkConfig::resolved_internal(config)?;`
+    core::Expected<ResolvedNetworkInternalConfig, std::string> internal =
+        NetworkConfig::ResolvedInternal(config);
+    if (!internal.ok()) return core::make_unexpected(internal.error());
+    return sandbox::network::NetworkAddressPlan(internal.value().host_interaction_cidr,
+                                                internal.value().veth_cidr,
+                                                internal.value().vm_link_cidr);
+}
+
 bool IsValidDnsName(const std::string& domain) {
     return core::IsValidDnsName(domain);
 }
