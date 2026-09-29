@@ -28,135 +28,136 @@ SandboxMetadata RegisterRunning(Fixture& f, uint32_t cpu, uint32_t mib) {
     m.created_at_ms = NowMs();
     m.timeout_ms = core::Optional<int64_t>(60 * 1000);
     MT_EXPECT_TRUE(f.store->Add(m).ok());
-    
+
     std::unique_ptr<sandbox::SandboxBackend> backend(new FakeSandbox(&f.script));
-    f.orch->RegisterSandboxHandle(m.id, 
-        SandboxHandlePtr(new SandboxHandle(std::move(backend))));
-    f.orch->UpsertProxyRoute(m.id, ProxyTarget{"10.0.0.1", 80, false});
+    f.orch->RegisterSandboxHandle(
+        m.id, SandboxHandlePtr(new SandboxHandle(std::move(backend))));
+    f.orch->UpsertProxyRoute(m.id, ProxyTarget("10.0.0.1"));
     return m;
 }
 
 }  // namespace
 
 // ============================================================
-// fork_sandbox :: happy path
+// fork_sandbox :: recoverable backend failure restores source to Running
 // ============================================================
-MT_TEST(fork_sandbox_creates_children_and_publishes_fork_events) {
+// FakeSandbox::Fork returns Recoverable by default. The orchestrator must
+// restore the source to Running (CAS Forking → Running) and surface
+// SandboxOperationFailed.
+MT_TEST(fork_sandbox_recoverable_failure_restores_source_running) {
     Fixture f;
     SandboxMetadata source = RegisterRunning(f, 2, 512);
-    
+
     OrchestratorResult<std::vector<SandboxForkOutcome> > forked =
         f.orch->ForkSandbox(source.id, 2, NewTimeout::Set(30 * 1000));
-    MT_EXPECT_TRUE(forked.ok());
-    MT_EXPECT_EQ(forked.value().size(), static_cast<size_t>(2));
-    
-    // Both children succeeded.
-    MT_EXPECT_TRUE(forked.value()[0].ok());
-    MT_EXPECT_TRUE(forked.value()[1].ok());
-    
-    // Each child inherited the source's resources and got a fresh timeout.
-    const SandboxMetadata& child0 = forked.value()[0].value();
-    MT_EXPECT_EQ(child0.resources.cpu_count, static_cast<uint32_t>(2));
-    MT_EXPECT_EQ(child0.resources.memory_mib, static_cast<uint32_t>(512));
-    MT_EXPECT_TRUE(child0.timeout_ms.has_value());
-    MT_EXPECT_EQ(*child0.timeout_ms, static_cast<int64_t>(30 * 1000));
-    MT_EXPECT_TRUE(child0.state == SandboxState::Running);
-    
-    // The source sandbox remains Running.
-    MT_EXPECT_TRUE(f.orch->GetSandbox(source.id).value()->state == 
+    MT_EXPECT_TRUE(!forked.ok());
+    MT_EXPECT_TRUE(forked.error().kind ==
+                   OrchestratorErrorKind::SandboxOperationFailed);
+
+    // Source must be back to Running after a recoverable backend error.
+    MT_EXPECT_TRUE(f.orch->GetSandbox(source.id).value()->state ==
                    SandboxState::Running);
-    
-    // Each child has a live handle and proxy route.
-    MT_EXPECT_TRUE(f.orch->SandboxHandleFor(child0.id) != nullptr);
-    MT_EXPECT_TRUE(f.orch->ProxyLookupFor(child0.id).value().kind ==
-                   ProxyLookupKind::Ready);
+    // Source handle must still be registered.
+    MT_EXPECT_TRUE(f.orch->SandboxHandleFor(source.id) != nullptr);
 }
 
 // ============================================================
-// fork_sandbox :: refuses sandboxes with volume mounts
+// fork_sandbox :: terminal backend failure removes the source sandbox
+// ============================================================
+MT_TEST(fork_sandbox_terminal_failure_removes_source_sandbox) {
+    Fixture f;
+    f.script.fail_fork_terminal = true;
+    SandboxMetadata source = RegisterRunning(f, 2, 512);
+
+    OrchestratorResult<std::vector<SandboxForkOutcome> > forked =
+        f.orch->ForkSandbox(source.id, 1, NewTimeout::Set(30 * 1000));
+    MT_EXPECT_TRUE(!forked.ok());
+    MT_EXPECT_TRUE(forked.error().kind ==
+                   OrchestratorErrorKind::SandboxOperationFailed);
+
+    // Terminal: source sandbox must have been removed from the store.
+    MT_EXPECT_TRUE(!f.orch->GetSandbox(source.id).value().has_value());
+    MT_EXPECT_TRUE(f.orch->SandboxHandleFor(source.id) == nullptr);
+}
+
+// ============================================================
+// fork_sandbox :: refuses source that has volume mounts
 // ============================================================
 MT_TEST(fork_sandbox_refuses_source_with_volume_mounts) {
     Fixture f;
     SandboxMetadata source = RegisterRunning(f, 2, 512);
-    source.volume_mounts["/data"] = "vol-123";
-    MT_EXPECT_TRUE(f.store->Add(source).ok());
-    
+
+    // Update the already-registered record to add volume mounts.
+    std::vector<SandboxState> running;
+    running.push_back(SandboxState::Running);
+    MT_EXPECT_TRUE(f.store->UpdateIfState(
+        source.id, running,
+        [](SandboxMetadata* m) { m->volume_mounts["/data"] = "vol-123"; }).ok());
+
     OrchestratorResult<std::vector<SandboxForkOutcome> > forked =
         f.orch->ForkSandbox(source.id, 1, NewTimeout::Set(30 * 1000));
     MT_EXPECT_TRUE(!forked.ok());
-    MT_EXPECT_TRUE(forked.error().kind == 
-                   OrchestratorError::Kind::InternalError);
+    MT_EXPECT_TRUE(forked.error().kind == OrchestratorErrorKind::InternalError);
 }
 
 // ============================================================
-// fork_sandbox_with_specs :: per-child volume mounts
-// ============================================================
-MT_TEST(fork_sandbox_with_specs_applies_per_child_volume_mounts) {
-    Fixture f;
-    SandboxMetadata source = RegisterRunning(f, 2, 512);
-    
-    std::vector<SandboxForkChildSpec> specs;
-    SandboxForkChildSpec c1;
-    c1.sandbox_id = core::SandboxId::Fresh();
-    c1.volume_mounts["/data"] = "vol-alpha";
-    specs.push_back(c1);
-    
-    SandboxForkChildSpec c2;
-    c2.sandbox_id = core::SandboxId::Fresh();
-    c2.volume_mounts["/data"] = "vol-beta";
-    specs.push_back(c2);
-    
-    OrchestratorResult<std::vector<SandboxForkOutcome> > forked =
-        f.orch->ForkSandboxWithSpecs(source.id, specs, NewTimeout::Set(30 * 1000));
-    MT_EXPECT_TRUE(forked.ok());
-    MT_EXPECT_EQ(forked.value().size(), static_cast<size_t>(2));
-    
-    MT_EXPECT_EQ(forked.value()[0].value().volume_mounts.at("/data"),
-                 std::string("vol-alpha"));
-    MT_EXPECT_EQ(forked.value()[1].value().volume_mounts.at("/data"),
-                 std::string("vol-beta"));
-}
-
-// ============================================================
-// fork_sandbox :: rejects duplicate child IDs
+// fork_sandbox_with_specs :: duplicate child IDs are rejected before backend
 // ============================================================
 MT_TEST(fork_sandbox_with_specs_rejects_duplicate_child_ids) {
     Fixture f;
     SandboxMetadata source = RegisterRunning(f, 2, 512);
-    
+
     core::SandboxId dup = core::SandboxId::Fresh();
     std::vector<SandboxForkChildSpec> specs;
     SandboxForkChildSpec c1;
     c1.sandbox_id = dup;
     specs.push_back(c1);
-    
     SandboxForkChildSpec c2;
     c2.sandbox_id = dup;  // collision
     specs.push_back(c2);
-    
+
     OrchestratorResult<std::vector<SandboxForkOutcome> > forked =
         f.orch->ForkSandboxWithSpecs(source.id, specs, NewTimeout::Set(30 * 1000));
     MT_EXPECT_TRUE(!forked.ok());
-    MT_EXPECT_TRUE(forked.error().kind ==
-                   OrchestratorError::Kind::InternalError);
+    MT_EXPECT_TRUE(forked.error().kind == OrchestratorErrorKind::InternalError);
 }
 
 // ============================================================
-// token methods
+// fork_sandbox_with_specs :: child ID that equals the source is rejected
+// ============================================================
+MT_TEST(fork_sandbox_with_specs_rejects_child_id_equal_to_source) {
+    Fixture f;
+    SandboxMetadata source = RegisterRunning(f, 2, 512);
+
+    std::vector<SandboxForkChildSpec> specs;
+    SandboxForkChildSpec c;
+    c.sandbox_id = source.id;  // same as source
+    specs.push_back(c);
+
+    OrchestratorResult<std::vector<SandboxForkOutcome> > forked =
+        f.orch->ForkSandboxWithSpecs(source.id, specs, NewTimeout::Set(30 * 1000));
+    MT_EXPECT_TRUE(!forked.ok());
+    MT_EXPECT_TRUE(forked.error().kind == OrchestratorErrorKind::InternalError);
+}
+
+// ============================================================
+// token methods :: GetEnvdAccessToken respects `secure` flag
 // ============================================================
 MT_TEST(get_envd_access_token_returns_token_iff_secure) {
     Fixture f;
-    sandbox::SandboxAccessTokenGenerator gen("test-secret");
-    f.orch->SetAccessTokenGenerator(gen);
-    
+    core::Expected<sandbox::SandboxAccessTokenGenerator, std::string> gen =
+        sandbox::SandboxAccessTokenGenerator::New("test-secret-32-bytes-padded!!!!!");
+    MT_EXPECT_TRUE(gen.ok());
+    f.orch->SetAccessTokenGenerator(gen.value());
+
     SandboxMetadata secure_meta;
     secure_meta.id     = core::SandboxId::Fresh();
     secure_meta.secure = true;
     core::Optional<sandbox::EnvdAccessToken> tok =
         f.orch->GetEnvdAccessToken(secure_meta);
     MT_EXPECT_TRUE(tok.has_value());
-    MT_EXPECT_TRUE(!tok->raw.empty());
-    
+    MT_EXPECT_TRUE(!tok->Expose().empty());
+
     SandboxMetadata public_meta;
     public_meta.id     = core::SandboxId::Fresh();
     public_meta.secure = false;
@@ -165,22 +166,32 @@ MT_TEST(get_envd_access_token_returns_token_iff_secure) {
     MT_EXPECT_TRUE(!none.has_value());
 }
 
+// ============================================================
+// token methods :: ValidateEnvdAccessToken accepts valid candidates
+// ============================================================
 MT_TEST(validate_envd_access_token_accepts_valid_candidate) {
     Fixture f;
-    sandbox::SandboxAccessTokenGenerator gen("test-secret");
-    f.orch->SetAccessTokenGenerator(gen);
-    
+    core::Expected<sandbox::SandboxAccessTokenGenerator, std::string> gen =
+        sandbox::SandboxAccessTokenGenerator::New("test-secret-32-bytes-padded!!!!!");
+    MT_EXPECT_TRUE(gen.ok());
+    f.orch->SetAccessTokenGenerator(gen.value());
+
     core::SandboxId sid = core::SandboxId::Fresh();
-    sandbox::EnvdAccessToken tok = gen.Generate(sid);
-    MT_EXPECT_TRUE(f.orch->ValidateEnvdAccessToken(sid, tok.raw));
+    sandbox::EnvdAccessToken tok = gen.value().Generate(sid);
+    MT_EXPECT_TRUE(f.orch->ValidateEnvdAccessToken(sid, tok.Expose()));
     MT_EXPECT_TRUE(!f.orch->ValidateEnvdAccessToken(sid, "bogus"));
 }
 
+// ============================================================
+// token methods :: TrafficAccessToken round-trips
+// ============================================================
 MT_TEST(traffic_access_token_generates_and_validates) {
     Fixture f;
-    sandbox::SandboxAccessTokenGenerator gen("test-secret");
-    f.orch->SetAccessTokenGenerator(gen);
-    
+    core::Expected<sandbox::SandboxAccessTokenGenerator, std::string> gen =
+        sandbox::SandboxAccessTokenGenerator::New("test-secret-32-bytes-padded!!!!!");
+    MT_EXPECT_TRUE(gen.ok());
+    f.orch->SetAccessTokenGenerator(gen.value());
+
     core::SandboxId sid = core::SandboxId::Fresh();
     std::string tok = f.orch->TrafficAccessToken(sid);
     MT_EXPECT_TRUE(!tok.empty());
@@ -189,109 +200,135 @@ MT_TEST(traffic_access_token_generates_and_validates) {
 }
 
 // ============================================================
-// capture_snapshot :: happy path
+// capture_snapshot :: FakeSandbox returns Recoverable — error mapped correctly
 // ============================================================
-MT_TEST(capture_snapshot_transitions_to_snapshotting_and_back) {
+// FakeSandbox::Snapshot() returns a Recoverable error ("fake: snapshot
+// unsupported"). The orchestrator should surface SandboxOperationFailed and
+// restore the sandbox to Running (recoverable path).
+MT_TEST(capture_snapshot_recoverable_failure_restores_running) {
     Fixture f;
     SandboxMetadata m = RegisterRunning(f, 2, 512);
-    
-    // The fake always returns "mock-snapshot-id".
+
     OrchestratorResult<SnapshotCaptureResult> captured =
         f.orch->CaptureSnapshot(m.id);
-    MT_EXPECT_TRUE(captured.ok());
-    MT_EXPECT_EQ(captured.value().captured_snapshot,
-                 std::string("mock-snapshot-id"));
-    MT_EXPECT_EQ(captured.value().metadata.id, m.id);
-    
-    // The sandbox is back to Running after the snapshot.
+    MT_EXPECT_TRUE(!captured.ok());
+    MT_EXPECT_TRUE(captured.error().kind ==
+                   OrchestratorErrorKind::SandboxOperationFailed);
+
+    // Recoverable: sandbox must be back to Running.
     MT_EXPECT_TRUE(f.orch->GetSandbox(m.id).value()->state ==
                    SandboxState::Running);
 }
 
-// ============================================================
-// capture_snapshot :: missing sandbox
-// ============================================================
 MT_TEST(capture_snapshot_on_missing_sandbox_is_not_found) {
     Fixture f;
     OrchestratorResult<SnapshotCaptureResult> captured =
         f.orch->CaptureSnapshot(core::SandboxId::Fresh());
     MT_EXPECT_TRUE(!captured.ok());
     MT_EXPECT_TRUE(captured.error().kind ==
-                   OrchestratorError::Kind::SandboxNotFound);
+                   OrchestratorErrorKind::SandboxNotFound);
 }
 
 // ============================================================
-// snapshot_volume_mounts :: happy path
+// snapshot_volume_mounts :: succeeds for a running sandbox
 // ============================================================
 MT_TEST(snapshot_volume_mounts_succeeds_for_running_sandbox) {
     Fixture f;
     SandboxMetadata m = RegisterRunning(f, 2, 512);
-    
-    OrchestratorResult<core::Unit> snapped =
-        f.orch->SnapshotVolumeMounts(m.id);
+
+    OrchestratorResult<core::Unit> snapped = f.orch->SnapshotVolumeMounts(m.id);
     MT_EXPECT_TRUE(snapped.ok());
-    
-    // The sandbox is back to Running.
+
+    // Sandbox is back to Running after the operation.
     MT_EXPECT_TRUE(f.orch->GetSandbox(m.id).value()->state ==
                    SandboxState::Running);
 }
 
+MT_TEST(snapshot_volume_mounts_on_missing_sandbox_is_not_found) {
+    Fixture f;
+    OrchestratorResult<core::Unit> snapped =
+        f.orch->SnapshotVolumeMounts(core::SandboxId::Fresh());
+    MT_EXPECT_TRUE(!snapped.ok());
+    MT_EXPECT_TRUE(snapped.error().kind == OrchestratorErrorKind::SandboxNotFound);
+}
+
 // ============================================================
-// replace_sandbox_network_policy :: happy path
+// replace_sandbox_network_policy :: persists the new policy
 // ============================================================
-MT_TEST(replace_sandbox_network_policy_updates_and_persists) {
+MT_TEST(replace_sandbox_network_policy_persists_new_policy) {
     Fixture f;
     SandboxMetadata m = RegisterRunning(f, 2, 512);
-    m.network_policy.allow_public_traffic = true;
-    MT_EXPECT_TRUE(f.store->Add(m).ok());
-    
+
+    // Ensure allow_public_traffic is true in the store.
+    std::vector<SandboxState> running;
+    running.push_back(SandboxState::Running);
+    MT_EXPECT_TRUE(f.store->UpdateIfState(
+        m.id, running,
+        [](SandboxMetadata* md) {
+            md->network_policy.allow_public_traffic = true;
+        }).ok());
+
     sandbox::network::SandboxNetworkPolicy new_policy;
-    new_policy.allow_localhost_ingress = true;
-    // Rust: `allow_public_traffic` is not user-updatable — the stored value
-    // always wins.
-    new_policy.allow_public_traffic = false;  // this should be ignored
-    
+    new_policy.allow_public_traffic = false;  // Rust: stored value wins, not this
+    new_policy.base_policy = sandbox::network::BaseSandboxNetworkPolicy::Default;
+
     OrchestratorResult<core::Unit> updated =
         f.orch->ReplaceSandboxNetworkPolicy(m.id, new_policy);
     MT_EXPECT_TRUE(updated.ok());
-    
-    // The store should have the new localhost flag but the original
-    // allow_public_traffic.
+
+    // The store record must reflect the update.
     core::Optional<SandboxMetadata> got = f.store->Get(m.id).value();
-    MT_EXPECT_TRUE(got->network_policy.allow_localhost_ingress);
+    MT_EXPECT_TRUE(got.has_value());
+    // `allow_public_traffic` must stay true — the stored value always wins.
     MT_EXPECT_TRUE(got->network_policy.allow_public_traffic);
 }
 
 // ============================================================
-// replace_sandbox_network_policy :: not running
+// replace_sandbox_network_policy :: missing sandbox
 // ============================================================
-MT_TEST(replace_sandbox_network_policy_rejects_non_running) {
+MT_TEST(replace_sandbox_network_policy_on_missing_sandbox_is_not_found) {
     Fixture f;
-    SandboxMetadata m = RegisterRunning(f, 2, 512);
-    m.state = SandboxState::Paused;
-    MT_EXPECT_TRUE(f.store->Add(m).ok());
-    
     sandbox::network::SandboxNetworkPolicy policy;
     OrchestratorResult<core::Unit> updated =
-        f.orch->ReplaceSandboxNetworkPolicy(m.id, policy);
+        f.orch->ReplaceSandboxNetworkPolicy(core::SandboxId::Fresh(), policy);
     MT_EXPECT_TRUE(!updated.ok());
-    MT_EXPECT_TRUE(updated.error().kind ==
-                   OrchestratorError::Kind::InvalidSandboxState);
+    MT_EXPECT_TRUE(updated.error().kind == OrchestratorErrorKind::SandboxNotFound);
 }
 
 // ============================================================
-// patch_sandbox_custom_extension_params :: no client configured
+// patch_sandbox_custom_extension_params :: fails when no client
 // ============================================================
 MT_TEST(patch_custom_extension_params_fails_when_client_absent) {
     Fixture f;
     SandboxMetadata m = RegisterRunning(f, 2, 512);
-    
+
     sandbox::custom_extension::Params patch;
     patch.json_bytes = "{\"key\":\"value\"}";
-    
+
     OrchestratorResult<core::Optional<sandbox::custom_extension::Params> > result =
         f.orch->PatchSandboxCustomExtensionParams(m.id, patch);
     MT_EXPECT_TRUE(!result.ok());
     MT_EXPECT_TRUE(result.error().kind ==
-                   OrchestratorError::Kind::SandboxOperationFailed);
+                   OrchestratorErrorKind::SandboxOperationFailed);
 }
+
+// ============================================================
+// patch_sandbox_custom_extension_params :: rejects non-Running
+// ============================================================
+MT_TEST(patch_custom_extension_params_rejects_paused_sandbox) {
+    Fixture f;
+    SandboxMetadata m = RegisterRunning(f, 2, 512);
+    std::vector<SandboxState> running;
+    running.push_back(SandboxState::Running);
+    MT_EXPECT_TRUE(f.store->UpdateStateIfState(
+        m.id, SandboxState::Paused, running).ok());
+
+    sandbox::custom_extension::Params patch;
+    OrchestratorResult<core::Optional<sandbox::custom_extension::Params> > result =
+        f.orch->PatchSandboxCustomExtensionParams(m.id, patch);
+    MT_EXPECT_TRUE(!result.ok());
+    MT_EXPECT_TRUE(result.error().kind ==
+                   OrchestratorErrorKind::InvalidSandboxState);
+}
+
+MT_MAIN

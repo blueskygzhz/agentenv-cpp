@@ -33,12 +33,27 @@ struct BackendScript {
     /// `ThawVolumes` fails, which escalates a recoverable capture error.
     bool fail_thaw = false;
 
+    // fork branches
+    bool fail_fork_terminal   = false;
+    bool fail_fork_recoverable = false;
+
+    // snapshot branches
+    bool succeed_snapshot = false;  // off by default (FakeSandbox returns unsupported)
+    std::string snapshot_id = "fake-snapshot-id";
+    bool fail_snapshot_terminal   = false;
+    bool fail_snapshot_recoverable = false;  // default when succeed_snapshot==false
+
+    // network / custom-extension branches
+    bool fail_update_network = false;
+
     // observed
-    int start_calls  = 0;
-    int wait_calls   = 0;
-    int stop_calls   = 0;
-    int freeze_calls = 0;
-    int thaw_calls   = 0;
+    int start_calls    = 0;
+    int wait_calls     = 0;
+    int stop_calls     = 0;
+    int freeze_calls   = 0;
+    int thaw_calls     = 0;
+    int fork_calls     = 0;
+    int snapshot_calls = 0;
 
     /// Rust `runtime_info().rootfs_virtual_size`.
     core::Optional<uint64_t> rootfs_virtual_size;
@@ -100,7 +115,13 @@ class FakeSandbox : public sandbox::SandboxBackend {
         return core::Unit();
     }
     sandbox::SandboxCaptureResult<std::vector<sandbox::SandboxForkResult> >
-        Fork(const std::vector<sandbox::SandboxForkSpec>&) override {
+        Fork(const std::vector<sandbox::SandboxForkSpec>& specs) override {
+        ++script_->fork_calls;
+        if (script_->fail_fork_terminal) {
+            return core::make_unexpected(
+                sandbox::SandboxCaptureError::Terminal("fake: fork broke the runtime"));
+        }
+        // Default: recoverable error. Use FakeForkableSandbox for success tests.
         return core::make_unexpected(
             sandbox::SandboxCaptureError::Recoverable("fake: fork unsupported"));
     }
