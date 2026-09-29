@@ -62,6 +62,8 @@ agentenv_add_test(test_snapshot_record    test_snapshot_record.cc     agentenv-s
 agentenv_add_test(test_posixfs_catalog    test_posixfs_catalog.cc     agentenv-snapshot agentenv-volume-record)
 agentenv_add_test(test_image_export_target test_image_export_target.cc agentenv-snapshot)
 agentenv_add_test(test_observability_host test_observability_host.cc agentenv-observability-node)
+agentenv_add_test(test_observability_prometheus test_observability_prometheus.cc agentenv-observability-node)
+agentenv_add_test(test_observability_reporter test_observability_reporter.cc agentenv-observability-node)
 agentenv_add_test(test_orchestrator_proxy test_orchestrator_proxy.cc agentenv-orchestrator)
 agentenv_add_test(test_orchestrator_lifecycle test_orchestrator_lifecycle.cc agentenv-orchestrator Threads::Threads)
 agentenv_add_test(test_orchestrator_launch test_orchestrator_launch.cc agentenv-orchestrator)
