@@ -29,9 +29,12 @@ class IrohBlobsP2pTransport : public P2pTransport {
     P2pResult<bool> LookupWithHints(const P2pArtifactKey& key,
      const std::vector<P2pArtifactProviderHint>& hints,
       P2pArtifactDescriptor* out) override;
-    P2pResult<uint64_t> Fetch(const P2pArtifactDescriptor& descriptor,
-      const std::string& destination) override;
-    P2pResult<std::vector<uint8_t> > FetchBytes(const P2pArtifactDescriptor& descriptor) override;
+    P2pResult<uint64_t> FetchWithOptions(const P2pArtifactDescriptor& descriptor,
+      const std::string& destination,
+      P2pFetchOptions options) override;
+    P2pResult<std::vector<uint8_t> >
+        FetchBytesWithOptions(const P2pArtifactDescriptor& descriptor,
+                              P2pFetchOptions options) override;
     P2pResult<std::shared_ptr<P2pByteStream> >
         FetchByteRange(const P2pArtifactDescriptor& descriptor,
      uint64_t offset, size_t len) override;

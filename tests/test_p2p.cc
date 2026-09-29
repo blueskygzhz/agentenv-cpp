@@ -295,9 +295,154 @@ MT_TEST(iroh_disabled_without_feature) {
     P2pArtifactDescriptor desc;
     auto r = inst.LookupWithHints("k", std::vector<P2pArtifactProviderHint>(), &desc);
     MT_EXPECT_TRUE(!r.ok());
-    MT_EXPECT_TRUE(r.error().kind == P2pError::Disabled);
+    MT_EXPECT_TRUE(r.error().kind == P2pError::TransportDisabled);
     P2pEndpoint ep;
     MT_EXPECT_TRUE(!inst.LocalEndpoint(&ep));
+}
+
+// ---- error.rs: Display strings must match thiserror verbatim ----
+MT_TEST(p2p_error_display_matches_rust) {
+    MT_EXPECT_TRUE(P2pError::MakeDisabled().ToString() ==
+                   "P2P artifact transport is disabled");
+    MT_EXPECT_TRUE(P2pError::Invalid("bad").ToString() ==
+                   "invalid P2P artifact descriptor: bad");
+    MT_EXPECT_TRUE(P2pError::MakeInvalidCatalog("/var/cat", "torn").ToString() ==
+                   "invalid P2P artifact catalog at \"/var/cat\": torn");
+    MT_EXPECT_TRUE(P2pError::MakeTimeout("fetch_byte_range").ToString() ==
+                   "P2P operation timed out: fetch_byte_range");
+    // #[error(transparent)] forwards the inner message with no prefix.
+    MT_EXPECT_TRUE(P2pError::MakeInternal("boom").ToString() == "boom");
+    MT_EXPECT_TRUE(P2pError::InternalMessage("publish", "io error").ToString() ==
+                   "publish: io error");
+}
+
+// ---- types.rs: P2pFetchOptions has a hand-written Default (advertise=true) ----
+MT_TEST(p2p_fetch_options_default_advertises) {
+    MT_EXPECT_TRUE(P2pFetchOptions::Default().advertise);
+    MT_EXPECT_TRUE(P2pFetchOptions() == P2pFetchOptions::Default());
+}
+
+// ---- transport.rs: provided methods delegate to the *_with_options ones ----
+MT_TEST(transport_default_methods_delegate_with_default_options) {
+    MockTransport t;
+    t.Publish(P2pPublishRequest::FromBytes("k", std::vector<uint8_t>(4, 7)));
+
+    P2pArtifactDescriptor desc;
+    // `lookup` == `lookup_with_hints(key, &[])`.
+    auto found = t.Lookup("k", &desc);
+    MT_EXPECT_TRUE(found.ok() && found.value());
+
+    auto bytes = t.FetchBytes(desc);
+    MT_EXPECT_TRUE(bytes.ok());
+    MT_EXPECT_EQ(static_cast<int>(bytes.value().size()), 4);
+    // The defaulted options must arrive with advertise=true.
+    MT_EXPECT_TRUE(t.LastFetchOptions().advertise);
+
+    P2pFetchOptions no_ad;
+    no_ad.advertise = false;
+    MT_EXPECT_TRUE(t.FetchBytesWithOptions(desc, no_ad).ok());
+    MT_EXPECT_TRUE(!t.LastFetchOptions().advertise);
+
+    // `shutdown` defaults to Ok(()).
+    MT_EXPECT_TRUE(t.Shutdown().ok());
+}
+
+// ---- transport.rs: DisabledP2pTransport ----
+MT_TEST(disabled_transport_semantics) {
+    DisabledP2pTransport t;
+    P2pArtifactDescriptor desc;
+    desc.key = "k";
+
+    // lookup => Ok(None), publish/unpublish => Ok, everything else => disabled.
+    auto look = t.Lookup("k", &desc);
+    MT_EXPECT_TRUE(look.ok() && !look.value());
+
+    auto pub_r = t.Publish(P2pPublishRequest::FromBytes("k", std::vector<uint8_t>()));
+    MT_EXPECT_TRUE(pub_r.ok());
+    auto unpub = t.Unpublish("k");
+    MT_EXPECT_TRUE(unpub.ok() && !unpub.value());
+
+    MT_EXPECT_TRUE(!t.Fetch(desc, "/tmp/x").ok());
+    MT_EXPECT_TRUE(t.Fetch(desc, "/tmp/x").error().kind == P2pError::TransportDisabled);
+    MT_EXPECT_TRUE(!t.FetchBytes(desc).ok());
+    MT_EXPECT_TRUE(!t.FetchByteRange(desc, 0, 1).ok());
+
+    P2pEndpoint ep;
+    MT_EXPECT_TRUE(!t.LocalEndpoint(&ep));  // default None
+    MT_EXPECT_TRUE(t.Shutdown().ok());
+}
+
+// ---- mock.rs: unpublish bookkeeping records every key, removed or not ----
+MT_TEST(mock_unpublish_records_all_keys) {
+    MockTransport t;
+    t.Publish(P2pPublishRequest::FromBytes("a", std::vector<uint8_t>(1, 1)));
+    t.Unpublish("a");
+    t.Unpublish("missing");
+
+    MT_EXPECT_EQ(t.UnpublishCount(), 2);
+    std::vector<P2pArtifactKey> keys = t.UnpublishedKeys();
+    MT_EXPECT_EQ(static_cast<int>(keys.size()), 2);
+    MT_EXPECT_TRUE(keys[0] == "a");
+    MT_EXPECT_TRUE(keys[1] == "missing");
+}
+
+// ---- discovery/scheduler.rs: peers_for_key must issue a keyed lookup RPC ----
+MT_TEST(scheduler_discovery_peers_for_key_uses_lookup_rpc) {
+    std::vector<SchedulerWirePeer> cached;
+    SchedulerWirePeer cached_peer;
+    cached_peer.node_id = "cached-node";
+    cached_peer.has_endpoint = true;
+    cached_peer.endpoint.backend = "backend";
+    cached_peer.endpoint.address = "cached-addr";
+    cached.push_back(cached_peer);
+
+    SchedulerPeerDiscovery d(
+        "self", "cluster-1", true, "backend",
+        [&cached](const std::string&, const std::string&, const std::string&,
+                  std::vector<SchedulerWirePeer>* out) -> bool {
+            *out = cached;
+            return true;
+        },
+        SchedulerPeerDiscovery::WireRecord());
+    d.Refresh();
+    MT_EXPECT_EQ(static_cast<int>(d.Peers().value().size()), 1);
+
+    // Without a lookup transport the call is an error, NOT the refresh cache.
+    auto no_transport = d.PeersForKey("art-1");
+    MT_EXPECT_TRUE(!no_transport.ok());
+
+    std::string seen_key;
+    std::string seen_exclude;
+    d.SetWireLookup([&seen_key, &seen_exclude](
+                        const std::string& cluster, const std::string& backend,
+                        const std::string& key, const std::string& exclude,
+                        std::vector<SchedulerWirePeer>* out) -> bool {
+        seen_key = key;
+        seen_exclude = exclude;
+        MT_EXPECT_TRUE(cluster == "cluster-1");
+        MT_EXPECT_TRUE(backend == "backend");
+        SchedulerWirePeer keyed;
+        keyed.node_id = "keyed-node";
+        keyed.has_endpoint = true;
+        keyed.endpoint.backend = "backend";
+        keyed.endpoint.address = "keyed-addr";
+        out->push_back(keyed);
+        // A mismatched backend must be filtered out of the response.
+        SchedulerWirePeer other;
+        other.node_id = "other-node";
+        other.has_endpoint = true;
+        other.endpoint.backend = "other";
+        other.endpoint.address = "other-addr";
+        out->push_back(other);
+        return true;
+    });
+
+    auto peers = d.PeersForKey("art-1");
+    MT_EXPECT_TRUE(peers.ok());
+    MT_EXPECT_EQ(static_cast<int>(peers.value().size()), 1);
+    MT_EXPECT_TRUE(peers.value()[0].node_id == "keyed-node");
+    MT_EXPECT_TRUE(seen_key == "art-1");
+    MT_EXPECT_TRUE(seen_exclude == "self");
 }
 
 MT_MAIN

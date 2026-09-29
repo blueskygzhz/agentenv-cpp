@@ -103,7 +103,8 @@ SchedulerPeerDiscovery::SchedulerPeerDiscovery(std::string local_node_id,
       has_backend_(has_backend),
       backend_(std::move(backend)),
       fetch_(std::move(fetch)),
- record_(std::move(record)) {}
+ record_(std::move(record)),
+      lookup_() {}
 
 void SchedulerPeerDiscovery::Refresh() {
     if (!fetch_) return;
@@ -119,11 +120,27 @@ P2pResult<std::vector<P2pPeer> > SchedulerPeerDiscovery::Peers() {
     return peers_;
 }
 
+void SchedulerPeerDiscovery::SetWireLookup(WireLookup lookup) {
+    lookup_ = std::move(lookup);
+}
+
 P2pResult<std::vector<P2pPeer> >
-SchedulerPeerDiscovery::PeersForKey(const P2pArtifactKey& /*key*/) {
-    if (!has_backend_) return std::vector<P2pPeer>();  // Rust: None backend => []
-    // A live impl issues a lookup RPC; here we fall back to the cached peers.
-    return peers_;
+SchedulerPeerDiscovery::PeersForKey(const P2pArtifactKey& key) {
+    // Rust: `let Some(backend) = self.backend.as_deref() else { return Ok(vec![]) }`.
+    if (!has_backend_) return std::vector<P2pPeer>();
+    // Rust issues `lookup_p2p_artifact` and filters the response. It never
+    // falls back to the refresh cache: an unavailable scheduler is an error,
+    // not "no providers", so the caller can distinguish the two.
+    if (!lookup_) {
+        return core::make_unexpected(
+            P2pError::MakeInternal("lookup P2P artifact in scheduler"));
+    }
+    std::vector<SchedulerWirePeer> wire;
+    if (!lookup_(cluster_id_, backend_, key, local_node_id_, &wire)) {
+        return core::make_unexpected(
+            P2pError::MakeInternal("lookup P2P artifact in scheduler"));
+    }
+    return FilterSchedulerP2pPeers(wire, backend_);
 }
 
 P2pResult<core::Unit> SchedulerPeerDiscovery::RecordKey(const P2pArtifactKey& key) {

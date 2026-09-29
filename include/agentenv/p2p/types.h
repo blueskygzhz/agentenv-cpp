@@ -105,6 +105,21 @@ struct P2pArtifactProviderHint {
     P2pEndpoint endpoint;
 };
 
+/// Rust: `P2pFetchOptions`.
+///
+/// `impl Default` sets `advertise: true` — note this is NOT `#[derive(Default)]`,
+/// so the default is deliberately `true`, not `false`.
+struct P2pFetchOptions {
+    /// The transport backend should automatically advertise the fetched artifact.
+    bool advertise = true;
+
+    /// Rust `P2pFetchOptions::default()`.
+    static P2pFetchOptions Default() { return P2pFetchOptions(); }
+
+    bool operator==(const P2pFetchOptions& o) const { return advertise == o.advertise; }
+    bool operator!=(const P2pFetchOptions& o) const { return !(*this == o); }
+};
+
 }  // namespace p2p
 }  // namespace agentenv
 #endif  // AGENTENV_P2P_TYPES_H_

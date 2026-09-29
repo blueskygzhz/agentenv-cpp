@@ -27,11 +27,12 @@ IrohBlobsP2pTransport::LookupWithHints(const P2pArtifactKey&,
   return core::make_unexpected(P2pError::MakeDisabled());
 }
 P2pResult<uint64_t>
-IrohBlobsP2pTransport::Fetch(const P2pArtifactDescriptor&, const std::string&) {
+IrohBlobsP2pTransport::FetchWithOptions(const P2pArtifactDescriptor&, const std::string&,
+                                       P2pFetchOptions) {
     return core::make_unexpected(P2pError::MakeDisabled());
 }
 P2pResult<std::vector<uint8_t> >
-IrohBlobsP2pTransport::FetchBytes(const P2pArtifactDescriptor&) {
+IrohBlobsP2pTransport::FetchBytesWithOptions(const P2pArtifactDescriptor&, P2pFetchOptions) {
     return core::make_unexpected(P2pError::MakeDisabled());
 }
 P2pResult<std::shared_ptr<P2pByteStream> >

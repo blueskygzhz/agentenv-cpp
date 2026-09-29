@@ -79,19 +79,31 @@ std::vector<P2pPeer>
 /// record/forget bookkeeping (the pure part) is fully real and testable.
 class SchedulerPeerDiscovery : public P2pPeerDiscovery {
  public:
+    /// Rust `list_p2p_peers` RPC.
     typedef std::function<bool(const std::string& cluster_id,
        const std::string& backend,
     const std::string& exclude_node_id,
    std::vector<SchedulerWirePeer>* out)> WireFetch;
+    /// Rust `record_p2p_artifact` / `forget_p2p_artifact` RPCs (`record` selects).
  typedef std::function<bool(const std::string& cluster_id,
    const std::string& backend,
      const std::string& key,
       const std::string& node_id,
  bool record)> WireRecord;
+    /// Rust `lookup_p2p_artifact` RPC — per-key provider lookup. Distinct from
+    /// `WireFetch`: it is keyed and is NOT served from the refresh cache.
+    typedef std::function<bool(const std::string& cluster_id,
+       const std::string& backend,
+       const std::string& key,
+       const std::string& exclude_node_id,
+       std::vector<SchedulerWirePeer>* out)> WireLookup;
 
     SchedulerPeerDiscovery(std::string local_node_id, std::string cluster_id,
     bool has_backend, std::string backend,
          WireFetch fetch, WireRecord record);
+
+    /// Installs the `lookup_p2p_artifact` transport used by `PeersForKey`.
+    void SetWireLookup(WireLookup lookup);
 
     /// Rust `refresh_scheduler_peers` body (one iteration): pull + cache.
     void Refresh();
@@ -108,6 +120,7 @@ class SchedulerPeerDiscovery : public P2pPeerDiscovery {
     std::string backend_;
     WireFetch   fetch_;
     WireRecord  record_;
+    WireLookup  lookup_;
     std::vector<P2pPeer> peers_;
 };
 
