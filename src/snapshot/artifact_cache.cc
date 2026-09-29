@@ -197,6 +197,16 @@ bool LocalArtifactCache::IsOverLimit() const {
     return total_size_ > max_size_bytes_;
 }
 
+void LocalArtifactCache::FinishInflight(const std::string& key, InflightEntry* entry,
+                                         bool ok, const std::string& err) {
+    std::unique_lock<std::mutex> lk(inflight_mu_);
+    entry->done = true;
+    entry->ok = ok;
+    entry->error = err;
+    inflight_.erase(key);
+    inflight_cv_.notify_all();
+}
+
 core::Expected<core::Unit, std::string> LocalArtifactCache::EvictLru() {
     const uint64_t target =
         static_cast<uint64_t>(static_cast<double>(max_size_bytes_) *

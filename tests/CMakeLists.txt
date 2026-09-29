@@ -64,6 +64,7 @@ agentenv_add_test(test_posixfs_layout     test_posixfs_layout.cc      agentenv-s
 agentenv_add_test(test_snapshot_record    test_snapshot_record.cc     agentenv-snapshot agentenv-template)
 agentenv_add_test(test_posixfs_catalog    test_posixfs_catalog.cc     agentenv-snapshot agentenv-volume-record)
 agentenv_add_test(test_posixfs_artifacts  test_posixfs_artifacts.cc   agentenv-snapshot agentenv-overlaybd)
+agentenv_add_test(test_artifact_cache     test_artifact_cache.cc      agentenv-snapshot)
 agentenv_add_test(test_image_export_target test_image_export_target.cc agentenv-snapshot)
 agentenv_add_test(test_observability_host test_observability_host.cc agentenv-observability-node)
 agentenv_add_test(test_observability_prometheus test_observability_prometheus.cc agentenv-observability-node)

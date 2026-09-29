@@ -74,21 +74,11 @@ WriteImageConfig(const std::string& destination, const std::string& label,
         }
     }
 
-    std::string tmp_path = destination + ".tmp";
-    std::string serialized = storage::overlaybd::SerializeImageConfig(cfg).ToString();
-    core::Expected<core::Unit, std::string> w = core::fs::Write(tmp_path, serialized);
+    std::string serialized = storage::overlaybd::ImageConfigToJson(cfg);
+    core::Expected<core::Unit, std::string> w = core::fs::Write(destination, serialized);
     if (!w.ok()) {
         return core::make_unexpected(repository::RepositoryError::Backend(
-            std::string("write temp runtime image config '") + tmp_path + "'", w.error()));
-    }
-
-    core::Expected<core::Unit, std::string> mv =
-        core::fs::Rename(tmp_path, destination);
-    if (!mv.ok()) {
-        core::fs::RemoveFile(tmp_path);
-        return core::make_unexpected(repository::RepositoryError::Backend(
-            std::string("move runtime image config '") + tmp_path + "' to '" + destination + "'",
-            mv.error()));
+            std::string("write runtime image config '") + destination + "'", w.error()));
     }
     return destination;
 }
