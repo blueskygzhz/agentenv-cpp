@@ -319,7 +319,7 @@ class FileBackedSandboxPersister : public SandboxPersister {
         PersistenceResult<core::Unit> stored = PutRecord(record);
         if (!stored.ok()) {
             // Rust drops the artifacts when the record cannot be written.
-            (void)core::fs::RemoveAll(*artifact_root);
+            (void)core::fs::RemoveDirAll(*artifact_root);
         }
         return stored;
     }
@@ -431,7 +431,7 @@ class FileBackedSandboxPersister : public SandboxPersister {
 
     /// Rust `remove_artifact_root` — an absent path is not an error.
     static PersistenceResult<core::Unit> RemoveArtifactRoot(const std::string& path) {
-        core::Expected<core::Unit, std::string> removed = core::fs::RemoveAll(path);
+        core::Expected<core::Unit, std::string> removed = core::fs::RemoveDirAll(path);
         if (!removed.ok()) {
             return core::make_unexpected(SandboxPersistenceError::Io(
                 "remove paused sandbox artifacts", path, removed.error()));

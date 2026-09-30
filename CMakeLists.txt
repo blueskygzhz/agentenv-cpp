@@ -79,6 +79,9 @@ add_subdirectory(src/volume-record)
 add_subdirectory(src/managed-secret)
 add_subdirectory(src/privileges-lib)
 add_subdirectory(src/snapshot-startup-pack)
+# Rust `src/local_store.rs` — needed by image (cache metadata) and
+# orchestrator (paused records), so it is configured before both.
+add_subdirectory(src/local-store)
 add_subdirectory(src/image)
 add_subdirectory(src/p2p)
 add_subdirectory(src/overlaybd)
