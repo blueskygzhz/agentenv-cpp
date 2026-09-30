@@ -22,6 +22,10 @@ add_library(agentenv-sandbox STATIC
     firecracker/config.cc
     # Rust: src/sandbox/firecracker/overlaybd_snapshot.rs (dirty-page mapping)
     firecracker/dirty_memory.cc
+    # Rust: src/sandbox/firecracker/process_vm_reader.rs
+    firecracker/process_vm.cc
+    # Rust: src/sandbox/firecracker/{pool,startup_pack,config}.rs
+    firecracker/lifecycle.cc
     firecracker/socket.cc
     firecracker/instance.cc
     firecracker/mmds.cc

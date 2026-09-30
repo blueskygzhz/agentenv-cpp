@@ -236,6 +236,17 @@ Expected<std::string, std::string> CreateTempDir(const std::string& prefix) {
     return std::string(&buffer[0]);
 }
 
+Expected<std::string, std::string> CreateTempDirIn(const std::string& parent,
+                                                   const std::string& prefix) {
+    std::string pattern = Join(parent, prefix + "XXXXXX");
+    std::vector<char> buffer(pattern.begin(), pattern.end());
+    buffer.push_back('\0');
+    if (::mkdtemp(&buffer[0]) == NULL) {
+        return make_unexpected(Errno("create_temp_dir_in", pattern, errno));
+    }
+    return std::string(&buffer[0]);
+}
+
 // ---------------------------------------------------------------------------
 // Unix security primitives
 // ---------------------------------------------------------------------------

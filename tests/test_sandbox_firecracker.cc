@@ -53,7 +53,10 @@ MT_TEST(extra_drives_duplicate_mount) {
     ds.push_back(Drive("b", "/mnt/x"));
     auto r = ValidateExtraDriveSet(ds, false);
     MT_EXPECT_TRUE(!r.ok());
-    MT_EXPECT_TRUE(r.error().find("duplicate extra drive mount path") != std::string::npos);
+    // An identical path is the degenerate case of the overlap rule Rust
+    // applies (`starts_with` either way), so it is reported as overlapping
+    // rather than merely duplicated.
+    MT_EXPECT_TRUE(r.error().find("overlapping extra drive mount path") != std::string::npos);
 }
 
 MT_TEST(extra_drives_too_many) {

@@ -71,6 +71,16 @@ Expected<std::vector<std::string>, std::string> ReadDir(const std::string& path)
 /// owns removal; pair it with `RemoveDirAll`.
 Expected<std::string, std::string> CreateTempDir(const std::string& prefix);
 
+/// Rust `tempfile::Builder::tempdir_in` / `TempDir::with_prefix_in` — creates
+/// `{parent}/{prefix}XXXXXX`.
+///
+/// Distinct from `CreateTempDir` because the parent is chosen by config (a
+/// pool directory on a specific filesystem), not by the environment: putting
+/// the directory on the wrong filesystem would turn a later hard-link into a
+/// full copy.
+Expected<std::string, std::string> CreateTempDirIn(const std::string& parent,
+                                                   const std::string& prefix);
+
 // ---------------------------------------------------------------------------
 // Unix security primitives.
 //
