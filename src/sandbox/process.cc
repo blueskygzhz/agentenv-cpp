@@ -9,6 +9,7 @@
 
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 
@@ -18,7 +19,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <map>
 #include <vector>
+
+#include "agentenv/core/fs.h"
 
 namespace agentenv {
 namespace sandbox {
@@ -138,10 +142,18 @@ class LocalProcessHandle : public ProcessHandle {
 
 class LocalExecutor : public Executor {
  public:
-    core::Expected<ProcessOutput, std::string> Run(const ProcessOpts& opts) override {
-        if (opts.argv.empty()) {
-            return core::make_unexpected(std::string("empty argv"));
+    core::Expected<ProcessOutput, std::string> RunCommandWithOpts(
+        const std::string& cmd, const std::vector<std::string>& args,
+        const ProcessOpts& opts) override {
+        if (cmd.empty()) {
+            return core::make_unexpected(std::string("empty command"));
         }
+
+        // argv[0] is the command itself, then its arguments.
+        std::vector<std::string> spliced;
+        spliced.reserve(args.size() + 1);
+        spliced.push_back(cmd);
+        for (std::size_t i = 0; i < args.size(); ++i) spliced.push_back(args[i]);
 
         int out_pipe[2] = {-1, -1};
         int err_pipe[2] = {-1, -1};
@@ -163,19 +175,22 @@ class LocalExecutor : public Executor {
             ::close(out_pipe[0]); ::close(out_pipe[1]);
             ::close(err_pipe[0]); ::close(err_pipe[1]);
 
-            if (!opts.cwd.empty()) {
-                if (::chdir(opts.cwd.c_str()) != 0) {
+            if (opts.cwd.has_value() && !opts.cwd->empty()) {
+                if (::chdir(opts.cwd->c_str()) != 0) {
                     ::_exit(127);
                 }
             }
-            for (size_t i = 0; i < opts.env_vars.size(); ++i) {
-                ::putenv(const_cast<char*>(opts.env_vars[i].c_str()));
+            // `envs` is a map, so a duplicate key cannot reach the process
+            // twice. `setenv` overwrites, matching the map's own semantics.
+            for (std::map<std::string, std::string>::const_iterator it = opts.envs.begin();
+                 it != opts.envs.end(); ++it) {
+                ::setenv(it->first.c_str(), it->second.c_str(), 1);
             }
 
             std::vector<char*> argv;
-            argv.reserve(opts.argv.size() + 1);
-            for (size_t i = 0; i < opts.argv.size(); ++i) {
-                argv.push_back(const_cast<char*>(opts.argv[i].c_str()));
+            argv.reserve(spliced.size() + 1);
+            for (size_t i = 0; i < spliced.size(); ++i) {
+                argv.push_back(const_cast<char*>(spliced[i].c_str()));
             }
             argv.push_back(nullptr);
 
@@ -186,15 +201,48 @@ class LocalExecutor : public Executor {
         // ---- parent ----
         ::close(out_pipe[1]);
         ::close(err_pipe[1]);
-        LocalProcessHandle handle(pid, out_pipe[0], err_pipe[0], opts.timeout_sec);
+        // Rust carries a `Duration`; the handle polls in whole seconds, so a
+        // sub-second timeout still yields at least one tick.
+        const int32_t timeout_sec =
+            opts.timeout_ms.has_value()
+                ? static_cast<int32_t>((*opts.timeout_ms + 999) / 1000)
+                : 0;
+        LocalProcessHandle handle(pid, out_pipe[0], err_pipe[0], timeout_sec);
         // Handle owns the read fds now.
         out_pipe[0] = -1;
         err_pipe[0] = -1;
         return handle.Wait();
     }
+
+    core::Expected<core::Unit, std::string> CreateDirAll(const std::string& path) override {
+        // Upstream this is an envd filesystem RPC so it works in images with
+        // no userland; the host-local executor uses the host filesystem for
+        // the same reason — no `mkdir` binary is required.
+        return core::fs::CreateDirAll(path);
+    }
 };
 
 }  // namespace
+
+ProcessOpts& ProcessOpts::WithEnvs(const std::map<std::string, std::string>& envs_in) {
+    envs = envs_in;
+    return *this;
+}
+
+ProcessOpts& ProcessOpts::WithCwd(const std::string& cwd_in) {
+    cwd = core::Optional<std::string>(cwd_in);
+    return *this;
+}
+
+ProcessOpts& ProcessOpts::WithTimeoutMs(int64_t timeout_in) {
+    timeout_ms = core::Optional<int64_t>(timeout_in);
+    return *this;
+}
+
+core::Expected<ProcessOutput, std::string> Executor::RunCommand(
+    const std::string& cmd, const std::vector<std::string>& args) {
+    return RunCommandWithOpts(cmd, args, ProcessOpts());
+}
 
 std::unique_ptr<Executor> MakeLocalExecutor() {
     return std::unique_ptr<Executor>(new LocalExecutor());

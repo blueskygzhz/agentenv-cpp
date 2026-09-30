@@ -2,6 +2,11 @@
 // Tests for sandbox::LocalExecutor (real fork/exec) + NetworkAddressPlan.
 #include "microtest.h"
 
+#include <map>
+#include <string>
+#include <vector>
+
+#include "agentenv/core/fs.h"
 #include "agentenv/sandbox/process.h"
 #include "agentenv/sandbox/network.h"
 
@@ -9,11 +14,10 @@ using namespace agentenv::sandbox;
 
 MT_TEST(local_executor_echo) {
     std::unique_ptr<Executor> ex = MakeLocalExecutor();
-    ProcessOpts opts;
-    opts.argv.push_back("/bin/echo");
-    opts.argv.push_back("hello");
-    opts.argv.push_back("world");
-    auto r = ex->Run(opts);
+    std::vector<std::string> args;
+    args.push_back("hello");
+    args.push_back("world");
+    auto r = ex->RunCommand("/bin/echo", args);
     MT_EXPECT_TRUE(r.ok());
     MT_EXPECT_EQ(r.value().exit_code, 0);
     MT_EXPECT_TRUE(r.value().stdout_data == "hello world\n");
@@ -21,22 +25,20 @@ MT_TEST(local_executor_echo) {
 
 MT_TEST(local_executor_exit_code) {
     std::unique_ptr<Executor> ex = MakeLocalExecutor();
-    ProcessOpts opts;
-    opts.argv.push_back("/bin/sh");
-    opts.argv.push_back("-c");
-    opts.argv.push_back("exit 7");
-    auto r = ex->Run(opts);
+    std::vector<std::string> args;
+    args.push_back("-c");
+    args.push_back("exit 7");
+    auto r = ex->RunCommand("/bin/sh", args);
     MT_EXPECT_TRUE(r.ok());
     MT_EXPECT_EQ(r.value().exit_code, 7);
 }
 
 MT_TEST(local_executor_stderr_capture) {
     std::unique_ptr<Executor> ex = MakeLocalExecutor();
-    ProcessOpts opts;
-    opts.argv.push_back("/bin/sh");
-    opts.argv.push_back("-c");
-    opts.argv.push_back("echo oops 1>&2");
-    auto r = ex->Run(opts);
+    std::vector<std::string> args;
+    args.push_back("-c");
+    args.push_back("echo oops 1>&2");
+    auto r = ex->RunCommand("/bin/sh", args);
     MT_EXPECT_TRUE(r.ok());
     MT_EXPECT_TRUE(r.value().stderr_data == "oops\n");
     MT_EXPECT_TRUE(r.value().stdout_data.empty());
@@ -45,9 +47,8 @@ MT_TEST(local_executor_stderr_capture) {
 MT_TEST(local_executor_cwd) {
     std::unique_ptr<Executor> ex = MakeLocalExecutor();
     ProcessOpts opts;
-    opts.argv.push_back("/bin/pwd");
-    opts.cwd = "/tmp";
-    auto r = ex->Run(opts);
+    opts.WithCwd("/tmp");
+    auto r = ex->RunCommandWithOpts("/bin/pwd", std::vector<std::string>(), opts);
     MT_EXPECT_TRUE(r.ok());
     // /tmp may be a symlink on some systems; accept prefix match.
     MT_EXPECT_TRUE(r.value().stdout_data.find("/tmp") != std::string::npos);
@@ -55,31 +56,41 @@ MT_TEST(local_executor_cwd) {
 
 MT_TEST(local_executor_env) {
     std::unique_ptr<Executor> ex = MakeLocalExecutor();
+    std::vector<std::string> args;
+    args.push_back("-c");
+    args.push_back("echo $AENV_TEST_VAR");
     ProcessOpts opts;
-    opts.argv.push_back("/bin/sh");
-    opts.argv.push_back("-c");
-    opts.argv.push_back("echo $AENV_TEST_VAR");
-    opts.env_vars.push_back("AENV_TEST_VAR=xyz123");
-    auto r = ex->Run(opts);
+    std::map<std::string, std::string> envs;
+    envs["AENV_TEST_VAR"] = "xyz123";
+    opts.WithEnvs(envs);
+    auto r = ex->RunCommandWithOpts("/bin/sh", args, opts);
     MT_EXPECT_TRUE(r.ok());
     MT_EXPECT_TRUE(r.value().stdout_data == "xyz123\n");
 }
 
 MT_TEST(local_executor_timeout) {
     std::unique_ptr<Executor> ex = MakeLocalExecutor();
+    std::vector<std::string> args;
+    args.push_back("10");
     ProcessOpts opts;
-    opts.argv.push_back("/bin/sleep");
-    opts.argv.push_back("10");
-    opts.timeout_sec = 1;
-    auto r = ex->Run(opts);
+    opts.WithTimeoutMs(1000);
+    auto r = ex->RunCommandWithOpts("/bin/sleep", args, opts);
     MT_EXPECT_TRUE(!r.ok());  // timed out -> error
 }
 
-MT_TEST(local_executor_empty_argv) {
+MT_TEST(local_executor_empty_command) {
     std::unique_ptr<Executor> ex = MakeLocalExecutor();
-    ProcessOpts opts;
-    auto r = ex->Run(opts);
+    auto r = ex->RunCommand("", std::vector<std::string>());
     MT_EXPECT_TRUE(!r.ok());
+}
+
+MT_TEST(local_executor_create_dir_all) {
+    std::unique_ptr<Executor> ex = MakeLocalExecutor();
+    const std::string dir = "/tmp/agentenv-exec-mkdir/nested/deep";
+    MT_EXPECT_TRUE(ex->CreateDirAll(dir).ok());
+    // An already-existing directory is not an error.
+    MT_EXPECT_TRUE(ex->CreateDirAll(dir).ok());
+    agentenv::core::fs::RemoveDirAll("/tmp/agentenv-exec-mkdir");
 }
 
 // ---- NetworkAddressPlan (address_plan.rs) ----
