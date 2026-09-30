@@ -24,6 +24,8 @@ agentenv_add_test(test_template_spec       test_template_spec.cc       agentenv-
 agentenv_add_test(test_template_step_executor test_template_step_executor.cc agentenv-template)
 # Rust: src/template/builder.rs
 agentenv_add_test(test_template_builder    test_template_builder.cc    agentenv-template)
+# Rust: src/template/runner.rs
+agentenv_add_test(test_template_runner     test_template_runner.cc     agentenv-template)
 agentenv_add_test(test_secrets             test_secrets.cc             agentenv-rootmod)
 agentenv_add_test(test_local_store         test_local_store.cc         agentenv-rootmod)
 agentenv_add_test(test_setup               test_setup.cc               agentenv-rootmod)
