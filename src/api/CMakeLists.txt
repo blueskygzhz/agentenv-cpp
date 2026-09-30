@@ -14,6 +14,8 @@ add_library(agentenv-api STATIC
     admin.cc
     # Rust: src/api/impls/volumes.rs
     volumes.cc
+    # Rust: src/api/impls/template_helpers.rs
+    template_helpers.cc
 )
 target_include_directories(agentenv-api PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # Note: api depends on orchestrator (via impls.cc). Kept as PUBLIC so downstream
@@ -29,4 +31,6 @@ target_link_libraries(agentenv-api PUBLIC
     agentenv-observability-node
     # `volumes` resolves mount declarations through the VolumeManager.
     agentenv-volume
+    # `template_helpers` builds a TemplateBuildSpec from the request DTOs.
+    agentenv-template
 )
