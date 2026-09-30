@@ -84,6 +84,7 @@ class ImageCacheHoldOwner {
     bool operator==(const ImageCacheHoldOwner& o) const {
         return namespace_ == o.namespace_ && key_ == o.key_;
     }
+    bool operator!=(const ImageCacheHoldOwner& o) const { return !(*this == o); }
  bool operator<(const ImageCacheHoldOwner& o) const {
         return namespace_ != o.namespace_ ? namespace_ < o.namespace_
 : key_ < o.key_;

@@ -340,5 +340,38 @@ uint16_t EffectiveEnvdPort(const orchestrator::SandboxMetadata& metadata,
     return configured_control_plane_port;
 }
 
+const char* const kEnvdStreamInputPath = "/process.Process/StreamInput";
+
+std::string StripProxyPrefix(const std::string& path) {
+    const std::string prefix(kProxyRoute);
+    // Not under the prefix: the caller is about to forward this to the
+    // sandbox, and passing an unstripped API path through would address the
+    // wrong thing. Rust's `strip_prefix(..).unwrap_or("")` says the same.
+    if (path.size() < prefix.size() || path.compare(0, prefix.size(), prefix) != 0) {
+        return std::string();
+    }
+    return path.substr(prefix.size());
+}
+
+bool IsEnvdStreamInputRequest(const std::string& method, const std::string& path) {
+    return method == "POST" && path == kEnvdStreamInputPath;
+}
+
+bool IsStreamClosedFailure(bool canceled_or_closed, const std::string& error_text) {
+    if (canceled_or_closed) return true;
+    // hyper-util keeps its ErrorKind private, so the rendered text is the only
+    // signal available for this case.
+    return error_text == "client error (SendRequest)";
+}
+
+bool IsBenignStreamInputDisconnect(const std::string& method, const std::string& path,
+                                   bool canceled_or_closed, const std::string& error_text) {
+    // Only StreamInput disconnects are benign. The same error on an ordinary
+    // request is a real failure, and treating it as benign would hide a
+    // broken sandbox.
+    if (!IsEnvdStreamInputRequest(method, path)) return false;
+    return IsStreamClosedFailure(canceled_or_closed, error_text);
+}
+
 }  // namespace api
 }  // namespace agentenv

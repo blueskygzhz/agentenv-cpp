@@ -16,6 +16,10 @@ add_library(agentenv-api STATIC
     volumes.cc
     # Rust: src/api/impls/template_helpers.rs
     template_helpers.cc
+    # Rust: src/api/impls/sandbox.rs (validation/projection helpers)
+    sandbox_params.cc
+    # Rust: src/api/impls/image_build.rs (session state + HEALTHCHECK)
+    image_build.cc
 )
 target_include_directories(agentenv-api PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # Note: api depends on orchestrator (via impls.cc). Kept as PUBLIC so downstream
@@ -33,4 +37,6 @@ target_link_libraries(agentenv-api PUBLIC
     agentenv-volume
     # `template_helpers` builds a TemplateBuildSpec from the request DTOs.
     agentenv-template
+    # `image_build` shell-quotes the rendered HEALTHCHECK command.
+    agentenv-shell-util
 )

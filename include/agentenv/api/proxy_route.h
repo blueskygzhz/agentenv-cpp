@@ -144,6 +144,45 @@ bool IsSandboxProxyRequest(const std::string& path, const HeaderMap& headers,
 uint16_t EffectiveEnvdPort(const orchestrator::SandboxMetadata& metadata,
                            uint16_t configured_control_plane_port);
 
+/// Rust `ENVD_STREAM_INPUT_PATH`.
+extern const char* const kEnvdStreamInputPath;
+
+/// Rust's proxy timeouts, in milliseconds. The upstream values differ between
+/// test and release builds (`#[cfg(test)]`); these are the release ones.
+const int64_t kProxyConnectTimeoutMs = 5 * 1000;
+const int64_t kProxyResponseHeaderTimeoutMs = 30 * 1000;
+const int64_t kProxyRequestBodyIdleTimeoutMs = 30 * 1000;
+const int64_t kProxyAutoResumeTimeoutMs = 60 * 1000;
+
+/// Rust `strip_proxy_prefix`.
+///
+/// A path that is not under the proxy prefix yields the empty string rather
+/// than itself: the caller is forwarding to the sandbox, and passing an
+/// unstripped API path through would address the wrong thing.
+std::string StripProxyPrefix(const std::string& path);
+
+/// Rust `is_envd_stream_input_request`.
+///
+/// StreamInput is envd's long-lived client-streaming attach endpoint, which is
+/// why its disconnects need separate treatment from an ordinary request's.
+bool IsEnvdStreamInputRequest(const std::string& method, const std::string& path);
+
+/// Rust `is_hyper_stream_closed` + `is_send_request_failure_text`, as a
+/// transport-independent classification.
+///
+/// `canceled_or_closed` is what hyper reports when the stream ended, and
+/// `error_text` covers the case hyper-util keeps private ("client error
+/// (SendRequest)"): for a long-lived attach request that means the upstream
+/// request channel was torn down while the client detached or envd paused.
+bool IsStreamClosedFailure(bool canceled_or_closed, const std::string& error_text);
+
+/// Rust `is_benign_stream_input_disconnect`.
+///
+/// Only StreamInput disconnects are benign. The same error on a normal request
+/// is a real failure, and reporting it as benign would hide a broken sandbox.
+bool IsBenignStreamInputDisconnect(const std::string& method, const std::string& path,
+                                   bool canceled_or_closed, const std::string& error_text);
+
 }  // namespace api
 }  // namespace agentenv
 #endif  // AGENTENV_API_PROXY_ROUTE_H_

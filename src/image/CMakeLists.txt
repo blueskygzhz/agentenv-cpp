@@ -10,6 +10,8 @@ add_library(agentenv-image STATIC
     cache_metadata_store.cc
     # Rust: the deleting-GC engine in src/image/cache/service.rs.
     cache_gc.cc
+    # Rust: src/image/cache/service.rs (operation-hold lifecycle)
+    cache_hold.cc
 )
 target_include_directories(agentenv-image PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-image PUBLIC

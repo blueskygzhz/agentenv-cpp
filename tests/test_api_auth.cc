@@ -474,4 +474,67 @@ MT_TEST(auth_is_sandbox_proxy_request_classification) {
     MT_EXPECT_TRUE(!IsSandboxProxyRequest("/sandboxes", none, domains, false));
 }
 
+// ---- proxy forwarding helpers (Rust: src/api/proxy.rs) ---------------------
+
+MT_TEST(proxy_strip_prefix_yields_the_forwarded_path) {
+    MT_EXPECT_EQ(StripProxyPrefix("/proxy/process.Process/StreamInput"),
+                 std::string("/process.Process/StreamInput"));
+    // The bare prefix forwards to the sandbox root.
+    MT_EXPECT_EQ(StripProxyPrefix("/proxy"), std::string(""));
+    MT_EXPECT_EQ(StripProxyPrefix("/proxy/"), std::string("/"));
+}
+
+MT_TEST(proxy_strip_prefix_discards_a_non_proxy_path) {
+    // Not under the prefix: passing an unstripped API path through would
+    // address the wrong thing on the sandbox, so it yields nothing.
+    MT_EXPECT_EQ(StripProxyPrefix("/sandboxes"), std::string(""));
+    MT_EXPECT_EQ(StripProxyPrefix("/"), std::string(""));
+    MT_EXPECT_EQ(StripProxyPrefix(""), std::string(""));
+}
+
+MT_TEST(proxy_identifies_the_envd_stream_input_request) {
+    MT_EXPECT_TRUE(IsEnvdStreamInputRequest("POST", kEnvdStreamInputPath));
+    // Method and path must both match: a GET on the same path is not the
+    // long-lived attach request.
+    MT_EXPECT_TRUE(!IsEnvdStreamInputRequest("GET", kEnvdStreamInputPath));
+    MT_EXPECT_TRUE(!IsEnvdStreamInputRequest("POST", "/process.Process/Start"));
+    // Case-sensitive, matching Rust's comparison against `Method::POST`.
+    MT_EXPECT_TRUE(!IsEnvdStreamInputRequest("post", kEnvdStreamInputPath));
+}
+
+MT_TEST(proxy_stream_closed_failure_classification) {
+    // What hyper reports when the stream ended.
+    MT_EXPECT_TRUE(IsStreamClosedFailure(true, "anything"));
+    // hyper-util keeps its ErrorKind private, so this exact text is the only
+    // available signal for a torn-down request channel.
+    MT_EXPECT_TRUE(IsStreamClosedFailure(false, "client error (SendRequest)"));
+    // Anything else is a genuine transport failure.
+    MT_EXPECT_TRUE(!IsStreamClosedFailure(false, "client error (Connect)"));
+    MT_EXPECT_TRUE(!IsStreamClosedFailure(false, ""));
+}
+
+MT_TEST(proxy_benign_disconnect_is_limited_to_stream_input) {
+    // A detaching client on the attach endpoint is expected, not a failure.
+    MT_EXPECT_TRUE(
+        IsBenignStreamInputDisconnect("POST", kEnvdStreamInputPath, true, ""));
+    MT_EXPECT_TRUE(IsBenignStreamInputDisconnect("POST", kEnvdStreamInputPath, false,
+                                                 "client error (SendRequest)"));
+
+    // The same error on an ordinary request is a real failure; treating it as
+    // benign would hide a broken sandbox.
+    MT_EXPECT_TRUE(!IsBenignStreamInputDisconnect("POST", "/process.Process/Start", true, ""));
+    MT_EXPECT_TRUE(!IsBenignStreamInputDisconnect("GET", kEnvdStreamInputPath, true, ""));
+    // And an unrelated error on the attach endpoint still fails.
+    MT_EXPECT_TRUE(!IsBenignStreamInputDisconnect("POST", kEnvdStreamInputPath, false,
+                                                  "client error (Connect)"));
+}
+
+MT_TEST(proxy_timeouts_are_ordered_sensibly) {
+    // Connecting must not be allowed to consume the whole response budget,
+    // and an auto-resume legitimately outlasts a single response.
+    MT_EXPECT_TRUE(kProxyConnectTimeoutMs < kProxyResponseHeaderTimeoutMs);
+    MT_EXPECT_TRUE(kProxyResponseHeaderTimeoutMs <= kProxyAutoResumeTimeoutMs);
+    MT_EXPECT_TRUE(kProxyRequestBodyIdleTimeoutMs > 0);
+}
+
 int main() { return microtest::RunAll(); }

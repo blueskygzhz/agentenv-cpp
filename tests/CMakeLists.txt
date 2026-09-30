@@ -82,6 +82,14 @@ agentenv_add_test(test_api_admin          test_api_admin.cc           agentenv-a
 agentenv_add_test(test_api_volumes        test_api_volumes.cc         agentenv-api agentenv-volume)
 # Rust: src/api/impls/template_helpers.rs
 agentenv_add_test(test_api_template_helpers test_api_template_helpers.cc agentenv-api agentenv-template)
+# Rust: src/api/impls/sandbox.rs
+agentenv_add_test(test_api_sandbox_params  test_api_sandbox_params.cc  agentenv-api agentenv-sandbox)
+# Rust: src/sandbox/firecracker/overlaybd_snapshot.rs (dirty-page mapping)
+agentenv_add_test(test_firecracker_dirty_memory test_firecracker_dirty_memory.cc agentenv-sandbox)
+# Rust: src/api/impls/image_build.rs
+agentenv_add_test(test_api_image_build     test_api_image_build.cc     agentenv-api)
+# Rust: src/image/cache/service.rs (operation holds)
+agentenv_add_test(test_image_cache_hold    test_image_cache_hold.cc    agentenv-image)
 agentenv_add_test(test_posixfs_layout     test_posixfs_layout.cc      agentenv-snapshot)
 agentenv_add_test(test_snapshot_record    test_snapshot_record.cc     agentenv-snapshot agentenv-template)
 agentenv_add_test(test_posixfs_catalog    test_posixfs_catalog.cc     agentenv-snapshot agentenv-volume-record)

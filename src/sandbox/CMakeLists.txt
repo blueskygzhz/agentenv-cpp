@@ -20,6 +20,8 @@ add_library(agentenv-sandbox STATIC
     ublk.cc
     # firecracker sub-module (Rust: src/sandbox/firecracker/*.rs)
     firecracker/config.cc
+    # Rust: src/sandbox/firecracker/overlaybd_snapshot.rs (dirty-page mapping)
+    firecracker/dirty_memory.cc
     firecracker/socket.cc
     firecracker/instance.cc
     firecracker/mmds.cc
