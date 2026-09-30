@@ -55,7 +55,35 @@ class LocalProcessHandle : public ProcessHandle {
 
     int64_t Pid() const override { return static_cast<int64_t>(pid_); }
 
+    core::Expected<core::Optional<ProcessOutput>, std::string> TryWait() override {
+        if (reaped_) return core::Optional<ProcessOutput>(reaped_output_);
+
+        // WNOHANG is the whole point: a start command is *expected* to still
+        // be running, and blocking here would wedge the ready-check loop.
+        int status = 0;
+        const pid_t done = ::waitpid(pid_, &status, WNOHANG);
+        if (done == 0) return core::Optional<ProcessOutput>();
+        if (done < 0) {
+            return core::make_unexpected(std::string("waitpid failed: ") +
+                                         std::strerror(errno));
+        }
+
+        ProcessOutput out;
+        // Drain whatever the process left behind; it has exited, so the pipes
+        // will not fill again and a short non-blocking read is enough.
+        set_nonblock(out_fd_);
+        set_nonblock(err_fd_);
+        DrainInto(out_fd_, &out.stdout_data);
+        DrainInto(err_fd_, &out.stderr_data);
+        out.exit_code = ExitCodeFrom(status);
+
+        reaped_        = true;
+        reaped_output_ = out;
+        return core::Optional<ProcessOutput>(out);
+    }
+
     core::Expected<ProcessOutput, std::string> Wait() override {
+        if (reaped_) return reaped_output_;
         ProcessOutput out;
         set_nonblock(out_fd_);
         set_nonblock(err_fd_);
@@ -116,13 +144,9 @@ class LocalProcessHandle : public ProcessHandle {
         if (timed_out) {
             return core::make_unexpected(std::string("process timed out"));
         }
-        if (WIFEXITED(status)) {
-            out.exit_code = WEXITSTATUS(status);
-        } else if (WIFSIGNALED(status)) {
-            out.exit_code = 128 + WTERMSIG(status);
-        } else {
-            out.exit_code = -1;
-        }
+        out.exit_code  = ExitCodeFrom(status);
+        reaped_        = true;
+        reaped_output_ = out;
         return out;
     }
 
@@ -134,15 +158,55 @@ class LocalProcessHandle : public ProcessHandle {
     }
 
  private:
+    static int32_t ExitCodeFrom(int status) {
+        if (WIFEXITED(status)) return WEXITSTATUS(status);
+        // Shell convention, so a signalled process is distinguishable from an
+        // ordinary non-zero exit.
+        if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+        return -1;
+    }
+
+    static void DrainInto(int fd, std::string* sink) {
+        if (fd < 0) return;
+        char buf[8192];
+        for (;;) {
+            const ssize_t n = ::read(fd, buf, sizeof(buf));
+            if (n <= 0) break;
+            if (sink->size() + static_cast<size_t>(n) > kMaxOutputBytes) break;
+            sink->append(buf, static_cast<size_t>(n));
+        }
+    }
+
     pid_t   pid_;
     int     out_fd_;
     int     err_fd_;
     int32_t timeout_sec_;
+    /// Once reaped, the result is remembered: `waitpid` on an already-reaped
+    /// pid would fail, and both `Wait` and `TryWait` may be called more than
+    /// once on the same handle.
+    bool          reaped_ = false;
+    ProcessOutput reaped_output_;
 };
 
 class LocalExecutor : public Executor {
  public:
     core::Expected<ProcessOutput, std::string> RunCommandWithOpts(
+        const std::string& cmd, const std::vector<std::string>& args,
+        const ProcessOpts& opts) override {
+        core::Expected<std::unique_ptr<ProcessHandle>, std::string> handle =
+            StartProcess(cmd, args, opts);
+        if (!handle.ok()) return core::make_unexpected(handle.error());
+        return handle.value()->Wait();
+    }
+
+    core::Expected<core::Unit, std::string> CreateDirAll(const std::string& path) override {
+        // Upstream this is an envd filesystem RPC so it works in images with
+        // no userland; the host-local executor uses the host filesystem for
+        // the same reason — no `mkdir` binary is required.
+        return core::fs::CreateDirAll(path);
+    }
+
+    core::Expected<std::unique_ptr<ProcessHandle>, std::string> StartProcess(
         const std::string& cmd, const std::vector<std::string>& args,
         const ProcessOpts& opts) override {
         if (cmd.empty()) {
@@ -207,18 +271,12 @@ class LocalExecutor : public Executor {
             opts.timeout_ms.has_value()
                 ? static_cast<int32_t>((*opts.timeout_ms + 999) / 1000)
                 : 0;
-        LocalProcessHandle handle(pid, out_pipe[0], err_pipe[0], timeout_sec);
-        // Handle owns the read fds now.
+        // The handle owns the read fds from here on.
+        std::unique_ptr<ProcessHandle> handle(
+            new LocalProcessHandle(pid, out_pipe[0], err_pipe[0], timeout_sec));
         out_pipe[0] = -1;
         err_pipe[0] = -1;
-        return handle.Wait();
-    }
-
-    core::Expected<core::Unit, std::string> CreateDirAll(const std::string& path) override {
-        // Upstream this is an envd filesystem RPC so it works in images with
-        // no userland; the host-local executor uses the host filesystem for
-        // the same reason — no `mkdir` binary is required.
-        return core::fs::CreateDirAll(path);
+        return std::move(handle);
     }
 };
 

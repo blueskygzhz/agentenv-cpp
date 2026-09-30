@@ -51,6 +51,13 @@ class ProcessHandle {
     virtual int64_t Pid() const = 0;
     virtual core::Expected<ProcessOutput, std::string> Wait() = 0;
     virtual core::Expected<core::Unit, std::string> Kill(int signal) = 0;
+
+    /// Has the process already exited?
+    ///
+    /// Rust expresses this as `tokio::time::timeout(1ms, handle.wait())` — a
+    /// `wait` that is not allowed to actually wait. An absent result means
+    /// "still running", which is the expected state for a start command.
+    virtual core::Expected<core::Optional<ProcessOutput>, std::string> TryWait() = 0;
 };
 
 /// Rust `Executor` — the process-execution surface the build pipeline uses.
@@ -74,6 +81,13 @@ class Executor {
     /// it works in images that ship no userland (scratch, distroless). An
     /// already-existing directory is not an error.
     virtual core::Expected<core::Unit, std::string> CreateDirAll(const std::string& path) = 0;
+
+    /// Rust `Executor::start_process` — spawns without waiting, returning a
+    /// handle. Used for a template's start command, which is expected to keep
+    /// running while the ready command polls it.
+    virtual core::Expected<std::unique_ptr<ProcessHandle>, std::string> StartProcess(
+        const std::string& cmd, const std::vector<std::string>& args,
+        const ProcessOpts& opts) = 0;
 
     /// Rust `Executor::run_command` — a non-virtual convenience over
     /// `RunCommandWithOpts` with default options, matching the Rust default

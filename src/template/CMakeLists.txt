@@ -4,6 +4,8 @@ add_library(agentenv-template STATIC
     build_spec.cc
     # Rust: src/template/step_executor.rs
     step_executor.cc
+    # Rust: src/template/builder.rs (preparation/validation half)
+    builder.cc
 )
 target_include_directories(agentenv-template PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # `snapshot` supplies SnapshotAlias / CommandContext / TemplateBuildErrorReason
