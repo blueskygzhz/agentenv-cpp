@@ -54,6 +54,14 @@ class RecordingSandbox : public sandbox::Executor {
         return core::make_unexpected(std::string("permission denied"));
     }
 
+    /// No build step starts a long-running process; Rust's equivalent double
+    /// returns an error here for the same reason.
+    core::Expected<std::unique_ptr<sandbox::ProcessHandle>, std::string> StartProcess(
+        const std::string&, const std::vector<std::string>&,
+        const sandbox::ProcessOpts&) override {
+        return core::make_unexpected(std::string("not used"));
+    }
+
     const std::vector<RecordedCall>& calls() const { return calls_; }
     const std::map<std::string, std::string>& last_envs() const { return last_envs_; }
 

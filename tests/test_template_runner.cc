@@ -89,6 +89,7 @@ class ScriptedExecutor : public sandbox::Executor {
         call.envs       = opts.envs;
         call.timeout_ms = opts.timeout_ms;
         calls_.push_back(call);
+        if (clock_ != NULL && per_call_ms_ > 0) clock_->SleepMs(per_call_ms_);
 
         const ScriptedReply reply = NextReply();
         if (reply.fail) return core::make_unexpected(std::string("executor failed"));
@@ -117,6 +118,13 @@ class ScriptedExecutor : public sandbox::Executor {
         return std::move(handle);
     }
 
+    /// Makes each command consume time, so the post-command deadline check
+    /// can be reached (the real executor consumes time too).
+    void ConsumeTimePerCall(RunnerClock* clock, int64_t ms) {
+        clock_      = clock;
+        per_call_ms_ = ms;
+    }
+
     void Push(const ScriptedReply& reply) { replies_.push_back(reply); }
     void PushExit(int32_t code) {
         ScriptedReply reply;
@@ -141,6 +149,8 @@ class ScriptedExecutor : public sandbox::Executor {
         return reply;
     }
 
+    RunnerClock* clock_       = NULL;
+    int64_t      per_call_ms_  = 0;
     std::vector<ScriptedReply> replies_;
     std::size_t                next_ = 0;
     bool                       fail_start_ = false;
@@ -535,7 +545,7 @@ MT_TEST(runner_ready_command_retries_through_executor_errors) {
     MT_EXPECT_EQ(sandbox.calls().size(), static_cast<std::size_t>(2));
 }
 
-MT_TEST(runner_ready_command_times_out) {
+MT_TEST(runner_ready_command_times_out_at_the_top_of_the_loop) {
     ScriptedExecutor sandbox;
     sandbox.PushExit(1);  // repeats once exhausted
     FakeClock clock;
@@ -547,10 +557,47 @@ MT_TEST(runner_ready_command_times_out) {
     MT_EXPECT_TRUE(!ready.ok());
     MT_EXPECT_TRUE(ready.error().reason.message.find("ready command timed out") !=
                    std::string::npos);
-    // The last attempt's exit code is reported, so the operator sees why.
-    MT_EXPECT_TRUE(ready.error().reason.message.find("exit_code=1") != std::string::npos);
     // The loop honoured the deadline rather than spinning forever.
     MT_EXPECT_TRUE(clock.NowMs() >= kReadyTimeoutMs);
+    // Bounded number of attempts: one per retry interval, not a spin.
+    MT_EXPECT_TRUE(sandbox.calls().size() <=
+                   static_cast<std::size_t>(kReadyTimeoutMs / kReadyRetryIntervalMs) + 1);
+}
+
+MT_TEST(runner_ready_command_timeout_reports_the_last_exit_code) {
+    ScriptedExecutor sandbox;
+    FakeClock clock;
+    // A command that itself consumes the remaining time reaches the
+    // post-command deadline check, which is the path that can name the exit
+    // code the caller actually saw.
+    sandbox.ConsumeTimePerCall(&clock, kReadyTimeoutMs + 1);
+    sandbox.PushExit(3);
+
+    const StartupCommand startup = MakeStartup("", "test -f /ready");
+    core::Optional<sandbox::ProcessHandle*> handle;
+    const core::Expected<core::Unit, TemplateBuildFailure> ready =
+        RunReadyCommand(&sandbox, startup, &handle, &clock);
+    MT_EXPECT_TRUE(!ready.ok());
+    MT_EXPECT_TRUE(ready.error().reason.message.find("ready command timed out") !=
+                   std::string::npos);
+    // The exit code is what tells the operator why it never became ready.
+    MT_EXPECT_TRUE(ready.error().reason.message.find("exit_code=3") != std::string::npos);
+    MT_EXPECT_EQ(sandbox.calls().size(), static_cast<std::size_t>(1));
+}
+
+MT_TEST(runner_ready_command_timeout_after_an_executor_error_omits_an_exit_code) {
+    ScriptedExecutor sandbox;
+    FakeClock clock;
+    sandbox.ConsumeTimePerCall(&clock, kReadyTimeoutMs + 1);
+    sandbox.PushFailure();
+
+    const StartupCommand startup = MakeStartup("", "test -f /ready");
+    core::Optional<sandbox::ProcessHandle*> handle;
+    const core::Expected<core::Unit, TemplateBuildFailure> ready =
+        RunReadyCommand(&sandbox, startup, &handle, &clock);
+    MT_EXPECT_TRUE(!ready.ok());
+    // There was no exit code to report: the command never ran.
+    MT_EXPECT_TRUE(ready.error().reason.message.find("exit_code") == std::string::npos);
 }
 
 MT_TEST(runner_ready_command_never_sleeps_past_the_deadline) {
