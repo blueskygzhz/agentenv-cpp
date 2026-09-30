@@ -335,5 +335,43 @@ bool ExtraDrivePrepareMode::AllowShrink() const {
     return kind == Kind::Fresh ? allow_shrink : false;
 }
 
+namespace {
+
+/// Splits an absolute path into components, dropping empty ones so a doubled
+/// separator does not create a phantom component.
+std::vector<std::string> MountPathComponents(const std::string& path) {
+    std::vector<std::string> components;
+    std::size_t begin = 0;
+    while (begin < path.size()) {
+        const std::size_t end = path.find('/', begin);
+        const std::string component =
+            end == std::string::npos ? path.substr(begin) : path.substr(begin, end - begin);
+        if (!component.empty()) components.push_back(component);
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+    return components;
+}
+
+/// Rust `Path::starts_with` — component-wise, not a raw string prefix.
+bool ComponentsStartWith(const std::vector<std::string>& path,
+                         const std::vector<std::string>& prefix) {
+    if (prefix.size() > path.size()) return false;
+    for (std::size_t i = 0; i < prefix.size(); ++i) {
+        if (path[i] != prefix[i]) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+bool MountPathsOverlap(const std::string& a, const std::string& b) {
+    const std::vector<std::string> left  = MountPathComponents(a);
+    const std::vector<std::string> right = MountPathComponents(b);
+    // Either being a component-wise prefix of the other means one would shadow
+    // the other inside the guest.
+    return ComponentsStartWith(left, right) || ComponentsStartWith(right, left);
+}
+
 }  // namespace sandbox
 }  // namespace agentenv

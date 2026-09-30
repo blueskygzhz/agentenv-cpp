@@ -161,7 +161,13 @@ MT_TEST(unix_socket_http_roundtrip) {
 MT_TEST(unix_socket_connect_missing) {
     std::shared_ptr<Connector> conn = MakeUnixConnector();
     auto sock = conn->Connect("/tmp/agentenv_no_such.sock");
-    MT_EXPECT_TRUE(!sock.ok());
+    // `Connect` is lazy, matching Rust's infallible `UnixSocketClient::new`:
+    // no connection is attempted until a request needs one, so a missing
+    // socket surfaces on first use rather than here.
+    MT_EXPECT_TRUE(sock.ok());
+    auto resp = sock.value()->Request("GET", "/", "");
+    MT_EXPECT_TRUE(!resp.ok());
+    MT_EXPECT_TRUE(resp.error().find("connect") != std::string::npos);
 }
 
 // ---- FirecrackerBackend pre-boot validation ----

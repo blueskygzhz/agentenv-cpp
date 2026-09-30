@@ -122,6 +122,18 @@ core::Expected<std::string, std::string> NormalizeMountPathForDrive(
 /// for one mount point.
 core::Expected<std::string, std::string> NormalizeMountPath(const std::string& mount_path);
 
+/// Rust's `existing.starts_with(&p) || p.starts_with(existing)` guard, used
+/// wherever a set of mount paths must not shadow one another.
+///
+/// Component-wise, matching `Path::starts_with`: `/mnt/a` and `/mnt/ab` are
+/// siblings and may coexist, while `/mnt/a` and `/mnt/a/b` would shadow each
+/// other inside the guest. A raw string prefix would reject the first pair.
+///
+/// Lives here rather than at a call site because both volume mounts and
+/// Firecracker extra drives need the same rule, and the two disagreeing would
+/// let a request through one path that the other rejects.
+bool MountPathsOverlap(const std::string& a, const std::string& b);
+
 /// Rust `struct DriveMount`.
 struct DriveMount {
     std::string drive_id;

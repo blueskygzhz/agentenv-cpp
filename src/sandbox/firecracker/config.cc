@@ -6,11 +6,13 @@
 // dir resolution and the host-side config validation.
 #include "agentenv/sandbox/firecracker/config.h"
 #include "agentenv/sandbox/firecracker/manifest.h"
+#include "agentenv/sandbox/extra_drive.h"
 
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <set>
+#include <vector>
 
 namespace agentenv {
 namespace sandbox {
@@ -63,27 +65,49 @@ ValidateExtraDriveSet(const std::vector<ExtraDriveSpec>& drives, bool check_imag
         return core::make_unexpected(
             std::string("too many extra drives: at most 24 are supported (/dev/vdc..=/dev/vdz)"));
     }
+
     std::set<std::string> drive_ids;
-    std::set<std::string> mount_paths;
+    // Normalized before comparison, so `//a///b/.` and `/a/b` cannot both be
+    // accepted for one mount point.
+    std::vector<std::string> mount_paths;
+
     for (size_t i = 0; i < drives.size(); ++i) {
         const ExtraDriveSpec& d = drives[i];
-        if (!valid_drive_id(d.drive_id)) {
+
+        // The shared validator, not a local copy: a second spelling of the rule
+        // could drift from the one `ExtraDrive` itself enforces.
+        const core::Expected<core::Unit, std::string> id_valid = ValidateDriveId(d.drive_id);
+        if (!id_valid.ok()) {
             return core::make_unexpected(std::string("invalid extra drive id: ") + d.drive_id);
         }
         if (!drive_ids.insert(d.drive_id).second) {
             return core::make_unexpected(std::string("duplicate extra drive id: ") + d.drive_id);
         }
-        if (!valid_mount_path(d.mount_path)) {
-            return core::make_unexpected(std::string("invalid extra drive mount path: ") + d.mount_path);
+
+        const core::Expected<std::string, std::string> normalized =
+            NormalizeMountPath(d.mount_path);
+        if (!normalized.ok()) {
+            return core::make_unexpected(std::string("invalid extra drive mount path: ") +
+                                         d.mount_path);
         }
-        if (!mount_paths.insert(d.mount_path).second) {
-            return core::make_unexpected(std::string("duplicate extra drive mount path: ") + d.mount_path);
+        // Overlap, not just equality: `/mnt/a` and `/mnt/a/b` are distinct
+        // strings but would shadow each other inside the guest, leaving the
+        // nested drive unreachable.
+        for (size_t existing = 0; existing < mount_paths.size(); ++existing) {
+            if (MountPathsOverlap(mount_paths[existing], normalized.value())) {
+                return core::make_unexpected(
+                    std::string("overlapping extra drive mount path: ") + d.mount_path);
+            }
         }
+        mount_paths.push_back(normalized.value());
+
         if (d.has_virtual_size && d.virtual_size == 0) {
-            return core::make_unexpected(std::string("extra drive virtual size must be non-zero: ") + d.drive_id);
+            return core::make_unexpected(
+                std::string("extra drive virtual size must be non-zero: ") + d.drive_id);
         }
         if (check_image_exists && !path_exists(d.image_config_path)) {
-            return core::make_unexpected(std::string("overlaybd image config not found at") + d.image_config_path);
+            return core::make_unexpected(std::string("overlaybd image config not found at ") +
+                                         d.image_config_path);
         }
     }
     return core::Unit{};

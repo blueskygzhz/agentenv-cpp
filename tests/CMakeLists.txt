@@ -84,6 +84,8 @@ agentenv_add_test(test_api_volumes        test_api_volumes.cc         agentenv-a
 agentenv_add_test(test_api_template_helpers test_api_template_helpers.cc agentenv-api agentenv-template)
 # Rust: src/api/impls/sandbox.rs
 agentenv_add_test(test_api_sandbox_params  test_api_sandbox_params.cc  agentenv-api agentenv-sandbox)
+# Rust: hyper / hyper-util legacy Client (HTTP over AF_UNIX + TCP)
+agentenv_add_test(test_core_http           test_core_http.cc           agentenv-core agentenv-sandbox Threads::Threads)
 # Rust: src/sandbox/firecracker/overlaybd_snapshot.rs (dirty-page mapping)
 agentenv_add_test(test_firecracker_dirty_memory test_firecracker_dirty_memory.cc agentenv-sandbox)
 # Rust: src/api/impls/image_build.rs

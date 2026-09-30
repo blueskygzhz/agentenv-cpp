@@ -3,6 +3,8 @@ add_library(agentenv-core STATIC
     digest.cc
     logging.cc
     executor.cc
+    # Rust: hyper / hyper-util legacy Client
+    http.cc
     config.cc
     json.cc
     fs.cc
