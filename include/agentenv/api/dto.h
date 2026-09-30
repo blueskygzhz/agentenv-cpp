@@ -81,6 +81,23 @@ struct ErrorResp {
     core::Json ToJson() const;
 };
 
+/// Rust generated `models::Error` — the `{code, message}` body every handler
+/// returns on failure. `code` is the HTTP status, mirroring
+/// `models::Error::new(400, ...)` upstream.
+struct ApiError {
+    int         code = 500;
+    std::string message;
+
+    static ApiError Make(int code, const std::string& message);
+
+    bool operator==(const ApiError& o) const {
+        return code == o.code && message == o.message;
+    }
+    bool operator!=(const ApiError& o) const { return !(*this == o); }
+
+    core::Json ToJson() const;
+};
+
 }  // namespace api
 }  // namespace agentenv
 #endif  // AGENTENV_API_DTO_H_

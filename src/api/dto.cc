@@ -165,5 +165,19 @@ core::Json ErrorResp::ToJson() const {
     return j;
 }
 
+ApiError ApiError::Make(int code, const std::string& message) {
+    ApiError error;
+    error.code    = code;
+    error.message = message;
+    return error;
+}
+
+core::Json ApiError::ToJson() const {
+    core::Json j;
+    j["code"]    = core::Json(static_cast<int64_t>(code));
+    j["message"] = core::Json(message);
+    return j;
+}
+
 }  // namespace api
 }  // namespace agentenv

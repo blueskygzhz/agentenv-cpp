@@ -12,6 +12,8 @@ add_library(agentenv-api STATIC
     auth.cc
     # Rust: src/api/impls/admin.rs
     admin.cc
+    # Rust: src/api/impls/volumes.rs
+    volumes.cc
 )
 target_include_directories(agentenv-api PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # Note: api depends on orchestrator (via impls.cc). Kept as PUBLIC so downstream
@@ -25,4 +27,6 @@ target_link_libraries(agentenv-api PUBLIC
     agentenv-image
     # `admin` projects observability's NodeSnapshot into the API shapes.
     agentenv-observability-node
+    # `volumes` resolves mount declarations through the VolumeManager.
+    agentenv-volume
 )
