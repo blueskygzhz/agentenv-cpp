@@ -20,6 +20,8 @@ agentenv_add_test(test_toml                test_toml.cc                agentenv-
 agentenv_add_test(test_cfg                 test_cfg.cc                 agentenv-cfg)
 agentenv_add_test(test_volume              test_volume.cc              agentenv-volume)
 agentenv_add_test(test_template_spec       test_template_spec.cc       agentenv-template)
+# Rust: src/template/step_executor.rs
+agentenv_add_test(test_template_step_executor test_template_step_executor.cc agentenv-template)
 agentenv_add_test(test_secrets             test_secrets.cc             agentenv-rootmod)
 agentenv_add_test(test_local_store         test_local_store.cc         agentenv-rootmod)
 agentenv_add_test(test_setup               test_setup.cc               agentenv-rootmod)
