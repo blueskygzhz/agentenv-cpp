@@ -49,7 +49,13 @@ agentenv_add_test(test_image_reference     test_image_reference.cc     agentenv-
 agentenv_add_test(test_image_oci  test_image_oci.cc   agentenv-image)
 agentenv_add_test(test_image_commit_index  test_image_commit_index.cc  agentenv-image)
 agentenv_add_test(test_image_cache     test_image_cache.cc    agentenv-image)
+# Rust: the `ImageCacheMetadataStore` tests in src/image/cache/graph.rs.
+agentenv_add_test(test_image_cache_metadata_store test_image_cache_metadata_store.cc agentenv-image)
+# Rust: the deleting-GC tests in src/image/cache/service.rs.
+agentenv_add_test(test_image_cache_gc     test_image_cache_gc.cc      agentenv-image)
 agentenv_add_test(test_p2p                 test_p2p.cc                 agentenv-p2p)
+# Rust: the catalog tests in src/p2p/iroh/{catalog,endpoint}.rs.
+agentenv_add_test(test_p2p_catalog         test_p2p_catalog.cc         agentenv-p2p)
 agentenv_add_test(test_storage_util        test_storage_util.cc        agentenv-storage-util)
 agentenv_add_test(test_storage_overlaybd   test_storage_overlaybd.cc   agentenv-overlaybd agentenv-ublk)
 agentenv_add_test(test_lsmt                test_lsmt.cc                agentenv-overlaybd)
@@ -65,6 +71,8 @@ agentenv_add_test(test_snapshot_record    test_snapshot_record.cc     agentenv-s
 agentenv_add_test(test_posixfs_catalog    test_posixfs_catalog.cc     agentenv-snapshot agentenv-volume-record)
 agentenv_add_test(test_posixfs_artifacts  test_posixfs_artifacts.cc   agentenv-snapshot agentenv-overlaybd)
 agentenv_add_test(test_artifact_cache     test_artifact_cache.cc      agentenv-snapshot)
+# Rust: the `SnapshotP2pArtifact` tests in src/snapshot/p2p.rs.
+agentenv_add_test(test_snapshot_p2p       test_snapshot_p2p.cc        agentenv-snapshot)
 agentenv_add_test(test_image_export_target test_image_export_target.cc agentenv-snapshot)
 agentenv_add_test(test_observability_host test_observability_host.cc agentenv-observability-node)
 agentenv_add_test(test_observability_prometheus test_observability_prometheus.cc agentenv-observability-node)

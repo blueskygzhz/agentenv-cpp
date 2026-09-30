@@ -232,6 +232,17 @@ class SandboxBackendFactory {
         BuildFromPausedState(const core::SandboxId& id,
                              const PausedSandboxState& state,
                              const core::Optional<EnvdAccessToken>& token) = 0;
+
+    /// Rust `decode_paused_state` — rebuilds the backend-specific paused state
+    /// from what `PausedSandboxState::Encode` produced, so a persisted record
+    /// can be resumed after a restart.
+    ///
+    /// `artifact_root` is the directory the persister allocated for this
+    /// sandbox; a backend that stores paths relative to it resolves them here.
+    /// `state` is the encoded JSON payload.
+    virtual core::Expected<std::shared_ptr<PausedSandboxState>, core::AnyError>
+        DecodePausedState(const std::string& artifact_root,
+                          const std::string& state) = 0;
 };
 
 // ---------------------------------------------------------------------------

@@ -38,4 +38,8 @@ target_link_libraries(agentenv-snapshot PUBLIC
     agentenv-volume-record
     # `CommittedSnapshot` carries an `ImageConfigs`.
     agentenv-template-image-configs
+    # `snapshot/p2p` keys overlaybd layers by digest/uuid and reads the layer
+    # trailer + image config to decide what is publishable.
+    agentenv-overlaybd-p2p
+    agentenv-overlaybd
 )

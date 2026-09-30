@@ -7,6 +7,7 @@
 
 #include "agentenv/core/fs.h"
 #include "agentenv/core/json.h"
+#include "agentenv/core/logging.h"
 #include "agentenv/local_store.h"
 #include "agentenv/sandbox/backend.h"
 
@@ -75,7 +76,7 @@ std::string SandboxPersistenceError::Message() const {
 // ---- DisabledSandboxPersister ----------------------------------------------
 
 PersistenceResult<std::vector<SandboxMetadata> >
-DisabledSandboxPersister::LoadAll() {
+DisabledSandboxPersister::LoadAll(sandbox::SandboxBackendFactory*) {
     return std::vector<SandboxMetadata>();
 }
 
@@ -213,14 +214,8 @@ class FileBackedSandboxPersister : public SandboxPersister {
         : root_(root), virtualization_mode_(mode), durability_(durability) {}
 
     /// Rust `load_all`.
-    ///
-    /// The Rust signature takes a `SandboxBackendFactory` and calls
-    /// `decode_paused_state` to rebuild the runtime handle. The C++ factory
-    /// has no such method, so the metadata is restored without
-    /// `paused_state`, matching Rust's
-    /// `into_metadata_without_runtime_state` path. Callers that need the
-    /// runtime handle re-derive it from `artifact_root` + `state`.
-    PersistenceResult<std::vector<SandboxMetadata> > LoadAll() override {
+    PersistenceResult<std::vector<SandboxMetadata> >
+    LoadAll(sandbox::SandboxBackendFactory* factory) override {
         core::Expected<std::shared_ptr<local_store::KvStore>, std::string> db = Db();
         if (!db.ok()) {
             return core::make_unexpected(
@@ -267,10 +262,36 @@ class FileBackedSandboxPersister : public SandboxPersister {
                 continue;
             }
 
-            // Rust keeps the metadata visible but not resumable when the
-            // node's virtualization mode differs.
             record.metadata.state = SandboxState::Paused;
             record.metadata.paused_state.reset();
+
+            // Rust keeps a record from another virtualization mode visible but
+            // not resumable: the metadata is loaded without runtime state so
+            // the sandbox can still be listed and deleted.
+            if (record.metadata.virtualization_mode != virtualization_mode_) {
+                AGENTENV_WARN("loading paused sandbox metadata without resumable runtime "
+                              "state because its virtualization mode is incompatible: " +
+                              sandbox_id);
+                retained.insert(sandbox_id);
+                sandboxes.push_back(record.metadata);
+                continue;
+            }
+
+            if (factory != NULL) {
+                core::Expected<std::shared_ptr<sandbox::PausedSandboxState>, core::AnyError>
+                    decoded = factory->DecodePausedState(record.artifact_root, record.state);
+                if (!decoded.ok()) {
+                    // Rust discards a record it cannot decode, together with
+                    // its artifacts: keeping it would strand disk space behind
+                    // a sandbox that can never be resumed.
+                    AGENTENV_WARN("discarding unusable paused sandbox record " + sandbox_id +
+                                  ": " + decoded.error().chain());
+                    PersistenceResult<core::Unit> cleanup = CleanupInvalidRecord(sandbox_id);
+                    if (!cleanup.ok()) return core::make_unexpected(cleanup.error());
+                    continue;
+                }
+                record.metadata.paused_state = decoded.value();
+            }
 
             retained.insert(sandbox_id);
             sandboxes.push_back(record.metadata);

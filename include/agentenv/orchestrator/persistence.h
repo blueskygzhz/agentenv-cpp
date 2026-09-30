@@ -13,6 +13,11 @@
 #include "agentenv/orchestrator/store.h"
 
 namespace agentenv {
+namespace sandbox {
+/// Defined in agentenv/sandbox/backend.h. Only used through a pointer here.
+class SandboxBackendFactory;
+}  // namespace sandbox
+
 namespace orchestrator {
 
 /// Rust enum `SandboxPersistenceError` (persistence/mod.rs).
@@ -46,14 +51,21 @@ using PersistenceResult = core::Expected<T, SandboxPersistenceError>;
 
 /// Rust trait `SandboxPersister` (persistence/mod.rs).
 ///
-/// The Rust trait is generic over `SandboxBackendFactory` in `load_all`; the
-/// factory is not yet ported, so the C++ signature drops that parameter.
+/// Rust makes `load_all` generic over `SandboxBackendFactory`; C++ takes the
+/// factory as an ordinary pointer because a virtual function cannot be
+/// templated. Passing null skips runtime-state decoding, which is what a
+/// caller that only wants the metadata does.
 class SandboxPersister {
  public:
     virtual ~SandboxPersister() {}
 
     /// Rust `load_all` — every persisted sandbox record from the last run.
-    virtual PersistenceResult<std::vector<SandboxMetadata> > LoadAll() = 0;
+    ///
+    /// The factory rebuilds each record's `paused_state` from its encoded
+    /// payload. A record whose state cannot be decoded is unusable, so it is
+    /// dropped along with its artifacts rather than surfaced as an error.
+    virtual PersistenceResult<std::vector<SandboxMetadata> >
+        LoadAll(sandbox::SandboxBackendFactory* factory) = 0;
 
     /// Rust `allocate_artifact_root` — an unset result means persistence is
     /// disabled and the backend owns its temporary artifacts' lifecycle.
@@ -85,7 +97,8 @@ class SandboxPersister {
 /// `load_all` yields nothing.
 class DisabledSandboxPersister : public SandboxPersister {
  public:
-    PersistenceResult<std::vector<SandboxMetadata> > LoadAll() override;
+    PersistenceResult<std::vector<SandboxMetadata> >
+        LoadAll(sandbox::SandboxBackendFactory* factory) override;
     PersistenceResult<core::Optional<std::string> >
         AllocateArtifactRoot(const core::SandboxId& id) override;
     PersistenceResult<core::Unit>

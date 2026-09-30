@@ -186,8 +186,28 @@ class FakeFactory : public sandbox::SandboxBackendFactory {
         ++build_from_paused_calls;
         return Make();
     }
+    core::Expected<std::shared_ptr<sandbox::PausedSandboxState>, core::AnyError>
+        DecodePausedState(const std::string&, const std::string&) override {
+        ++decode_paused_calls;
+        if (fail_decode) {
+            return core::make_unexpected(core::err("fake: decode refused"));
+        }
+        return std::shared_ptr<sandbox::PausedSandboxState>(new FakePausedState());
+    }
+
+    int  decode_paused_calls = 0;
+    bool fail_decode = false;
 
  private:
+    /// The minimum a persister round-trip needs: something that re-encodes.
+    class FakePausedState : public sandbox::PausedSandboxState {
+     public:
+        std::string Encode() const override { return "{}"; }
+        sandbox::RuntimeArtifactSet RuntimeArtifacts() const override {
+            return sandbox::RuntimeArtifactSet();
+        }
+    };
+
     core::Expected<std::unique_ptr<sandbox::SandboxBackend>, core::AnyError> Make() {
         if (fail_build) {
             return core::make_unexpected(core::err("fake: build refused"));

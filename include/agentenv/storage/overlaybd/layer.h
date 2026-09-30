@@ -34,6 +34,28 @@ class LayerStack : public VirtualFile {
 
 std::unique_ptr<LayerStack> MakeLayerStack();
 
+// ---- layer_metadata.rs free functions --------------------------------------
+
+/// Rust `COMMIT_FILE_NAME` / `SEALED_FILE_NAME`. These are a naming
+/// convention rather than an implementation detail: anything that *writes* a
+/// layer must use one of them for the result to be findable from a
+/// `LayerConfig` that carries only a directory.
+extern const char* const kCommitFileName;
+extern const char* const kSealedFileName;
+
+/// Rust `read_overlaybd_layer_uuid`.
+///
+/// The uuid lives in the sealed trailer as a NUL-terminated ASCII string. Rust
+/// maps both "no uuid" and "unparseable uuid" onto `Uuid::nil()`, so callers
+/// only have to test for nil; this port keeps that, returning an empty string
+/// for the nil case. An unreadable or non-sealed file is an error, not nil.
+core::Expected<std::string, std::string>
+    ReadOverlaybdLayerUuid(const std::string& path);
+
+/// Rust `read_overlaybd_layer_virtual_size`.
+core::Expected<uint64_t, std::string>
+    ReadOverlaybdLayerVirtualSize(const std::string& path);
+
 }  // namespace overlaybd
 }  // namespace storage
 }  // namespace agentenv

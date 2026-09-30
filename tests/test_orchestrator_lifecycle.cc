@@ -425,8 +425,8 @@ MT_TEST(disabled_persister_is_inert) {
     DisabledSandboxPersister p;
     core::SandboxId id = core::SandboxId::Fresh();
 
-    MT_EXPECT_TRUE(p.LoadAll().ok());
-    MT_EXPECT_EQ(p.LoadAll().value().size(), static_cast<std::size_t>(0));
+    MT_EXPECT_TRUE(p.LoadAll(NULL).ok());
+    MT_EXPECT_EQ(p.LoadAll(NULL).value().size(), static_cast<std::size_t>(0));
 
     // Rust returns Ok(None): persistence disabled.
     core::Expected<core::Optional<std::string>, SandboxPersistenceError> root =
