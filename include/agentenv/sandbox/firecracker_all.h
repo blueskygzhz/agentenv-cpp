@@ -10,7 +10,7 @@
 
 #include "agentenv/sandbox/firecracker/config.h"     // Rust: config.rs
 #include "agentenv/sandbox/firecracker/socket.h"     // Rust: socket.rs / connector.rs
-#include "agentenv/sandbox/firecracker/manifest.h"   // Rust: manifest.rs / mmds.rs / overlaybd_snapshot.rs
+#include "agentenv/sandbox/firecracker/mmds.h"       // Rust: mmds.rs
 #include "agentenv/sandbox/firecracker/instance.h"   // Rust: instance.rs / process_vm_reader.rs
 #include "agentenv/sandbox/firecracker/pool.h"       // Rust: pool.rs / factory.rs
 #include "agentenv/sandbox/firecracker/sandbox.h"    // Rust: sandbox.rs (FirecrackerBackend)

@@ -2,7 +2,7 @@
 // Tests for firecracker::MmdsMetadata (SHA-512 + e2b JSON) and FirecrackerPool.
 #include "microtest.h"
 
-#include "agentenv/sandbox/firecracker/manifest.h"
+#include "agentenv/sandbox/firecracker/mmds.h"
 #include "agentenv/sandbox/firecracker/pool.h"
 
 using namespace agentenv::sandbox::firecracker;
@@ -49,6 +49,50 @@ MT_TEST(mmds_extra_flattened) {
     MT_EXPECT_TRUE(j.find("\"instanceID\"") != std::string::npos);
 }
 
+MT_TEST(mmds_extra_cannot_override_reserved_fields) {
+    // MMDS is what the guest reads its own identity from, and accessTokenHash
+    // is what it authenticates against. Extras are opaque API pass-through, so
+    // a caller restating a reserved key must not get a second copy into the
+    // document — a duplicate JSON key would leave which one wins up to the
+    // guest's parser.
+    agentenv::core::Uuid nil;
+    agentenv::core::SandboxId sid(nil);
+    MmdsMetadata m(sid, "snapshot-123");
+    m.SetAccessToken("a-real-token");
+    const std::string expected_hash = m.AccessTokenHash();
+
+    for (int i = 0; i < 4; ++i) {
+        m.WithExtra(kMmdsReservedFields[i], "\"attacker-controlled\"");
+    }
+    MT_EXPECT_EQ(m.ExtraCount(), static_cast<std::size_t>(0));
+
+    std::string j = m.ToJson();
+    MT_EXPECT_TRUE(j.find("attacker-controlled") == std::string::npos);
+    MT_EXPECT_TRUE(j.find("\"instanceID\":\"00000000-0000-0000-0000-000000000000\"")
+                   != std::string::npos);
+    MT_EXPECT_TRUE(j.find("\"envID\":\"snapshot-123\"") != std::string::npos);
+    MT_EXPECT_TRUE(j.find("\"accessTokenHash\":\"" + expected_hash + "\"") != std::string::npos);
+    // A non-reserved key alongside them still gets through.
+    m.WithExtra("custom", "42");
+    MT_EXPECT_EQ(m.ExtraCount(), static_cast<std::size_t>(1));
+    MT_EXPECT_TRUE(m.ToJson().find("\"custom\":42") != std::string::npos);
+}
+
+MT_TEST(mmds_stores_only_the_token_digest) {
+    agentenv::core::Uuid nil;
+    agentenv::core::SandboxId sid(nil);
+    MmdsMetadata m(sid, "snapshot-123");
+    // Seeded with the hash of the empty token, not an empty string, so the
+    // field is always a well-formed digest.
+    MT_EXPECT_EQ(m.AccessTokenHash(), MmdsMetadata::HashAccessToken(""));
+
+    const std::string token = "super-secret-token";
+    m.SetAccessToken(token);
+    MT_EXPECT_EQ(m.AccessTokenHash(), MmdsMetadata::HashAccessToken(token));
+    // The plaintext must never reach the document the guest can read.
+    MT_EXPECT_TRUE(m.ToJson().find(token) == std::string::npos);
+}
+
 // ---- FirecrackerPool watermark management ----
 // A trivial Instance stub; the pool only needs to hold/hand out shared_ptrs.
 struct StubInstance : public Instance {
@@ -59,7 +103,7 @@ struct StubInstance : public Instance {
         return agentenv::core::Unit{};
     }
   agentenv::core::Expected<agentenv::core::Unit, std::string>
-    SetMmds(const MmdsData&) override { return agentenv::core::Unit{}; }
+    SetMmds(const MmdsMetadata&) override { return agentenv::core::Unit{}; }
 };
 
 static warmpool::PoolConfig make_cfg(std::size_t low, std::size_t high) {

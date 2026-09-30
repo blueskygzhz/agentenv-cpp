@@ -331,11 +331,20 @@ core::Expected<core::Unit, std::string> FirecrackerInstance::Shutdown() {
     return Stop(10000);
 }
 core::Expected<core::Unit, std::string>
-FirecrackerInstance::SetMmds(const MmdsData& d) {
-    if (d.json_bytes.size() > kMmdsSizeLimit) {
-        return core::make_unexpected(std::string("MMDS metadata exceeds size limit"));
+FirecrackerInstance::SetMmds(const MmdsMetadata& metadata) {
+    // Rust serializes first and measures *that*, because the limit applies to
+    // the payload Firecracker receives. `imageConfigs` extras are the usual
+    // reason this trips, so the error names the actual size and the cap.
+    const std::string payload = metadata.ToJson();
+    if (payload.size() > kMmdsSizeLimit) {
+        char msg[256];
+        std::snprintf(msg, sizeof(msg),
+                      "MMDS metadata payload is %zu bytes, exceeds Firecracker MMDS size "
+                      "limit %zu; imageConfigs may be too large",
+                      payload.size(), kMmdsSizeLimit);
+        return core::make_unexpected(std::string(msg));
     }
-    return ApiPut("/mmds", d.json_bytes);
+    return ApiPut("/mmds", payload);
 }
 
 // ---- ProcessVmReader ----

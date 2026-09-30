@@ -90,9 +90,9 @@ class MemoryDonor {
     int            stop_pipe_[2];
 };
 
-sandbox::firecracker::ExtraDriveSpec Drive(const std::string& id, const std::string& mount,
+agentenv::sandbox::ExtraDrive Drive(const std::string& id, const std::string& mount,
                                            const std::string& image) {
-    sandbox::firecracker::ExtraDriveSpec spec;
+    agentenv::sandbox::ExtraDrive spec;
     spec.drive_id          = id;
     spec.mount_path        = mount;
     spec.image_config_path = image;
@@ -275,7 +275,7 @@ MT_TEST(lifecycle_work_dir_creates_a_missing_parent) {
 // ---- extra drive validation (the overlap fix) -----------------------------
 
 MT_TEST(fc_extra_drives_reject_overlapping_mount_paths) {
-    std::vector<sandbox::firecracker::ExtraDriveSpec> drives;
+    std::vector<agentenv::sandbox::ExtraDrive> drives;
     drives.push_back(Drive("a", "/mnt/data", "/tmp/a.json"));
     drives.push_back(Drive("b", "/mnt/data/inner", "/tmp/b.json"));
 
@@ -289,7 +289,7 @@ MT_TEST(fc_extra_drives_reject_overlapping_mount_paths) {
 }
 
 MT_TEST(fc_extra_drives_allow_sibling_mount_paths) {
-    std::vector<sandbox::firecracker::ExtraDriveSpec> drives;
+    std::vector<agentenv::sandbox::ExtraDrive> drives;
     // A string-prefix check would wrongly reject these: `/mnt/ab` is not
     // inside `/mnt/a`.
     drives.push_back(Drive("a", "/mnt/a", "/tmp/a.json"));
@@ -298,7 +298,7 @@ MT_TEST(fc_extra_drives_allow_sibling_mount_paths) {
 }
 
 MT_TEST(fc_extra_drives_normalize_before_comparing) {
-    std::vector<sandbox::firecracker::ExtraDriveSpec> drives;
+    std::vector<agentenv::sandbox::ExtraDrive> drives;
     // The same mount point spelled two ways must not be accepted twice.
     drives.push_back(Drive("a", "/mnt/data", "/tmp/a.json"));
     drives.push_back(Drive("b", "//mnt///data/.", "/tmp/b.json"));
@@ -306,28 +306,27 @@ MT_TEST(fc_extra_drives_normalize_before_comparing) {
 }
 
 MT_TEST(fc_extra_drives_still_reject_duplicate_ids_and_bad_input) {
-    std::vector<sandbox::firecracker::ExtraDriveSpec> dup_ids;
+    std::vector<agentenv::sandbox::ExtraDrive> dup_ids;
     dup_ids.push_back(Drive("a", "/mnt/one", "/tmp/a.json"));
     dup_ids.push_back(Drive("a", "/mnt/two", "/tmp/b.json"));
     MT_EXPECT_TRUE(!ValidateExtraDriveSet(dup_ids, false).ok());
 
-    std::vector<sandbox::firecracker::ExtraDriveSpec> bad_id;
+    std::vector<agentenv::sandbox::ExtraDrive> bad_id;
     bad_id.push_back(Drive("bad id", "/mnt/one", "/tmp/a.json"));
     MT_EXPECT_TRUE(!ValidateExtraDriveSet(bad_id, false).ok());
 
-    std::vector<sandbox::firecracker::ExtraDriveSpec> relative;
+    std::vector<agentenv::sandbox::ExtraDrive> relative;
     relative.push_back(Drive("a", "relative/path", "/tmp/a.json"));
     MT_EXPECT_TRUE(!ValidateExtraDriveSet(relative, false).ok());
 
-    std::vector<sandbox::firecracker::ExtraDriveSpec> zero_size;
+    std::vector<agentenv::sandbox::ExtraDrive> zero_size;
     zero_size.push_back(Drive("a", "/mnt/one", "/tmp/a.json"));
-    zero_size[0].has_virtual_size = true;
-    zero_size[0].virtual_size     = 0;
+    zero_size[0].virtual_size     = static_cast<uint64_t>(0);
     MT_EXPECT_TRUE(!ValidateExtraDriveSet(zero_size, false).ok());
 }
 
 MT_TEST(fc_extra_drives_enforce_the_hardware_ceiling) {
-    std::vector<sandbox::firecracker::ExtraDriveSpec> drives;
+    std::vector<agentenv::sandbox::ExtraDrive> drives;
     // /dev/vdc..vdz is 24 slots; the 25th has nowhere to attach.
     for (int i = 0; i < 25; ++i) {
         char id[16];

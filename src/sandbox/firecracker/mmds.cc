@@ -5,7 +5,7 @@
 // names and hashes the (currently always empty) access token with SHA-512.
 // A self-contained SHA-512 is included so the port needs no crypto dependency;
 // it matches the FIPS 180-4 test vectors and the Rust `hash_access_token`.
-#include "agentenv/sandbox/firecracker/manifest.h"
+#include "agentenv/sandbox/firecracker/mmds.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -155,9 +155,30 @@ MmdsMetadata::MmdsMetadata(const core::SandboxId& sandbox_id, const std::string&
       logs_collector_address_(""),
       access_token_hash_(HashAccessToken("")) {}
 
+const char* const kMmdsReservedFields[4] = {"instanceID", "envID", "address",
+                                            "accessTokenHash"};
+
+bool IsReservedMmdsField(const std::string& key) {
+    for (std::size_t i = 0; i < 4; ++i) {
+        if (key == kMmdsReservedFields[i]) return true;
+    }
+    return false;
+}
+
 MmdsMetadata& MmdsMetadata::WithExtra(const std::string& key, const std::string& json_value) {
-  extra_.push_back(std::make_pair(key, json_value));
+    // Rust `extra.retain(|key, _| !RESERVED_FIELDS.contains(...))`. Extras are
+    // opaque data the API layer passes through to the guest, so a caller must
+    // not be able to restate `instanceID` or `accessTokenHash` and have the
+    // duplicate win — MMDS is what the guest reads its own identity from, and
+    // the hash is what it authenticates against. Dropped silently, as in Rust:
+    // a rejected key is not an error the API layer can act on.
+    if (IsReservedMmdsField(key)) return *this;
+    extra_.push_back(std::make_pair(key, json_value));
     return *this;
+}
+
+void MmdsMetadata::SetAccessToken(const std::string& token) {
+    access_token_hash_ = HashAccessToken(token);
 }
 
 static std::string json_escape(const std::string& s) {

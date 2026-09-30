@@ -335,22 +335,35 @@ MT_TEST(acquire_file_lock_serializes_two_processes) {
     // lock the final count would be lower than the number of increments.
     const int kChildren = 4;
     const int kIterations = 20;
+
+    // Every cycle is serialized and each `WriteAtomic` fsyncs twice (the file,
+    // then its directory), so all kChildren * kIterations cycles together are
+    // dominated by fsync latency — on a slow or loaded filesystem this test
+    // spends over ten seconds in the kernel. The timeout is here only so a
+    // genuine deadlock fails instead of hanging forever, so it has to be well
+    // clear of that total; a budget sized for the happy path turns ordinary
+    // disk slowness into a flaky failure.
+    const int64_t kLockTimeoutMs = 120000;
+
     std::vector<pid_t> pids;
     for (int c = 0; c < kChildren; ++c) {
         const pid_t pid = ::fork();
         MT_EXPECT_TRUE(pid >= 0);
         if (pid == 0) {
             for (int i = 0; i < kIterations; ++i) {
+                // Distinct exit codes per failure: a bare `1` cannot tell a
+                // lock timeout apart from a failed read, which is exactly the
+                // information needed when this fails on CI and not locally.
                 const agentenv::core::Expected<FileLockGuard, std::string> guard =
-                    agentenv::core::AcquireFileLock(lock_path, "c", 10000, NULL);
-                if (!guard.ok()) ::_exit(1);
+                    agentenv::core::AcquireFileLock(lock_path, "c", kLockTimeoutMs, NULL);
+                if (!guard.ok()) ::_exit(11);
                 const agentenv::core::Expected<std::string, std::string> current =
                     fs::ReadToString(counter);
-                if (!current.ok()) ::_exit(1);
+                if (!current.ok()) ::_exit(12);
                 const long value = std::strtol(current.value().c_str(), NULL, 10);
                 char next[32];
                 std::snprintf(next, sizeof(next), "%ld", value + 1);
-                if (!agentenv::core::WriteAtomic(counter, next).ok()) ::_exit(1);
+                if (!agentenv::core::WriteAtomic(counter, next).ok()) ::_exit(13);
             }
             ::_exit(0);
         }
@@ -364,8 +377,11 @@ MT_TEST(acquire_file_lock_serializes_two_processes) {
         MT_EXPECT_EQ(WEXITSTATUS(status), 0);
     }
 
-    MT_EXPECT_EQ(fs::ReadToString(counter).value(),
-                 std::string("80"));  // kChildren * kIterations
+    // Derived, not a literal: changing either constant above must not quietly
+    // leave this assertion checking the old total.
+    char expected[32];
+    std::snprintf(expected, sizeof(expected), "%d", kChildren * kIterations);
+    MT_EXPECT_EQ(fs::ReadToString(counter).value(), std::string(expected));
 }
 
 MT_TEST(file_lock_guard_moves_without_releasing) {

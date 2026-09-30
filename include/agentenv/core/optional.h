@@ -18,14 +18,21 @@ static const nullopt_t nullopt{ nullopt_t::init{} };
 template <typename T>
 class Optional {
  public:
-    Optional() : has_(false) {}
-    Optional(nullopt_t) : has_(false) {}
+    // The storage of an *empty* Optional is value-initialized rather than left
+    // indeterminate. Nothing reads it while `has_` is false, but leaving it
+    // indeterminate makes a byte-wise copy of any aggregate holding an empty
+    // Optional formally read uninitialized memory, which GCC reports as
+    // -Wmaybe-uninitialized once Optionals are nested (an `Optional<T>` whose
+    // `T` itself has an Optional member). Zeroing the empty case costs one
+    // store per construction and keeps those copies well-defined.
+    Optional() : s_(), has_(false) {}
+    Optional(nullopt_t) : s_(), has_(false) {}
     Optional(const T& v) : has_(true) { new (&s_) T(v); }
     Optional(T&& v)      : has_(true) { new (&s_) T(std::move(v)); }
 
-    Optional(const Optional& o) : has_(o.has_) {
+    Optional(const Optional& o) : s_(), has_(o.has_) {
         if (has_) new (&s_) T(*o); }
-    Optional(Optional&& o) noexcept : has_(o.has_) {
+    Optional(Optional&& o) noexcept : s_(), has_(o.has_) {
         if (has_) new (&s_) T(std::move(*o)); }
     ~Optional() { reset(); }
 

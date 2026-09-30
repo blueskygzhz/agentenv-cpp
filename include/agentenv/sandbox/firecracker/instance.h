@@ -10,7 +10,8 @@
 
 #include "agentenv/core/expected.h"
 #include "agentenv/core/identity.h"
-#include "agentenv/sandbox/firecracker/manifest.h"
+#include "agentenv/sandbox/manifest.h"
+#include "agentenv/sandbox/firecracker/mmds.h"
 #include "agentenv/sandbox/firecracker/socket.h"
 
 namespace agentenv {
@@ -25,7 +26,10 @@ class Instance {
     virtual ~Instance() {}
     virtual core::Expected<core::Unit, std::string> Boot() = 0;
     virtual core::Expected<core::Unit, std::string> Shutdown() = 0;
-    virtual core::Expected<core::Unit, std::string> SetMmds(const MmdsData& d) = 0;
+    /// Rust `FirecrackerInstance::set_mmds(&MmdsMetadata)` — takes the document
+    /// itself, not pre-serialized bytes, so the size check below is applied to
+    /// what actually goes on the wire.
+    virtual core::Expected<core::Unit, std::string> SetMmds(const MmdsMetadata& metadata) = 0;
 };
 
 /// Rust: firecracker/instance.rs :: MMDS_SIZE_LIMIT (1 MiB).
@@ -98,7 +102,7 @@ class FirecrackerInstance : public Instance {
     // ---- Instance ABC ----
     core::Expected<core::Unit, std::string> Boot() override;
     core::Expected<core::Unit, std::string> Shutdown() override;
-    core::Expected<core::Unit, std::string> SetMmds(const MmdsData& d) override;
+    core::Expected<core::Unit, std::string> SetMmds(const MmdsMetadata& metadata) override;
 
  private:
     core::Expected<core::Unit, std::string> ApiPut(const std::string& path,
@@ -126,8 +130,11 @@ std::unique_ptr<ProcessVmReader> MakeProcessVmReader();
 
 /// Rust: firecracker/sandbox.rs :: FirecrackerCapturedSnapshot.
 struct CapturedSnapshot {
-    SnapshotManifest manifest;
-    std::string      snapshot_dir;
+    /// The real manifest type from `sandbox/manifest.h`. It is backend-agnostic
+    /// by design (`backend` names the VMM), so there is no Firecracker-specific
+    /// manifest to carry here.
+    SandboxSnapshotManifest manifest;
+    std::string             snapshot_dir;
 };
 
 /// Rust: firecracker/sandbox.rs :: FirecrackerPausedState.
