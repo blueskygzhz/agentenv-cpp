@@ -214,6 +214,59 @@ SandboxConfig SandboxConfig::New(const std::string& firecracker_binary,
     return config;
 }
 
+core::Expected<SandboxConfig, std::string> SandboxConfig::FromAppConfigWithUserImage(
+    const cfg::AppConfig& config, ublk::OverlaybdDeviceConfig user_image_config) {
+    const storage::overlaybd::UpperMode runtime_upper_mode =
+        config.ublk.overlaybd.runtime_upper_mode;
+    user_image_config.runtime_upper_mode = runtime_upper_mode;
+
+    core::Expected<CommonConfig, std::string> common = CommonConfig::FromAppConfig(config);
+    if (!common.ok()) return core::make_unexpected(common.error());
+
+    SandboxConfig out;
+    out.common = common.value();
+    out.common.rootfs_image_config = user_image_config;
+    out.common.ublk_config = ublk::UblkConfig::OverlaybdWithRuntimeUpperMode(
+        user_image_config.image_config_path, user_image_config.read_only, runtime_upper_mode);
+    out.kernel_image = config.ResolvedKernelImagePath();
+    // Rust `.boot_args.clone().or_else(|| Some(DEFAULT_BOOT_ARGS))` — always
+    // set on this path, so a configured empty string is kept, not replaced.
+    out.boot_args = config.firecracker.boot_args.has_value()
+                        ? config.firecracker.boot_args
+                        : core::Optional<std::string>(std::string(kDefaultBootArgs));
+    out.vcpu_count = config.machine.vcpu_count;
+    out.mem_size_mib = config.machine.mem_size_mib;
+    return out;
+}
+
+SandboxConfig& SandboxConfig::ApplyLaunchConfig(const SandboxLaunchConfig& launch_config) {
+    // Rust `.filter(|env_vars| !env_vars.is_empty())`: an empty override must
+    // not turn an absent env map into an empty one.
+    if (launch_config.env_vars.has_value() && !launch_config.env_vars->empty()) {
+        if (!common.env_vars.has_value()) {
+            common.env_vars = std::map<std::string, std::string>();
+        }
+        const std::map<std::string, std::string>& overrides = *launch_config.env_vars;
+        for (std::map<std::string, std::string>::const_iterator it = overrides.begin();
+             it != overrides.end(); ++it) {
+            (*common.env_vars)[it->first] = it->second;
+        }
+    }
+
+    MmdsMetadata mmds(launch_config.sandbox_id, launch_config.snapshot_id);
+    mmds.WithAccessToken(launch_config.envd_access_token).WithExtra(launch_config.extra_mmds);
+    common.mmds_metadata = mmds;
+
+    // Plain assignments, as in Rust: a launch without these clears them.
+    common.network_policy = launch_config.network;
+    common.custom_extension_params_json =
+        launch_config.custom_extension_params.has_value()
+            ? core::Optional<std::string>(launch_config.custom_extension_params->json_bytes)
+            : core::Optional<std::string>();
+    common.envd_access_token = launch_config.envd_access_token;
+    return *this;
+}
+
 core::Expected<core::Unit, std::string> SandboxConfig::Validate() const {
     core::Expected<core::Unit, std::string> common_ok = common.Validate();
     if (!common_ok.ok()) return core::make_unexpected(common_ok.error());

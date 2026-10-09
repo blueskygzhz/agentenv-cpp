@@ -13,7 +13,11 @@
 #include <utility>
 #include <vector>
 
+#include "agentenv/core/expected.h"
 #include "agentenv/core/identity.h"
+#include "agentenv/core/json.h"
+#include "agentenv/core/optional.h"
+#include "agentenv/sandbox/access.h"
 
 namespace agentenv {
 namespace sandbox {
@@ -28,6 +32,11 @@ bool IsReservedMmdsField(const std::string& key);
 /// Rust `struct MmdsMetadata`. Serializes to a flat JSON object with the
 /// e2b-compatible field names, `extra` pairs flattened next to the core fields
 /// (Rust's `#[serde(flatten)]`).
+///
+/// The document is built as a `core::Json` value rather than by pasting
+/// strings together: extras are API-supplied, and a value spliced in as raw
+/// text could close the object early and smuggle in a second `accessTokenHash`
+/// — the exact override the reserved-key filter exists to stop.
 class MmdsMetadata {
  public:
     /// Rust `MmdsMetadata::new(sandbox_id, snapshot_id)`.
@@ -37,35 +46,53 @@ class MmdsMetadata {
     /// digest and an unset token is not mistakable for a missing one.
     MmdsMetadata(const core::SandboxId& sandbox_id, const std::string& snapshot_id);
 
-    /// Rust `with_extra` — merge an opaque top-level key/value pair.
+    /// Rust `with_extra(Map)` — merge opaque top-level pairs.
     ///
-    /// `json_value` must be a valid JSON fragment (the caller quotes strings).
-    /// Reserved keys are **dropped**, matching Rust's `extra.retain(...)`: this
-    /// is what stops API-supplied extras from overriding the sandbox's identity
-    /// or its access token hash.
-    MmdsMetadata& WithExtra(const std::string& key, const std::string& json_value);
+    /// Reserved keys are **dropped** (`extra.retain(...)`), so API-supplied
+    /// extras cannot override the sandbox's identity or its access token
+    /// hash. A key already present is *replaced*, as `Map::extend` does —
+    /// one key, one value, so the guest never sees a duplicate.
+    MmdsMetadata& WithExtra(const core::JsonObject& extra);
 
-    /// Rust `set_access_token` — stores only the digest, never the token.
-    void SetAccessToken(const std::string& token);
+    /// Rust `with_access_token`.
+    MmdsMetadata& WithAccessToken(const core::Optional<EnvdAccessToken>& token);
 
-    /// Rust `Serialize` — `instanceID` / `envID` / `address` /
-    /// `accessTokenHash`, plus flattened extras.
+    /// Rust `set_access_token` — stores only the digest, never the token. An
+    /// absent token hashes the empty string, as upstream.
+    void SetAccessToken(const core::Optional<EnvdAccessToken>& token);
+
+    /// Rust `Serialize`.
+    core::Json ToValue() const;
+    /// `ToValue().ToString()` — the body sent to `PUT /mmds`.
     std::string ToJson() const;
+
+    /// Rust `Deserialize`. The four core fields are required; every other
+    /// key is collected into `extra` (`#[serde(flatten)]`), so a document
+    /// written without extras (the legacy shape) reads back with none.
+    static core::Expected<MmdsMetadata, std::string> FromValue(const core::Json& value);
 
     const std::string& SandboxId() const { return sandbox_id_; }
     const std::string& SnapshotId() const { return snapshot_id_; }
+    const std::string& LogsCollectorAddress() const { return logs_collector_address_; }
     const std::string& AccessTokenHash() const { return access_token_hash_; }
+    const core::JsonObject& Extra() const { return extra_; }
     std::size_t ExtraCount() const { return extra_.size(); }
+
+    /// Rust `#[derive(PartialEq)]`.
+    bool operator==(const MmdsMetadata& o) const;
+    bool operator!=(const MmdsMetadata& o) const { return !(*this == o); }
 
     /// Rust `hash_access_token` — lowercase hex SHA-512.
     static std::string HashAccessToken(const std::string& token);
 
  private:
+    MmdsMetadata() {}
+
     std::string sandbox_id_;              // "instanceID"
     std::string snapshot_id_;             // "envID"
     std::string logs_collector_address_;  // "address"
     std::string access_token_hash_;       // "accessTokenHash"
-    std::vector<std::pair<std::string, std::string> > extra_;  // flattened
+    core::JsonObject extra_;              // flattened
 };
 
 }  // namespace firecracker

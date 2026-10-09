@@ -57,6 +57,9 @@ struct BackendScript {
 
     /// Rust `runtime_info().rootfs_virtual_size`.
     core::Optional<uint64_t> rootfs_virtual_size;
+
+    /// The specs the last `Fork` call received.
+    std::vector<sandbox::SandboxForkSpec> last_fork_specs;
 };
 
 class FakeSandbox : public sandbox::SandboxBackend {
@@ -117,6 +120,7 @@ class FakeSandbox : public sandbox::SandboxBackend {
     sandbox::SandboxCaptureResult<std::vector<sandbox::SandboxForkResult> >
         Fork(const std::vector<sandbox::SandboxForkSpec>& specs) override {
         ++script_->fork_calls;
+        script_->last_fork_specs = specs;
         if (script_->fail_fork_terminal) {
             return core::make_unexpected(
                 sandbox::SandboxCaptureError::Terminal("fake: fork broke the runtime"));
@@ -165,18 +169,26 @@ class FakeFactory : public sandbox::SandboxBackendFactory {
     int         build_from_snapshot_calls = 0;
     int         build_from_paused_calls = 0;
 
+    /// What the orchestrator handed the factory on the last build, so a test
+    /// can assert the launch inputs and not just that a build happened.
+    sandbox::FreshSandboxBuildSpec last_build_spec;
+    sandbox::SandboxLaunchConfig   last_launch_config;
+
     core::Expected<std::unique_ptr<sandbox::SandboxBackend>, core::AnyError>
         Build(const sandbox::FreshSandboxBuildSpec& spec,
-              const sandbox::SandboxLaunchConfig&) override {
+              const sandbox::SandboxLaunchConfig& config) override {
         ++build_calls;
         last_image_config_path = spec.image_config_path;
+        last_build_spec = spec;
+        last_launch_config = config;
         return Make();
     }
     core::Expected<std::unique_ptr<sandbox::SandboxBackend>, core::AnyError>
         BuildFromSnapshot(const std::string& snapshot_id,
-                          const sandbox::SandboxLaunchConfig&) override {
+                          const sandbox::SandboxLaunchConfig& config) override {
         ++build_from_snapshot_calls;
         last_snapshot_id = snapshot_id;
+        last_launch_config = config;
         return Make();
     }
     core::Expected<std::unique_ptr<sandbox::SandboxBackend>, core::AnyError>

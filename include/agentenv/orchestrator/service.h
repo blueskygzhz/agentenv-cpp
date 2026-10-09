@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "agentenv/cfg.h"
 #include "agentenv/core/expected.h"
 #include "agentenv/core/identity.h"
 #include "agentenv/core/optional.h"
@@ -101,6 +102,21 @@ core::Optional<SandboxState> RollbackExpectedState(FailedLaunchStage stage,
 /// Rust `FailedLaunchStage::should_detach_proxy_route`.
 bool ShouldDetachProxyRoute(FailedLaunchStage stage);
 
+/// Rust `persisted_sandboxes_require_managed_seed` — any restored sandbox
+/// whose access depends on a token derived from the seed: a `secure` one (envd
+/// token) or one that refuses public traffic (traffic token).
+bool PersistedSandboxesRequireManagedSeed(const std::vector<SandboxMetadata>& persisted);
+
+/// Rust `default_fresh_sandbox_resources` — the configured machine shape.
+/// `disk_size_mib` is 0 and is filled from the backend's runtime info once the
+/// rootfs device exists.
+sandbox::SandboxResources DefaultFreshSandboxResources(const cfg::AppConfig& config);
+
+/// Rust `configured_runtime_versions` — the releases this node boots fresh
+/// sandboxes with. An unset kernel/firecracker version is recorded as
+/// `"unknown"` rather than left empty, as upstream.
+snapshot::SnapshotRuntimeVersions ConfiguredRuntimeVersions(const cfg::AppConfig& config);
+
 /// Rust enum `DeleteProgress` (service.rs, private) — the three-phase delete.
 ///
 /// Rust:
@@ -176,6 +192,41 @@ class Orchestrator {
                  std::shared_ptr<sandbox::SandboxBackendFactory> factory,
                  std::shared_ptr<SandboxPersister> persister);
     ~Orchestrator();
+
+    /// Rust `Orchestrator::new` / `new_inner_with_volumes` — the startup path.
+    ///
+    /// Restores the previous run before the orchestrator exists: every record
+    /// `persister.load_all(factory)` yields is added to `store`, so a paused
+    /// sandbox survives a restart. The access-token seed is loaded *after*
+    /// that scan because whether it may be regenerated depends on it — a
+    /// persisted sandbox that carries tokens would be locked out by a new
+    /// seed, so `LoadOrCreate` is told the seed must already exist.
+    ///
+    /// Rust reads `ConfigManager::global_config()`; the config is a parameter
+    /// here so a test can supply its own. Not started (their subsystems are
+    /// not ported): the metrics and auto-evict tasks, and the paused
+    /// image-protection reconcile that gates local image maintenance.
+    static OrchestratorResult<std::shared_ptr<Orchestrator> >
+        New(std::shared_ptr<MetadataStore> store,
+            std::shared_ptr<sandbox::SandboxBackendFactory> factory,
+            std::shared_ptr<SandboxPersister> persister,
+            const cfg::AppConfig& config,
+            std::shared_ptr<volume::VolumeManager> volume_manager =
+                std::shared_ptr<volume::VolumeManager>());
+
+    /// Rust `with_file_backed_store_and_factory` — in-memory store, and a
+    /// file-backed persister at `orchestrator.persisted_sandbox_store_path`
+    /// that judges records against this node's virtualization mode.
+    static OrchestratorResult<std::shared_ptr<Orchestrator> >
+        WithFileBackedStoreAndFactory(std::shared_ptr<sandbox::SandboxBackendFactory> factory,
+                                      const cfg::AppConfig& config);
+
+    /// Rust `with_file_backed_store_factory_and_volumes`.
+    static OrchestratorResult<std::shared_ptr<Orchestrator> >
+        WithFileBackedStoreFactoryAndVolumes(
+            std::shared_ptr<sandbox::SandboxBackendFactory> factory,
+            std::shared_ptr<volume::VolumeManager> volume_manager,
+            const cfg::AppConfig& config);
 
     // ---- queries (Rust: get_sandbox / list_sandboxes / ...) ---------------
 
@@ -449,6 +500,12 @@ class Orchestrator {
 
     /// Rust `default_sandbox_timeout`, from
     /// `config.orchestrator.default_sandbox_timeout_secs`.
+    /// Rust `configured_runtime_versions()` — stamped on a fresh sandbox's
+    /// metadata. Rust reads the global config at create time; it is fixed
+    /// at construction here (`New` sets it from the config it is given).
+    void SetConfiguredRuntimeVersions(const snapshot::SnapshotRuntimeVersions& versions) {
+        configured_runtime_versions_ = versions;
+    }
     void SetDefaultSandboxTimeoutMs(int64_t ms) { default_sandbox_timeout_ms_ = ms; }
     int64_t DefaultSandboxTimeoutMs() const { return default_sandbox_timeout_ms_; }
 
@@ -602,6 +659,7 @@ class Orchestrator {
 
     /// Rust `default_sandbox_timeout`.
     int64_t default_sandbox_timeout_ms_;
+    snapshot::SnapshotRuntimeVersions configured_runtime_versions_;
 
     /// Rust `default_fresh_sandbox_resources()`, read from config.machine.
     sandbox::SandboxResources default_fresh_resources_;

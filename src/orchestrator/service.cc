@@ -92,6 +92,112 @@ Orchestrator::Orchestrator(std::shared_ptr<MetadataStore> store,
 
 Orchestrator::~Orchestrator() {}
 
+// Rust `persisted_sandboxes_require_managed_seed`.
+bool PersistedSandboxesRequireManagedSeed(const std::vector<SandboxMetadata>& persisted) {
+    for (std::size_t i = 0; i < persisted.size(); ++i) {
+        if (persisted[i].secure || !persisted[i].network_policy.allow_public_traffic) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Rust `default_fresh_sandbox_resources`.
+sandbox::SandboxResources DefaultFreshSandboxResources(const cfg::AppConfig& config) {
+    sandbox::SandboxResources resources;
+    resources.cpu_count     = config.machine.vcpu_count;
+    resources.memory_mib    = config.machine.mem_size_mib;
+    resources.disk_size_mib = 0;
+    return resources;
+}
+
+// Rust `configured_runtime_versions`.
+snapshot::SnapshotRuntimeVersions ConfiguredRuntimeVersions(const cfg::AppConfig& config) {
+    return snapshot::SnapshotRuntimeVersions::New(
+        config.kernel.version.has_value() ? *config.kernel.version : std::string("unknown"),
+        config.firecracker.version.has_value() ? *config.firecracker.version
+                                               : std::string("unknown"),
+        config.envd.version, config.ResolvedToolsVersion());
+}
+
+// Rust `Orchestrator::new_inner_with_volumes`.
+OrchestratorResult<std::shared_ptr<Orchestrator> >
+Orchestrator::New(std::shared_ptr<MetadataStore> store,
+                  std::shared_ptr<sandbox::SandboxBackendFactory> factory,
+                  std::shared_ptr<SandboxPersister> persister,
+                  const cfg::AppConfig& config,
+                  std::shared_ptr<volume::VolumeManager> volume_manager) {
+    // `persister.load_all(&factory).await?` — SandboxPersistenceFailed.
+    PersistenceResult<std::vector<SandboxMetadata> > persisted =
+        persister->LoadAll(factory.get());
+    if (!persisted.ok()) {
+        return core::make_unexpected(
+            OrchestratorError::SandboxPersistenceFailed(persisted.error().Message()));
+    }
+
+    // `SandboxAccessTokenGenerator::load_or_create(..)??` — anyhow, hence
+    // ConfigLoadFailed.
+    const bool managed_seed_must_exist =
+        PersistedSandboxesRequireManagedSeed(persisted.value());
+    core::Expected<sandbox::SandboxAccessTokenGenerator, std::string> access_tokens =
+        sandbox::SandboxAccessTokenGenerator::LoadOrCreate(config, managed_seed_must_exist);
+    if (!access_tokens.ok()) {
+        return core::make_unexpected(OrchestratorError::ConfigLoadFailed(access_tokens.error()));
+    }
+
+    // Rust collects `restored_paused` here for `reconcile_paused_at_startup`,
+    // which only runs when image GC is enabled and needs the runtime
+    // image-ref subsystem (not ported). Nothing else reads it.
+
+    // `store.add(metadata).await?` — From<StoreError>.
+    const std::vector<SandboxMetadata>& records = persisted.value();
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        core::Expected<core::Unit, StoreError> added = store->Add(records[i]);
+        if (!added.ok()) {
+            if (added.error().kind == StoreError::Kind::SandboxNotFound) {
+                return core::make_unexpected(OrchestratorError::SandboxNotFound(records[i].id));
+            }
+            return core::make_unexpected(
+                OrchestratorError::StoreOperationFailed(added.error().Message()));
+        }
+    }
+
+    std::shared_ptr<Orchestrator> orchestrator(
+        new Orchestrator(store, factory, persister));
+    orchestrator->SetDefaultSandboxTimeoutMs(
+        static_cast<int64_t>(config.orchestrator.default_sandbox_timeout_secs) * 1000);
+    orchestrator->SetVirtualizationMode(config.virtualization_mode);
+    orchestrator->SetDefaultFreshResources(DefaultFreshSandboxResources(config));
+    orchestrator->SetConfiguredRuntimeVersions(ConfiguredRuntimeVersions(config));
+    orchestrator->SetAccessTokenGenerator(access_tokens.value());
+    if (volume_manager) orchestrator->SetVolumeManager(volume_manager);
+    return orchestrator;
+}
+
+// Rust `with_file_backed_store_and_factory`.
+OrchestratorResult<std::shared_ptr<Orchestrator> >
+Orchestrator::WithFileBackedStoreAndFactory(
+    std::shared_ptr<sandbox::SandboxBackendFactory> factory, const cfg::AppConfig& config) {
+    return New(std::shared_ptr<MetadataStore>(new InMemoryMetadataStore()), factory,
+               std::shared_ptr<SandboxPersister>(new FileBackedSandboxPersister(
+                   config.orchestrator.persisted_sandbox_store_path,
+                   config.virtualization_mode)),
+               config);
+}
+
+// Rust `with_file_backed_store_factory_and_volumes`.
+OrchestratorResult<std::shared_ptr<Orchestrator> >
+Orchestrator::WithFileBackedStoreFactoryAndVolumes(
+    std::shared_ptr<sandbox::SandboxBackendFactory> factory,
+    std::shared_ptr<volume::VolumeManager> volume_manager,
+    const cfg::AppConfig& config) {
+    return New(std::shared_ptr<MetadataStore>(new InMemoryMetadataStore()), factory,
+               std::shared_ptr<SandboxPersister>(new FileBackedSandboxPersister(
+                   config.orchestrator.persisted_sandbox_store_path,
+                   config.virtualization_mode)),
+               config, volume_manager);
+}
+
 // ---- queries ---------------------------------------------------------------
 
 // Rust `get_sandbox`.
@@ -964,10 +1070,15 @@ Orchestrator::CreateSandboxInner(const core::SandboxId& sandbox_id,
     // Rust builds the launch config and the transitional metadata per source
     // variant, then funnels both into `launch_sandbox`.
     sandbox::SandboxLaunchConfig launch_config;
-    launch_config.sandbox_id              = sandbox_id;
-    launch_config.env_vars                = request.env_vars;
-    launch_config.envd_access_token       = envd_access_token;
-    launch_config.extra_drives_in_snapshot = request.extra_drives_in_snapshot;
+    launch_config.sandbox_id        = sandbox_id;
+    launch_config.envd_access_token = envd_access_token;
+    // Rust passes `Option<HashMap>` through; an empty override is a no-op
+    // downstream either way, so only a non-empty map is carried.
+    if (!request.env_vars.empty()) {
+        launch_config.env_vars = core::Optional<std::map<std::string, std::string> >(
+            std::map<std::string, std::string>(request.env_vars.begin(),
+                                               request.env_vars.end()));
+    }
 
     SandboxMetadata metadata;
     metadata.id               = sandbox_id;
@@ -983,10 +1094,15 @@ Orchestrator::CreateSandboxInner(const core::SandboxId& sandbox_id,
     metadata.context          = source.context;
     metadata.image_configs    = source.image_configs;
 
-    // Rust `network_policy.runtime_policy()` — empty when nothing must be
-    // installed in the guest.
-    if (request.network_policy.RuntimePolicy()) {
-        launch_config.network = core::Optional<std::string>(std::string("policy"));
+    // Rust `network: network_policy.runtime_policy()` — the policy itself, and
+    // only when the guest needs rules installed. (This used to carry the
+    // placeholder string "policy", so a backend could never learn the rules.)
+    launch_config.network = request.network_policy.RuntimePolicy();
+
+    // Rust: both variants put a non-empty `imageConfigs` into the MMDS extras,
+    // which is how the guest learns its image's OCI config.
+    if (!source.image_configs.IsEmpty()) {
+        launch_config.extra_mmds["imageConfigs"] = source.image_configs.ToJson();
     }
 
     LaunchPlan plan;
@@ -1010,15 +1126,10 @@ Orchestrator::CreateSandboxInner(const core::SandboxId& sandbox_id,
                 ? request.custom_extension_params
                 : source.snapshot_custom_extension_params;
 
-        launch_config.snapshot_id = source.snapshot_id;
-        launch_config.extra_drives.clear();
-        for (std::size_t i = 0; i < request.extra_drives.size(); ++i) {
-            launch_config.extra_drives.push_back(request.extra_drives[i].drive_id);
-        }
-        if (effective_params) {
-            launch_config.custom_extension_params =
-                core::Optional<std::string>(effective_params->json_bytes);
-        }
+        launch_config.snapshot_id              = source.snapshot_id;
+        launch_config.extra_drives             = request.extra_drives;
+        launch_config.extra_drives_in_snapshot = request.extra_drives_in_snapshot;
+        launch_config.custom_extension_params  = effective_params;
 
         metadata.snapshot_id             = source.snapshot_id;
         metadata.snapshot_alias          = source.snapshot_alias;
@@ -1045,30 +1156,26 @@ Orchestrator::CreateSandboxInner(const core::SandboxId& sandbox_id,
                                    : default_fresh_resources_;
 
         launch_config.snapshot_id = source.image_ref;
+        // Rust `extra_drives: Vec::new()` — on a fresh boot every drive goes
+        // through the build spec instead; nothing is bound to snapshot slots.
         launch_config.extra_drives.clear();
-        for (std::size_t i = 0; i < extra_drives.size(); ++i) {
-            launch_config.extra_drives.push_back(extra_drives[i].drive_id);
-        }
+        launch_config.extra_drives_in_snapshot = false;
         // Rust's fresh path does NOT inherit anything: the request's value is
         // the only source.
-        if (request.custom_extension_params) {
-            launch_config.custom_extension_params =
-                core::Optional<std::string>(
-                    request.custom_extension_params->json_bytes);
-        }
-        // Rust `extra_drives_in_snapshot` is hardcoded false on a fresh boot.
-        launch_config.extra_drives_in_snapshot = false;
+        launch_config.custom_extension_params = request.custom_extension_params;
 
         sandbox::FreshSandboxBuildSpec build_spec;
         build_spec.image_config_path = source.overlaybd_config_path;
+        build_spec.context           = source.context;
         build_spec.resources         = resources;
+        build_spec.extra_drives      = extra_drives;
         build_spec.extra_boot_args   = source.extra_boot_args;
-        for (std::size_t i = 0; i < extra_drives.size(); ++i) {
-            build_spec.extra_drives.push_back(extra_drives[i].image_config_path);
-        }
 
         metadata.snapshot_id             = source.image_ref;
         metadata.virtualization_mode     = virtualization_mode_;
+        // Rust `configured_runtime_versions()` — a fresh boot runs this node's
+        // releases, which a later snapshot of it must record.
+        metadata.runtime_versions        = configured_runtime_versions_;
         metadata.resources               = resources;
         metadata.custom_extension_params = request.custom_extension_params;
 
@@ -1623,10 +1730,7 @@ Orchestrator::ForkSandboxInner(
             spec.envd_access_token = core::Optional<sandbox::EnvdAccessToken>(
                 access_tokens_.Generate(child_specs[i].sandbox_id));
         }
-        spec.extra_drives.clear();
-        for (std::size_t d = 0; d < child_specs[i].extra_drives.size(); ++d) {
-            spec.extra_drives.push_back(child_specs[i].extra_drives[d].drive_id);
-        }
+        spec.extra_drives = child_specs[i].extra_drives;
         spec.replace_drive_ids = child_specs[i].replace_drive_ids;
         backend_specs.push_back(spec);
     }

@@ -8,6 +8,7 @@
 #ifndef AGENTENV_SANDBOX_BACKEND_H_
 #define AGENTENV_SANDBOX_BACKEND_H_
 
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -17,8 +18,15 @@
 #include "agentenv/core/error.h"
 #include "agentenv/core/expected.h"
 #include "agentenv/core/optional.h"
+#include "agentenv/core/json.h"
 #include "agentenv/sandbox/access.h"
+#include "agentenv/sandbox/custom_extension.h"
+#include "agentenv/sandbox/extra_drive.h"
+#include "agentenv/sandbox/network/policy.h"
 #include "agentenv/sandbox/types.h"
+// Header-only use: `CommandContext` is a plain struct, so naming it here does
+// not make the sandbox library depend on the snapshot library.
+#include "agentenv/snapshot/types.h"
 
 namespace agentenv {
 namespace sandbox {
@@ -116,7 +124,11 @@ class PausedSandboxState {
 struct SandboxForkSpec {
     core::SandboxId          sandbox_id;
     core::Optional<EnvdAccessToken> envd_access_token;
-    std::vector<std::string> extra_drives;
+    /// Rust `Vec<ExtraDrive>` — the full drives, because a fork's replacement
+    /// drives are swapped into the captured state by value (image config,
+    /// mount path, size), not looked up by id.
+    std::vector<ExtraDrive>  extra_drives;
+    /// Pairs of `(source_drive_id, replacement_drive_id)`.
     std::vector<std::pair<std::string, std::string> > replace_drive_ids;
 };
 
@@ -193,22 +205,46 @@ class SandboxBackend {
 // ---------------------------------------------------------------------------
 
 /// Rust `FreshSandboxBuildSpec` (sandbox/mod.rs).
+///
+/// Everything a backend needs to boot an image it has never seen: the user
+/// rootfs, the image's command context (env, workdir, user — baked into the
+/// guest's defaults), the machine shape, and every attached drive in full.
 struct FreshSandboxBuildSpec {
     std::string              image_config_path;
+    /// Rust `context: CommandContext`.
+    snapshot::CommandContext context;
     SandboxResources         resources;
-    std::vector<std::string> extra_drives;
+    /// Rust `Vec<ExtraDrive>`. On a fresh boot *all* drives travel here —
+    /// the image's own and the launch-time ones — because nothing is bound
+    /// yet; `SandboxLaunchConfig::extra_drives` stays empty on this path.
+    std::vector<ExtraDrive>  extra_drives;
     core::Optional<std::string> extra_boot_args;
 };
 
-/// Rust `SandboxLaunchConfig` (sandbox/mod.rs).
+/// Rust `SandboxLaunchConfig` (sandbox/mod.rs) — launch-time inputs from the
+/// orchestrator, layered over whatever the source (image or snapshot) carries.
 struct SandboxLaunchConfig {
     core::SandboxId          sandbox_id;
     std::string              snapshot_id;
-    std::unordered_map<std::string, std::string> env_vars;
-    core::Optional<std::string> network;
-    std::vector<std::string> extra_drives;
+    /// Rust `Option<HashMap<String, String>>` — overrides applied *on top of*
+    /// the source defaults; a key present in both takes this value.
+    core::Optional<std::map<std::string, std::string> > env_vars;
+    /// Rust `Option<SandboxNetworkPolicy>` — the policy itself, set only when
+    /// the guest needs rules installed (`SandboxNetworkPolicy::RuntimePolicy`).
+    core::Optional<network::SandboxNetworkPolicy> network;
+    /// Rust `extra_mmds: serde_json::Map` — opaque pairs merged into the MMDS
+    /// document (the orchestrator puts `imageConfigs` here). Reserved MMDS
+    /// keys are dropped when merged, never here.
+    core::JsonObject         extra_mmds;
+    /// Rust `Vec<ExtraDrive>` — drives supplied for this launch (volumes).
+    std::vector<ExtraDrive>  extra_drives;
+    /// Whether `extra_drives` already occupy reserved slots in the source
+    /// Firecracker state and can be bound before snapshot load.
     bool                     extra_drives_in_snapshot = false;
-    core::Optional<std::string> custom_extension_params;
+    /// Rust `Option<CustomExtensionParams>`; takes precedence over any value
+    /// persisted in the source snapshot.
+    core::Optional<custom_extension::Params> custom_extension_params;
+    /// Runtime-only credential for envd. Never serialized.
     core::Optional<EnvdAccessToken> envd_access_token;
 };
 

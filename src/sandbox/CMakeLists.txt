@@ -31,6 +31,8 @@ add_library(agentenv-sandbox STATIC
     firecracker/mmds.cc
  firecracker/pool.cc
     firecracker/sandbox.cc
+    # Rust: src/sandbox/firecracker/factory.rs (config half of `build`)
+    firecracker/factory.cc
 )
 target_include_directories(agentenv-sandbox PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-sandbox PUBLIC

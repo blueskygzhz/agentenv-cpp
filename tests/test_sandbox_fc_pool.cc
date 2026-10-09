@@ -2,6 +2,7 @@
 // Tests for firecracker::MmdsMetadata (SHA-512 + e2b JSON) and FirecrackerPool.
 #include "microtest.h"
 
+#include "agentenv/core/json.h"
 #include "agentenv/sandbox/firecracker/mmds.h"
 #include "agentenv/sandbox/firecracker/pool.h"
 
@@ -24,73 +25,135 @@ MT_TEST(sha512_abc_vector) {
         "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f");
 }
 
-MT_TEST(mmds_e2b_field_names) {
-    // Nil UUID sandbox id.
+namespace {
+agentenv::core::SandboxId NilSandboxId() {
     agentenv::core::Uuid nil;  // default-constructed == all zero
-    agentenv::core::SandboxId sid(nil);
-    MmdsMetadata m(sid, "snapshot-123");
-    std::string j = m.ToJson();
-    MT_EXPECT_TRUE(j.find("\"instanceID\":\"00000000-0000-0000-0000-000000000000\"")
-               != std::string::npos);
-  MT_EXPECT_TRUE(j.find("\"envID\":\"snapshot-123\"") != std::string::npos);
- MT_EXPECT_TRUE(j.find("\"address\":\"\"") != std::string::npos);
-    MT_EXPECT_TRUE(j.find("\"accessTokenHash\":\"cf83e1357") != std::string::npos);
+    return agentenv::core::SandboxId(nil);
+}
+agentenv::core::Json ParsedValue(const MmdsMetadata& m) {
+    agentenv::core::Expected<agentenv::core::Json, agentenv::core::AnyError> v =
+        agentenv::core::Json::Parse(m.ToJson());
+    MT_EXPECT_TRUE(v.ok());
+    return v.ok() ? v.value() : agentenv::core::Json();
+}
+agentenv::core::Json J(const std::string& text) {
+    return agentenv::core::Json::Parse(text).value();
+}
+agentenv::sandbox::EnvdAccessToken Token(const std::string& v) {
+    return agentenv::sandbox::EnvdAccessToken(v);
+}
+}  // namespace
+
+// mmds.rs :: serializes_with_e2b_mmds_field_names — exactly four keys.
+MT_TEST(mmds_serializes_with_e2b_mmds_field_names) {
+    MmdsMetadata m(NilSandboxId(), "snapshot-123");
+    MT_EXPECT_EQ(m.ToJson(),
+                 J("{\"instanceID\":\"00000000-0000-0000-0000-000000000000\","
+                   "\"envID\":\"snapshot-123\",\"address\":\"\","
+                   "\"accessTokenHash\":\"" + MmdsMetadata::HashAccessToken("") + "\"}")
+                     .ToString());
 }
 
-MT_TEST(mmds_extra_flattened) {
-    agentenv::core::Uuid nil;
-    agentenv::core::SandboxId sid(nil);
-    MmdsMetadata m(sid, "snap-1");
-    m.WithExtra("imageConfigs", "{\"rootfs\":{\"Cmd\":[\"/bin/sh\"]}}");
-    std::string j = m.ToJson();
-    MT_EXPECT_TRUE(j.find("\"imageConfigs\":{\"rootfs\":{\"Cmd\":[\"/bin/sh\"]}}")
-   != std::string::npos);
-    // core field still present
-    MT_EXPECT_TRUE(j.find("\"instanceID\"") != std::string::npos);
-}
-
-MT_TEST(mmds_extra_cannot_override_reserved_fields) {
-    // MMDS is what the guest reads its own identity from, and accessTokenHash
-    // is what it authenticates against. Extras are opaque API pass-through, so
-    // a caller restating a reserved key must not get a second copy into the
-    // document — a duplicate JSON key would leave which one wins up to the
-    // guest's parser.
-    agentenv::core::Uuid nil;
-    agentenv::core::SandboxId sid(nil);
-    MmdsMetadata m(sid, "snapshot-123");
-    m.SetAccessToken("a-real-token");
-    const std::string expected_hash = m.AccessTokenHash();
-
-    for (int i = 0; i < 4; ++i) {
-        m.WithExtra(kMmdsReservedFields[i], "\"attacker-controlled\"");
-    }
-    MT_EXPECT_EQ(m.ExtraCount(), static_cast<std::size_t>(0));
-
-    std::string j = m.ToJson();
-    MT_EXPECT_TRUE(j.find("attacker-controlled") == std::string::npos);
-    MT_EXPECT_TRUE(j.find("\"instanceID\":\"00000000-0000-0000-0000-000000000000\"")
-                   != std::string::npos);
-    MT_EXPECT_TRUE(j.find("\"envID\":\"snapshot-123\"") != std::string::npos);
-    MT_EXPECT_TRUE(j.find("\"accessTokenHash\":\"" + expected_hash + "\"") != std::string::npos);
-    // A non-reserved key alongside them still gets through.
-    m.WithExtra("custom", "42");
-    MT_EXPECT_EQ(m.ExtraCount(), static_cast<std::size_t>(1));
-    MT_EXPECT_TRUE(m.ToJson().find("\"custom\":42") != std::string::npos);
-}
-
-MT_TEST(mmds_stores_only_the_token_digest) {
-    agentenv::core::Uuid nil;
-    agentenv::core::SandboxId sid(nil);
-    MmdsMetadata m(sid, "snapshot-123");
-    // Seeded with the hash of the empty token, not an empty string, so the
-    // field is always a well-formed digest.
-    MT_EXPECT_EQ(m.AccessTokenHash(), MmdsMetadata::HashAccessToken(""));
-
+// mmds.rs :: hashes_secure_access_token_with_sha512
+MT_TEST(mmds_hashes_secure_access_token_with_sha512) {
     const std::string token = "super-secret-token";
-    m.SetAccessToken(token);
+    MmdsMetadata m(NilSandboxId(), "snapshot-123");
+    // Seeded with the hash of the empty token, not an empty string.
+    MT_EXPECT_EQ(m.AccessTokenHash(), MmdsMetadata::HashAccessToken(""));
+    m.WithAccessToken(agentenv::core::Optional<agentenv::sandbox::EnvdAccessToken>(Token(token)));
     MT_EXPECT_EQ(m.AccessTokenHash(), MmdsMetadata::HashAccessToken(token));
-    // The plaintext must never reach the document the guest can read.
     MT_EXPECT_TRUE(m.ToJson().find(token) == std::string::npos);
+    // `set_access_token(None)` goes back to the empty-token digest.
+    m.SetAccessToken(agentenv::core::nullopt);
+    MT_EXPECT_EQ(m.AccessTokenHash(), MmdsMetadata::HashAccessToken(""));
+}
+
+// mmds.rs :: extra_fields_are_flattened_into_top_level
+MT_TEST(mmds_extra_fields_are_flattened_into_top_level) {
+    agentenv::core::JsonObject extra;
+    extra["imageConfigs"] = J("{\"rootfs\":{\"Cmd\":[\"/bin/sh\"]}}");
+    MmdsMetadata m(NilSandboxId(), "snap-1");
+    m.WithExtra(extra);
+    agentenv::core::Json v = ParsedValue(m);
+    MT_EXPECT_EQ(v["imageConfigs"].ToString(), J("{\"rootfs\":{\"Cmd\":[\"/bin/sh\"]}}").ToString());
+    MT_EXPECT_EQ(v["instanceID"].as_string(), std::string("00000000-0000-0000-0000-000000000000"));
+}
+
+// mmds.rs :: extra_fields_cannot_override_reserved_fields
+MT_TEST(mmds_extra_fields_cannot_override_reserved_fields) {
+    MmdsMetadata expected(NilSandboxId(), "snapshot-123");
+    expected.WithAccessToken(
+        agentenv::core::Optional<agentenv::sandbox::EnvdAccessToken>(Token("a-real-token")));
+    agentenv::core::JsonObject extra;
+    for (int i = 0; i < 4; ++i) {
+        extra[kMmdsReservedFields[i]] = agentenv::core::Json("attacker-controlled");
+    }
+    MmdsMetadata m = expected;
+    m.WithExtra(extra);
+    MT_EXPECT_TRUE(m == expected);
+    MT_EXPECT_EQ(m.ExtraCount(), static_cast<std::size_t>(0));
+    MT_EXPECT_TRUE(m.ToJson().find("attacker-controlled") == std::string::npos);
+}
+
+// The previous port pasted extras into the document as raw text, so a value
+// that was not a single JSON value could close the object early and add its
+// own `accessTokenHash` — defeating the reserved-key filter. Values are JSON
+// now; a string full of JSON syntax stays a string.
+MT_TEST(mmds_extra_value_cannot_inject_fields) {
+    MmdsMetadata m(NilSandboxId(), "snap-1");
+    agentenv::core::JsonObject extra;
+    extra["custom"] = agentenv::core::Json("1,\"accessTokenHash\":\"forged\"");
+    extra["line\nbreak\"key"] = agentenv::core::Json("tab\there");
+    m.WithExtra(extra);
+    agentenv::core::Json v = ParsedValue(m);
+    MT_EXPECT_EQ(v["accessTokenHash"].as_string(), MmdsMetadata::HashAccessToken(""));
+    MT_EXPECT_EQ(v["custom"].as_string(), std::string("1,\"accessTokenHash\":\"forged\""));
+    MT_EXPECT_EQ(v["line\nbreak\"key"].as_string(), std::string("tab\there"));
+}
+
+// Rust `Map::extend` replaces an existing key; the guest must never see two.
+MT_TEST(mmds_with_extra_replaces_existing_key) {
+    MmdsMetadata m(NilSandboxId(), "snap-1");
+    agentenv::core::JsonObject first, second;
+    first["custom"] = agentenv::core::Json(static_cast<int64_t>(1));
+    second["custom"] = agentenv::core::Json(static_cast<int64_t>(2));
+    m.WithExtra(first).WithExtra(second);
+    MT_EXPECT_EQ(m.ExtraCount(), static_cast<std::size_t>(1));
+    const std::string j = m.ToJson();
+    MT_EXPECT_EQ(j.find("\"custom\""), j.rfind("\"custom\""));
+    MT_EXPECT_EQ(ParsedValue(m)["custom"].as_int(), static_cast<int64_t>(2));
+}
+
+// mmds.rs :: round_trips_with_extra_fields
+MT_TEST(mmds_round_trips_with_extra_fields) {
+    agentenv::core::JsonObject extra;
+    extra["custom"] = agentenv::core::Json(static_cast<int64_t>(42));
+    MmdsMetadata original(NilSandboxId(), "snap-1");
+    original.WithExtra(extra);
+    agentenv::core::Expected<MmdsMetadata, std::string> restored =
+        MmdsMetadata::FromValue(J(original.ToJson()));
+    MT_EXPECT_TRUE(restored.ok());
+    MT_EXPECT_TRUE(restored.value() == original);
+}
+
+// mmds.rs :: deserializes_legacy_json_without_extra_fields
+MT_TEST(mmds_deserializes_legacy_json_without_extra_fields) {
+    agentenv::core::Expected<MmdsMetadata, std::string> m = MmdsMetadata::FromValue(
+        J("{\"instanceID\":\"00000000-0000-0000-0000-000000000000\",\"envID\":\"snapshot-123\","
+          "\"address\":\"\",\"accessTokenHash\":\"" + MmdsMetadata::HashAccessToken("") + "\"}"));
+    MT_EXPECT_TRUE(m.ok());
+    MT_EXPECT_EQ(m.value().ExtraCount(), static_cast<std::size_t>(0));
+    MT_EXPECT_EQ(m.value().SandboxId(), std::string("00000000-0000-0000-0000-000000000000"));
+}
+
+MT_TEST(mmds_deserialize_requires_core_fields) {
+    MT_EXPECT_TRUE(!MmdsMetadata::FromValue(
+                        J("{\"instanceID\":\"x\",\"envID\":\"y\",\"address\":\"\"}"))
+                        .ok());
+    MT_EXPECT_TRUE(!MmdsMetadata::FromValue(J("{\"instanceID\":1,\"envID\":\"y\","
+                                              "\"address\":\"\",\"accessTokenHash\":\"h\"}"))
+                        .ok());
+    MT_EXPECT_TRUE(!MmdsMetadata::FromValue(J("[]")).ok());
 }
 
 // ---- FirecrackerPool watermark management ----

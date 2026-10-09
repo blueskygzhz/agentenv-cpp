@@ -165,43 +165,69 @@ bool IsReservedMmdsField(const std::string& key) {
     return false;
 }
 
-MmdsMetadata& MmdsMetadata::WithExtra(const std::string& key, const std::string& json_value) {
-    // Rust `extra.retain(|key, _| !RESERVED_FIELDS.contains(...))`. Extras are
-    // opaque data the API layer passes through to the guest, so a caller must
-    // not be able to restate `instanceID` or `accessTokenHash` and have the
-    // duplicate win — MMDS is what the guest reads its own identity from, and
-    // the hash is what it authenticates against. Dropped silently, as in Rust:
-    // a rejected key is not an error the API layer can act on.
-    if (IsReservedMmdsField(key)) return *this;
-    extra_.push_back(std::make_pair(key, json_value));
+MmdsMetadata& MmdsMetadata::WithExtra(const core::JsonObject& extra) {
+    // Rust `extra.retain(|key, _| !RESERVED_FIELDS.contains(...))` then
+    // `self.extra.extend(extra)`. Dropped silently, as in Rust: a rejected key
+    // is not an error the API layer can act on.
+    for (core::JsonObject::const_iterator it = extra.begin(); it != extra.end(); ++it) {
+        if (IsReservedMmdsField(it->first)) continue;
+        extra_[it->first] = it->second;
+    }
     return *this;
 }
 
-void MmdsMetadata::SetAccessToken(const std::string& token) {
-    access_token_hash_ = HashAccessToken(token);
+MmdsMetadata& MmdsMetadata::WithAccessToken(const core::Optional<EnvdAccessToken>& token) {
+    SetAccessToken(token);
+    return *this;
 }
 
-static std::string json_escape(const std::string& s) {
-    std::string out;
-    for (size_t i = 0; i < s.size(); ++i) {
-        char c = s[i];
-    if (c == '"' || c == '\\') { out.push_back('\\'); out.push_back(c); }
-        else out.push_back(c);
-  }
-    return out;
+void MmdsMetadata::SetAccessToken(const core::Optional<EnvdAccessToken>& token) {
+    access_token_hash_ = HashAccessToken(token.has_value() ? token->Expose() : std::string());
 }
 
-std::string MmdsMetadata::ToJson() const {
-    std::string j = "{";
-    j += "\"instanceID\":\"" + json_escape(sandbox_id_) + "\",";
-    j += "\"envID\":\"" + json_escape(snapshot_id_) + "\",";
-    j += "\"address\":\"" + json_escape(logs_collector_address_) + "\",";
-    j += "\"accessTokenHash\":\"" + json_escape(access_token_hash_) + "\"";
-    for (size_t i = 0; i < extra_.size(); ++i) {
-        j += ",\"" + json_escape(extra_[i].first) + "\":" + extra_[i].second;
-  }
-    j += "}";
-    return j;
+core::Json MmdsMetadata::ToValue() const {
+    // Extras first, then the core fields over them. `WithExtra` already keeps
+    // reserved keys out, so this order only matters for a value built some
+    // other way — and then the sandbox's identity must still win.
+    core::JsonObject object = extra_;
+    object["instanceID"]      = core::Json(sandbox_id_);
+    object["envID"]           = core::Json(snapshot_id_);
+    object["address"]         = core::Json(logs_collector_address_);
+    object["accessTokenHash"] = core::Json(access_token_hash_);
+    return core::Json(object);
+}
+
+std::string MmdsMetadata::ToJson() const { return ToValue().ToString(); }
+
+core::Expected<MmdsMetadata, std::string> MmdsMetadata::FromValue(const core::Json& value) {
+    if (value.kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(std::string("invalid type: expected struct MmdsMetadata"));
+    }
+    const core::JsonObject& fields = value.as_object();
+    MmdsMetadata metadata;
+    std::string* const targets[4] = {&metadata.sandbox_id_, &metadata.snapshot_id_,
+                                     &metadata.logs_collector_address_,
+                                     &metadata.access_token_hash_};
+    for (std::size_t i = 0; i < 4; ++i) {
+        core::JsonObject::const_iterator it = fields.find(kMmdsReservedFields[i]);
+        if (it == fields.end()) {
+            return core::make_unexpected(std::string("missing field `") +
+                                         kMmdsReservedFields[i] + "`");
+        }
+        if (it->second.kind() != core::Json::Kind::String) {
+            return core::make_unexpected(std::string("invalid type for `") +
+                                         kMmdsReservedFields[i] + "`: expected a string");
+        }
+        *targets[i] = it->second.as_string();
+    }
+    for (core::JsonObject::const_iterator it = fields.begin(); it != fields.end(); ++it) {
+        if (!IsReservedMmdsField(it->first)) metadata.extra_[it->first] = it->second;
+    }
+    return metadata;
+}
+
+bool MmdsMetadata::operator==(const MmdsMetadata& o) const {
+    return ToJson() == o.ToJson();
 }
 
 }  // namespace firecracker

@@ -400,7 +400,7 @@ MT_TEST(snapshot_projection_keeps_absent_env_vars_absent) {
     MT_EXPECT_TRUE(!empty.value().common.env_vars.has_value());
 
     RunnableSnapshotView with_env = OkSnapshotView();
-    with_env.env_vars.push_back(std::make_pair(std::string("A"), std::string("1")));
+    with_env.env_vars["A"] = "1";
     with_env.user = std::string("agent");
     auto populated = SnapshotConfigFromRunnable(base, app, with_env, OkManifestView());
     MT_EXPECT_TRUE(populated.ok());

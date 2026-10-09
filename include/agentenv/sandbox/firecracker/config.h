@@ -10,6 +10,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -19,7 +20,9 @@
 #include "agentenv/core/identity.h"
 #include "agentenv/core/optional.h"
 #include "agentenv/core/virtualization.h"
+#include "agentenv/sandbox/backend.h"
 #include "agentenv/sandbox/extra_drive.h"
+#include "agentenv/sandbox/firecracker/mmds.h"
 #include "agentenv/sandbox/network/policy.h"
 #include "agentenv/sandbox/ublk.h"
 
@@ -101,15 +104,16 @@ struct CommonConfig {
 
     /// Rust `Option<HashMap<String, String>>`: absent and empty are distinct —
     /// `apply_launch_config` only creates the map when there is something to
-    /// put in it.
-    core::Optional<std::vector<std::pair<std::string, std::string> > > env_vars;
+    /// put in it. A map, not a list: a launch override of a key the image
+    /// already sets must *replace* it (`HashMap::extend`), never sit beside it.
+    core::Optional<std::map<std::string, std::string> > env_vars;
     core::Optional<std::string> default_workdir;
     core::Optional<std::string> default_user;
 
-    /// Rust `mmds_metadata: Option<MmdsMetadata>` — the rendered MMDS document.
-    /// Held as its serialized JSON so this header does not pull in mmds.h; the
-    /// document is only ever handed to the API socket as a body anyway.
-    core::Optional<std::string> mmds_metadata_json;
+    /// Rust `mmds_metadata: Option<MmdsMetadata>`. Kept as the structured
+    /// document (not pre-rendered text) because it is persisted with snapshot
+    /// configs and re-stamped with a fresh access-token hash on resume.
+    core::Optional<MmdsMetadata> mmds_metadata;
 
     /// OverlayBD config for the sandbox user rootfs drive.
     core::Optional<ublk::OverlaybdDeviceConfig> rootfs_image_config;
@@ -144,7 +148,7 @@ struct CommonConfig {
     /// Rust `#[serde(skip)] envd_access_token` — runtime-only. Re-derived from
     /// sandbox metadata on resume and deliberately absent from persisted
     /// snapshot configs, so a leaked snapshot cannot carry a live credential.
-    core::Optional<std::string> envd_access_token;
+    core::Optional<EnvdAccessToken> envd_access_token;
 
     /// Rust `FirecrackerCommonConfig::new`.
     static CommonConfig New(const std::string& firecracker_binary,
@@ -192,6 +196,25 @@ struct SandboxConfig {
                              const std::string& tools_drive_version,
                              const std::string& user_image_config_path);
 
+    /// Rust `FirecrackerSandboxConfig::from_app_config_with_user_image`.
+    ///
+    /// The node's overlaybd `runtime_upper_mode` overrides whatever the caller
+    /// put in `user_image_config`: the upper format is how *this host* runs a
+    /// writable image. The ublk device is derived from the same config so the
+    /// daemon opens the image exactly as `rootfs_image_config` describes it.
+    static core::Expected<SandboxConfig, std::string> FromAppConfigWithUserImage(
+        const cfg::AppConfig& config, ublk::OverlaybdDeviceConfig user_image_config);
+
+    /// Rust `FirecrackerSandboxConfig::apply_launch_config`.
+    ///
+    /// Layers the orchestrator's launch inputs over the image defaults: env
+    /// overrides *extend* (and win over) the image's env, the MMDS document is
+    /// built fresh for this sandbox id with the launch's extras and token
+    /// hash, and network policy, custom-extension params and the envd token
+    /// are taken from the launch as-is — including clearing them when the
+    /// launch has none.
+    SandboxConfig& ApplyLaunchConfig(const SandboxLaunchConfig& launch_config);
+
     /// Rust `FirecrackerSandboxConfig::validate`.
     core::Expected<core::Unit, std::string> Validate() const;
 };
@@ -211,7 +234,7 @@ struct RunnableSnapshotView {
     std::string tools_drive_version;
     std::string envd_version;
     /// Rust `snapshot.committed().context.{env_vars,workdir,user}`.
-    std::vector<std::pair<std::string, std::string> > env_vars;
+    std::map<std::string, std::string> env_vars;
     std::string workdir;
     core::Optional<std::string> user;
 };

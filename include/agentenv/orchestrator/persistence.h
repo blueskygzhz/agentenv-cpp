@@ -10,6 +10,8 @@
 #include "agentenv/core/expected.h"
 #include "agentenv/core/identity.h"
 #include "agentenv/core/optional.h"
+#include "agentenv/core/virtualization.h"
+#include "agentenv/local_store.h"
 #include "agentenv/orchestrator/store.h"
 
 namespace agentenv {
@@ -112,11 +114,46 @@ class DisabledSandboxPersister : public SandboxPersister {
         DeleteRecordAndArtifacts(const core::SandboxId& id) override;
 };
 
-/// "disabled" — Rust `DisabledSandboxPersister`.
-/// "file"     — Rust `FileBackedSandboxPersister` (not yet ported; falls back
-///              to the disabled persister so wiring stays valid).
-std::unique_ptr<SandboxPersister> MakePersister(const std::string& kind,
-                                                const std::string& path);
+/// Rust struct `FileBackedSandboxPersister` (persistence/file_backed.rs).
+///
+/// One KV record per paused sandbox under `<root>/records.db`, plus a
+/// per-sandbox artifact directory under `<root>/artifacts/<id>/<uuid>`.
+///
+/// `virtualization_mode` is the *node's* mode: a record captured under another
+/// mode is loaded visible-but-not-resumable, so it must come from the node's
+/// config. Durability defaults to `Sync`, as in Rust.
+class FileBackedSandboxPersister : public SandboxPersister {
+ public:
+    /// Rust `FileBackedSandboxPersister::new`.
+    FileBackedSandboxPersister(const std::string& root, core::VirtualizationMode mode);
+    ~FileBackedSandboxPersister();
+
+    /// Rust `with_durability`. Rust consumes `self` before the store can be
+    /// opened; here it must likewise be called before the first operation,
+    /// since the store is opened lazily and at most once.
+    FileBackedSandboxPersister& WithDurability(local_store::Durability durability);
+
+    PersistenceResult<std::vector<SandboxMetadata> >
+        LoadAll(sandbox::SandboxBackendFactory* factory) override;
+    PersistenceResult<core::Optional<std::string> >
+        AllocateArtifactRoot(const core::SandboxId& id) override;
+    PersistenceResult<core::Unit>
+        PersistPaused(const SandboxMetadata& metadata,
+                      const core::Optional<std::string>& artifact_root,
+                      const sandbox::PausedSandboxState* paused_state) override;
+    PersistenceResult<core::Unit> MarkResuming(const core::SandboxId& id) override;
+    PersistenceResult<core::Unit> RollbackResuming(const core::SandboxId& id) override;
+    PersistenceResult<core::Unit> DeleteRecord(const core::SandboxId& id) override;
+    PersistenceResult<core::Unit>
+        DeleteRecordAndArtifacts(const core::SandboxId& id) override;
+
+ private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+
+    FileBackedSandboxPersister(const FileBackedSandboxPersister&);
+    FileBackedSandboxPersister& operator=(const FileBackedSandboxPersister&);
+};
 
 }  // namespace orchestrator
 }  // namespace agentenv

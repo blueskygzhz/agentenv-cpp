@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Rust: src/sandbox/firecracker/{pool,factory}.rs.
+// Rust: src/sandbox/firecracker/pool.rs.
 #ifndef AGENTENV_SANDBOX_FIRECRACKER_POOL_H_
 #define AGENTENV_SANDBOX_FIRECRACKER_POOL_H_
 
@@ -22,14 +22,6 @@ class Pool {
     virtual ~Pool() {}
     virtual core::Expected<std::shared_ptr<Instance>, std::string> Acquire() = 0;
 virtual void Release(std::shared_ptr<Instance> inst) = 0;
-};
-
-/// Rust: firecracker/factory.rs :: FirecrackerSandboxFactory.
-class Factory {
- public:
-    virtual ~Factory() {}
-    virtual core::Expected<std::shared_ptr<Backend>, std::string>
-        BuildBackend(const SandboxConfig& cfg) = 0;
 };
 
 /// Rust: firecracker/pool.rs :: FirecrackerPool — warm-entry容量管理.
