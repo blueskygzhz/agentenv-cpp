@@ -273,55 +273,192 @@ std::string FirecrackerInstance::ResolveHostPath(const std::string& path) const 
     return work_dir_ + "/" + path;
 }
 
-core::Expected<core::Unit, std::string>
-FirecrackerInstance::ApiPut(const std::string& path, const std::string& json_body) {
+core::Expected<std::string, std::string>
+FirecrackerInstance::ApiRequest(const std::string& method, const std::string& path,
+                                const std::string& json_body) {
     if (!connector_) {
         return core::make_unexpected(std::string("no api connector configured"));
     }
     auto sock = connector_->Connect(socket_path_);
     if (!sock.ok()) return core::make_unexpected(sock.error());
-    auto resp = sock.value()->Request("PUT", path, json_body);
+    return sock.value()->Request(method, path, json_body);
+}
+
+core::Expected<core::Unit, std::string>
+FirecrackerInstance::ApiPut(const std::string& path, const std::string& json_body) {
+    auto resp = ApiRequest("PUT", path, json_body);
     if (!resp.ok()) return core::make_unexpected(resp.error());
     return core::Unit{};
 }
 
 core::Expected<core::Unit, std::string>
+FirecrackerInstance::SetCpuConfig(const std::string& json) {
+    // Rust parses into a `RawValue` and forwards it untouched. Parsing is only
+    // a validity gate: the template is an opaque, architecture-specific
+    // document, so re-serializing a parsed form risks changing it.
+    const core::Expected<core::Json, core::AnyError> parsed = core::Json::Parse(json);
+    if (!parsed.ok()) {
+        return core::make_unexpected(std::string("Failed to parse cpu_config_json: ") +
+                                     parsed.error().chain());
+    }
+    return ApiPut("/cpu-config", json);
+}
+
+core::Expected<core::Unit, std::string>
+FirecrackerInstance::SetLogger(const std::string& log_path, const std::string& level) {
+    const core::Expected<core::Json, std::string> body = LoggerBody(log_path, level);
+    if (!body.ok()) return core::make_unexpected(body.error());
+    return ApiPut("/logger", body.value().ToString());
+}
+
+core::Expected<core::Unit, std::string>
 FirecrackerInstance::SetMachineConfig(uint32_t mem_mib, uint32_t vcpus, bool smt,
-          bool track_dirty) {
-    char body[192];
-    std::snprintf(body, sizeof(body),
-        "{\"mem_size_mib\":%u,\"vcpu_count\":%u,\"smt\":%s,\"track_dirty_pages\":%s}",
-        mem_mib, vcpus, smt ? "true" : "false", track_dirty ? "true" : "false");
-    return ApiPut("/machine-config", body);
+                                      bool track_dirty) {
+    return ApiPut("/machine-config",
+                  MachineConfigBody(mem_mib, vcpus, smt, track_dirty).ToString());
 }
 
 core::Expected<core::Unit, std::string>
 FirecrackerInstance::SetBootSource(const std::string& kernel_image,
-           const std::string& boot_args) {
-    std::string body = "{\"kernel_image_path\":\"" + kernel_image + "\"";
-    if (!boot_args.empty()) body += ",\"boot_args\":\"" + boot_args + "\"";
-    body += "}";
-    return ApiPut("/boot-source", body);
+                                   const core::Optional<std::string>& initrd_path,
+                                   const core::Optional<std::string>& boot_args) {
+    return ApiPut("/boot-source",
+                  BootSourceBody(kernel_image, initrd_path, boot_args).ToString());
 }
 
 core::Expected<core::Unit, std::string>
 FirecrackerInstance::AddDrive(const std::string& drive_id, const std::string& path_on_host,
-bool is_root, bool read_only) {
-    std::string body = "{\"drive_id\":\"" + drive_id + "\",\"path_on_host\":\"" +
-       path_on_host + "\",\"is_root_device\":" +
-              (is_root ? "true" : "false") + ",\"is_read_only\":" +
-         (read_only ? "true" : "false") + "}";
-    return ApiPut("/drives/" + drive_id, body);
+                              bool is_root, bool read_only, bool direct, IoEngine io_engine,
+                              const core::Optional<RateLimiter>& rate_limiter) {
+    return ApiPut("/drives/" + drive_id,
+                  DriveBody(drive_id, path_on_host, is_root, read_only, direct, io_engine,
+                            rate_limiter)
+                      .ToString());
+}
+
+core::Expected<core::Unit, std::string>
+FirecrackerInstance::PatchDriveRateLimiter(const std::string& drive_id,
+                                           const RateLimiter& rate_limiter) {
+    const core::Json body = PartialDriveBody(drive_id, core::nullopt,
+                                             core::Optional<RateLimiter>(rate_limiter));
+    auto resp = ApiRequest("PATCH", "/drives/" + drive_id, body.ToString());
+    if (!resp.ok()) {
+        return core::make_unexpected(std::string("Failed to patch rate limiter on drive ") +
+                                     drive_id + ": " + resp.error());
+    }
+    return core::Unit{};
+}
+
+core::Expected<core::Unit, std::string>
+FirecrackerInstance::PatchDrivePath(const std::string& drive_id,
+                                    const std::string& path_on_host) {
+    const core::Json body = PartialDriveBody(
+        drive_id, core::Optional<std::string>(path_on_host), core::nullopt);
+    auto resp = ApiRequest("PATCH", "/drives/" + drive_id, body.ToString());
+    if (!resp.ok()) {
+        return core::make_unexpected(std::string("Failed to patch host path on drive ") +
+                                     drive_id + ": " + resp.error());
+    }
+    return core::Unit{};
+}
+
+core::Expected<core::Unit, std::string>
+FirecrackerInstance::AddNetworkInterface(const std::string& iface_id,
+                                         const core::Optional<std::string>& guest_mac,
+                                         const std::string& host_dev_name,
+                                         const core::Optional<RateLimiter>& rx_rate_limiter,
+                                         const core::Optional<RateLimiter>& tx_rate_limiter) {
+    const core::Json body = NetworkInterfaceBody(iface_id, guest_mac, host_dev_name,
+                                                 rx_rate_limiter, tx_rate_limiter);
+    auto put = ApiPut("/network-interfaces/" + iface_id, body.ToString());
+    if (!put.ok()) {
+        return core::make_unexpected(std::string("Failed to add network interface ") +
+                                     iface_id + ": " + put.error());
+    }
+    return core::Unit{};
+}
+
+core::Expected<core::Unit, std::string>
+FirecrackerInstance::SetMmdsConfig(const std::string& iface_id) {
+    return ApiPut("/mmds/config", MmdsConfigBody(iface_id).ToString());
+}
+
+core::Expected<core::Unit, std::string> FirecrackerInstance::SetBalloon() {
+    return ApiPut("/balloon", BalloonBody().ToString());
 }
 
 core::Expected<core::Unit, std::string> FirecrackerInstance::Start() {
-    return ApiPut("/actions", "{\"action_type\":\"InstanceStart\"}");
+    core::JsonObject action;
+    action["action_type"] = core::Json(std::string("InstanceStart"));
+    return ApiPut("/actions", core::Json(action).ToString());
 }
+
 core::Expected<core::Unit, std::string> FirecrackerInstance::Pause() {
-    return ApiPut("/vm", "{\"state\":\"Paused\"}");
+    core::JsonObject body;
+    body["state"] = core::Json(std::string("Paused"));
+    auto resp = ApiRequest("PATCH", "/vm", core::Json(body).ToString());
+    if (!resp.ok()) return core::make_unexpected(resp.error());
+    return core::Unit{};
 }
+
 core::Expected<core::Unit, std::string> FirecrackerInstance::Resume() {
-    return ApiPut("/vm", "{\"state\":\"Resumed\"}");
+    core::JsonObject body;
+    body["state"] = core::Json(std::string("Resumed"));
+    auto resp = ApiRequest("PATCH", "/vm", core::Json(body).ToString());
+    if (!resp.ok()) return core::make_unexpected(resp.error());
+    return core::Unit{};
+}
+
+core::Expected<core::Unit, std::string>
+FirecrackerInstance::CreateStateOnlySnapshot(const std::string& snapshot_path) {
+    return ApiPut("/snapshot/create", SnapshotCreateBody(snapshot_path).ToString());
+}
+
+core::Expected<DirtyMemoryRanges, std::string> FirecrackerInstance::GetDirtyMemoryRanges() {
+    auto resp = ApiRequest("GET", "/vm/dirty-memory-ranges", std::string());
+    if (!resp.ok()) {
+        return core::make_unexpected(std::string("Failed to get dirty memory ranges: ") +
+                                     resp.error());
+    }
+    const core::Expected<core::Json, core::AnyError> value = core::Json::Parse(resp.value());
+    if (!value.ok()) {
+        return core::make_unexpected(std::string("Failed to get dirty memory ranges: ") +
+                                     value.error().chain());
+    }
+    return ParseDirtyMemoryRanges(value.value());
+}
+
+core::Expected<core::Unit, std::string> FirecrackerInstance::LoadSnapshotUffd(
+    const std::string& snapshot_path, const std::string& uffd_uds_path,
+    const std::vector<std::pair<std::string, std::string> >& network_overrides) {
+    // Rust resolves the snapshot path against the work dir but leaves the uffd
+    // socket path as given: the socket is created by the uffd handler, which
+    // does not share this instance's work directory.
+    const core::Json body = SnapshotLoadBody(
+        ResolveHostPath(snapshot_path), MemoryBackendType::Uffd, uffd_uds_path,
+        /*resume_vm=*/true, /*track_dirty_pages=*/false, /*track_dirty_pages_set=*/false,
+        network_overrides);
+    auto put = ApiPut("/snapshot/load", body.ToString());
+    if (!put.ok()) {
+        return core::make_unexpected(
+            std::string("Failed to load snapshot with uffd backend: ") + put.error());
+    }
+    return core::Unit{};
+}
+
+core::Expected<core::Unit, std::string> FirecrackerInstance::LoadSnapshotFile(
+    const std::string& snapshot_path, const std::string& mem_backend_path,
+    const std::vector<std::pair<std::string, std::string> >& network_overrides,
+    bool resume_vm, bool track_dirty_pages) {
+    const core::Json body = SnapshotLoadBody(
+        ResolveHostPath(snapshot_path), MemoryBackendType::File, mem_backend_path, resume_vm,
+        track_dirty_pages, /*track_dirty_pages_set=*/true, network_overrides);
+    auto put = ApiPut("/snapshot/load", body.ToString());
+    if (!put.ok()) {
+        return core::make_unexpected(
+            std::string("Failed to load snapshot with file backend: ") + put.error());
+    }
+    return core::Unit{};
 }
 
 core::Expected<core::Unit, std::string> FirecrackerInstance::Boot() {

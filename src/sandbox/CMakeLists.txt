@@ -31,6 +31,8 @@ add_library(agentenv-sandbox STATIC
     firecracker/lifecycle.cc
     firecracker/socket.cc
     firecracker/instance.cc
+    # Rust: the firecracker_client::models bodies instance.rs sends
+    firecracker/instance_api.cc
     firecracker/mmds.cc
  firecracker/pool.cc
     firecracker/sandbox.cc
@@ -46,5 +48,8 @@ target_link_libraries(agentenv-sandbox PUBLIC
     agentenv-managed-secret
     agentenv-snapshot-startup-pack
     agentenv-privileges
-
+    # `ublk::OverlaybdDeviceConfig` serializes `runtime_upper_mode` through
+    # `storage::overlaybd::UpperModeToString` / `UpperModeParse`, so the
+    # persisted spelling has exactly one definition.
+    agentenv-overlaybd
 )

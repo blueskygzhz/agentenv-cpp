@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Rust: src/sandbox/firecracker/overlaybd_snapshot.rs
+#include "agentenv/core/serde.h"
 #include "agentenv/sandbox/firecracker/dirty_memory.h"
 
 #include <algorithm>
@@ -231,6 +232,55 @@ void SplitRuntimeSuffix(const std::vector<std::string>& lower_files,
             runtime_owned_suffix->push_back(lower_files[i]);
         }
     }
+}
+
+core::Expected<DirtyMemoryRanges, std::string> ParseDirtyMemoryRanges(
+    const core::Json& json) {
+    namespace sd = core::serde;
+    if (json.kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(
+            std::string("invalid type: expected struct DirtyMemoryRanges"));
+    }
+    const core::JsonObject& fields = json.as_object();
+    DirtyMemoryRanges out;
+
+    // `page_size` is an i32 and `memory_size` an i64 in the API model. Both are
+    // required: this reply is what decides which bytes of guest memory land in
+    // the snapshot, so a missing field must fail rather than default to 0 and
+    // produce an empty or truncated memory image.
+    const core::Expected<uint64_t, std::string> page_size =
+        sd::RequireUint(fields, "page_size", 0x7fffffffull);
+    if (!page_size.ok()) return core::make_unexpected(page_size.error());
+    out.page_size = static_cast<int32_t>(page_size.value());
+
+    const core::Expected<uint64_t, std::string> memory_size =
+        sd::RequireUint(fields, "memory_size", 0x7fffffffffffffffull);
+    if (!memory_size.ok()) return core::make_unexpected(memory_size.error());
+    out.memory_size = static_cast<int64_t>(memory_size.value());
+
+    const core::Expected<const core::JsonArray*, std::string> ranges =
+        sd::RequireArray(fields, "ranges");
+    if (!ranges.ok()) return core::make_unexpected(ranges.error());
+    for (std::size_t i = 0; i < ranges.value()->size(); ++i) {
+        const core::Json& entry = (*ranges.value())[i];
+        if (entry.kind() != core::Json::Kind::Object) {
+            return core::make_unexpected(
+                std::string("invalid type: expected struct DirtyMemoryRange"));
+        }
+        const core::JsonObject& range_fields = entry.as_object();
+        DirtyMemoryRange range;
+        const char* const kNames[3] = {"base_host_virt_addr", "image_offset", "length"};
+        int64_t* const kTargets[3] = {&range.base_host_virt_addr, &range.image_offset,
+                                      &range.length};
+        for (int f = 0; f < 3; ++f) {
+            const core::Expected<uint64_t, std::string> v =
+                sd::RequireUint(range_fields, kNames[f], 0x7fffffffffffffffull);
+            if (!v.ok()) return core::make_unexpected(v.error());
+            *kTargets[f] = static_cast<int64_t>(v.value());
+        }
+        out.ranges.push_back(range);
+    }
+    return out;
 }
 
 }  // namespace firecracker

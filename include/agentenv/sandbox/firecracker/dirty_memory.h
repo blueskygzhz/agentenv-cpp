@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "agentenv/core/expected.h"
+#include "agentenv/core/json.h"
 #include "agentenv/storage/overlaybd/lsmt.h"
 
 namespace agentenv {
@@ -68,6 +69,13 @@ struct DirtyMemoryRanges {
     int64_t memory_size = 0;
     std::vector<DirtyMemoryRange> ranges;
 };
+
+/// Rust `Deserialize` for the `GET /vm/dirty-memory-ranges` reply.
+///
+/// Every field is required: this reply decides which byte ranges of guest
+/// memory are written into the snapshot, so a missing or mistyped one must
+/// fail here rather than silently produce a short memory image.
+core::Expected<DirtyMemoryRanges, std::string> ParseDirtyMemoryRanges(const core::Json& json);
 
 /// Rust `checked_i64_to_u64` — the API's signed integers must be non-negative
 /// before they can be used as offsets or lengths.
