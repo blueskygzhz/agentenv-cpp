@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "agentenv/core/expected.h"
+#include "agentenv/core/json.h"
 #include "agentenv/storage/overlaybd/config.h"
 
 namespace agentenv {
@@ -30,6 +31,14 @@ struct OverlaybdDeviceConfig {
     /// upper format than the one the image was built with.
     storage::overlaybd::UpperMode runtime_upper_mode =
         storage::overlaybd::UpperMode::LogStructured;
+
+    /// Rust `Serialize` — `image_config_path` / `read_only` /
+    /// `runtime_upper_mode`, the last in its camelCase serde spelling.
+    core::Json ToJson() const;
+    /// Rust `Deserialize`. `runtime_upper_mode` has
+    /// `#[serde(default = "default_runtime_upper_mode")]`, so a record written
+    /// before the field existed reads back as `LogStructured`.
+    static core::Expected<OverlaybdDeviceConfig, std::string> FromJson(const core::Json& json);
 
     bool operator==(const OverlaybdDeviceConfig& o) const {
         return image_config_path == o.image_config_path && read_only == o.read_only &&
@@ -57,6 +66,16 @@ struct UblkConfig {
     static UblkConfig OverlaybdWithRuntimeUpperMode(
         const std::string& image_config_path, bool read_only,
         storage::overlaybd::UpperMode runtime_upper_mode);
+
+    /// Rust `Serialize` — `{"backend": {"Overlaybd": {...}}}` (externally
+    /// tagged, as serde writes an enum variant with a payload).
+    core::Json ToJson() const;
+    /// Rust's hand-written `Deserialize for UblkBackend`.
+    ///
+    /// The removed `Cow` backend is refused by name rather than ignored: a
+    /// sandbox captured on it has a runtime nothing here can reopen, so it
+    /// must be rebuilt instead of silently resumed against overlaybd.
+    static core::Expected<UblkConfig, std::string> FromJson(const core::Json& json);
 
     bool operator==(const UblkConfig& o) const {
         return backend == o.backend && overlaybd == o.overlaybd;

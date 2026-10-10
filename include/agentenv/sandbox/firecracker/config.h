@@ -61,6 +61,23 @@ struct RuntimePolicy {
 
     /// Rust `FirecrackerRuntimePolicy::from_app_config`.
     static RuntimePolicy FromAppConfig(const cfg::AppConfig& config);
+
+    /// Rust `Serialize` — each field is a `Duration`, which serde writes as
+    /// `{"secs": N, "nanos": N}`.
+    core::Json ToJson() const;
+    /// Rust `Deserialize`. Sub-millisecond `nanos` are truncated: this struct
+    /// stores milliseconds, and every value upstream is built with
+    /// `from_secs` / `from_millis`, so a finer one can only come from a
+    /// hand-edited record.
+    static core::Expected<RuntimePolicy, std::string> FromJson(const core::Json& json);
+
+    bool operator==(const RuntimePolicy& o) const {
+        return socket_timeout_ms == o.socket_timeout_ms &&
+               socket_poll_interval_ms == o.socket_poll_interval_ms &&
+               envd_timeout_ms == o.envd_timeout_ms &&
+               envd_poll_interval_ms == o.envd_poll_interval_ms;
+    }
+    bool operator!=(const RuntimePolicy& o) const { return !(*this == o); }
 };
 
 /// Rust: firecracker/config.rs :: FirecrackerCommonConfig — everything a fresh
@@ -176,6 +193,23 @@ struct CommonConfig {
     /// resumed against whichever tools drive happens to be current.
     core::Expected<std::string, std::string> ResolvedToolsDrivePath(
         const cfg::AppConfig& config) const;
+
+    // ---- serialization ---------------------------------------------------
+
+    /// Rust `Serialize`. Field names are the struct's own (no `rename_all`).
+    ///
+    /// `envd_access_token` is `#[serde(skip)]` and is never written: a
+    /// persisted capture must not carry a live credential, and the token is
+    /// re-derived from sandbox metadata on resume.
+    core::Json ToJson() const;
+
+    /// Rust `Deserialize`.
+    ///
+    /// The `#[serde(default)]` fields take the *type's* default when missing,
+    /// which deliberately differs from what `New()` would set:
+    /// `track_dirty_pages` reads back as **false** on a record that predates
+    /// the field, not as the `true` a fresh config starts with.
+    static core::Expected<CommonConfig, std::string> FromJson(const core::Json& json);
 };
 
 /// Rust: firecracker/config.rs :: logging_enabled lives in `lifecycle.h` —
@@ -278,6 +312,16 @@ struct SnapshotConfig {
 
     /// Rust `FirecrackerSnapshotConfig::validate_persisted_artifacts`.
     core::Expected<core::Unit, std::string> ValidatePersistedArtifacts() const;
+
+    // ---- serialization ---------------------------------------------------
+
+    /// Rust `Serialize`. `managed_snapshot_root`, `pack_recording` and
+    /// `memory_startup_pack` are `#[serde(skip)]`: they describe *this* run of
+    /// the capture (a directory lease, a one-off recording VM, a resolved
+    /// prefetch manifest), not the capture itself.
+    core::Json ToJson() const;
+    /// Rust `Deserialize`; the skipped fields come back at their defaults.
+    static core::Expected<SnapshotConfig, std::string> FromJson(const core::Json& json);
 };
 
 /// Rust: firecracker/config.rs :: FirecrackerSnapshotConfig::from_runnable_snapshot

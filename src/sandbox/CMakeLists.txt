@@ -20,6 +20,9 @@ add_library(agentenv-sandbox STATIC
     ublk.cc
     # firecracker sub-module (Rust: src/sandbox/firecracker/*.rs)
     firecracker/config.cc
+    # Rust: the Serialize/Deserialize derives on the firecracker configs —
+    # this is the on-disk form of a paused sandbox.
+    firecracker/config_json.cc
     # Rust: src/sandbox/firecracker/overlaybd_snapshot.rs (dirty-page mapping)
     firecracker/dirty_memory.cc
     # Rust: src/sandbox/firecracker/process_vm_reader.rs
@@ -33,6 +36,8 @@ add_library(agentenv-sandbox STATIC
     firecracker/sandbox.cc
     # Rust: src/sandbox/firecracker/factory.rs (config half of `build`)
     firecracker/factory.cc
+    # Rust: firecracker/sandbox.rs :: FirecrackerPausedState
+    firecracker/paused_state.cc
 )
 target_include_directories(agentenv-sandbox PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-sandbox PUBLIC

@@ -87,6 +87,23 @@ core::Expected<SandboxConfig, std::string> FreshSandboxConfigForBuild(
     return config;
 }
 
+core::Expected<std::shared_ptr<PausedSandboxState>, core::AnyError>
+DecodeFirecrackerPausedState(const std::string& artifact_root, const std::string& state) {
+    // The trait hands the payload over as text (the C++ `PausedSandboxState`
+    // encodes to a string); Rust receives an already-parsed `serde_json::Value`
+    // from the record. Text that is not JSON is this port's form of the
+    // deserialize error Rust would raise.
+    const core::Expected<core::Json, core::AnyError> value = core::Json::Parse(state);
+    if (!value.ok()) {
+        return core::make_unexpected(
+            core::err("deserialize Firecracker paused state: " + value.error().chain()));
+    }
+    const core::Expected<FirecrackerPausedState, std::string> decoded =
+        FirecrackerPausedState::Decode(artifact_root, value.value());
+    if (!decoded.ok()) return core::make_unexpected(core::err(decoded.error()));
+    return std::shared_ptr<PausedSandboxState>(new FirecrackerPausedState(decoded.value()));
+}
+
 }  // namespace firecracker
 }  // namespace sandbox
 }  // namespace agentenv

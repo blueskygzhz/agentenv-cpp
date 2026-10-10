@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "agentenv/core/expected.h"
+#include "agentenv/core/json.h"
 #include "agentenv/core/optional.h"
 
 namespace agentenv {
@@ -97,6 +98,19 @@ struct ExtraDrive {
     /// Rust `ExtraDrive::try_with_virtual_size` — rejects zero, which would
     /// otherwise reach the daemon as a request for an empty device.
     core::Expected<ExtraDrive, std::string> TryWithVirtualSize(uint64_t size) const;
+
+    // ---- serialization (Rust derive) -------------------------------------
+
+    /// Rust `Serialize` — externally tagged `{"Overlaybd": {...}}`.
+    /// `virtual_size`, `sub_path` and `snapshot_output_dir` carry
+    /// `skip_serializing_if = "Option::is_none"`, so an absent one is omitted
+    /// rather than written as null.
+    core::Json ToJson() const;
+
+    /// Rust `Deserialize`. `mount_path`, `volume` and the three optionals are
+    /// `#[serde(default)]`; `drive_id`, `image_config_path` and `read_only`
+    /// are required.
+    static core::Expected<ExtraDrive, std::string> FromJson(const core::Json& json);
 
     bool operator==(const ExtraDrive& o) const;
     bool operator!=(const ExtraDrive& o) const { return !(*this == o); }

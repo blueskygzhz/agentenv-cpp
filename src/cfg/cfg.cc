@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Rust: src/cfg.rs
+#include "agentenv/core/serde.h"
 #include "agentenv/cfg.h"
 
 #include <cstdlib>
@@ -10,6 +11,49 @@
 
 namespace agentenv {
 namespace cfg {
+
+// ---- DiskRateLimitConfig serialization ------------------------------------
+//
+// Persisted inside a paused sandbox's snapshot config: fresh boot and resume
+// must apply the same limit, so it travels with the capture instead of being
+// re-read from this node's config at resume time.
+
+core::Json DiskRateLimitConfig::ToJson() const {
+    core::JsonObject object;
+    object["enabled"] = core::Json(enabled);
+    object["bandwidth_bytes_per_sec"] = core::Json(static_cast<int64_t>(bandwidth_bytes_per_sec));
+    object["bandwidth_burst_bytes"] = core::Json(static_cast<int64_t>(bandwidth_burst_bytes));
+    object["iops"] = core::Json(static_cast<int64_t>(iops));
+    object["iops_burst"] = core::Json(static_cast<int64_t>(iops_burst));
+    return core::Json(object);
+}
+
+core::Expected<DiskRateLimitConfig, std::string> DiskRateLimitConfig::FromJson(
+    const core::Json& json) {
+    namespace sd = core::serde;
+    if (json.kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(
+            std::string("invalid type: expected struct DiskRateLimitConfig"));
+    }
+    const core::JsonObject& fields = json.as_object();
+    DiskRateLimitConfig config;
+
+    const core::Expected<bool, std::string> enabled = sd::RequireBool(fields, "enabled");
+    if (!enabled.ok()) return core::make_unexpected(enabled.error());
+    config.enabled = enabled.value();
+
+    const char* const kNames[4] = {"bandwidth_bytes_per_sec", "bandwidth_burst_bytes", "iops",
+                                   "iops_burst"};
+    uint64_t* const kTargets[4] = {&config.bandwidth_bytes_per_sec,
+                                   &config.bandwidth_burst_bytes, &config.iops,
+                                   &config.iops_burst};
+    for (int i = 0; i < 4; ++i) {
+        const core::Expected<uint64_t, std::string> v = sd::RequireUint(fields, kNames[i]);
+        if (!v.ok()) return core::make_unexpected(v.error());
+        *kTargets[i] = v.value();
+    }
+    return config;
+}
 
 const char* const kEnvConfigPath = "AENV_CONFIG_PATH";
 const char* const kTestAccessTokenHashSeed = "agentenv-unit-test-access-token-seed";

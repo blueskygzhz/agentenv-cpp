@@ -2,6 +2,8 @@
 // Rust: src/sandbox/extra_drive.rs
 #include "agentenv/sandbox/extra_drive.h"
 
+#include "agentenv/core/serde.h"
+
 #include <cctype>
 
 namespace agentenv {
@@ -371,6 +373,94 @@ bool MountPathsOverlap(const std::string& a, const std::string& b) {
     // Either being a component-wise prefix of the other means one would shadow
     // the other inside the guest.
     return ComponentsStartWith(left, right) || ComponentsStartWith(right, left);
+}
+
+// ---- serialization (Rust derive on `enum ExtraDrive`) ----------------------
+
+namespace sd = core::serde;
+
+/// Rust's single `Overlaybd` variant; externally tagged by serde.
+static const char* const kOverlaybdVariant = "Overlaybd";
+
+core::Json ExtraDrive::ToJson() const {
+    core::JsonObject inner;
+    inner["drive_id"] = core::Json(drive_id);
+    inner["image_config_path"] = core::Json(image_config_path);
+    inner["read_only"] = core::Json(read_only);
+    inner["mount_path"] = core::Json(mount_path);
+    // `skip_serializing_if = "Option::is_none"`: omitted, not null. An absent
+    // `virtual_size` means "let the daemon read the size from the image", so
+    // writing null would still round-trip, but omitting it keeps the record
+    // byte-compatible with what the Rust server writes.
+    if (virtual_size.has_value()) {
+        inner["virtual_size"] = core::Json(static_cast<int64_t>(*virtual_size));
+    }
+    if (sub_path.has_value()) inner["sub_path"] = core::Json(*sub_path);
+    if (snapshot_output_dir.has_value()) {
+        inner["snapshot_output_dir"] = core::Json(*snapshot_output_dir);
+    }
+    inner["volume"] = core::Json(volume);
+
+    core::JsonObject object;
+    object[kOverlaybdVariant] = core::Json(inner);
+    return core::Json(object);
+}
+
+core::Expected<ExtraDrive, std::string> ExtraDrive::FromJson(const core::Json& json) {
+    if (json.kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(std::string("invalid type: expected enum ExtraDrive"));
+    }
+    const core::Json* payload = sd::OptValue(json.as_object(), kOverlaybdVariant);
+    if (payload == NULL) {
+        return core::make_unexpected(std::string("unknown variant, expected `Overlaybd`"));
+    }
+    if (payload->kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(sd::InvalidType(kOverlaybdVariant, "an object"));
+    }
+    const core::JsonObject& fields = payload->as_object();
+    ExtraDrive drive;
+    drive.kind = Kind::Overlaybd;
+
+    const core::Expected<std::string, std::string> id = sd::RequireString(fields, "drive_id");
+    if (!id.ok()) return core::make_unexpected(id.error());
+    drive.drive_id = id.value();
+
+    const core::Expected<std::string, std::string> image =
+        sd::RequireString(fields, "image_config_path");
+    if (!image.ok()) return core::make_unexpected(image.error());
+    drive.image_config_path = image.value();
+
+    const core::Expected<bool, std::string> read_only = sd::RequireBool(fields, "read_only");
+    if (!read_only.ok()) return core::make_unexpected(read_only.error());
+    drive.read_only = read_only.value();
+
+    // `#[serde(default)]` on a `PathBuf` is the empty path, not the drive's
+    // computed default mount path: an old record that predates mount paths
+    // describes a drive the guest never mounted.
+    const core::Expected<std::string, std::string> mount =
+        sd::DefaultString(fields, "mount_path");
+    if (!mount.ok()) return core::make_unexpected(mount.error());
+    drive.mount_path = mount.value();
+
+    const core::Expected<core::Optional<uint64_t>, std::string> size =
+        sd::OptUint(fields, "virtual_size");
+    if (!size.ok()) return core::make_unexpected(size.error());
+    drive.virtual_size = size.value();
+
+    const core::Expected<core::Optional<std::string>, std::string> sub =
+        sd::OptString(fields, "sub_path");
+    if (!sub.ok()) return core::make_unexpected(sub.error());
+    drive.sub_path = sub.value();
+
+    const core::Expected<core::Optional<std::string>, std::string> out =
+        sd::OptString(fields, "snapshot_output_dir");
+    if (!out.ok()) return core::make_unexpected(out.error());
+    drive.snapshot_output_dir = out.value();
+
+    const core::Expected<bool, std::string> is_volume = sd::DefaultBool(fields, "volume");
+    if (!is_volume.ok()) return core::make_unexpected(is_volume.error());
+    drive.volume = is_volume.value();
+    return drive;
 }
 
 }  // namespace sandbox

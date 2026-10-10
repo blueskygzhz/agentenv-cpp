@@ -11,6 +11,7 @@
 #ifndef AGENTENV_SANDBOX_FIRECRACKER_FACTORY_H_
 #define AGENTENV_SANDBOX_FIRECRACKER_FACTORY_H_
 
+#include <memory>
 #include <string>
 
 #include "agentenv/cfg.h"
@@ -18,6 +19,7 @@
 #include "agentenv/core/optional.h"
 #include "agentenv/sandbox/backend.h"
 #include "agentenv/sandbox/firecracker/config.h"
+#include "agentenv/sandbox/firecracker/paused_state.h"
 
 namespace agentenv {
 namespace sandbox {
@@ -37,6 +39,16 @@ core::Expected<SandboxConfig, std::string> FreshSandboxConfigForBuild(
     const core::Optional<std::string>& cpu_config_json,
     const FreshSandboxBuildSpec& build_spec,
     const SandboxLaunchConfig& launch_config);
+
+/// Rust `FirecrackerSandboxFactory::decode_paused_state`.
+///
+/// A free function rather than a `SandboxBackendFactory` method because the
+/// factory's other three methods construct a live `FirecrackerSandbox`, which
+/// is not ported yet. This is the part the orchestrator's restart path needs:
+/// `SandboxPersister::LoadAll` calls it for every stored record, and a record
+/// it rejects is dropped together with its artifacts.
+core::Expected<std::shared_ptr<PausedSandboxState>, core::AnyError>
+    DecodeFirecrackerPausedState(const std::string& artifact_root, const std::string& state);
 
 }  // namespace firecracker
 }  // namespace sandbox

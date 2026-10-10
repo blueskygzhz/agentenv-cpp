@@ -28,6 +28,7 @@
 
 #include "agentenv/cfg/image.h"
 #include "agentenv/cfg/network.h"
+#include "agentenv/core/json.h"
 #include "agentenv/core/expected.h"
 #include "agentenv/core/optional.h"
 #include "agentenv/core/toml.h"
@@ -235,6 +236,19 @@ struct DiskRateLimitConfig {
     uint64_t bandwidth_burst_bytes = 0;
     uint64_t iops = 0;
     uint64_t iops_burst = 0;
+
+    /// Rust `Serialize` / `Deserialize`. No field carries `#[serde(default)]`,
+    /// so a present `disk_rate_limit` object must be complete; it is the
+    /// *container* field in `FirecrackerCommonConfig` that may be missing.
+    core::Json ToJson() const;
+    static core::Expected<DiskRateLimitConfig, std::string> FromJson(const core::Json& json);
+
+    bool operator==(const DiskRateLimitConfig& o) const {
+        return enabled == o.enabled && bandwidth_bytes_per_sec == o.bandwidth_bytes_per_sec &&
+               bandwidth_burst_bytes == o.bandwidth_burst_bytes && iops == o.iops &&
+               iops_burst == o.iops_burst;
+    }
+    bool operator!=(const DiskRateLimitConfig& o) const { return !(*this == o); }
 };
 
 /// Rust struct `MachineConfig`.
