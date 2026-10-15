@@ -94,6 +94,15 @@ struct PauseToDirSpec {
     std::function<void(int64_t)> on_pid_read;
 };
 
+/// Rust `managed_snapshot_base` — `{work_dir}/managed-snapshots`, or
+/// `{system-temp}/aenv/managed-snapshots` when `work_dir` is unset.
+///
+/// This is where a `Snapshot()` with no caller-supplied directory writes.
+/// Keeping it a function of the config rather than a constant is the point:
+/// captures are large and must land on the filesystem the operator chose for
+/// them, not on whatever `/tmp` happens to be.
+std::string ManagedSnapshotBase(const core::Optional<std::string>& work_dir);
+
 /// The artifacts a successful capture produced.
 struct PauseToDirResult {
     /// `{snapshot_dir}/vm_state.bin`.
@@ -128,6 +137,11 @@ struct FreshStartSpec {
     /// Parent for the per-instance work directory.
     std::string chroot_base_dir;
     core::SandboxId sandbox_id;
+    /// Rust `[firecracker].work_dir`. Only the managed-snapshot base is
+    /// derived from it here (see [`ManagedSnapshotBase`]); the per-instance
+    /// work directory comes from `chroot_base_dir`. Absent falls back to the
+    /// system temporary directory, as Rust does.
+    core::Optional<std::string> firecracker_work_dir;
     bool capture_output = true;
     int64_t socket_timeout_ms = 10 * 1000;
     int64_t socket_poll_ms = 10;
@@ -249,8 +263,31 @@ class FirecrackerSandboxBackend : public SandboxBackend {
     /// Rust `stop` — idempotent. Stops the VMM and removes its API socket.
     core::Expected<core::Unit, core::AnyError> Stop() override;
 
+    /// Rust `snapshot` — `pause_to_dir` into a managed directory, then resume.
+    /// Returns the directory holding the capture.
+    ///
+    /// Unlike `Pause`, the sandbox keeps running afterwards, which is the
+    /// whole difference between the two: a snapshot is taken *of* a live
+    /// sandbox, so the resume is part of the operation rather than the
+    /// caller's next step. A resume that fails is therefore `Terminal` even
+    /// though the capture itself succeeded — the artifacts are fine, the
+    /// sandbox is not.
+    ///
+    /// The destination is `{ManagedSnapshotBase}/{sandbox_id}/{uuid}`. The
+    /// per-sandbox root is resolved once and reused, so repeated snapshots of
+    /// one sandbox stay together instead of scattering across the base.
+    SandboxCaptureResult<std::string> Snapshot() override;
+
     /// Rust `runtime_info`.
     SandboxRuntimeInfo RuntimeInfoOf() const override;
+
+    /// Overrides the memory-layer write used by `Snapshot`, which otherwise
+    /// reads guest memory out of the live VMM with `process_vm_readv`.
+    ///
+    /// Without this the capture path cannot be exercised at all off a real
+    /// microVM: a stand-in VMM has no guest memory to read, so the layer write
+    /// fails for a reason that has nothing to do with the sequence under test.
+    void SetMemoryLayerWriterForTesting(const MemoryLayerWriter& writer);
 
     // ---- not available in this build --------------------------------------
     //
@@ -259,7 +296,6 @@ class FirecrackerSandboxBackend : public SandboxBackend {
     // never written, and the failure then appears on a different node, at a
     // different time, as a corrupt record.
 
-    SandboxCaptureResult<std::string> Snapshot() override;
     SandboxCaptureResult<core::Unit> SnapshotVolumes() override;
     SandboxCaptureResult<core::Unit> FreezeAndSnapshotVolumes() override;
     core::Expected<core::Unit, core::AnyError> ThawVolumes() override;

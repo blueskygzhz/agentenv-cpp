@@ -35,6 +35,19 @@ core::AnyError NotAvailable(const char* what) {
 
 }  // namespace
 
+std::string ManagedSnapshotBase(const core::Optional<std::string>& work_dir) {
+    // Rust `std::env::temp_dir()`: `$TMPDIR` when set, `/tmp` otherwise. The
+    // `aenv` component only appears on the fallback path, matching Rust —
+    // a configured work_dir is already ours, so it is not namespaced again.
+    if (work_dir.has_value() && !work_dir->empty()) {
+        return *work_dir + "/managed-snapshots";
+    }
+    const char* tmp = ::getenv("TMPDIR");
+    std::string base = (tmp != NULL && *tmp != '\0') ? std::string(tmp) : std::string("/tmp");
+    while (base.size() > 1 && base[base.size() - 1] == '/') base.erase(base.size() - 1);
+    return base + "/aenv/managed-snapshots";
+}
+
 /// Rust: the `ProcessVmReader` element of `src_layers`.
 ///
 /// `CompactTo` addresses sources by byte offset; for this layer that offset is
@@ -217,6 +230,27 @@ class FirecrackerSandboxBackend::Impl {
     bool startable;
     LaunchMode launch;
     EnvdInstance::HealthProbe envd_probe;
+    /// Test override for the guest-memory layer write.
+    MemoryLayerWriter memory_layer_writer;
+
+    /// Rust `live_snapshot_root` — resolved once, then reused.
+    ///
+    /// The caching is not an optimisation: Rust holds the root in a guard for
+    /// the sandbox's lifetime, so every capture of one sandbox lands under the
+    /// same directory. Re-deriving it per call would be equivalent only as
+    /// long as nothing in the derivation ever changes.
+    std::string live_snapshot_root;
+
+    core::Expected<std::string, std::string> LiveSnapshotRoot() {
+        if (!live_snapshot_root.empty()) return live_snapshot_root;
+        const std::string root = ManagedSnapshotBase(spec.firecracker_work_dir) + "/" +
+                                 spec.sandbox_id.ToString();
+        // Rust `PersistentSnapshotRootGuard::prepare`.
+        const core::Expected<core::Unit, std::string> made = MakeDirs(root);
+        if (!made.ok()) return core::make_unexpected(made.error());
+        live_snapshot_root = root;
+        return live_snapshot_root;
+    }
 
     /// Rust `recover_capture_failure`.
     ///
@@ -402,6 +436,58 @@ FirecrackerSandboxBackend::PauseToDir(const PauseToDirSpec& spec) {
     return result;
 }
 
+SandboxCaptureResult<std::string> FirecrackerSandboxBackend::Snapshot() {
+    if (!impl_->instance) {
+        return core::make_unexpected(
+            SandboxCaptureError::Terminal("snapshot: no live microVM"));
+    }
+
+    const core::Expected<std::string, std::string> root = impl_->LiveSnapshotRoot();
+    if (!root.ok()) {
+        // Nothing has been paused yet, so the sandbox is untouched and this
+        // needs no recovery.
+        return core::make_unexpected(SandboxCaptureError::Recoverable(
+            std::string("snapshot: ") + root.error()));
+    }
+
+    PauseToDirSpec spec;
+    // A fresh v7 id per capture: time-ordered, so a directory listing is in
+    // capture order, and collision-free, so two snapshots of one sandbox never
+    // write into each other.
+    spec.snapshot_dir = root.value() + "/" + core::Uuid::GenV7().ToString();
+    // Rust reads `has_writable_persistent_volumes()` off the sandbox's own
+    // drives. This backend attaches none and has no envd client to flush
+    // through, so the flag is false by construction rather than by choice --
+    // once volumes are wired up, this is where the flush hooks in.
+    spec.has_writable_persistent_volumes = false;
+    spec.write_memory_layer = impl_->memory_layer_writer;
+
+    const SandboxCaptureResult<PauseToDirResult> captured = PauseToDir(spec);
+    if (!captured.ok()) {
+        // PauseToDir has already run the recovery resume and removed the
+        // partial directory; re-running either here would resume a sandbox
+        // that a terminal error says must not be trusted.
+        return core::make_unexpected(captured.error());
+    }
+
+    // Rust `map_err(SandboxCaptureError::terminal)`: unconditionally terminal,
+    // and not routed through RecoverCaptureFailure. The capture is on disk and
+    // intact, so there is nothing to retry -- what failed is putting the
+    // source sandbox back, and a caller that kept using it would be driving a
+    // VM frozen at the moment of the snapshot.
+    const core::Expected<core::Unit, std::string> resumed = impl_->instance->Resume();
+    if (!resumed.ok()) {
+        return core::make_unexpected(SandboxCaptureError::Terminal(
+            "snapshot captured but sandbox could not be resumed: " + resumed.error()));
+    }
+    return spec.snapshot_dir;
+}
+
+void FirecrackerSandboxBackend::SetMemoryLayerWriterForTesting(
+    const MemoryLayerWriter& writer) {
+    impl_->memory_layer_writer = writer;
+}
+
 // ---- not available in this build ------------------------------------------
 
 core::Expected<core::Unit, core::AnyError> FirecrackerSandboxBackend::StartNowait() {
@@ -450,10 +536,6 @@ core::Expected<core::Unit, core::AnyError> FirecrackerSandboxBackend::Start() {
     const core::Expected<core::Unit, core::AnyError> started = StartNowait();
     if (!started.ok()) return started;
     return WaitForReady();
-}
-SandboxCaptureResult<std::string> FirecrackerSandboxBackend::Snapshot() {
-    return core::make_unexpected(
-        SandboxCaptureError::Recoverable("snapshot: not available in this build"));
 }
 SandboxCaptureResult<core::Unit> FirecrackerSandboxBackend::SnapshotVolumes() {
     return core::make_unexpected(

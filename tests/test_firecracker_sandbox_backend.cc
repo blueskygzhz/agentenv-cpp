@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "agentenv/core/fs.h"
 #include "agentenv/sandbox/firecracker/sandbox_backend.h"
 
 using namespace agentenv;
@@ -84,6 +85,18 @@ std::unique_ptr<FirecrackerSandboxBackend> MakeBackend(ScriptedConnector* conn) 
         new FirecrackerSandboxBackend(std::move(instance), cfg));
 }
 
+/// `SandboxId` is a UUID, so a readable label like "sbx-start-0001" does not
+/// parse and `.value()` on the failure yields an unspecified id -- which the
+/// managed-snapshot path is derived from. A real one, fixed so assertions can
+/// name the directory it produces.
+const char* const kTestSandboxIdText = "0192f3a1-4c5d-7e80-9abc-def012345678";
+
+core::SandboxId TestSandboxId() {
+    const core::Expected<core::SandboxId, std::string> parsed =
+        core::SandboxId::Parse(kTestSandboxIdText);
+    return parsed.ok() ? parsed.value() : core::SandboxId();
+}
+
 /// A spec whose paths exist, so a start reaches the VMM stand-in.
 FreshStartSpec SpecIn(const std::string& dir) {
     { std::ofstream f((dir + "/vmlinux").c_str()); f << "k"; }
@@ -91,6 +104,9 @@ FreshStartSpec SpecIn(const std::string& dir) {
     spec.firecracker_bin = AGENTENV_FAKE_FIRECRACKER;
     spec.chroot_base_dir = dir + "/chroot";
     spec.sandbox_id = core::SandboxId::Parse("sbx-start-0001").value();
+    // Keeps `Snapshot`'s managed-snapshot base inside the test's temp dir
+    // instead of the shared `/tmp/aenv`, where concurrent runs would collide.
+    spec.firecracker_work_dir = core::Optional<std::string>(dir + "/fc-work");
     spec.socket_timeout_ms = 300;
     spec.socket_poll_ms = 5;
     spec.envd_timeout_ms = 60;
@@ -416,7 +432,11 @@ MT_TEST(unported_capture_methods_report_failure) {
     ScriptedConnector* conn = new ScriptedConnector();
     std::unique_ptr<FirecrackerSandboxBackend> backend = MakeBackend(conn);
 
-    MT_EXPECT_TRUE(!backend->Snapshot().ok());
+    // `Snapshot` is no longer on this list: it runs the real capture sequence
+    // now, so it is covered by its own tests below rather than by asserting
+    // it refuses. Leaving it here would have kept passing for the wrong
+    // reason -- it still fails without a spawned child, but from the Pid()
+    // read rather than from being unported.
     MT_EXPECT_TRUE(!backend->SnapshotVolumes().ok());
     MT_EXPECT_TRUE(!backend->FreezeAndSnapshotVolumes().ok());
     MT_EXPECT_TRUE(!backend->ThawVolumes().ok());
@@ -944,6 +964,160 @@ MT_TEST(cleanup_does_not_follow_a_symlink_out_of_the_snapshot_dir) {
     MT_EXPECT_TRUE(PathExists(outside));
     MT_EXPECT_TRUE(PathExists(outside + "/keep.txt"));
     MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+// ============================================================
+// Rust `snapshot` — pause_to_dir into a managed dir, then resume
+// ============================================================
+
+namespace {
+
+/// The layer writer `Snapshot` needs off a real VMM: a stand-in has no guest
+/// memory, so the real `process_vm_readv` path cannot run here.
+MemoryLayerWriter TracingWriter(CaptureTrace* trace) {
+    return [trace](const std::string& path,
+                   const std::vector<storage::overlaybd::lsmt::SegmentMapping>&,
+                   uint64_t memory_size, int64_t pid)
+        -> core::Expected<core::Unit, std::string> {
+        trace->events.push_back("write_layer");
+        trace->pid_seen = pid;
+        trace->memory_size_seen = memory_size;
+        std::ofstream f(path.c_str());
+        f << "layer";
+        return core::Unit{};
+    };
+}
+
+bool StartsWithPath(const std::string& s, const std::string& prefix) {
+    return s.size() > prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
+}
+
+}  // namespace
+
+MT_TEST(snapshot_captures_then_leaves_the_sandbox_running) {
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+    backend->SetMemoryLayerWriterForTesting(TracingWriter(&trace));
+
+    SandboxCaptureResult<std::string> r = backend->Snapshot();
+    MT_EXPECT_TRUE(r.ok());
+    if (!r.ok()) {
+        MT_EXPECT_EQ(r.error().Message(), std::string(""));
+        return;
+    }
+
+    // The resume is what separates `snapshot` from `pause`: the sandbox is
+    // still the caller's to use afterwards, so a capture that left it paused
+    // would be a silently broken sandbox rather than a failed call.
+    const int resume_at = IndexIn(trace.events, "resume");
+    const int create_at = IndexIn(trace.events, "create_snapshot");
+    MT_EXPECT_TRUE(create_at >= 0);
+    MT_EXPECT_TRUE(resume_at > create_at);
+
+    // Artifacts are where the result says they are. Only the memory layer is
+    // checked on disk: `vm_state.bin` is written by the VMM in response to
+    // `/snapshot/create`, which the stand-in only records.
+    MT_EXPECT_TRUE(PathExists(r.value()));
+    MT_EXPECT_TRUE(PathExists(r.value() + "/mem_overlaybd/overlaybd.commit"));
+
+    // Under the configured work dir, namespaced by sandbox id -- not in the
+    // process's temp dir, which is where an unconfigured base would land.
+    const std::string expected_root =
+        dir + "/fc-work/managed-snapshots/" +
+        core::SandboxId::Parse("sbx-start-0001").value().ToString();
+    MT_EXPECT_TRUE(StartsWithPath(r.value(), expected_root + "/"));
+
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(two_snapshots_share_a_root_and_do_not_collide) {
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+    backend->SetMemoryLayerWriterForTesting(TracingWriter(&trace));
+
+    SandboxCaptureResult<std::string> first = backend->Snapshot();
+    SandboxCaptureResult<std::string> second = backend->Snapshot();
+    MT_EXPECT_TRUE(first.ok());
+    MT_EXPECT_TRUE(second.ok());
+    if (!first.ok() || !second.ok()) return;
+
+    // Distinct directories: a reused name would have the second capture
+    // overwrite the first, and both records would then point at one of them.
+    MT_EXPECT_TRUE(first.value() != second.value());
+    MT_EXPECT_TRUE(PathExists(first.value() + "/mem_overlaybd/overlaybd.commit"));
+    MT_EXPECT_TRUE(PathExists(second.value() + "/mem_overlaybd/overlaybd.commit"));
+    // ...but one root, so a sandbox's captures stay together.
+    MT_EXPECT_EQ(first.value().substr(0, first.value().rfind('/')),
+                 second.value().substr(0, second.value().rfind('/')));
+
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(a_failed_snapshot_capture_resumes_and_leaves_no_directory) {
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    // The capture's own call fails; the pause before it does not.
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, "/snapshot/create");
+    if (!backend) return;
+    backend->SetMemoryLayerWriterForTesting(TracingWriter(&trace));
+
+    SandboxCaptureResult<std::string> r = backend->Snapshot();
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+    // Recoverable, and therefore a promise the sandbox is running again.
+    MT_EXPECT_TRUE(!r.error().IsTerminal());
+    MT_EXPECT_TRUE(IndexIn(trace.events, "resume") >= 0);
+
+    // Nothing half-written was left under the root: a capture directory that
+    // exists but is incomplete cannot be told from a good one by name.
+    const std::string root =
+        dir + "/fc-work/managed-snapshots/" +
+        core::SandboxId::Parse("sbx-start-0001").value().ToString();
+    const core::Expected<std::vector<std::string>, std::string> entries =
+        core::fs::ReadDir(root);
+    MT_EXPECT_TRUE(entries.ok());
+    if (entries.ok()) MT_EXPECT_EQ(entries.value().size(), static_cast<std::size_t>(0));
+
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(snapshot_without_a_live_vm_is_terminal) {
+    ScriptedConnector* conn = new ScriptedConnector();
+    std::unique_ptr<FirecrackerSandboxBackend> backend(new FirecrackerSandboxBackend(
+        FreshStartSpec(), SnapshotConfig(), std::shared_ptr<Connector>(conn)));
+
+    SandboxCaptureResult<std::string> r = backend->Snapshot();
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+    // Terminal rather than recoverable: `Recoverable` promises a running
+    // sandbox, and there is no sandbox at all to promise about.
+    MT_EXPECT_TRUE(r.error().IsTerminal());
+    MT_EXPECT_TRUE(r.error().Message().find("no live microVM") != std::string::npos);
+    // Nothing was attempted against the VMM.
+    MT_EXPECT_EQ(conn->calls.size(), static_cast<std::size_t>(0));
+}
+
+MT_TEST(managed_snapshot_base_follows_the_configured_work_dir) {
+    // Captures are large; landing them on `/tmp` when the operator named a
+    // filesystem for them is the kind of thing only noticed when it fills up.
+    MT_EXPECT_EQ(ManagedSnapshotBase(core::Optional<std::string>("/data/fc")),
+                 std::string("/data/fc/managed-snapshots"));
+    // Unset falls back to the system temp dir, namespaced under `aenv`.
+    const std::string fallback = ManagedSnapshotBase(core::Optional<std::string>());
+    MT_EXPECT_TRUE(fallback.find("/aenv/managed-snapshots") != std::string::npos);
+    // An empty string is a missing value, not a request to write at the root:
+    // `/managed-snapshots` is both unwritable and not what was meant.
+    MT_EXPECT_EQ(ManagedSnapshotBase(core::Optional<std::string>(std::string())), fallback);
 }
 
 MT_MAIN
