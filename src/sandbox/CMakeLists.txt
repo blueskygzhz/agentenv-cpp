@@ -37,6 +37,10 @@ add_library(agentenv-sandbox STATIC
     firecracker/configure.cc
     # Rust: impl SandboxBackend for FirecrackerSandbox
     firecracker/sandbox_backend.cc
+    # Rust: overlaybd_snapshot.rs :: build_mem_snapshot_image_config
+    firecracker/mem_image_config.cc
+    # Rust: factory.rs :: impl SandboxBackendFactory
+    firecracker/factory_impl.cc
     firecracker/mmds.cc
  firecracker/pool.cc
     firecracker/sandbox.cc

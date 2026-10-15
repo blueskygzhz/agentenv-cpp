@@ -484,44 +484,6 @@ FirecrackerInstance::SetMmds(const MmdsMetadata& metadata) {
     return ApiPut("/mmds", payload);
 }
 
-// ---- ProcessVmReader ----
-}  // namespace firecracker
-}  // namespace sandbox
-}  // namespace agentenv
-
-// process_vm_readv needs <sys/uio.h>; keep the impl in a fresh TU section.
-#include <sys/uio.h>
-
-namespace agentenv {
-namespace sandbox {
-namespace firecracker {
-namespace {
-class RealProcessVmReader : public ProcessVmReader {
- public:
-    core::Expected<std::vector<uint8_t>, std::string>
-    Read(int64_t pid, uint64_t addr, size_t len) override {
-        std::vector<uint8_t> out(len, 0);
-  struct iovec local;
-        local.iov_base = out.empty() ? nullptr : &out[0];
-        local.iov_len = len;
-        struct iovec remote;
-        remote.iov_base = reinterpret_cast<void*>(static_cast<uintptr_t>(addr));
-     remote.iov_len = len;
-    ssize_t n = ::process_vm_readv(static_cast<pid_t>(pid), &local, 1, &remote, 1, 0);
-        if (n < 0) {
-  return core::make_unexpected(std::string("process_vm_readv failed: ") +
-     std::strerror(errno));
-      }
-  out.resize(static_cast<size_t>(n));
-        return out;
-    }
-};
-}  // namespace
-
-std::unique_ptr<ProcessVmReader> MakeProcessVmReader() {
-    return std::unique_ptr<ProcessVmReader>(new RealProcessVmReader());
-}
-
 }  // namespace firecracker
 }  // namespace sandbox
 }  // namespace agentenv

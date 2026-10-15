@@ -15,6 +15,7 @@
 #ifndef AGENTENV_SANDBOX_FIRECRACKER_SANDBOX_BACKEND_H_
 #define AGENTENV_SANDBOX_FIRECRACKER_SANDBOX_BACKEND_H_
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -22,12 +23,86 @@
 #include "agentenv/sandbox/backend.h"
 #include "agentenv/sandbox/envd.h"
 #include "agentenv/sandbox/firecracker/instance.h"
+#include "agentenv/sandbox/firecracker/dirty_memory.h"
 #include "agentenv/sandbox/firecracker/paused_state.h"
 #include "agentenv/sandbox/firecracker/sandbox.h"
 
 namespace agentenv {
 namespace sandbox {
 namespace firecracker {
+
+/// Rust `publish_memory_overlaybd_layer` — writes the captured guest memory
+/// out as a sealed LSMT layer.
+///
+/// Built on `storage::overlaybd::lsmt::CompactTo`, with the live VMM's address
+/// space as the source: a `CompactSource` backed by `ProcessVmReader`, so the
+/// bytes are pulled straight out of the paused VM with `process_vm_readv`
+/// rather than staged through a file.
+///
+/// Rust writes to `<path>.tmp` and renames on success, removing the temp file
+/// on failure. Reproduced exactly: the final name is what the resume path
+/// loads, so it must never exist in a half-written state — a reader cannot
+/// tell a truncated commit file from a short one.
+core::Expected<core::Unit, std::string> PublishMemoryOverlaybdLayer(
+    const std::string& output_path,
+    const std::vector<storage::overlaybd::lsmt::SegmentMapping>& mappings,
+    uint64_t virtual_size, int64_t firecracker_pid);
+
+/// Overrides the memory-layer write. Null means use
+/// [`PublishMemoryOverlaybdLayer`].
+typedef std::function<core::Expected<core::Unit, std::string>(
+    const std::string& data_path,
+    const std::vector<storage::overlaybd::lsmt::SegmentMapping>& mappings,
+    uint64_t memory_size, int64_t firecracker_pid)>
+    MemoryLayerWriter;
+
+/// Rust `FirecrackerSandbox::pause_to_dir` — capture a paused VM's state into
+/// a caller-supplied directory.
+///
+/// The ordering is the substance here, and three rules in it are load-bearing:
+///
+///   * **Writable volumes are flushed before the VM is paused.** The flush runs
+///     `busybox sync` *inside the guest* through envd, and envd cannot be
+///     reached once the VM is paused. Reversing these two silently captures
+///     volumes with dirty page cache, so the resumed sandbox sees a filesystem
+///     that is stale rather than merely old.
+///   * **The pid is read before the state snapshot is taken.** Guest memory is
+///     pulled out of the live VMM with `process_vm_readv`, so the capture needs
+///     a pid that is still valid; reading it later would race a VMM that died
+///     during the snapshot and attribute the failure to the wrong step.
+///   * **A failed capture removes the directory it was writing into.** A
+///     half-written snapshot directory is indistinguishable from a complete one
+///     by name, and the resume path would later load a `vm_state.bin` whose
+///     memory layer was never finished.
+struct PauseToDirSpec {
+    /// Destination directory. Created by this call, removed again on failure.
+    std::string snapshot_dir;
+    /// Rust `has_writable_persistent_volumes` — true when any extra drive is
+    /// writable *and* has a snapshot output directory.
+    bool has_writable_persistent_volumes = false;
+    /// Runs `busybox sync` in the guest. Required when the flag above is set;
+    /// Rust fails with "cannot flush writable volumes because envd is not
+    /// running" when envd is absent, rather than skipping the flush.
+    std::function<core::Expected<core::Unit, std::string>()> flush_volumes;
+    /// Overrides the memory-layer write. Null uses the real one.
+    MemoryLayerWriter write_memory_layer;
+
+    /// Invoked with the VMM pid the moment it is read, before the state
+    /// snapshot is requested. Observation only -- it exists so the ordering
+    /// rule above can be asserted, since the pid's *value* is identical
+    /// whether it is read before or after and therefore proves nothing.
+    std::function<void(int64_t)> on_pid_read;
+};
+
+/// The artifacts a successful capture produced.
+struct PauseToDirResult {
+    /// `{snapshot_dir}/vm_state.bin`.
+    std::string vm_state_path;
+    /// `{snapshot_dir}/mem_overlaybd/overlaybd.commit`.
+    std::string memory_layer_path;
+    /// Total size of the contiguous guest-memory image.
+    uint64_t memory_size = 0;
+};
 
 /// Rust `enum LaunchMode { Fresh(..), Resume(..) }`.
 ///
@@ -151,6 +226,15 @@ class FirecrackerSandboxBackend : public SandboxBackend {
     /// is live.
     SandboxCaptureResult<std::shared_ptr<PausedSandboxState> >
         Pause(const core::Optional<std::string>& artifact_root) override;
+
+    /// Rust `pause_to_dir` — pause, then write the capture artifacts into
+    /// `spec.snapshot_dir`. See [`PauseToDirSpec`] for the ordering rules.
+    ///
+    /// Reports through `SandboxCaptureError` like `Pause` does, and for the
+    /// same reason: a caller needs to know whether the runtime was mutated.
+    /// Unlike `Pause`, a failure here has usually already paused the VM, so
+    /// the recovery resume matters more, not less.
+    SandboxCaptureResult<PauseToDirResult> PauseToDir(const PauseToDirSpec& spec);
 
     /// Rust `resume` — `PATCH /vm {"state":"Resumed"}`.
     ///

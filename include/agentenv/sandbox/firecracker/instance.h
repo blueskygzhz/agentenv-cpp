@@ -273,17 +273,10 @@ class FirecrackerInstance : public Instance {
     int64_t     child_pid_;   // -1 when no child
 };
 
-/// Rust: firecracker/process_vm_reader.rs :: ProcessVmReader (process_vm_readv).
-class ProcessVmReader {
- public:
-    virtual ~ProcessVmReader() {}
-    virtual core::Expected<std::vector<uint8_t>, std::string>
-        Read(int64_t pid, uint64_t addr, size_t len) = 0;
-};
-
-/// A real process_vm_readv(2)-backed reader (works on any pid we may ptrace/read;
-/// used with the firecracker pid to sample guest-visible memory ranges).
-std::unique_ptr<ProcessVmReader> MakeProcessVmReader();
+// ProcessVmReader lives in "firecracker/process_vm.h" — the port of
+// process_vm_reader.rs. An abstract duplicate used to be declared here with no
+// implementor other than its own factory and no caller at all; it collided by
+// name with the real one.
 
 /// Rust: firecracker/sandbox.rs :: FirecrackerCapturedSnapshot.
 struct CapturedSnapshot {

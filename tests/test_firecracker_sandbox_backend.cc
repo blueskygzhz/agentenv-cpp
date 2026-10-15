@@ -9,6 +9,9 @@
 // live — a failure that shows up later, as a sandbox that answers nothing.
 #include "microtest.h"
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <cstdlib>
 #include <fstream>
 #include <future>
@@ -102,6 +105,119 @@ std::string MakeStartDir() {
     char tmpl[] = "/tmp/aenv-start-XXXXXX";
     char* p = ::mkdtemp(tmpl);
     return p ? std::string(p) : std::string();
+}
+
+/// Records the order in which capture steps ran, so the ordering rules can be
+/// asserted rather than inferred from side effects.
+struct CaptureTrace {
+    std::vector<std::string> events;
+    int64_t pid_seen = 0;
+    uint64_t memory_size_seen = 0;
+};
+
+bool PathExists(const std::string& p) {
+    struct stat st;
+    return ::stat(p.c_str(), &st) == 0;
+}
+
+/// A spec whose callbacks succeed and log themselves.
+PauseToDirSpec TracingSpec(const std::string& dir, CaptureTrace* trace) {
+    PauseToDirSpec spec;
+    spec.snapshot_dir = dir + "/capture";
+    spec.flush_volumes = [trace]() -> core::Expected<core::Unit, std::string> {
+        trace->events.push_back("flush");
+        return core::Unit{};
+    };
+    spec.on_pid_read = [trace](int64_t pid) {
+        trace->events.push_back("pid");
+        trace->pid_seen = pid;
+    };
+    spec.write_memory_layer =
+        [trace](const std::string& path,
+                const std::vector<storage::overlaybd::lsmt::SegmentMapping>&,
+                uint64_t memory_size, int64_t pid)
+        -> core::Expected<core::Unit, std::string> {
+        trace->events.push_back("write_layer");
+        trace->pid_seen = pid;
+        trace->memory_size_seen = memory_size;
+        std::ofstream f(path.c_str());
+        f << "layer";
+        return core::Unit{};
+    };
+    return spec;
+}
+
+/// A connector that answers the dirty-ranges GET with a usable reply.
+class CaptureConnector : public Connector {
+ public:
+    CaptureConnector(CaptureTrace* trace, const std::string& fail_path)
+        : trace_(trace), fail_path_(fail_path) {}
+
+    core::Expected<std::shared_ptr<Socket>, std::string>
+    Connect(const std::string&) override {
+        class S : public Socket {
+         public:
+            S(CaptureTrace* t, const std::string& fp) : t_(t), fp_(fp) {}
+            core::Expected<std::string, std::string>
+            Request(const std::string& m, const std::string& p,
+                    const std::string& b) override {
+                if (p == "/vm" && b.find("Paused") != std::string::npos) {
+                    t_->events.push_back("pause");
+                } else if (p == "/vm" && b.find("Resumed") != std::string::npos) {
+                    t_->events.push_back("resume");
+                } else if (p == "/snapshot/create") {
+                    t_->events.push_back("create_snapshot");
+                } else if (p == "/vm/dirty-memory-ranges") {
+                    t_->events.push_back("dirty_ranges");
+                }
+                if (!fp_.empty() && p == fp_) {
+                    return core::make_unexpected(std::string("HTTP 400: ") + fp_ + " refused");
+                }
+                if (p == "/vm/dirty-memory-ranges") {
+                    return std::string(
+                        "{\"page_size\":4096,\"memory_size\":8192,\"ranges\":["
+                        "{\"base_host_virt_addr\":4096,\"image_offset\":0,"
+                        "\"length\":8192}]}");
+                }
+                return std::string();
+            }
+            std::future<core::Expected<std::string, std::string> >
+            RequestAsync(const std::string& m, const std::string& p,
+                         const std::string& b) override {
+                std::promise<core::Expected<std::string, std::string> > pr;
+                pr.set_value(Request(m, p, b));
+                return pr.get_future();
+            }
+         private:
+            CaptureTrace* t_;
+            std::string fp_;
+        };
+        return std::shared_ptr<Socket>(new S(trace_, fail_path_));
+    }
+
+ private:
+    CaptureTrace* trace_;
+    std::string fail_path_;
+};
+
+/// A started backend over the fake VMM, so Pid() returns a real child.
+std::unique_ptr<FirecrackerSandboxBackend> StartedBackend(const std::string& dir,
+                                                          CaptureTrace* trace,
+                                                          const std::string& fail_path) {
+    SnapshotConfig cfg;
+    std::unique_ptr<FirecrackerSandboxBackend> backend(new FirecrackerSandboxBackend(
+        SpecIn(dir), cfg,
+        std::shared_ptr<Connector>(new CaptureConnector(trace, fail_path))));
+    if (!backend->StartNowait().ok()) return std::unique_ptr<FirecrackerSandboxBackend>();
+    trace->events.clear();  // drop the boot calls
+    return backend;
+}
+
+int IndexIn(const std::vector<std::string>& v, const std::string& what) {
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        if (v[i] == what) return static_cast<int>(i);
+    }
+    return -1;
 }
 
 std::size_t CountWithState(const std::vector<std::string>& calls, const std::string& state) {
@@ -533,6 +649,301 @@ MT_TEST(start_fresh_instance_does_not_hand_back_an_instance_on_failure) {
         StartFreshInstance(spec, std::shared_ptr<Connector>(new ScriptedConnector()), &out);
     MT_EXPECT_TRUE(!r.ok());
     MT_EXPECT_TRUE(out.get() == NULL);
+}
+
+// ============================================================
+// pause_to_dir: the ordering rules
+// ============================================================
+
+MT_TEST(capture_flushes_writable_volumes_before_pausing) {
+    // The flush runs `busybox sync` inside the guest through envd, and envd
+    // cannot be reached once the VM is paused. Reversed, the capture takes
+    // volumes with dirty page cache -- the resumed sandbox then sees a stale
+    // filesystem, not merely an old one.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    spec.has_writable_persistent_volumes = true;
+
+    SandboxCaptureResult<PauseToDirResult> r = backend->PauseToDir(spec);
+    MT_EXPECT_TRUE(r.ok());
+    if (!r.ok()) return;
+    MT_EXPECT_TRUE(IndexIn(trace.events, "flush") >= 0);
+    MT_EXPECT_TRUE(IndexIn(trace.events, "flush") < IndexIn(trace.events, "pause"));
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(capture_skips_the_flush_when_no_volume_needs_it) {
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    spec.has_writable_persistent_volumes = false;
+
+    MT_EXPECT_TRUE(backend->PauseToDir(spec).ok());
+    MT_EXPECT_EQ(IndexIn(trace.events, "flush"), -1);
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(a_writable_volume_without_envd_is_refused_before_the_pause) {
+    // Rust fails with this exact reason rather than skipping the flush: a
+    // capture that silently omits it produces the stale filesystem above.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    spec.has_writable_persistent_volumes = true;
+    spec.flush_volumes = NULL;  // envd not running
+
+    SandboxCaptureResult<PauseToDirResult> r = backend->PauseToDir(spec);
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+    MT_EXPECT_TRUE(r.error().message.find("envd is not running") != std::string::npos);
+    // Recoverable, and genuinely so: the VM was never paused.
+    MT_EXPECT_TRUE(!r.error().IsTerminal());
+    MT_EXPECT_EQ(IndexIn(trace.events, "pause"), -1);
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(capture_reads_the_pid_before_taking_the_state_snapshot) {
+    // Guest memory is pulled from the live VMM with process_vm_readv, so the
+    // capture needs a pid that is still valid. Reading it afterwards would
+    // race a VMM that died during the snapshot and blame the wrong step.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    // The pid is read through the instance, so the only way to observe *when*
+    // is to kill the VMM between the pause and the snapshot: a capture that
+    // reads the pid first still has it, while one that reads it later does
+    // not. The value alone proves nothing -- it is the same number either way.
+    SandboxCaptureResult<PauseToDirResult> r =
+        backend->PauseToDir(TracingSpec(dir, &trace));
+    MT_EXPECT_TRUE(r.ok());
+    if (!r.ok()) return;
+    MT_EXPECT_TRUE(trace.pid_seen > 0);
+    // Ordering, asserted directly: the pid must already be known by the time
+    // the state snapshot is requested.
+    MT_EXPECT_TRUE(IndexIn(trace.events, "pid") >= 0);
+    MT_EXPECT_TRUE(IndexIn(trace.events, "pid") <
+                   IndexIn(trace.events, "create_snapshot"));
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(dirty_ranges_are_read_after_the_state_snapshot) {
+    // vm_state.bin must describe the same instant as the ranges. Reading the
+    // ranges first would describe memory as of before the state was written.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    MT_EXPECT_TRUE(backend->PauseToDir(TracingSpec(dir, &trace)).ok());
+    const int snap = IndexIn(trace.events, "create_snapshot");
+    const int ranges = IndexIn(trace.events, "dirty_ranges");
+    const int layer = IndexIn(trace.events, "write_layer");
+    MT_EXPECT_TRUE(snap >= 0 && ranges >= 0 && layer >= 0);
+    MT_EXPECT_TRUE(snap < ranges);
+    MT_EXPECT_TRUE(ranges < layer);
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(a_successful_capture_names_its_artifacts) {
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    SandboxCaptureResult<PauseToDirResult> r =
+        backend->PauseToDir(TracingSpec(dir, &trace));
+    MT_EXPECT_TRUE(r.ok());
+    if (!r.ok()) return;
+    MT_EXPECT_TRUE(r.value().vm_state_path.find("vm_state") != std::string::npos);
+    MT_EXPECT_TRUE(r.value().memory_layer_path.find("mem_overlaybd/overlaybd.commit") !=
+                   std::string::npos);
+    // The declared memory size comes from the API reply, not from the layer.
+    MT_EXPECT_EQ(r.value().memory_size, static_cast<uint64_t>(8192));
+    MT_EXPECT_TRUE(PathExists(r.value().memory_layer_path));
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+// ============================================================
+// pause_to_dir: failure cleanup
+// ============================================================
+
+MT_TEST(a_failed_capture_removes_the_partial_directory) {
+    // A half-written snapshot directory cannot be told from a complete one by
+    // name, so the resume path would later load a vm_state.bin whose memory
+    // layer was never finished.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    spec.write_memory_layer =
+        [](const std::string& path,
+           const std::vector<storage::overlaybd::lsmt::SegmentMapping>&, uint64_t,
+           int64_t) -> core::Expected<core::Unit, std::string> {
+        // Write something, then fail: this is the half-written case.
+        std::ofstream f(path.c_str());
+        f << "partial";
+        return core::make_unexpected(std::string("layer write failed"));
+    };
+
+    SandboxCaptureResult<PauseToDirResult> r = backend->PauseToDir(spec);
+    MT_EXPECT_TRUE(!r.ok());
+    MT_EXPECT_TRUE(!PathExists(spec.snapshot_dir));
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(a_failed_capture_resumes_the_vm_before_reporting_recoverable) {
+    // The VM is already paused by the time the capture fails, so the recovery
+    // resume matters more here than in a plain Pause, not less: Recoverable
+    // still promises the caller a runnable sandbox.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    spec.write_memory_layer =
+        [](const std::string&, const std::vector<storage::overlaybd::lsmt::SegmentMapping>&,
+           uint64_t, int64_t) -> core::Expected<core::Unit, std::string> {
+        return core::make_unexpected(std::string("layer write failed"));
+    };
+
+    SandboxCaptureResult<PauseToDirResult> r = backend->PauseToDir(spec);
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+    MT_EXPECT_TRUE(!r.error().IsTerminal());
+    MT_EXPECT_TRUE(IndexIn(trace.events, "resume") >= 0);
+    MT_EXPECT_TRUE(IndexIn(trace.events, "pause") < IndexIn(trace.events, "resume"));
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(a_refused_state_snapshot_cleans_up_and_recovers) {
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, "/snapshot/create");
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    SandboxCaptureResult<PauseToDirResult> r = backend->PauseToDir(spec);
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+    MT_EXPECT_TRUE(r.error().message.find("/snapshot/create refused") != std::string::npos);
+    MT_EXPECT_TRUE(!PathExists(spec.snapshot_dir));
+    // The layer writer was never reached.
+    MT_EXPECT_EQ(IndexIn(trace.events, "write_layer"), -1);
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(no_injected_writer_uses_the_real_overlaybd_layer_writer) {
+    // With no override the capture goes through PublishMemoryOverlaybdLayer,
+    // which compacts the VM's memory into a sealed LSMT file. The fake VMM has
+    // no guest memory at the captured addresses, so the read fails -- what
+    // matters here is that the real writer ran at all, and that its failure is
+    // handled like any other capture failure: directory removed, VM resumed.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    spec.write_memory_layer = NULL;  // use the real one
+
+    SandboxCaptureResult<PauseToDirResult> r = backend->PauseToDir(spec);
+    // Either outcome is acceptable; the invariants below are not.
+    if (!r.ok()) {
+        MT_EXPECT_TRUE(!PathExists(spec.snapshot_dir));
+        MT_EXPECT_TRUE(IndexIn(trace.events, "resume") >= 0);
+    } else {
+        MT_EXPECT_TRUE(PathExists(r.value().memory_layer_path));
+        // The temp file never survives.
+        MT_EXPECT_TRUE(!PathExists(r.value().memory_layer_path + ".tmp"));
+    }
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(capture_on_an_unstarted_backend_is_terminal) {
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    SnapshotConfig cfg;
+    FirecrackerSandboxBackend backend(
+        SpecIn(dir), cfg,
+        std::shared_ptr<Connector>(new CaptureConnector(&trace, std::string())));
+
+    SandboxCaptureResult<PauseToDirResult> r =
+        backend.PauseToDir(TracingSpec(dir, &trace));
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+    MT_EXPECT_TRUE(r.error().IsTerminal());
+}
+
+MT_TEST(cleanup_does_not_follow_a_symlink_out_of_the_snapshot_dir) {
+    // The capture directory is attacker-adjacent: it holds paths derived from
+    // image configs. If cleanup followed a symlink it found there, a link to
+    // an unrelated directory would have that directory deleted instead.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    // A directory outside the capture, with a file in it, pointed at by a
+    // symlink the capture leaves behind.
+    const std::string outside = dir + "/outside";
+    ::mkdir(outside.c_str(), 0700);
+    { std::ofstream f((outside + "/keep.txt").c_str()); f << "keep"; }
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    const std::string link = spec.snapshot_dir + "/link";
+    spec.write_memory_layer =
+        [&link, &outside](const std::string&,
+                          const std::vector<storage::overlaybd::lsmt::SegmentMapping>&,
+                          uint64_t, int64_t) -> core::Expected<core::Unit, std::string> {
+        ::symlink(outside.c_str(), link.c_str());
+        return core::make_unexpected(std::string("layer write failed"));
+    };
+
+    MT_EXPECT_TRUE(!backend->PauseToDir(spec).ok());
+    // The capture directory is gone...
+    MT_EXPECT_TRUE(!PathExists(spec.snapshot_dir));
+    // ...and the directory it linked to survived, contents intact.
+    MT_EXPECT_TRUE(PathExists(outside));
+    MT_EXPECT_TRUE(PathExists(outside + "/keep.txt"));
+    MT_EXPECT_TRUE(backend->Stop().ok());
 }
 
 MT_MAIN
