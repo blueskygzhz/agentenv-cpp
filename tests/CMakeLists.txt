@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
 
+# Stand-in VMM for the boot tests: makes the spawn/wait half of the boot
+# sequence reachable without KVM.
+add_executable(fake_firecracker helpers/fake_firecracker.cc)
+set(AGENTENV_FAKE_FC "$<TARGET_FILE:fake_firecracker>")
+
+
 # Minimal in-source micro-test framework so the skeleton has zero third-party
 # test dependency. Real project would migrate this to GoogleTest.
 add_library(agentenv-microtest STATIC microtest.cc)
@@ -116,3 +122,13 @@ agentenv_add_test(test_firecracker_paused_state test_firecracker_paused_state.cc
 agentenv_add_test(test_firecracker_instance_api test_firecracker_instance_api.cc agentenv-sandbox)
 agentenv_add_test(test_firecracker_configure test_firecracker_configure.cc agentenv-sandbox)
 agentenv_add_test(test_firecracker_boot test_firecracker_boot.cc agentenv-sandbox)
+
+# The boot tests spawn the stand-in VMM, so they need its path and must not be
+# built before it exists.
+foreach(_t test_firecracker_boot)
+    if(TARGET ${_t})
+        add_dependencies(${_t} fake_firecracker)
+        target_compile_definitions(${_t} PRIVATE
+            AGENTENV_FAKE_FIRECRACKER="${AGENTENV_FAKE_FC}")
+    endif()
+endforeach()

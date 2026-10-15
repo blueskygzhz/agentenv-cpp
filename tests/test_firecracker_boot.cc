@@ -9,6 +9,8 @@
 // fails are all otherwise unreachable without hardware.
 #include "microtest.h"
 
+#include <cerrno>
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -82,6 +84,53 @@ class RecordingConnector : public Connector {
     std::string fail_path_;
 };
 
+/// Notes the spawned VMM's pid on first connect, so a test can ask whether the
+/// process survived a failed boot. The pid is read from the work directory's
+/// parent process list rather than returned by the API, because a failed Boot
+/// hands back no handle.
+class PidCapturingConnector : public Connector {
+ public:
+    explicit PidCapturingConnector(const std::string& fail_path)
+        : vmm_pid(0), fail_path_(fail_path) {}
+
+    core::Expected<std::shared_ptr<Socket>, std::string>
+    Connect(const std::string& /*api_socket_path*/) override {
+        if (vmm_pid == 0) vmm_pid = FindFakeVmmChild();
+        return std::shared_ptr<Socket>(new RecordingSocket(&calls, fail_path_));
+    }
+
+    std::vector<RecordingSocket::Call> calls;
+    pid_t vmm_pid;
+
+ private:
+    /// The only child of this test process is the stand-in VMM.
+    static pid_t FindFakeVmmChild() {
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/%d/task/%d/children",
+                      static_cast<int>(::getpid()), static_cast<int>(::getpid()));
+        std::ifstream f(path);
+        pid_t pid = 0;
+        if (f) f >> pid;
+        return pid;
+    }
+
+    std::string fail_path_;
+};
+
+/// Counts `agentenv-fc-*` work directories under a chroot base. The work
+/// directory is created immediately before the spawn, so its absence proves
+/// nothing was started -- which an already-reaped child cannot show.
+std::size_t CountWorkDirs(const std::string& chroot_base) {
+    std::size_t n = 0;
+    std::string cmd = "find " + chroot_base + " -maxdepth 3 -name 'agentenv-fc-*' -type d "
+                      "2>/dev/null | wc -l";
+    std::FILE* p = ::popen(cmd.c_str(), "r");
+    if (p == NULL) return 0;
+    if (std::fscanf(p, "%zu", &n) != 1) n = 0;
+    ::pclose(p);
+    return n;
+}
+
 std::string MakeTempDir() {
     char tmpl[] = "/tmp/aenv-boot-XXXXXX";
     char* p = ::mkdtemp(tmpl);
@@ -111,7 +160,7 @@ LaunchPlan PlanIn(const std::string& dir) {
 /// for the socket check: `sleep` itself.
 Config ConfigFor(const std::string& chroot_base) {
     Config cfg;
-    cfg.firecracker_bin = "/bin/sleep";
+    cfg.firecracker_bin = AGENTENV_FAKE_FIRECRACKER;
     cfg.chroot_base_dir = chroot_base;
     cfg.use_jailer = false;
     cfg.capture_output = true;
@@ -181,6 +230,12 @@ MT_TEST(a_permanent_misconfiguration_is_caught_before_the_vmm_starts) {
     MT_EXPECT_TRUE(!r.ok());
     MT_EXPECT_TRUE(r.error().chain().find("physical extra drives") != std::string::npos);
     MT_EXPECT_EQ(conn->calls.size(), static_cast<std::size_t>(0));
+    // No request having been issued is not enough: that holds even if the
+    // sequence were built after the spawn, since the failure still precedes
+    // the first call. What must be true is that no VMM was ever started, and
+    // the only observable trace of one is the work directory it is spawned
+    // into -- CreateFirecrackerWorkDir runs just before the spawn.
+    MT_EXPECT_EQ(CountWorkDirs(dir + "/chroot"), static_cast<std::size_t>(0));
 }
 
 // ============================================================
@@ -209,7 +264,7 @@ MT_TEST(boot_issues_the_whole_sequence_in_order) {
     MT_EXPECT_EQ(paths[0], std::string("/machine-config"));
     MT_EXPECT_EQ(paths[1], std::string("/boot-source"));
     MT_EXPECT_EQ(paths[2], std::string("/drives/rootfs"));
-    MT_EXPECT_EQ(paths[3], std::string("/drives/userrootfs"));
+    MT_EXPECT_EQ(paths[3], std::string("/drives/user_rootfs"));
     MT_EXPECT_EQ(paths[4], std::string("/balloon"));
     // InstanceStart comes last, after every configuration call.
     MT_EXPECT_EQ(paths[5], std::string("/actions"));
@@ -313,16 +368,23 @@ MT_TEST(a_failed_boot_does_not_leave_a_running_vmm) {
     if (dir.empty()) return;
 
     FirecrackerBackend backend(ConfigFor(dir + "/chroot"));
-    backend.SetConnectorForTesting(
-        std::shared_ptr<Connector>(new RecordingConnector("/balloon")));
+
+    // Capture the VMM's pid from inside the boot, since a failed Boot returns
+    // no handle to find it through.
+    PidCapturingConnector* conn = new PidCapturingConnector("/balloon");
+    backend.SetConnectorForTesting(std::shared_ptr<Connector>(conn));
 
     core::Expected<Handle, core::AnyError> r = backend.Boot(PlanIn(dir));
     MT_EXPECT_TRUE(!r.ok());
 
-    // The stand-in VMM is `sleep`, which would still be alive on its own. If
-    // the cleanup ran, no child of ours remains to be reaped.
-    const pid_t leaked = ::waitpid(-1, NULL, WNOHANG);
-    MT_EXPECT_TRUE(leaked <= 0);
+    // The stand-in VMM sleeps for 30s, so it would still be alive on its own.
+    // `waitpid` cannot show this -- Stop() reaps the child itself, so it
+    // returns <= 0 either way. Signal 0 asks whether the process still exists.
+    MT_EXPECT_TRUE(conn->vmm_pid > 0);
+    if (conn->vmm_pid > 0) {
+        // ESRCH: the process is gone, not merely reaped.
+        MT_EXPECT_TRUE(::kill(conn->vmm_pid, 0) != 0);
+    }
 }
 
 MT_TEST(a_failed_start_action_is_reported_as_such) {

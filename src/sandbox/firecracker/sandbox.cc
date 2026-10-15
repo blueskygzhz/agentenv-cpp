@@ -347,28 +347,22 @@ FirecrackerBackend::Boot(LaunchPlan plan) {
 
     const int64_t started_ms = now_ms();
 
-    // --- 1. work directory ---
-    const core::Expected<std::string, std::string> work_dir =
-        CreateFirecrackerWorkDir(core::Optional<std::string>(
-            impl_->cfg.chroot_base_dir + "/firecracker/" + plan.sandbox_id.ToString()));
-    if (!work_dir.ok()) {
-        return ready_err<Handle>(std::string("firecracker boot: ") + work_dir.error());
-    }
-
-    // --- 2. build the ordered sequence BEFORE spawning ---
+    // --- 1. build the ordered sequence, before anything is created ---
     //
-    // Deliberately before the spawn: the two `ensure!`s in here (a short
-    // prepared drive list, more volumes than reserved slots) are permanent
-    // misconfigurations, and finding them after a VMM is running means killing
-    // it again for something that was knowable up front.
+    // Deliberately first: the two `ensure!`s in here (a short prepared drive
+    // list, more volumes than reserved slots) are permanent misconfigurations.
+    // Finding them after a VMM is running means killing it again for something
+    // that was knowable up front -- and finding them after the work directory
+    // exists leaves an empty directory behind on every such failure.
     ConfigurePlan cplan;
     cplan.mem_size_mib = static_cast<uint32_t>(plan.mem_bytes / (1024 * 1024));
     cplan.vcpu_count = static_cast<uint32_t>(plan.vcpus);
     cplan.track_dirty_pages = impl_->cfg.track_dirty_pages;
     cplan.log_level = impl_->cfg.log_level;
-    if (!impl_->cfg.log_level.empty()) {
-        cplan.log_path = work_dir.value() + "/firecracker.log";
-    }
+    // Placeholder: the real path needs the work directory, which does not
+    // exist yet. Only its emptiness is load-bearing for the sequence (a blank
+    // path suppresses the logger step), so it is filled in after the mkdir.
+    if (!impl_->cfg.log_level.empty()) cplan.log_path = "firecracker.log";
     cplan.cpu_config_json = impl_->cfg.cpu_config_json;
     cplan.kernel_image = plan.kernel_path;
     if (!plan.kernel_cmdline.empty()) {
@@ -386,6 +380,21 @@ FirecrackerBackend::Boot(LaunchPlan plan) {
         BuildConfigureSequence(cplan);
     if (!steps.ok()) {
         return ready_err<Handle>(std::string("firecracker boot: ") + steps.error());
+    }
+
+    // --- 2. work directory ---
+    const core::Expected<std::string, std::string> work_dir =
+        CreateFirecrackerWorkDir(core::Optional<std::string>(
+            impl_->cfg.chroot_base_dir + "/firecracker/" + plan.sandbox_id.ToString()));
+    if (!work_dir.ok()) {
+        return ready_err<Handle>(std::string("firecracker boot: ") + work_dir.error());
+    }
+    // Now that the directory exists, point the logger at a file inside it.
+    std::vector<ConfigureStep> plan_steps = steps.value();
+    for (std::size_t i = 0; i < plan_steps.size(); ++i) {
+        if (plan_steps[i].kind == ConfigureStep::Kind::Logger) {
+            plan_steps[i].path = work_dir.value() + "/firecracker.log";
+        }
     }
 
     // --- 3. spawn ---
@@ -406,19 +415,19 @@ FirecrackerBackend::Boot(LaunchPlan plan) {
         return ready_err<Handle>(std::string("firecracker boot: spawn: ") + spawned.error());
     }
 
-    // From here on every failure must stop the VMM. A returned error with a
+    // From here on every failure must stop the VMM: a returned error with a
     // live Firecracker still holding the work directory leaks both, and the
     // next boot for this sandbox id would collide with it.
     //
-    // `Stop` is best-effort on an already-dead child: it reaps, then removes
-    // the socket, so calling it after an early exit is correct rather than
-    // merely harmless.
-    struct Stopper {
-        FirecrackerInstance* inst;
-        bool armed;
-        explicit Stopper(FirecrackerInstance* i) : inst(i), armed(true) {}
-        ~Stopper() { if (armed && inst != NULL) inst->Stop(kPoolFirecrackerStopTimeoutMs); }
-    } stopper(instance.get());
+    // No scope guard is needed for that. `instance` is a `unique_ptr`, and
+    // `~FirecrackerInstance` is this port's `Drop`: it SIGKILLs the child,
+    // reaps it, and removes the socket. Every early return below therefore
+    // stops the VMM by unwinding, and only the success path moves the instance
+    // out into `impl_->instances`.
+    //
+    // An explicit SIGTERM-then-wait guard was tried here and removed: it
+    // duplicated the destructor on the failure path, and disarming it on
+    // success is what the move already expresses.
 
     // --- 4. wait for the API socket ---
     const core::Expected<core::Unit, std::string> ready =
@@ -432,7 +441,7 @@ FirecrackerBackend::Boot(LaunchPlan plan) {
 
     // --- 5. apply the sequence ---
     const core::Expected<core::Unit, std::string> configured =
-        ApplyConfigureSequence(instance.get(), steps.value());
+        ApplyConfigureSequence(instance.get(), plan_steps);
     if (!configured.ok()) {
         return ready_err<Handle>(std::string("firecracker boot: ") + configured.error());
     }
@@ -443,8 +452,6 @@ FirecrackerBackend::Boot(LaunchPlan plan) {
         return ready_err<Handle>(std::string("firecracker boot: InstanceStart: ") +
                                  start.error());
     }
-
-    stopper.armed = false;  // booted; the instance is now owned by the backend
 
     Handle handle;
     handle.sandbox_id = plan.sandbox_id;
