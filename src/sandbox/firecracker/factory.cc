@@ -3,11 +3,99 @@
 #include "agentenv/sandbox/firecracker/factory.h"
 
 #include <cstdint>
+#include <sstream>
 #include <vector>
 
 namespace agentenv {
 namespace sandbox {
 namespace firecracker {
+
+core::Expected<core::Unit, std::string> PrepareSnapshotConfigForResume(
+    SnapshotConfig* config, const core::SandboxId& sandbox_id,
+    const core::Optional<EnvdAccessToken>& envd_access_token) {
+    if (config == NULL) return core::make_unexpected(std::string("null snapshot config"));
+
+    const std::size_t drive_count = config->common.extra_drives.size();
+
+    // A capture from before reserved volume slots existed lists every drive
+    // directly and reserves none. Taken literally its volumes would be bound
+    // into physical slots, so the physical count is restated as the whole
+    // list -- which is what it meant when it was written.
+    if (config->common.volume_drive_slots == 0) {
+        config->common.physical_extra_drive_count = drive_count;
+    }
+
+    if (config->common.physical_extra_drive_count > drive_count) {
+        std::ostringstream why;
+        why << "snapshot records " << config->common.physical_extra_drive_count
+            << " physical extra drives but only " << drive_count << " logical drives";
+        return core::make_unexpected(why.str());
+    }
+
+    const std::size_t volume_count = drive_count - config->common.physical_extra_drive_count;
+    if (volume_count > config->common.volume_drive_slots) {
+        std::ostringstream why;
+        why << "snapshot has " << volume_count
+            << " launch-time volume drives but only " << config->common.volume_drive_slots
+            << " reserved drive slots";
+        return core::make_unexpected(why.str());
+    }
+
+    // Runtime identity and auth override whatever the capture recorded. The
+    // token is a live credential: carrying the captured sandbox's forward
+    // would let this one authenticate as that one.
+    config->common.envd_access_token = envd_access_token;
+
+    // Rust `get_or_insert_with(|| MmdsMetadata::new(id, "unknown"))` — a
+    // capture with no document still needs one, and "unknown" is the snapshot
+    // id placeholder upstream uses rather than inventing a real-looking one.
+    if (!config->common.mmds_metadata.has_value()) {
+        config->common.mmds_metadata =
+            core::Optional<MmdsMetadata>(MmdsMetadata(sandbox_id, "unknown"));
+    }
+    config->common.mmds_metadata->SetSandboxId(sandbox_id);
+    config->common.mmds_metadata->SetAccessToken(envd_access_token);
+    return core::Unit{};
+}
+
+core::Expected<core::Unit, std::string> PartitionExtraDrives(
+    SandboxConfig* config, std::size_t max_volume_count) {
+    if (config == NULL) return core::make_unexpected(std::string("null config"));
+
+    std::vector<ExtraDrive> physical;
+    std::vector<ExtraDrive> volumes;
+    for (std::size_t i = 0; i < config->common.extra_drives.size(); ++i) {
+        const ExtraDrive& drive = config->common.extra_drives[i];
+        if (drive.IsVolume()) {
+            volumes.push_back(drive);
+        } else {
+            physical.push_back(drive);
+        }
+    }
+
+    config->common.physical_extra_drive_count = physical.size();
+    // Rust `min(MAX_EXTRA_DRIVES.saturating_sub(physical_count))`: the guest
+    // only has letters `vdc`..`vdz`, so the reservation cannot exceed what is
+    // left after the physical drives. Saturating, because a config with more
+    // physical drives than letters must yield zero slots rather than wrap.
+    const std::size_t remaining =
+        kMaxExtraDrives > physical.size() ? kMaxExtraDrives - physical.size() : 0;
+    config->common.volume_drive_slots =
+        max_volume_count < remaining ? max_volume_count : remaining;
+
+    if (volumes.size() > config->common.volume_drive_slots) {
+        std::ostringstream why;
+        why << "fresh sandbox has " << volumes.size() << " volumes but only "
+            << config->common.volume_drive_slots << " reserved volume slots";
+        return core::make_unexpected(why.str());
+    }
+
+    // Physical first, volumes after: the order here is the slot order, and
+    // `BuildConfigureSequence` splits the list at `physical_extra_drive_count`.
+    physical.insert(physical.end(), volumes.begin(), volumes.end());
+    config->common.extra_drives = physical;
+    return core::Unit{};
+}
 
 core::Expected<SandboxConfig, std::string> FreshSandboxConfigForBuild(
     const cfg::AppConfig& app_config,

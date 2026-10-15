@@ -185,6 +185,10 @@ void MmdsMetadata::SetAccessToken(const core::Optional<EnvdAccessToken>& token) 
     access_token_hash_ = HashAccessToken(token.has_value() ? token->Expose() : std::string());
 }
 
+void MmdsMetadata::SetSandboxId(const core::SandboxId& sandbox_id) {
+    sandbox_id_ = sandbox_id.ToString();
+}
+
 core::Json MmdsMetadata::ToValue() const {
     // Extras first, then the core fields over them. `WithExtra` already keeps
     // reserved keys out, so this order only matters for a value built some

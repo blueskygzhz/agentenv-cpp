@@ -2,6 +2,8 @@ add_library(agentenv-api STATIC
     dto.cc
     pagination.cc
     server.cc
+    # Rust: the serving half of src/api/mod.rs (framing + routing over TCP)
+    http_server.cc
     proxy.cc
     impls.cc
     # Rust: src/api/impls/attached_drives.rs

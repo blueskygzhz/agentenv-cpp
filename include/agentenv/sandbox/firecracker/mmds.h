@@ -61,6 +61,14 @@ class MmdsMetadata {
     /// absent token hashes the empty string, as upstream.
     void SetAccessToken(const core::Optional<EnvdAccessToken>& token);
 
+    /// Rust `metadata.sandbox_id = id.to_string()` on the resume path.
+    ///
+    /// A resumed sandbox gets a new id while the document it inherits still
+    /// names the one that was captured. The guest reads its own identity from
+    /// here, so leaving the old value makes it report as the wrong sandbox —
+    /// and the logs collector then files its output under that id.
+    void SetSandboxId(const core::SandboxId& sandbox_id);
+
     /// Rust `Serialize`.
     core::Json ToValue() const;
     /// `ToValue().ToString()` — the body sent to `PUT /mmds`.

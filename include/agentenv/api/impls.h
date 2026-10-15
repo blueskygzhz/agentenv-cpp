@@ -13,33 +13,60 @@
 namespace agentenv {
 namespace api {
 
+/// Rust `impl From<OrchestratorError> for models::Error` (impls/sandbox.rs).
+///
+/// The status is part of the contract, not a detail: a client retries a 503,
+/// gives up on a 400 and backs off on a 409. Collapsing these to one code
+/// would make every failure look alike to the caller.
+ApiError ToApiError(const orchestrator::OrchestratorError& err);
+
+/// Rust `sandbox_not_found` — 404 with the id in the message.
+ApiError SandboxNotFound(const std::string& id);
+
 /// Rust struct `ApiImpl` — glues API DTOs to orchestrator/snapshot/template.
+///
+/// Every handler reports failure as an `ApiError` carrying the status Rust
+/// assigns it. A handler that cannot do its job returns an error rather than
+/// an empty success: a caller told its snapshot was taken, or its sandbox
+/// deleted, discovers otherwise on another node at another time, and by then
+/// the record is simply corrupt.
 class ApiImpl {
  public:
     explicit ApiImpl(std::shared_ptr<orchestrator::Orchestrator> svc)
         : svc_(std::move(svc)) {}
 
     // Sandbox handlers (Rust: src/api/impls/sandbox.rs).
-    core::Expected<CreateSandboxResp, core::AnyError>
+    core::Expected<CreateSandboxResp, ApiError>
         CreateSandbox(const CreateSandboxReq& req);
-    core::Expected<core::Unit, core::AnyError>
+    core::Expected<core::Unit, ApiError>
         DeleteSandbox(const std::string& sandbox_id);
-    core::Expected<GetSandboxResp, core::AnyError>
+    core::Expected<GetSandboxResp, ApiError>
         GetSandbox(const std::string& sandbox_id);
-    core::Expected<ListSandboxesResp, core::AnyError>
+    core::Expected<ListSandboxesResp, ApiError>
         ListSandboxes();
-    core::Expected<ExecResp, core::AnyError>
+    core::Expected<ExecResp, ApiError>
         Exec(const std::string& sandbox_id, const ExecReq& req);
 
+    /// Rust `pause_sandbox` / `resume_sandbox` handlers.
+    core::Expected<core::Unit, ApiError>
+        PauseSandbox(const std::string& sandbox_id);
+    core::Expected<GetSandboxResp, ApiError>
+        ResumeSandbox(const std::string& sandbox_id);
+
     // Snapshot handlers (Rust: src/api/impls/snapshot.rs).
-    core::Expected<core::Unit, core::AnyError>
+    core::Expected<core::Unit, ApiError>
         CreateSnapshot(const std::string& sandbox_id);
 
     // Template handlers (Rust: src/api/impls/template.rs).
-    core::Expected<core::Unit, core::AnyError>
+    core::Expected<core::Unit, ApiError>
         ListTemplates();
 
  private:
+    /// Parses an id and maps a bad one onto Rust's 404. Rust takes the id
+    /// through a typed path parameter, so a malformed one never reaches the
+    /// handler and is indistinguishable from a missing sandbox to the caller.
+    core::Expected<core::SandboxId, ApiError> ParseId(const std::string& text) const;
+
     std::shared_ptr<orchestrator::Orchestrator> svc_;
 };
 

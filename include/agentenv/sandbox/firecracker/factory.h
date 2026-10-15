@@ -34,6 +34,47 @@ namespace firecracker {
 ///
 /// Rust reads `ConfigManager::global_config()`; the config is a parameter here
 /// so the projection can be tested without installing a global.
+/// Rust `FirecrackerSandbox::from_snapshot_config_with_override` — prepare a
+/// captured config for a resume under a new sandbox id.
+///
+/// Three things happen, and all three are load-bearing:
+///
+///  1. A legacy capture (`volume_drive_slots == 0`) predates reserved volume
+///     slots and lists every drive as physical. Read as-is it would attach
+///     volumes into physical slots, so its physical count is restated as the
+///     whole list.
+///
+///  2. The drive counts are checked against each other. Firecracker reopens
+///     every serialized slot path on load, so a config claiming more physical
+///     drives than it carries, or more volumes than it reserved, cannot be
+///     loaded — and failing here names the record rather than the load.
+///
+///  3. Runtime identity overrides what the capture recorded: the new sandbox
+///     id and this launch's envd token replace the captured ones, in the MMDS
+///     document as well as the config. The guest reads its identity from MMDS,
+///     so a stale id there makes a resumed sandbox report as the one that was
+///     captured — and the token is a live credential that must not be the
+///     captured sandbox's.
+core::Expected<core::Unit, std::string> PrepareSnapshotConfigForResume(
+    SnapshotConfig* config, const core::SandboxId& sandbox_id,
+    const core::Optional<EnvdAccessToken>& envd_access_token);
+
+/// Rust `FirecrackerSandbox::new_with_id` — the drive partitioning it does
+/// before handing the config to `build`.
+///
+/// Physical drives come first and volumes after, because the guest names
+/// drives positionally (`vdc`, `vdd`, ...) and a volume that lands in a
+/// physical slot is mounted as the wrong filesystem. `volume_drive_slots` is
+/// the number of placeholders reserved on the first boot: Firecracker cannot
+/// add a virtio-block device after a snapshot restore, so a volume attached
+/// later has to occupy a slot that already exists.
+///
+/// Fails rather than truncating when there are more volumes than slots. The
+/// alternative is a sandbox that boots without the volume its caller asked
+/// for, which is only noticed when the guest finds the mount point empty.
+core::Expected<core::Unit, std::string> PartitionExtraDrives(
+    SandboxConfig* config, std::size_t max_volume_count);
+
 core::Expected<SandboxConfig, std::string> FreshSandboxConfigForBuild(
     const cfg::AppConfig& app_config,
     const core::Optional<std::string>& cpu_config_json,

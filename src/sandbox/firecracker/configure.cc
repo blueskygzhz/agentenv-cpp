@@ -16,8 +16,13 @@
 
 #include "agentenv/sandbox/firecracker/instance.h"
 #include "agentenv/sandbox/firecracker/lifecycle.h"
+// `ResumeStep` / `ResumeStartSpec`. The resume sequence is built here next to
+// the configure one: both are ordered API plans over the same instance, and
+// the reason for modelling them as data is identical.
+#include "agentenv/sandbox/firecracker/sandbox_backend.h"
 
 #include <cstdio>
+#include <utility>
 
 namespace agentenv {
 namespace sandbox {
@@ -283,6 +288,168 @@ ApplyConfigureSequence(FirecrackerInstance* instance,
             // repair an earlier rejection, so continuing would only replace a
             // precise error with a confusing one from further down.
             return core::make_unexpected(ConfigureStepName(step) + ": " + r.error());
+        }
+    }
+    return core::Unit{};
+}
+
+// ── resume sequence ─────────────────────────────────────────────────────────
+
+namespace {
+
+std::string ResumeStepName(const ResumeStep& step) {
+    switch (step.kind) {
+    case ResumeStep::Kind::Logger:           return "PUT /logger";
+    case ResumeStep::Kind::SnapshotLoad:     return "PUT /snapshot/load";
+    case ResumeStep::Kind::PatchDrivePath:   return "PATCH /drives/" + step.id + " (path)";
+    case ResumeStep::Kind::Mmds:             return "PUT /mmds";
+    case ResumeStep::Kind::PatchRateLimiter: return "PATCH /drives/" + step.id + " (limiter)";
+    case ResumeStep::Kind::Resume:           return "PATCH /vm (Resumed)";
+    }
+    return "unknown resume step";
+}
+
+}  // namespace
+
+core::Expected<std::vector<ResumeStep>, std::string>
+BuildResumeSequence(const ResumeStartSpec& spec) {
+    const SnapshotConfig& config = spec.snapshot_config;
+    std::vector<ResumeStep> steps;
+
+    // Checked before anything is created. Each of these would otherwise
+    // surface as a VM that loaded and then could not find its disk, by which
+    // point the error names the load rather than the missing field.
+    if (!config.common.rootfs_image_config.has_value()) {
+        return core::make_unexpected(std::string("snapshot rootfs image config is missing"));
+    }
+    if (!config.common.rootfs_virtual_size.has_value()) {
+        return core::make_unexpected(std::string("snapshot rootfs virtual size is missing"));
+    }
+    if (config.vm_state_path.empty()) {
+        return core::make_unexpected(std::string("snapshot vm state path is missing"));
+    }
+    // Rust fails fast on `UblkDeviceManager::is_available()` for exactly this:
+    // memory restore reads through a block device, and without one the load
+    // would be issued against a path that does not exist.
+    if (spec.mem_device_path.empty()) {
+        return core::make_unexpected(std::string(
+            "snapshot resume requires a memory block device "
+            "(this build has no ublk daemon client)"));
+    }
+
+    // 1. Logger first. Firecracker accepts `PUT /logger` pre-boot only, and a
+    //    loaded snapshot is no longer pre-boot.
+    if (LoggingEnabled(config.common.firecracker_log_level)) {
+        ResumeStep logger;
+        logger.kind = ResumeStep::Kind::Logger;
+        logger.path = "firecracker.log";  // resolved against the work dir
+        logger.text = *config.common.firecracker_log_level;
+        steps.push_back(logger);
+    }
+
+    // 2. The load itself.
+    ResumeStep load;
+    load.kind = ResumeStep::Kind::SnapshotLoad;
+    load.path = config.vm_state_path;
+    load.text = spec.mem_device_path;
+    load.track_dirty_pages = config.common.track_dirty_pages;
+    steps.push_back(load);
+
+    // 3. Volumes absent from the source state were loaded as placeholders, so
+    //    their real paths are patched in after the load. A volume that *was*
+    //    in the source state is bound before the load instead and needs no
+    //    patch -- this port binds none, so only the shape is modelled here.
+    const std::size_t physical = config.common.physical_extra_drive_count;
+    for (std::size_t i = physical; i < config.common.extra_drives.size(); ++i) {
+        ResumeStep patch;
+        patch.kind = ResumeStep::Kind::PatchDrivePath;
+        patch.id = VolumeDriveSlotId(i - physical);
+        patch.path = config.common.extra_drives[i].image_config_path;
+        steps.push_back(patch);
+    }
+
+    // 4. MMDS before the resume: the guest reads its identity from the
+    //    document, and `PrepareSnapshotConfigForResume` has just corrected it.
+    //    Letting the guest run first would let it read the captured id.
+    if (config.common.mmds_metadata.has_value()) {
+        ResumeStep mmds;
+        mmds.kind = ResumeStep::Kind::Mmds;
+        mmds.text = config.common.mmds_metadata->ToJson();
+        steps.push_back(mmds);
+    }
+
+    // 5. Reconcile the inherited rate limiter while the VM is loaded but still
+    //    paused. After the resume the guest has already issued I/O under
+    //    whatever limit the capture carried; before the load there is no drive
+    //    to patch. Both buckets are always written, so a dimension this node
+    //    leaves unset clears the inherited one rather than keeping it.
+    const core::Expected<RateLimiter, std::string> reconciled =
+        ReconcileDiskRateLimiter(config.common.disk_rate_limit);
+    if (!reconciled.ok()) return core::make_unexpected(reconciled.error());
+    ResumeStep limiter;
+    limiter.kind = ResumeStep::Kind::PatchRateLimiter;
+    limiter.id = kUserRootfsDriveId;
+    limiter.rate_limiter = reconciled.value();
+    steps.push_back(limiter);
+
+    // 6. Let it run.
+    ResumeStep resume;
+    resume.kind = ResumeStep::Kind::Resume;
+    steps.push_back(resume);
+
+    return steps;
+}
+
+core::Expected<core::Unit, std::string>
+ApplyResumeSequence(FirecrackerInstance* instance, const std::vector<ResumeStep>& steps) {
+    if (instance == NULL) {
+        return core::make_unexpected(std::string("no firecracker instance"));
+    }
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+        const ResumeStep& step = steps[i];
+        core::Expected<core::Unit, std::string> r = core::Unit{};
+        switch (step.kind) {
+        case ResumeStep::Kind::Logger:
+            r = instance->SetLogger(step.path, step.text);
+            break;
+        case ResumeStep::Kind::SnapshotLoad:
+            // `resume_vm = false`: the VM is left loaded-but-paused so the
+            // limiter can be reconciled before the guest issues any I/O.
+            r = instance->LoadSnapshotFile(
+                step.path, step.text,
+                std::vector<std::pair<std::string, std::string> >(
+                    1, std::make_pair(std::string("eth0"), std::string("tap0"))),
+                /*resume_vm=*/false, step.track_dirty_pages);
+            break;
+        case ResumeStep::Kind::PatchDrivePath:
+            r = instance->PatchDrivePath(step.id, step.path);
+            break;
+        case ResumeStep::Kind::Mmds: {
+            const core::Expected<core::Json, core::AnyError> doc =
+                core::Json::Parse(step.text);
+            if (!doc.ok()) {
+                return core::make_unexpected(std::string("PUT /mmds: ") + doc.error().chain());
+            }
+            const core::Expected<MmdsMetadata, std::string> metadata =
+                MmdsMetadata::FromValue(doc.value());
+            if (!metadata.ok()) {
+                return core::make_unexpected(std::string("PUT /mmds: ") + metadata.error());
+            }
+            r = instance->SetMmds(metadata.value());
+            break;
+        }
+        case ResumeStep::Kind::PatchRateLimiter:
+            r = instance->PatchDriveRateLimiter(step.id, step.rate_limiter);
+            break;
+        case ResumeStep::Kind::Resume:
+            r = instance->Resume();
+            break;
+        }
+        if (!r.ok()) {
+            // Abort the rest, as the fresh path does: once the load is
+            // rejected there is no VM for the later calls to act on, and a
+            // patch against a nonexistent drive reports a confusing error.
+            return core::make_unexpected(ResumeStepName(step) + ": " + r.error());
         }
     }
     return core::Unit{};

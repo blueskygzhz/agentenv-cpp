@@ -150,6 +150,96 @@ struct FreshStartSpec {
     int64_t envd_poll_ms = 100;
 };
 
+/// What a resume start needs, alongside the capture it restores.
+///
+/// Separate from `FreshStartSpec` because the two differ in what they send the
+/// VMM, not only in their inputs: a resume has no boot source and no drive
+/// attachments to make, and instead carries the state file and the memory
+/// device the load reads from.
+struct ResumeStartSpec {
+    /// The capture to restore, already prepared for this launch.
+    SnapshotConfig snapshot_config;
+    std::string firecracker_bin;
+    /// Parent for the per-instance work directory.
+    std::string chroot_base_dir;
+    core::SandboxId sandbox_id;
+    core::Optional<std::string> firecracker_work_dir;
+    bool capture_output = true;
+    int64_t socket_timeout_ms = 10 * 1000;
+    int64_t socket_poll_ms = 10;
+    int64_t envd_timeout_ms = 60 * 1000;
+    int64_t envd_poll_ms = 100;
+
+    /// Host path of the block device backing guest memory, which the snapshot
+    /// load reads through.
+    ///
+    /// Rust gets this from `UblkDeviceManager::get_or_create_shared_mem`. It
+    /// is a parameter here because this port has no ublk daemon: without one
+    /// the resume cannot proceed, and an empty value is what says so.
+    std::string mem_device_path;
+};
+
+/// Rust `FirecrackerSandbox::start_resume` — the ordered API sequence a resume
+/// issues, as a plan.
+///
+/// Modelled like `BuildConfigureSequence` and for the same reason: the order
+/// is the substance, and a wrong one fails deep inside a load where the error
+/// names the last call rather than the cause. Three orderings here are
+/// load-bearing:
+///
+///   * The logger is configured *before* the load. Firecracker accepts
+///     `PUT /logger` pre-boot only, and a loaded snapshot is no longer
+///     pre-boot.
+///
+///   * The rate limiter is reconciled *after* the load and *before* the
+///     resume. A restored VM inherits whatever limiter was active when it was
+///     paused; reconciling after the resume lets the guest issue unthrottled
+///     I/O first, and before the load there is no drive to patch.
+///
+///   * The MMDS document is written before the resume, so the guest cannot
+///     read its own identity before it has been corrected.
+struct ResumeStep {
+    enum class Kind {
+        Logger,          ///< `PUT /logger`
+        SnapshotLoad,    ///< `PUT /snapshot/load`
+        PatchDrivePath,  ///< `PATCH /drives/{id}` — a new volume's path
+        Mmds,            ///< `PUT /mmds`
+        PatchRateLimiter,///< `PATCH /drives/{id}` — the reconciled limiter
+        Resume,          ///< `PATCH /vm {"state":"Resumed"}`
+    };
+
+    Kind kind = Kind::Resume;
+    /// `PatchDrivePath` / `PatchRateLimiter`: the drive id.
+    std::string id;
+    /// `Logger`: log path. `SnapshotLoad`: vm state path.
+    /// `PatchDrivePath`: the new host path.
+    std::string path;
+    /// `Logger`: level. `SnapshotLoad`: the memory device path.
+    std::string text;
+    /// `SnapshotLoad`.
+    bool track_dirty_pages = false;
+    /// `PatchRateLimiter`.
+    RateLimiter rate_limiter;
+};
+
+/// Rust `start_resume` — the ordered sequence, derived from the capture.
+///
+/// Fails rather than producing a partial sequence when the capture is missing
+/// what a load needs (rootfs config, rootfs virtual size, memory device). All
+/// three are checked before anything is created, because each one would
+/// otherwise surface as a VM that loaded and then could not find its disk.
+core::Expected<std::vector<ResumeStep>, std::string>
+    BuildResumeSequence(const ResumeStartSpec& spec);
+
+/// Issues an already-ordered resume sequence against a live instance.
+///
+/// Split from `BuildResumeSequence` for the same reason the configure sequence
+/// is: the ordering stays testable without a VMM, and the dispatch stays
+/// testable without re-deriving the order.
+core::Expected<core::Unit, std::string>
+    ApplyResumeSequence(FirecrackerInstance* instance,
+                        const std::vector<ResumeStep>& steps);
+
 /// Rust `FirecrackerSandbox::start_fresh` — the process half of a fresh boot.
 ///
 /// Spawns the VMM, waits for its API socket, applies `spec.configure` and
@@ -192,6 +282,22 @@ class FirecrackerSandboxBackend : public SandboxBackend {
     /// is built at start time.
     FirecrackerSandboxBackend(FreshStartSpec spec, SnapshotConfig snapshot_config,
                               std::shared_ptr<Connector> connector);
+
+    /// A backend that resumes from a capture, as Rust's
+    /// `from_snapshot_config_with_override` returns.
+    ///
+    /// Distinct from the fresh constructor because `StartNowait` dispatches on
+    /// the launch mode and the two send the VMM different things: a resume
+    /// issues `PUT /snapshot/load` against drives already bound to the
+    /// captured artifacts, where a fresh boot sets a boot source and attaches
+    /// drives. Collapsing them would mean a resume silently taking the fresh
+    /// path and booting a new VM over a capture nobody loaded.
+    ///
+    /// `snapshot_config` is expected to have been through
+    /// `PrepareSnapshotConfigForResume`, which is where the drive counts are
+    /// checked and the runtime identity overridden.
+    static FirecrackerSandboxBackend* NewResuming(
+        ResumeStartSpec spec, std::shared_ptr<Connector> connector);
 
     /// Injects the envd health probe. Null uses the real one, which this port
     /// does not have — so without an injected probe `WaitForReady` reports

@@ -1,73 +1,174 @@
 // SPDX-License-Identifier: MIT
-// A minimal Server implementation that does NO listening — it is a "dispatcher"
-// intended to be driven by tests. When AGENTENV_WITH_HTTPLIB is enabled, replace
-// this with a cpp-httplib-backed server.
+// Rust: src/api/mod.rs — the router. `MakeServer` picks the transport;
+// `RegisterOrchestratorRoutes` is the route table itself.
 #include "agentenv/api/server.h"
 
-#include <stdexcept>
 #include <vector>
+
+#include "agentenv/api/http_server.h"
+#include "agentenv/api/impls.h"
 
 namespace agentenv {
 namespace api {
 
-class InMemoryServer final : public Server {
- public:
-    void Route(const std::string& method, const std::string& path_pattern, Handler h) override {
-        RouteEntry e;
-        e.method = method;
-        e.path_pattern = path_pattern;
-        e.handler = std::move(h);
-        routes_.push_back(std::move(e));
-    }
+namespace {
 
-    core::Expected<core::Unit, core::AnyError>
-    ListenAndServe(const std::string& /*bind_addr*/) override {
-        // No listener in the skeleton; return "not implemented".
-        return core::make_unexpected(core::err(
-            "api::Server: no HTTP backend compiled in "
-            "(build with AGENTENV_WITH_HTTPLIB to enable)"));
-    }
-
-    void Stop() override {}
-
-    /// Test hook: dispatch synchronously.
-    HttpResponse Dispatch(const HttpRequest& req) {
-        for (std::size_t i = 0; i < routes_.size(); ++i) {
-            const RouteEntry& r = routes_[i];
-            if (r.method == req.method && r.path_pattern == req.path) {
-                HttpResponse resp;
-                r.handler(req, &resp);
-                return resp;
-            }
-        }
-        HttpResponse resp;
-        resp.status = 404;
-        resp.body = R"({"code":"not_found","message":"no route"})";
-        return resp;
-    }
-
- private:
-    struct RouteEntry {
-        std::string method;
-        std::string path_pattern;
-        Handler handler;
-    };
-    std::vector<RouteEntry> routes_;
-};
-
-std::unique_ptr<Server> MakeServer() {
-#ifdef AGENTENV_WITH_HTTPLIB
-    // TODO: return an httplib-backed server.
-    return std::unique_ptr<Server>(new InMemoryServer());
-#else
-    return std::unique_ptr<Server>(new InMemoryServer());
-#endif
+/// Writes an `ApiError` out as the `{code, message}` body with a matching
+/// HTTP status. The two must agree: a 200 carrying an error body is read as
+/// success by every client that checks the status first.
+void WriteError(const ApiError& error, HttpResponse* out) {
+    out->status = error.code;
+    out->body = error.ToJson().ToString();
 }
 
-void RegisterOrchestratorRoutes(Server* /*server*/,
-                                orchestrator::Orchestrator* /*svc*/) {
-    // Skeleton: real wiring goes here once the Rust `src/api/impls/*` handlers
-    // are ported onto the Orchestrator surface.
+void WriteJson(const core::Json& value, HttpResponse* out) {
+    out->status = 200;
+    out->body = value.ToString();
+}
+
+/// Looks a path parameter up. Captured segments are merged into `query` by
+/// the router before the handler runs.
+std::string Param(const HttpRequest& request, const char* name) {
+    const std::unordered_map<std::string, std::string>::const_iterator it =
+        request.query.find(name);
+    return it == request.query.end() ? std::string() : it->second;
+}
+
+/// Parses a JSON request body, reporting a 400 rather than letting a
+/// malformed body reach a handler as a default-constructed request — which
+/// would create a sandbox from a request the client never sent.
+bool ParseBody(const HttpRequest& request, core::Json* out, HttpResponse* resp) {
+    const core::Expected<core::Json, core::AnyError> parsed =
+        core::Json::Parse(request.body.empty() ? std::string("{}") : request.body);
+    if (!parsed.ok()) {
+        WriteError(ApiError::Make(400, "malformed JSON body: " + parsed.error().chain()),
+                   resp);
+        return false;
+    }
+    *out = parsed.value();
+    return true;
+}
+
+}  // namespace
+
+std::unique_ptr<Server> MakeServer() {
+    // One real transport. The in-memory dispatcher this used to return made
+    // `ListenAndServe` fail at runtime while every build and test passed,
+    // so the binary looked complete and served nothing.
+    return std::unique_ptr<Server>(new HttpServer());
+}
+
+void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc) {
+    if (server == NULL || svc == NULL) return;
+
+    // The handlers share one ApiImpl. It holds a shared_ptr, so the lambdas
+    // below keep it alive for as long as the routes are registered.
+    //
+    // `svc` is a raw pointer owned by the caller (main holds the shared_ptr),
+    // so the aliasing constructor is used: the ApiImpl must not be the thing
+    // that decides when the orchestrator dies.
+    std::shared_ptr<orchestrator::Orchestrator> alias(
+        std::shared_ptr<orchestrator::Orchestrator>(), svc);
+    std::shared_ptr<ApiImpl> impl(new ApiImpl(alias));
+
+    // ---- sandboxes --------------------------------------------------------
+
+    server->Route("GET", "/sandboxes", [impl](const HttpRequest&, HttpResponse* resp) {
+        const core::Expected<ListSandboxesResp, ApiError> r = impl->ListSandboxes();
+        if (!r.ok()) return WriteError(r.error(), resp);
+        WriteJson(r.value().ToJson(), resp);
+    });
+
+    server->Route("POST", "/sandboxes", [impl](const HttpRequest& req, HttpResponse* resp) {
+        core::Json body;
+        if (!ParseBody(req, &body, resp)) return;
+        const core::Expected<CreateSandboxReq, core::AnyError> parsed =
+            CreateSandboxReq::FromJson(body);
+        if (!parsed.ok()) {
+            return WriteError(ApiError::Make(400, parsed.error().chain()), resp);
+        }
+        const core::Expected<CreateSandboxResp, ApiError> r =
+            impl->CreateSandbox(parsed.value());
+        if (!r.ok()) return WriteError(r.error(), resp);
+        resp->status = 201;
+        resp->body = r.value().ToJson().ToString();
+    });
+
+    server->Route("GET", "/sandboxes/{id}",
+                  [impl](const HttpRequest& req, HttpResponse* resp) {
+        const core::Expected<GetSandboxResp, ApiError> r =
+            impl->GetSandbox(Param(req, "id"));
+        if (!r.ok()) return WriteError(r.error(), resp);
+        WriteJson(r.value().ToJson(), resp);
+    });
+
+    server->Route("DELETE", "/sandboxes/{id}",
+                  [impl](const HttpRequest& req, HttpResponse* resp) {
+        const core::Expected<core::Unit, ApiError> r =
+            impl->DeleteSandbox(Param(req, "id"));
+        if (!r.ok()) return WriteError(r.error(), resp);
+        // 204: the delete succeeded and there is nothing to return. An empty
+        // 200 body would be indistinguishable from a handler that forgot to
+        // write one.
+        resp->status = 204;
+    });
+
+    server->Route("POST", "/sandboxes/{id}/pause",
+                  [impl](const HttpRequest& req, HttpResponse* resp) {
+        const core::Expected<core::Unit, ApiError> r =
+            impl->PauseSandbox(Param(req, "id"));
+        if (!r.ok()) return WriteError(r.error(), resp);
+        resp->status = 204;
+    });
+
+    server->Route("POST", "/sandboxes/{id}/resume",
+                  [impl](const HttpRequest& req, HttpResponse* resp) {
+        const core::Expected<GetSandboxResp, ApiError> r =
+            impl->ResumeSandbox(Param(req, "id"));
+        if (!r.ok()) return WriteError(r.error(), resp);
+        WriteJson(r.value().ToJson(), resp);
+    });
+
+    server->Route("POST", "/sandboxes/{id}/exec",
+                  [impl](const HttpRequest& req, HttpResponse* resp) {
+        core::Json body;
+        if (!ParseBody(req, &body, resp)) return;
+        const core::Expected<ExecReq, core::AnyError> parsed = ExecReq::FromJson(body);
+        if (!parsed.ok()) {
+            return WriteError(ApiError::Make(400, parsed.error().chain()), resp);
+        }
+        const core::Expected<ExecResp, ApiError> r =
+            impl->Exec(Param(req, "id"), parsed.value());
+        if (!r.ok()) return WriteError(r.error(), resp);
+        WriteJson(r.value().ToJson(), resp);
+    });
+
+    server->Route("POST", "/sandboxes/{id}/snapshot",
+                  [impl](const HttpRequest& req, HttpResponse* resp) {
+        const core::Expected<core::Unit, ApiError> r =
+            impl->CreateSnapshot(Param(req, "id"));
+        if (!r.ok()) return WriteError(r.error(), resp);
+        resp->status = 204;
+    });
+
+    // ---- templates --------------------------------------------------------
+
+    server->Route("GET", "/templates", [impl](const HttpRequest&, HttpResponse* resp) {
+        const core::Expected<core::Unit, ApiError> r = impl->ListTemplates();
+        if (!r.ok()) return WriteError(r.error(), resp);
+        resp->status = 200;
+        resp->body = "{\"templates\":[]}";
+    });
+
+    // ---- health -----------------------------------------------------------
+
+    // Deliberately not routed through ApiImpl: this must answer while the
+    // orchestrator is busy or degraded, which is exactly when a load balancer
+    // asks. It reports that the process is serving, nothing more.
+    server->Route("GET", "/health", [](const HttpRequest&, HttpResponse* resp) {
+        resp->status = 200;
+        resp->body = "{\"status\":\"ok\"}";
+    });
 }
 
 }  // namespace api

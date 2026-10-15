@@ -221,9 +221,29 @@ class FirecrackerSandboxBackend::Impl {
         : snapshot_config(std::move(cfg)), spec(std::move(s)), connector(std::move(c)),
           startable(true) {}
 
+    /// Resume form. `spec` is filled from the resume spec's shared fields so
+    /// `WaitForReady` and `Snapshot` -- which read the envd timeouts and the
+    /// work dir -- behave the same on both paths.
+    Impl(ResumeStartSpec s, std::shared_ptr<Connector> c)
+        : snapshot_config(s.snapshot_config), resume_spec(std::move(s)),
+          connector(std::move(c)), startable(true) {
+        launch.kind = LaunchMode::Kind::Resume;
+        spec.firecracker_bin = resume_spec.firecracker_bin;
+        spec.chroot_base_dir = resume_spec.chroot_base_dir;
+        spec.sandbox_id = resume_spec.sandbox_id;
+        spec.firecracker_work_dir = resume_spec.firecracker_work_dir;
+        spec.capture_output = resume_spec.capture_output;
+        spec.socket_timeout_ms = resume_spec.socket_timeout_ms;
+        spec.socket_poll_ms = resume_spec.socket_poll_ms;
+        spec.envd_timeout_ms = resume_spec.envd_timeout_ms;
+        spec.envd_poll_ms = resume_spec.envd_poll_ms;
+    }
+
     std::unique_ptr<FirecrackerInstance> instance;
     SnapshotConfig snapshot_config;
     FreshStartSpec spec;
+    /// Only meaningful when `launch.kind == Resume`.
+    ResumeStartSpec resume_spec;
     std::shared_ptr<Connector> connector;
     /// False for a backend handed an already-booted instance: there is nothing
     /// left to start, and a start would spawn a second VMM over the first.

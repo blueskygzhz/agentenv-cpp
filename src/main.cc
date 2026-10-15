@@ -64,8 +64,12 @@ int main(int argc, char** argv) {
 
     ae::sandbox::firecracker::Config fc_cfg;
     fc_cfg.firecracker_bin = app_cfg.ResolvedFirecrackerBinaryPath();
+    // The AppConfig goes in too: `Build` projects each request onto it (rootfs
+    // image, tools drive, boot-arg allowlist), and a factory without one can
+    // only refuse to build.
     auto factory = std::shared_ptr<ae::sandbox::SandboxBackendFactory>(
-                       new ae::sandbox::firecracker::FirecrackerSandboxFactory(fc_cfg));
+                       new ae::sandbox::firecracker::FirecrackerSandboxFactory(
+                           fc_cfg, app_cfg));
 
     auto built = ae::orchestrator::Orchestrator::New(store, factory, persister, app_cfg);
     if (!built.ok()) {
@@ -82,7 +86,9 @@ int main(int argc, char** argv) {
     auto server = ae::api::MakeServer();
     ae::api::RegisterOrchestratorRoutes(server.get(), svc.get());
 
-    AGENTENV_INFO("agentenv listening on " << cfg.server_bind_addr);
+    // No "listening" line here: this used to log it before the bind, so a
+    // server that never came up still claimed it had. `ListenAndServe` logs
+    // once the socket is actually bound, with the port it really got.
     auto r = server->ListenAndServe(cfg.server_bind_addr);
     if (!r.ok()) {
         AGENTENV_ERROR("server failed: " << r.error().chain());

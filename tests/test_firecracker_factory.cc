@@ -5,6 +5,7 @@
 //       contracts (orchestrator/service.rs :: create_sandbox_inner, fork).
 #include "microtest.h"
 
+#include <cstdio>
 #include <map>
 #include <string>
 #include <vector>
@@ -460,6 +461,100 @@ MT_TEST(fork_hands_backend_full_extra_drives) {
     MT_EXPECT_EQ(d.drive_id, std::string("replacement"));
     MT_EXPECT_EQ(d.image_config_path, std::string("/img/replacement.json"));
     MT_EXPECT_EQ(d.mount_path, std::string("/mnt/data"));
+}
+
+// ============================================================
+// Rust `FirecrackerSandbox::new_with_id` — drive partitioning
+// ============================================================
+
+namespace {
+
+ExtraDrive VolumeDrive(const std::string& id, const std::string& mount) {
+    ExtraDrive d = Drive(id, mount);
+    d.volume = true;
+    return d;
+}
+
+std::vector<std::string> DriveIds(const std::vector<ExtraDrive>& drives) {
+    std::vector<std::string> ids;
+    for (std::size_t i = 0; i < drives.size(); ++i) ids.push_back(drives[i].drive_id);
+    return ids;
+}
+
+}  // namespace
+
+MT_TEST(physical_drives_are_ordered_before_volumes) {
+    // The guest names drives positionally (vdc, vdd, ...), so the list order
+    // *is* the slot assignment. A volume left ahead of a physical drive is
+    // mounted as the wrong filesystem -- which the API accepts without
+    // complaint, because every drive on its own is valid.
+    SandboxConfig config;
+    config.common.extra_drives.push_back(VolumeDrive("vol-a", "/mnt/a"));
+    config.common.extra_drives.push_back(Drive("phys-a", "/mnt/p1"));
+    config.common.extra_drives.push_back(VolumeDrive("vol-b", "/mnt/b"));
+    config.common.extra_drives.push_back(Drive("phys-b", "/mnt/p2"));
+
+    MT_EXPECT_TRUE(PartitionExtraDrives(&config, 4).ok());
+
+    const std::vector<std::string> ids = DriveIds(config.common.extra_drives);
+    MT_EXPECT_EQ(ids.size(), static_cast<std::size_t>(4));
+    if (ids.size() != 4) return;
+    MT_EXPECT_EQ(ids[0], std::string("phys-a"));
+    MT_EXPECT_EQ(ids[1], std::string("phys-b"));
+    MT_EXPECT_EQ(ids[2], std::string("vol-a"));
+    MT_EXPECT_EQ(ids[3], std::string("vol-b"));
+    // The split point `BuildConfigureSequence` uses.
+    MT_EXPECT_EQ(config.common.physical_extra_drive_count, static_cast<std::size_t>(2));
+}
+
+MT_TEST(more_volumes_than_slots_is_refused_not_truncated) {
+    // Firecracker cannot add a virtio-block device after a snapshot restore,
+    // so every volume must occupy a slot reserved on the first boot. Dropping
+    // the surplus would boot a sandbox whose caller asked for a volume and
+    // finds the mount point empty.
+    SandboxConfig config;
+    config.common.extra_drives.push_back(VolumeDrive("v1", "/mnt/1"));
+    config.common.extra_drives.push_back(VolumeDrive("v2", "/mnt/2"));
+    config.common.extra_drives.push_back(VolumeDrive("v3", "/mnt/3"));
+
+    const core::Expected<core::Unit, std::string> r = PartitionExtraDrives(&config, 2);
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+    MT_EXPECT_TRUE(r.error().find("3 volumes") != std::string::npos);
+    MT_EXPECT_TRUE(r.error().find("2 reserved volume slots") != std::string::npos);
+}
+
+MT_TEST(reserved_slots_never_exceed_the_guests_drive_letters) {
+    // The guest only has vdc..vdz. Reserving more slots than letters would
+    // name a drive the guest cannot address.
+    SandboxConfig config;
+    for (std::size_t i = 0; i < kMaxExtraDrives - 1; ++i) {
+        char id[32];
+        std::snprintf(id, sizeof(id), "phys-%02zu", i);
+        config.common.extra_drives.push_back(Drive(id, "/mnt/p"));
+    }
+    // Asks for far more volume slots than the one remaining letter.
+    MT_EXPECT_TRUE(PartitionExtraDrives(&config, 100).ok());
+    MT_EXPECT_EQ(config.common.volume_drive_slots, static_cast<std::size_t>(1));
+}
+
+MT_TEST(a_physical_drive_count_past_the_letters_yields_no_slots) {
+    // Saturating, not wrapping: `remaining` is computed by subtraction, and
+    // an unsigned wrap here would reserve billions of slots and then accept
+    // any number of volumes.
+    SandboxConfig config;
+    for (std::size_t i = 0; i < kMaxExtraDrives + 3; ++i) {
+        char id[32];
+        std::snprintf(id, sizeof(id), "phys-%02zu", i);
+        config.common.extra_drives.push_back(Drive(id, "/mnt/p"));
+    }
+    MT_EXPECT_TRUE(PartitionExtraDrives(&config, 4).ok());
+    MT_EXPECT_EQ(config.common.volume_drive_slots, static_cast<std::size_t>(0));
+
+    // And with a volume present it must now fail rather than reserve a slot
+    // that does not exist.
+    config.common.extra_drives.push_back(VolumeDrive("vol", "/mnt/v"));
+    MT_EXPECT_TRUE(!PartitionExtraDrives(&config, 4).ok());
 }
 
 MT_MAIN

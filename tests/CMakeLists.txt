@@ -78,6 +78,8 @@ agentenv_add_test(test_snapshot_repository test_snapshot_repository.cc agentenv-
 agentenv_add_test(test_shell_util          test_shell_util.cc  agentenv-shell-util)
 agentenv_add_test(test_warm_pool    test_warm_pool.cc           agentenv-core)
 agentenv_add_test(test_api_pagination     test_api_pagination.cc      agentenv-api agentenv-snapshot)
+# Rust: the framing/routing half of src/api/mod.rs + the error->status mapping
+agentenv_add_test(test_api_http_server    test_api_http_server.cc     agentenv-api)
 # Rust: src/api/impls/attached_drives.rs
 agentenv_add_test(test_api_attached_drives test_api_attached_drives.cc agentenv-api)
 # Rust: src/api/impls/auth.rs + the routing half of src/api/proxy.rs
@@ -133,3 +135,15 @@ foreach(_t test_firecracker_boot test_firecracker_sandbox_backend)
             AGENTENV_FAKE_FIRECRACKER="${AGENTENV_FAKE_FC}")
     endif()
 endforeach()
+# End-to-end: starts the real binary and drives it over a real socket.
+#
+# Everything above runs against in-process fakes. This is the only check that
+# the process binds, routes and answers at all -- the gap that let the binary
+# build and pass every test while `ListenAndServe` returned "not implemented".
+find_program(AGENTENV_BASH bash)
+if(AGENTENV_BASH AND TARGET agentenv)
+    add_test(NAME smoke_api
+             COMMAND ${AGENTENV_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/smoke_api.sh
+                     $<TARGET_FILE:agentenv>)
+    set_tests_properties(smoke_api PROPERTIES TIMEOUT 60)
+endif()

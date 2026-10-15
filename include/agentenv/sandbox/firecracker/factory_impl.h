@@ -13,6 +13,8 @@
 #include <memory>
 #include <string>
 
+#include "agentenv/cfg.h"
+#include "agentenv/core/optional.h"
 #include "agentenv/sandbox/backend.h"
 #include "agentenv/sandbox/firecracker/sandbox.h"
 
@@ -22,17 +24,34 @@ namespace firecracker {
 
 /// Rust `FirecrackerSandboxFactory`.
 ///
-/// `DecodePausedState` is fully ported — it is the one method the restart path
-/// cannot do without, and the only one whose inputs are entirely on disk. The
-/// three `Build*` methods need subsystems this port does not have (image
-/// unpack, ublk device setup, network slot allocation), so they report that
-/// rather than returning a backend that cannot run: a factory that handed back
-/// a half-wired sandbox would fail later, inside the orchestrator's lifecycle,
-/// where the error no longer names the cause.
+/// `Build` and `DecodePausedState` are ported. `Build` is config assembly, as
+/// it is upstream: Rust's `build` projects the request onto a
+/// `FirecrackerSandboxConfig` and constructs the sandbox object, while the
+/// ublk device and the network slot are brought up later by `start`. The
+/// sandbox it returns therefore starts as far as this port's `StartNowait`
+/// goes, and fails there — naming the missing subsystem — rather than at
+/// construction, which is also where Rust would fail.
+///
+/// `BuildFromSnapshot` and `BuildFromPausedState` remain unported: both issue
+/// `PUT /snapshot/load` against drives already bound to captured artifacts,
+/// which needs the resume launch mode.
 class FirecrackerSandboxFactory : public SandboxBackendFactory {
  public:
+    /// The firecracker-only config. `Build` needs the whole `AppConfig` (the
+    /// rootfs image, the tools drive, the boot-arg allowlist), so a factory
+    /// made this way reports `Build` as unconfigured rather than inventing
+    /// defaults for paths an operator is supposed to choose.
     explicit FirecrackerSandboxFactory(Config cfg);
+
+    /// The form `main` uses. Carries the node config `Build` projects onto a
+    /// `SandboxConfig`.
+    FirecrackerSandboxFactory(Config cfg, cfg::AppConfig app_config);
+
     ~FirecrackerSandboxFactory() override;
+
+    /// Rust `cpu_config_arc` — the cluster-wide CPU template the scheduler
+    /// distributes, applied only on the fresh-boot path.
+    void SetCpuConfigJson(const core::Optional<std::string>& cpu_config_json);
 
     FirecrackerSandboxFactory(const FirecrackerSandboxFactory&) = delete;
     FirecrackerSandboxFactory& operator=(const FirecrackerSandboxFactory&) = delete;
