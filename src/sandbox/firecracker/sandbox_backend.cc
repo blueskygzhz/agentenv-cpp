@@ -212,6 +212,68 @@ StartFreshInstance(const FreshStartSpec& spec, std::shared_ptr<Connector> connec
     return core::Unit{};
 }
 
+core::Expected<core::Unit, std::string>
+StartResumeInstance(const ResumeStartSpec& spec, std::shared_ptr<Connector> connector,
+                    std::unique_ptr<FirecrackerInstance>* out) {
+    if (out == NULL) return core::make_unexpected(std::string("no output slot"));
+
+    // The sequence is built first, exactly as the fresh path builds its
+    // configure plan up front: every check inside is a property of the capture
+    // itself, so finding one after a VMM is running means killing it for
+    // something that was knowable before anything was created.
+    std::vector<ResumeStep> steps;
+    {
+        const core::Expected<std::vector<ResumeStep>, std::string> built =
+            BuildResumeSequence(spec);
+        if (!built.ok()) return core::make_unexpected(built.error());
+        steps = built.value();
+    }
+
+    const core::Expected<std::string, std::string> work_dir =
+        CreateFirecrackerWorkDir(core::Optional<std::string>(
+            spec.chroot_base_dir + "/firecracker/" + spec.sandbox_id.ToString()));
+    if (!work_dir.ok()) return core::make_unexpected(work_dir.error());
+
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+        if (steps[i].kind == ResumeStep::Kind::Logger) {
+            steps[i].path = work_dir.value() + "/firecracker.log";
+        }
+    }
+
+    core::Optional<std::string> stdout_path;
+    core::Optional<std::string> stderr_path;
+    WarmStdioPaths(work_dir.value(), spec.capture_output, &stdout_path, &stderr_path);
+
+    if (!connector) connector = MakeUnixConnector();
+    std::unique_ptr<FirecrackerInstance> instance(
+        new FirecrackerInstance(work_dir.value(), connector));
+
+    const core::Expected<core::Unit, std::string> spawned = instance->Spawn(
+        spec.firecracker_bin,
+        stdout_path.has_value() ? *stdout_path : std::string(),
+        stderr_path.has_value() ? *stderr_path : std::string());
+    if (!spawned.ok()) {
+        return core::make_unexpected(std::string("spawn: ") + spawned.error());
+    }
+
+    // Past the spawn every early return must stop the VMM; the unique_ptr's
+    // destructor is this port's `Drop` and does it on unwind.
+    const core::Expected<core::Unit, std::string> ready =
+        instance->WaitForReady(spec.socket_timeout_ms, spec.socket_poll_ms);
+    if (!ready.ok()) return core::make_unexpected(ready.error());
+
+    // No `InstanceStart` on this path: the VM comes into existence already
+    // running from the loaded state, and the sequence's own final step is the
+    // resume. Issuing a start as well would be rejected -- and if it were not,
+    // it would boot a second machine over the restored one.
+    const core::Expected<core::Unit, std::string> applied =
+        ApplyResumeSequence(instance.get(), steps);
+    if (!applied.ok()) return core::make_unexpected(applied.error());
+
+    *out = std::move(instance);
+    return core::Unit{};
+}
+
 class FirecrackerSandboxBackend::Impl {
  public:
     Impl(std::unique_ptr<FirecrackerInstance> i, SnapshotConfig cfg)
@@ -305,6 +367,18 @@ FirecrackerSandboxBackend::FirecrackerSandboxBackend(
     : impl_(new Impl(std::move(spec), std::move(snapshot_config), std::move(connector))) {}
 
 FirecrackerSandboxBackend::~FirecrackerSandboxBackend() = default;
+
+FirecrackerSandboxBackend* FirecrackerSandboxBackend::NewResuming(
+    ResumeStartSpec spec, std::shared_ptr<Connector> connector) {
+    // A private constructor would be cleaner, but `Impl` is incomplete in the
+    // header; a static factory keeps the resume form distinguishable from the
+    // fresh one at the call site, which is the part that matters -- the two
+    // send the VMM different things.
+    FirecrackerSandboxBackend* backend = new FirecrackerSandboxBackend(
+        FreshStartSpec(), SnapshotConfig(), std::shared_ptr<Connector>());
+    backend->impl_.reset(new Impl(std::move(spec), std::move(connector)));
+    return backend;
+}
 
 void FirecrackerSandboxBackend::SetEnvdProbeForTesting(
     const EnvdInstance::HealthProbe& probe) {
@@ -520,15 +594,15 @@ core::Expected<core::Unit, core::AnyError> FirecrackerSandboxBackend::StartNowai
         // socket path, where the second's requests reach whichever bound it.
         return core::make_unexpected(core::err("start_nowait: sandbox is already started"));
     }
-    if (impl_->launch.kind != LaunchMode::Kind::Fresh) {
-        // Resume sends a different sequence (`PUT /snapshot/load` instead of
-        // boot-source plus drives), so it cannot borrow the fresh path.
-        return core::make_unexpected(
-            core::err("start_nowait: resume from snapshot is not available in this build"));
-    }
+    // Rust `match &self.launch { Fresh => start_fresh, Resume => start_resume }`.
+    // The two send the VMM different things -- a boot source plus drive
+    // attachments against `PUT /snapshot/load` -- so the dispatch is the whole
+    // reason `LaunchMode` exists rather than being collapsed to a flag.
     std::unique_ptr<FirecrackerInstance> started;
     const core::Expected<core::Unit, std::string> r =
-        StartFreshInstance(impl_->spec, impl_->connector, &started);
+        impl_->launch.kind == LaunchMode::Kind::Resume
+            ? StartResumeInstance(impl_->resume_spec, impl_->connector, &started)
+            : StartFreshInstance(impl_->spec, impl_->connector, &started);
     if (!r.ok()) return core::make_unexpected(core::err(r.error()));
     impl_->instance = std::move(started);
     return core::Unit{};

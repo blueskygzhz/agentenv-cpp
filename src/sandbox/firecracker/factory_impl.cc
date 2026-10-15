@@ -32,6 +32,13 @@ class FirecrackerSandboxFactory::Impl {
     /// — and defaulting would silently boot from paths nobody chose.
     bool has_app_config;
     core::Optional<std::string> cpu_config_json;
+
+    /// Stands in for `UblkDeviceManager::get_or_create_shared_mem`, which this
+    /// port has no client for. Empty in production, which is what makes a
+    /// resume refuse at start instead of loading from a path that is not a
+    /// block device.
+    std::string mem_device_path_for_testing;
+    std::shared_ptr<Connector> connector_for_testing;
 };
 
 FirecrackerSandboxFactory::FirecrackerSandboxFactory(Config cfg)
@@ -45,6 +52,12 @@ FirecrackerSandboxFactory::~FirecrackerSandboxFactory() = default;
 void FirecrackerSandboxFactory::SetCpuConfigJson(
     const core::Optional<std::string>& cpu_config_json) {
     impl_->cpu_config_json = cpu_config_json;
+}
+
+void FirecrackerSandboxFactory::SetResumeDepsForTesting(
+    const std::string& mem_device_path, std::shared_ptr<Connector> connector) {
+    impl_->mem_device_path_for_testing = mem_device_path;
+    impl_->connector_for_testing = connector;
 }
 
 core::Expected<std::unique_ptr<SandboxBackend>, core::AnyError>
@@ -142,13 +155,54 @@ FirecrackerSandboxFactory::BuildFromSnapshot(const std::string& /*snapshot_id*/,
 
 core::Expected<std::unique_ptr<SandboxBackend>, core::AnyError>
 FirecrackerSandboxFactory::BuildFromPausedState(
-    const core::SandboxId& /*id*/, const PausedSandboxState& /*state*/,
-    const core::Optional<EnvdAccessToken>& /*token*/) {
-    // Resuming a paused state issues `PUT /snapshot/load` against a VMM whose
-    // drives are already bound to the captured artifacts, which needs the ublk
-    // setup above plus the resume launch mode.
-    return core::make_unexpected(
-        NotPorted("BuildFromPausedState", "ublk device + snapshot-load launch mode"));
+    const core::SandboxId& id, const PausedSandboxState& state,
+    const core::Optional<EnvdAccessToken>& token) {
+    // Rust `state.downcast_ref::<FirecrackerPausedState>()`. A state from
+    // another backend carries a different capture shape entirely, so this is
+    // refused rather than reinterpreted.
+    const FirecrackerPausedState* paused =
+        dynamic_cast<const FirecrackerPausedState*>(&state);
+    if (paused == NULL) {
+        return core::make_unexpected(core::err(
+            "the provided PausedSandboxState is not a Firecracker paused state"));
+    }
+
+    SnapshotConfig snapshot_config = paused->snapshot_config();
+    const core::Expected<core::Unit, std::string> prepared =
+        PrepareSnapshotConfigForResume(&snapshot_config, id, token);
+    if (!prepared.ok()) {
+        return core::make_unexpected(
+            core::err("firecracker resume: " + prepared.error()));
+    }
+
+    ResumeStartSpec spec;
+    spec.snapshot_config = snapshot_config;
+    spec.firecracker_bin = snapshot_config.common.firecracker_binary.empty()
+                               ? impl_->cfg.firecracker_bin
+                               : snapshot_config.common.firecracker_binary;
+    spec.chroot_base_dir = impl_->cfg.chroot_base_dir;
+    spec.sandbox_id = id;
+    spec.firecracker_work_dir = snapshot_config.common.firecracker_work_base_dir;
+    spec.capture_output = snapshot_config.common.firecracker_log_level.has_value();
+    spec.socket_timeout_ms =
+        static_cast<int64_t>(snapshot_config.common.runtime_policy.socket_timeout_ms);
+    spec.socket_poll_ms =
+        static_cast<int64_t>(snapshot_config.common.runtime_policy.socket_poll_interval_ms);
+    spec.envd_timeout_ms =
+        static_cast<int64_t>(snapshot_config.common.runtime_policy.envd_timeout_ms);
+    spec.envd_poll_ms =
+        static_cast<int64_t>(snapshot_config.common.runtime_policy.envd_poll_interval_ms);
+    // Left empty: Rust gets it from `get_or_create_shared_mem`, and this port
+    // has no ublk daemon client. `BuildResumeSequence` turns that into a
+    // refusal naming the missing daemon, so the backend is constructed and
+    // fails at start -- where Rust's own `ensure!(is_available())` fires too,
+    // rather than at construction where Rust would still succeed.
+    spec.mem_device_path = impl_->mem_device_path_for_testing;
+
+    std::unique_ptr<SandboxBackend> backend(
+        FirecrackerSandboxBackend::NewResuming(spec, impl_->connector_for_testing));
+    return core::Expected<std::unique_ptr<SandboxBackend>, core::AnyError>(
+        std::move(backend));
 }
 
 core::Expected<std::shared_ptr<PausedSandboxState>, core::AnyError>

@@ -125,10 +125,12 @@ agentenv_add_test(test_firecracker_instance_api test_firecracker_instance_api.cc
 agentenv_add_test(test_firecracker_configure test_firecracker_configure.cc agentenv-sandbox)
 agentenv_add_test(test_firecracker_boot test_firecracker_boot.cc agentenv-sandbox)
 agentenv_add_test(test_firecracker_sandbox_backend test_firecracker_sandbox_backend.cc agentenv-sandbox)
+# Rust: from_snapshot_config_with_override + start_resume + build_from_paused_state
+agentenv_add_test(test_firecracker_resume test_firecracker_resume.cc agentenv-sandbox)
 
 # The boot tests spawn the stand-in VMM, so they need its path and must not be
 # built before it exists.
-foreach(_t test_firecracker_boot test_firecracker_sandbox_backend)
+foreach(_t test_firecracker_boot test_firecracker_sandbox_backend test_firecracker_resume)
     if(TARGET ${_t})
         add_dependencies(${_t} fake_firecracker)
         target_compile_definitions(${_t} PRIVATE

@@ -259,6 +259,16 @@ core::Expected<core::Unit, std::string>
     StartFreshInstance(const FreshStartSpec& spec, std::shared_ptr<Connector> connector,
                        std::unique_ptr<FirecrackerInstance>* out);
 
+/// Rust `FirecrackerSandbox::start_resume` — the process half of a resume.
+///
+/// Same shape as `StartFreshInstance` (build the plan, make the work dir,
+/// spawn, wait for the socket, apply) with one difference that matters: there
+/// is no `InstanceStart`. The VM comes into existence already running from the
+/// loaded state, and the sequence's own last step is the resume.
+core::Expected<core::Unit, std::string>
+    StartResumeInstance(const ResumeStartSpec& spec, std::shared_ptr<Connector> connector,
+                        std::unique_ptr<FirecrackerInstance>* out);
+
 /// Rust `impl SandboxBackend for FirecrackerSandbox`.
 ///
 /// Owns one live microVM. Only the lifecycle methods this port can honour are

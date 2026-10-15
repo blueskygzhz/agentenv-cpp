@@ -53,6 +53,17 @@ class FirecrackerSandboxFactory : public SandboxBackendFactory {
     /// distributes, applied only on the fresh-boot path.
     void SetCpuConfigJson(const core::Optional<std::string>& cpu_config_json);
 
+    /// Stands in for the two resume dependencies this port has no client for:
+    /// the shared memory ublk device (`get_or_create_shared_mem`) and the API
+    /// connector.
+    ///
+    /// Without these a resume is refused at start, naming the missing daemon.
+    /// They exist so the resume sequence can be driven end-to-end against a
+    /// fake VMM, which is otherwise unreachable — and the sequence's ordering
+    /// is the part that decides whether a restore works at all.
+    void SetResumeDepsForTesting(const std::string& mem_device_path,
+                                 std::shared_ptr<Connector> connector);
+
     FirecrackerSandboxFactory(const FirecrackerSandboxFactory&) = delete;
     FirecrackerSandboxFactory& operator=(const FirecrackerSandboxFactory&) = delete;
 
