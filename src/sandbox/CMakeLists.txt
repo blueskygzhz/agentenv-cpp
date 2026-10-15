@@ -35,6 +35,8 @@ add_library(agentenv-sandbox STATIC
     firecracker/instance_api.cc
     # Rust: sandbox.rs :: configure_microvm — the pre-boot call sequence
     firecracker/configure.cc
+    # Rust: impl SandboxBackend for FirecrackerSandbox
+    firecracker/sandbox_backend.cc
     firecracker/mmds.cc
  firecracker/pool.cc
     firecracker/sandbox.cc

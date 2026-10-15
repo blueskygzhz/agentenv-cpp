@@ -122,10 +122,11 @@ agentenv_add_test(test_firecracker_paused_state test_firecracker_paused_state.cc
 agentenv_add_test(test_firecracker_instance_api test_firecracker_instance_api.cc agentenv-sandbox)
 agentenv_add_test(test_firecracker_configure test_firecracker_configure.cc agentenv-sandbox)
 agentenv_add_test(test_firecracker_boot test_firecracker_boot.cc agentenv-sandbox)
+agentenv_add_test(test_firecracker_sandbox_backend test_firecracker_sandbox_backend.cc agentenv-sandbox)
 
 # The boot tests spawn the stand-in VMM, so they need its path and must not be
 # built before it exists.
-foreach(_t test_firecracker_boot)
+foreach(_t test_firecracker_boot test_firecracker_sandbox_backend)
     if(TARGET ${_t})
         add_dependencies(${_t} fake_firecracker)
         target_compile_definitions(${_t} PRIVATE

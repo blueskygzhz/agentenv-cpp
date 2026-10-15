@@ -8,6 +8,7 @@
 // therefore fails with a precise, actionable error (missing binary / kernel /
 // rootfs, or "requires KVM") instead of a blanket "not implemented".
 #include "agentenv/sandbox/firecracker/lifecycle.h"
+#include "agentenv/sandbox/firecracker/sandbox_backend.h"
 #include "agentenv/sandbox/firecracker/instance.h"
 #include <ctime>
 #include <map>
@@ -347,21 +348,26 @@ FirecrackerBackend::Boot(LaunchPlan plan) {
 
     const int64_t started_ms = now_ms();
 
-    // --- 1. build the ordered sequence, before anything is created ---
-    //
-    // Deliberately first: the two `ensure!`s in here (a short prepared drive
-    // list, more volumes than reserved slots) are permanent misconfigurations.
-    // Finding them after a VMM is running means killing it again for something
-    // that was knowable up front -- and finding them after the work directory
-    // exists leaves an empty directory behind on every such failure.
-    ConfigurePlan cplan;
+    // The whole fresh-start sequence lives in StartFreshInstance, shared with
+    // `FirecrackerSandboxBackend::StartNowait`. It used to be duplicated here;
+    // two copies of a sequence whose order is the entire point is exactly how
+    // the two drift apart.
+    FreshStartSpec spec;
+    spec.firecracker_bin = impl_->cfg.firecracker_bin;
+    spec.chroot_base_dir = impl_->cfg.chroot_base_dir;
+    spec.sandbox_id = plan.sandbox_id;
+    spec.capture_output = impl_->cfg.capture_output;
+    spec.socket_timeout_ms = impl_->cfg.socket_timeout_ms;
+    spec.socket_poll_ms = impl_->cfg.socket_poll_ms;
+
+    ConfigurePlan& cplan = spec.configure;
     cplan.mem_size_mib = static_cast<uint32_t>(plan.mem_bytes / (1024 * 1024));
     cplan.vcpu_count = static_cast<uint32_t>(plan.vcpus);
     cplan.track_dirty_pages = impl_->cfg.track_dirty_pages;
     cplan.log_level = impl_->cfg.log_level;
-    // Placeholder: the real path needs the work directory, which does not
-    // exist yet. Only its emptiness is load-bearing for the sequence (a blank
-    // path suppresses the logger step), so it is filled in after the mkdir.
+    // Only emptiness is load-bearing for the sequence (a blank path suppresses
+    // the logger step); the real path needs the work directory, which
+    // StartFreshInstance creates and fills in.
     if (!impl_->cfg.log_level.empty()) cplan.log_path = "firecracker.log";
     cplan.cpu_config_json = impl_->cfg.cpu_config_json;
     cplan.kernel_image = plan.kernel_path;
@@ -376,81 +382,23 @@ FirecrackerBackend::Boot(LaunchPlan plan) {
     // configuring a document the guest could not reach.
     cplan.has_network_slot = false;
 
-    const core::Expected<std::vector<ConfigureStep>, std::string> steps =
-        BuildConfigureSequence(cplan);
-    if (!steps.ok()) {
-        return ready_err<Handle>(std::string("firecracker boot: ") + steps.error());
-    }
-
-    // --- 2. work directory ---
-    const core::Expected<std::string, std::string> work_dir =
-        CreateFirecrackerWorkDir(core::Optional<std::string>(
-            impl_->cfg.chroot_base_dir + "/firecracker/" + plan.sandbox_id.ToString()));
-    if (!work_dir.ok()) {
-        return ready_err<Handle>(std::string("firecracker boot: ") + work_dir.error());
-    }
-    // Now that the directory exists, point the logger at a file inside it.
-    std::vector<ConfigureStep> plan_steps = steps.value();
-    for (std::size_t i = 0; i < plan_steps.size(); ++i) {
-        if (plan_steps[i].kind == ConfigureStep::Kind::Logger) {
-            plan_steps[i].path = work_dir.value() + "/firecracker.log";
+    // Validated before anything is created: the two `ensure!`s in here are
+    // permanent misconfigurations, so finding them after a VMM is running
+    // means killing it again for something knowable up front, and finding them
+    // after the mkdir leaves an empty work directory behind.
+    {
+        const core::Expected<std::vector<ConfigureStep>, std::string> steps =
+            BuildConfigureSequence(cplan);
+        if (!steps.ok()) {
+            return ready_err<Handle>(std::string("firecracker boot: ") + steps.error());
         }
     }
 
-    // --- 3. spawn ---
-    core::Optional<std::string> stdout_path;
-    core::Optional<std::string> stderr_path;
-    WarmStdioPaths(work_dir.value(), impl_->cfg.capture_output, &stdout_path, &stderr_path);
-
-    std::shared_ptr<Connector> connector = impl_->connector;
-    if (!connector) connector = MakeUnixConnector();
-    std::unique_ptr<FirecrackerInstance> instance(
-        new FirecrackerInstance(work_dir.value(), connector));
-
-    const core::Expected<core::Unit, std::string> spawned = instance->Spawn(
-        impl_->cfg.firecracker_bin,
-        stdout_path.has_value() ? *stdout_path : std::string(),
-        stderr_path.has_value() ? *stderr_path : std::string());
-    if (!spawned.ok()) {
-        return ready_err<Handle>(std::string("firecracker boot: spawn: ") + spawned.error());
-    }
-
-    // From here on every failure must stop the VMM: a returned error with a
-    // live Firecracker still holding the work directory leaks both, and the
-    // next boot for this sandbox id would collide with it.
-    //
-    // No scope guard is needed for that. `instance` is a `unique_ptr`, and
-    // `~FirecrackerInstance` is this port's `Drop`: it SIGKILLs the child,
-    // reaps it, and removes the socket. Every early return below therefore
-    // stops the VMM by unwinding, and only the success path moves the instance
-    // out into `impl_->instances`.
-    //
-    // An explicit SIGTERM-then-wait guard was tried here and removed: it
-    // duplicated the destructor on the failure path, and disarming it on
-    // success is what the move already expresses.
-
-    // --- 4. wait for the API socket ---
-    const core::Expected<core::Unit, std::string> ready =
-        instance->WaitForReady(impl_->cfg.socket_timeout_ms, impl_->cfg.socket_poll_ms);
-    if (!ready.ok()) {
-        // WaitForReady already distinguishes "child exited" from "timed out"
-        // and quotes the captured stderr, which is the difference between a
-        // bad kernel path and a host that is merely slow.
-        return ready_err<Handle>(std::string("firecracker boot: ") + ready.error());
-    }
-
-    // --- 5. apply the sequence ---
-    const core::Expected<core::Unit, std::string> configured =
-        ApplyConfigureSequence(instance.get(), plan_steps);
-    if (!configured.ok()) {
-        return ready_err<Handle>(std::string("firecracker boot: ") + configured.error());
-    }
-
-    // --- 6. start the microVM ---
-    const core::Expected<core::Unit, std::string> start = instance->Start();
-    if (!start.ok()) {
-        return ready_err<Handle>(std::string("firecracker boot: InstanceStart: ") +
-                                 start.error());
+    std::unique_ptr<FirecrackerInstance> instance;
+    const core::Expected<core::Unit, std::string> started =
+        StartFreshInstance(spec, impl_->connector, &instance);
+    if (!started.ok()) {
+        return ready_err<Handle>(std::string("firecracker boot: ") + started.error());
     }
 
     Handle handle;
