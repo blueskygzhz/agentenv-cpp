@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: MIT
+// Rust: src/sandbox/firecracker/sandbox.rs ::
+//   FirecrackerSandbox::{configure_microvm, configure_extra_drives}
+//
+// The pre-boot call sequence. The port already had every individual API call
+// (instance.h) but nothing that ordered them, which is the part that decides
+// whether a VM boots at all rather than whether one request is well-formed.
+//
+// Why this is a plan instead of a method that issues the calls: the ordering is
+// the fragile part and it is what a test needs to see. A wrong order still
+// yields well-formed requests that Firecracker accepts individually, so the
+// failure surfaces much later -- as a guest that mounts the wrong filesystem,
+// or a `PUT` refused because the VM has already booted. Building the sequence
+// as data lets those rules be asserted without a VMM, a work dir or KVM.
+#include "agentenv/sandbox/firecracker/sandbox.h"
+
+#include "agentenv/sandbox/firecracker/lifecycle.h"
+
+#include <cstdio>
+
+namespace agentenv {
+namespace sandbox {
+namespace firecracker {
+
+namespace {
+
+ConfigureStep DriveStep(const std::string& drive_id, const std::string& path_on_host,
+                        bool is_root, bool read_only, bool direct, IoEngine io_engine,
+                        const core::Optional<RateLimiter>& rate_limiter) {
+    ConfigureStep step;
+    step.kind = ConfigureStep::Kind::Drive;
+    step.id = drive_id;
+    step.path = path_on_host;
+    step.is_root = is_root;
+    step.read_only = read_only;
+    step.direct = direct;
+    step.io_engine = io_engine;
+    step.rate_limiter = rate_limiter;
+    return step;
+}
+
+/// Rust `configure_extra_drives` — every extra drive is non-root, direct, and
+/// Async, and carries no limiter. Only `read_only` varies, per mount.
+void AppendExtraDrives(const std::vector<DriveMount>& mounts,
+                       std::vector<ConfigureStep>* out) {
+    for (std::size_t i = 0; i < mounts.size(); ++i) {
+        out->push_back(DriveStep(mounts[i].drive_id, mounts[i].attachment_path,
+                                 /*is_root=*/false, mounts[i].read_only, /*direct=*/true,
+                                 IoEngine::Async, core::nullopt));
+    }
+}
+
+}  // namespace
+
+core::Expected<std::vector<ConfigureStep>, std::string>
+BuildConfigureSequence(const ConfigurePlan& plan) {
+    std::vector<ConfigureStep> steps;
+
+    // 1. Logger, first. Firecracker accepts it pre-boot and only once, so it
+    //    has to precede anything that could fail: a later failure is the thing
+    //    the log was wanted for.
+    //
+    //    A blank level means logging is off (`LoggingEnabled`), so a
+    //    whitespace-only config value does not create an empty log file.
+    if (LoggingEnabled(plan.log_level.empty() ? core::nullopt
+                                              : core::Optional<std::string>(plan.log_level)) &&
+        !plan.log_path.empty()) {
+        ConfigureStep step;
+        step.kind = ConfigureStep::Kind::Logger;
+        step.path = plan.log_path;
+        step.text = plan.log_level;
+        steps.push_back(step);
+    }
+
+    // 2. Machine config. `smt` is hard-coded false, as Rust passes.
+    {
+        ConfigureStep step;
+        step.kind = ConfigureStep::Kind::MachineConfig;
+        step.mem_size_mib = plan.mem_size_mib;
+        step.vcpu_count = plan.vcpu_count;
+        step.smt = false;
+        step.track_dirty_pages = plan.track_dirty_pages;
+        steps.push_back(step);
+    }
+
+    // 3. CPU template, only when non-empty. Rust checks `!cpu_json.is_empty()`
+    //    inside the `Some` arm, so a present-but-empty string is not a request
+    //    for an empty template -- Firecracker would reject that body.
+    if (!plan.cpu_config_json.empty()) {
+        ConfigureStep step;
+        step.kind = ConfigureStep::Kind::CpuConfig;
+        step.text = plan.cpu_config_json;
+        steps.push_back(step);
+    }
+
+    // 4. Boot source. `initrd_path` is always absent on this path.
+    {
+        ConfigureStep step;
+        step.kind = ConfigureStep::Kind::BootSource;
+        step.path = plan.kernel_image;
+        if (plan.boot_args.has_value()) step.text = *plan.boot_args;
+        steps.push_back(step);
+    }
+
+    // 5. Drives, in guest slot order. The guest names virtio-blk devices
+    //    positionally (`vda`, `vdb`, `vdc`...), so the order here *is* the
+    //    guest's device layout. Attaching these out of order still succeeds at
+    //    the API and then mounts the wrong filesystem.
+
+    // vda: tools drive, root device, always read-only. Sync engine and no
+    // limiter -- it is small, read-only and on the boot path.
+    steps.push_back(DriveStep(kRootfsDriveId, kRootfsDrivePath, /*is_root=*/true,
+                              /*read_only=*/true, /*direct=*/false, IoEngine::Sync,
+                              core::nullopt));
+
+    // vdb: user image, writable. The limiter is attached here as pre-boot
+    // drive config rather than PATCHed after start, so throttling is in force
+    // from the guest's first I/O instead of after a brief unthrottled window.
+    const core::Expected<core::Optional<RateLimiter>, std::string> limiter =
+        BuildDiskRateLimiter(plan.disk_rate_limit);
+    if (!limiter.ok()) return core::make_unexpected(limiter.error());
+    steps.push_back(DriveStep(kUserRootfsDriveId, kUserRootfsDrivePath, /*is_root=*/false,
+                              /*read_only=*/false, /*direct=*/true, IoEngine::Async,
+                              limiter.value()));
+
+    // vdc+: physical extra drives, then the reserved volume slots.
+    //
+    // Rust splits one prepared list at `physical_extra_drive_count`. Splitting
+    // a shorter list would silently reclassify a physical drive as a volume
+    // slot, so a short list is an error rather than a truncation.
+    if (plan.physical_extra_drive_count > plan.extra_drive_attachments.size()) {
+        char msg[192];
+        std::snprintf(msg, sizeof(msg),
+                      "fresh sandbox expects %zu physical extra drives, but only %zu were "
+                      "prepared",
+                      plan.physical_extra_drive_count, plan.extra_drive_attachments.size());
+        return core::make_unexpected(std::string(msg));
+    }
+    const std::size_t physical_count = plan.physical_extra_drive_count;
+    const std::vector<DriveMount> physical(plan.extra_drive_attachments.begin(),
+                                           plan.extra_drive_attachments.begin() +
+                                               static_cast<std::ptrdiff_t>(physical_count));
+    const std::vector<DriveMount> volumes(plan.extra_drive_attachments.begin() +
+                                              static_cast<std::ptrdiff_t>(physical_count),
+                                          plan.extra_drive_attachments.end());
+    AppendExtraDrives(physical, &steps);
+
+    // Every volume occupies a slot reserved on the first boot, because
+    // Firecracker cannot add a virtio-block device after a snapshot restore.
+    // More volumes than slots therefore cannot be fixed later by adding one:
+    // it is a permanent misconfiguration and must fail now.
+    if (volumes.size() > plan.volume_drive_slots) {
+        return core::make_unexpected(
+            std::string("fresh sandbox has more volume drives than reserved volume slots"));
+    }
+    // The slots are attached by slot id, not by the volume's own id: the guest
+    // must see the same device names across a restore, and the binding from
+    // slot to volume is a symlink made before this point.
+    std::vector<DriveMount> slots;
+    for (std::size_t i = 0; i < plan.volume_drive_slots; ++i) {
+        DriveMount slot;
+        slot.drive_id = VolumeDriveSlotId(physical_count + i);
+        slot.attachment_path = slot.drive_id + ".img";
+        slot.read_only = false;
+        slots.push_back(slot);
+    }
+    AppendExtraDrives(slots, &steps);
+
+    // 6. Network, MMDS config and the MMDS document -- all three together, or
+    //    none. MMDS is served over the interface, so configuring the document
+    //    without one leaves the guest unable to read its own metadata.
+    if (plan.has_network_slot) {
+        ConfigureStep iface;
+        iface.kind = ConfigureStep::Kind::NetworkInterface;
+        iface.id = "eth0";
+        iface.path = "tap0";
+        steps.push_back(iface);
+
+        ConfigureStep mmds_cfg;
+        mmds_cfg.kind = ConfigureStep::Kind::MmdsConfig;
+        mmds_cfg.id = "eth0";
+        steps.push_back(mmds_cfg);
+
+        ConfigureStep mmds;
+        mmds.kind = ConfigureStep::Kind::Mmds;
+        mmds.text = plan.mmds_json;
+        steps.push_back(mmds);
+    }
+
+    // 7. Balloon, last. Paired with DAMON reclaim in the kernel boot args:
+    //    DAMON reclaims cold pagecache inside the guest and the balloon reports
+    //    the freed pages to the host, so the host can release the memory.
+    {
+        ConfigureStep step;
+        step.kind = ConfigureStep::Kind::Balloon;
+        steps.push_back(step);
+    }
+
+    return steps;
+}
+
+}  // namespace firecracker
+}  // namespace sandbox
+}  // namespace agentenv

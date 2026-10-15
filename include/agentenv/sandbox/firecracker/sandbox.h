@@ -58,6 +58,13 @@ struct TokenBucket {
     bool operator!=(const TokenBucket& o) const { return !(*this == o); }
 };
 
+/// Rust `IoEngine` — the virtio-blk I/O engine for a drive.
+enum class IoEngine {
+    Sync,
+    Async,
+};
+const char* IoEngineToString(IoEngine engine);
+
 /// Firecracker API model `RateLimiter`.
 struct RateLimiter {
     core::Optional<TokenBucket> bandwidth;
@@ -95,6 +102,98 @@ core::Expected<core::Optional<RateLimiter>, std::string>
 /// [`DisabledBucket`] so any inherited limit on it is cleared.
 core::Expected<RateLimiter, std::string>
     ReconcileDiskRateLimiter(const cfg::DiskRateLimitConfig& cfg);
+
+// ── microVM configuration sequence ──────────────────────────────────────────
+//
+// Rust `FirecrackerSandbox::configure_microvm` — the pre-boot call sequence
+// that turns a bare Firecracker process into the machine a sandbox expects.
+// Until now the port had every individual API call but nothing that ordered
+// them, which is the part that decides whether a VM boots at all.
+//
+// The order is not cosmetic. Firecracker applies most of these only pre-boot
+// and rejects them afterwards, and the drives must be attached in slot order
+// because the guest names them positionally (`vda`, `vdb`, `vdc`...). A drive
+// added out of order still succeeds at the API, then the guest mounts the
+// wrong filesystem.
+//
+// Modelled as a plan rather than executed inline so the ordering can be tested
+// without a VMM. The sequence is what breaks, and a wrong sequence fails deep
+// inside a boot where the error names the last call rather than the cause.
+
+/// One pre-boot API call, in the order it must be issued.
+struct ConfigureStep {
+    enum class Kind {
+        Logger,           ///< `PUT /logger`
+        MachineConfig,    ///< `PUT /machine-config`
+        CpuConfig,        ///< `PUT /cpu-config`
+        BootSource,       ///< `PUT /boot-source`
+        Drive,            ///< `PUT /drives/{id}`
+        NetworkInterface, ///< `PUT /network-interfaces/{id}`
+        MmdsConfig,       ///< `PUT /mmds/config`
+        Mmds,             ///< `PUT /mmds`
+        Balloon,          ///< `PUT /balloon`
+    };
+
+    Kind kind = Kind::Balloon;
+    /// `Drive` / `NetworkInterface` / `MmdsConfig`: the device id.
+    std::string id;
+    /// `Drive`: host path. `BootSource`: kernel image. `Logger`: log path.
+    std::string path;
+    /// `Logger`: level. `CpuConfig`: the template. `BootSource`: boot args.
+    std::string text;
+    /// `Drive` flags, mirroring `add_drive`'s arguments.
+    bool is_root = false;
+    bool read_only = false;
+    bool direct = false;
+    IoEngine io_engine = IoEngine::Sync;
+    core::Optional<RateLimiter> rate_limiter;
+    /// `MachineConfig`.
+    uint32_t mem_size_mib = 0;
+    uint32_t vcpu_count = 0;
+    bool smt = false;
+    bool track_dirty_pages = false;
+};
+
+/// What `BuildConfigureSequence` needs to know. Deliberately not the whole
+/// sandbox config: this keeps the ordering testable without a work dir, a
+/// VMM or a tools-drive version to resolve.
+struct ConfigurePlan {
+    uint32_t mem_size_mib = 0;
+    uint32_t vcpu_count = 0;
+    bool track_dirty_pages = false;
+    /// Empty means no logger is configured, matching `LoggingEnabled`.
+    std::string log_path;
+    std::string log_level;
+    /// Empty means no CPU template, as Rust checks `!cpu_json.is_empty()`.
+    std::string cpu_config_json;
+    /// Already canonicalised by the caller, as Rust does before this point.
+    std::string kernel_image;
+    core::Optional<std::string> boot_args;
+    cfg::DiskRateLimitConfig disk_rate_limit;
+    /// Physical extra drives, then volume slots. Rust splits one prepared
+    /// list at `physical_extra_drive_count`, so the split is validated here.
+    std::vector<DriveMount> extra_drive_attachments;
+    std::size_t physical_extra_drive_count = 0;
+    std::size_t volume_drive_slots = 0;
+    /// Rust gates the interface, MMDS config and MMDS document on
+    /// `network_slot.is_some()`. All three move together: MMDS is served over
+    /// the interface, so configuring it without one leaves the guest unable to
+    /// read its own metadata.
+    bool has_network_slot = false;
+    /// Serialized MMDS document. Only read when `has_network_slot`.
+    std::string mmds_json;
+};
+
+/// Rust `configure_microvm` — the ordered pre-boot call sequence.
+///
+/// Fails rather than truncating when the prepared drive list is shorter than
+/// `physical_extra_drive_count`, or when there are more volume drives than
+/// reserved slots. Both are Rust `ensure!`s, and both would otherwise attach a
+/// drive to the wrong slot: Firecracker cannot add a virtio-block device after
+/// a snapshot restore, so every volume must occupy a slot reserved on the
+/// first boot.
+core::Expected<std::vector<ConfigureStep>, std::string>
+    BuildConfigureSequence(const ConfigurePlan& plan);
 
 // ── drive slots / boot args ─────────────────────────────────────────────────
 

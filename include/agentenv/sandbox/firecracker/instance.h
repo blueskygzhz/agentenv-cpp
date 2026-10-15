@@ -71,13 +71,6 @@ core::Json BootSourceBody(const std::string& kernel_image_path,
                           const core::Optional<std::string>& initrd_path,
                           const core::Optional<std::string>& boot_args);
 
-/// Rust `IoEngine`.
-enum class IoEngine {
-    Sync,
-    Async,
-};
-const char* IoEngineToString(IoEngine engine);
-
 /// Rust `Drive` as used by `add_drive` (pre-boot `PUT /drives/{id}`).
 ///
 /// The limiter is attached here rather than PATCHed after start, so throttling

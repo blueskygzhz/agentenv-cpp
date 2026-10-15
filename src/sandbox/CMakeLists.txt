@@ -33,6 +33,8 @@ add_library(agentenv-sandbox STATIC
     firecracker/instance.cc
     # Rust: the firecracker_client::models bodies instance.rs sends
     firecracker/instance_api.cc
+    # Rust: sandbox.rs :: configure_microvm — the pre-boot call sequence
+    firecracker/configure.cc
     firecracker/mmds.cc
  firecracker/pool.cc
     firecracker/sandbox.cc
