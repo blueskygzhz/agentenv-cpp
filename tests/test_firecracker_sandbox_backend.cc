@@ -103,7 +103,7 @@ FreshStartSpec SpecIn(const std::string& dir) {
     FreshStartSpec spec;
     spec.firecracker_bin = AGENTENV_FAKE_FIRECRACKER;
     spec.chroot_base_dir = dir + "/chroot";
-    spec.sandbox_id = core::SandboxId::Parse("sbx-start-0001").value();
+    spec.sandbox_id = TestSandboxId();
     // Keeps `Snapshot`'s managed-snapshot base inside the test's temp dir
     // instead of the shared `/tmp/aenv`, where concurrent runs would collide.
     spec.firecracker_work_dir = core::Optional<std::string>(dir + "/fc-work");
@@ -1028,7 +1028,7 @@ MT_TEST(snapshot_captures_then_leaves_the_sandbox_running) {
     // process's temp dir, which is where an unconfigured base would land.
     const std::string expected_root =
         dir + "/fc-work/managed-snapshots/" +
-        core::SandboxId::Parse("sbx-start-0001").value().ToString();
+        TestSandboxId().ToString();
     MT_EXPECT_TRUE(StartsWithPath(r.value(), expected_root + "/"));
 
     MT_EXPECT_TRUE(backend->Stop().ok());
@@ -1082,7 +1082,7 @@ MT_TEST(a_failed_snapshot_capture_resumes_and_leaves_no_directory) {
     // exists but is incomplete cannot be told from a good one by name.
     const std::string root =
         dir + "/fc-work/managed-snapshots/" +
-        core::SandboxId::Parse("sbx-start-0001").value().ToString();
+        TestSandboxId().ToString();
     const core::Expected<std::vector<std::string>, std::string> entries =
         core::fs::ReadDir(root);
     MT_EXPECT_TRUE(entries.ok());

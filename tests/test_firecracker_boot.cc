@@ -143,12 +143,21 @@ void WriteFile(const std::string& path, const std::string& text) {
     f << text;
 }
 
+/// `SandboxId` is a UUID, so a readable label like "sbx-boot-0001" does not
+/// parse and `.value()` on the failure yields an unspecified id. It keys the
+/// backend's instance map and names the chroot, so it has to be a real one.
+core::SandboxId TestSandboxId() {
+    const core::Expected<core::SandboxId, std::string> parsed =
+        core::SandboxId::Parse("0192f3a1-4c5d-7e80-9abc-def012345678");
+    return parsed.ok() ? parsed.value() : core::SandboxId();
+}
+
 /// A plan whose paths all exist, so validation passes and the sequence runs.
 LaunchPlan PlanIn(const std::string& dir) {
     WriteFile(dir + "/vmlinux", "not really a kernel");
     WriteFile(dir + "/rootfs.img", "not really a rootfs");
     LaunchPlan plan;
-    plan.sandbox_id = core::SandboxId::Parse("sbx-boot-0001").value();
+    plan.sandbox_id = TestSandboxId();
     plan.kernel_path = dir + "/vmlinux";
     plan.rootfs_path = dir + "/rootfs.img";
     plan.vcpus = 2;
