@@ -21,6 +21,9 @@ namespace agentenv {
 namespace sandbox {
 namespace firecracker {
 
+class FirecrackerInstance;
+class Connector;
+
 // ── snapshot / drive path constants ─────────────────────────────────────────
 
 /// Rust `VM_STATE_FILE_NAME`.
@@ -195,6 +198,17 @@ struct ConfigurePlan {
 core::Expected<std::vector<ConfigureStep>, std::string>
     BuildConfigureSequence(const ConfigurePlan& plan);
 
+/// Rust `FirecrackerSandbox::configure_microvm`'s executor half — issues an
+/// already-ordered sequence against a live instance.
+///
+/// Split from `BuildConfigureSequence` so the ordering stays testable without a
+/// VMM while the dispatch itself stays testable without re-deriving the order.
+/// A step that fails aborts the rest: Firecracker applies these pre-boot and a
+/// later call cannot repair an earlier rejection.
+core::Expected<core::Unit, std::string>
+    ApplyConfigureSequence(FirecrackerInstance* instance,
+                           const std::vector<ConfigureStep>& steps);
+
 // ── drive slots / boot args ─────────────────────────────────────────────────
 
 /// Rust `VOLUME_DRIVE_PLACEHOLDER_SIZE`.
@@ -248,6 +262,38 @@ struct Config {
     std::string jailer_bin      = "/usr/bin/jailer";
     std::string chroot_base_dir = "/var/lib/agentenv/vm";
     bool        use_jailer      = true;
+
+    /// Rust `RuntimePolicy::socket_timeout` / `socket_poll_interval`, from
+    /// `firecracker.socket_timeout_secs` / `socket_poll_ms`.
+    ///
+    /// Bounds the wait for the API socket to appear. Without it a Firecracker
+    /// that dies on startup would be waited on forever; `WaitForReady` also
+    /// reaps the child, so an early exit is reported as such rather than as a
+    /// timeout.
+    int64_t socket_timeout_ms = 10 * 1000;
+    int64_t socket_poll_ms    = 10;
+
+    /// Rust `capture_output` — when set, the VMM's stdout/stderr go to files
+    /// in the work directory instead of being inherited. Both or neither, per
+    /// `WarmStdioPaths`: half the diagnostics is worse than none, because it
+    /// looks complete.
+    bool capture_output = true;
+
+    /// Written into `PUT /logger` when non-empty. A blank level turns the VMM
+    /// logger off (`LoggingEnabled`), which is not the same as this being
+    /// unset: the logger may only be configured once per VM.
+    std::string log_level;
+
+    /// Passed to `PUT /cpu-config` verbatim when non-empty.
+    std::string cpu_config_json;
+
+    /// Rust `FirecrackerCommonConfig::{track_dirty_pages, volume_drive_slots,
+    /// physical_extra_drive_count}`.
+    bool        track_dirty_pages = false;
+    std::size_t volume_drive_slots = 0;
+    std::size_t physical_extra_drive_count = 0;
+
+    cfg::DiskRateLimitConfig disk_rate_limit;
 };
 
 class FirecrackerBackend final : public Backend {
@@ -257,6 +303,14 @@ class FirecrackerBackend final : public Backend {
 
     core::Expected<Handle, core::AnyError>
         Boot(LaunchPlan plan) override;
+
+    /// Injects the API connector used for `Boot`. Null (the default) means the
+    /// real unix-socket connector is built per boot.
+    ///
+    /// Exists so the boot sequence can be driven end-to-end against a fake
+    /// VMM: everything from spawn onwards is otherwise unreachable without
+    /// KVM, which is exactly the part that was never executed before.
+    void SetConnectorForTesting(std::shared_ptr<Connector> connector);
     core::Expected<core::Unit, core::AnyError>
         Shutdown(core::SandboxId id) override;
     core::Expected<core::Unit, core::AnyError>

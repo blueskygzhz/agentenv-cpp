@@ -7,6 +7,10 @@
 // layout, faithfully following the first steps of the Rust `boot` path. Boot
 // therefore fails with a precise, actionable error (missing binary / kernel /
 // rootfs, or "requires KVM") instead of a blanket "not implemented".
+#include "agentenv/sandbox/firecracker/lifecycle.h"
+#include "agentenv/sandbox/firecracker/instance.h"
+#include <ctime>
+#include <map>
 #include "agentenv/sandbox/firecracker/sandbox.h"
 #include "agentenv/sandbox/firecracker/config.h"
 
@@ -267,6 +271,11 @@ class FirecrackerBackend::Impl {
  public:
     explicit Impl(Config c) : cfg(std::move(c)) {}
     Config cfg;
+    /// Injected for tests; null means build the real unix-socket connector.
+    std::shared_ptr<Connector> connector;
+    /// Booted VMs, keyed by sandbox id. Owning: dropping an entry runs
+    /// ~FirecrackerInstance, which stops the VMM and removes its socket.
+    std::map<std::string, std::unique_ptr<FirecrackerInstance> > instances;
 
     // Rust: jailer lays out {chroot_base}/firecracker/{sandbox_id}/root .
     std::string ChrootPath(const core::SandboxId& id) const {
@@ -291,6 +300,11 @@ template <typename T>
 core::Expected<T, core::AnyError> ready_ok(T value) {
     return core::Expected<T, core::AnyError>(std::move(value));
 }
+int64_t now_ms() {
+    struct timespec ts;
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
 bool is_file(const std::string& p) {
     struct stat st;
     return ::stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
@@ -303,12 +317,12 @@ bool exists(const std::string& p) {
 
 core::Expected<Handle, core::AnyError>
 FirecrackerBackend::Boot(LaunchPlan plan) {
-    // --- pre-boot validation (this part is real and testable) ---
+    // --- pre-boot validation ---
     //
     // This checks only what the plan actually carries. The full Rust validator
     // is `SandboxConfig::Validate`, which additionally resolves the tools drive
-    // version against the global config; this backend skeleton is not wired to
-    // an AppConfig, so calling it would fail for a reason unrelated to the
+    // version against the global config; this backend is not wired to an
+    // AppConfig, so calling it would fail for a reason unrelated to the
     // caller's request.
     if (impl_->cfg.firecracker_bin.empty() || !exists(impl_->cfg.firecracker_bin)) {
         return ready_err<Handle>(std::string("firecracker boot: firecracker binary not found at ") +
@@ -322,16 +336,128 @@ FirecrackerBackend::Boot(LaunchPlan plan) {
         return ready_err<Handle>(std::string("firecracker boot: rootfs not found at ") +
                                  plan.rootfs_path);
     }
-    // KVM is required to actually launch; we can only get this far without it.
-    if (!exists("/dev/kvm")) {
+    // KVM is checked before anything is created, so a host that cannot run a
+    // microVM fails without leaving a work directory behind. A test connector
+    // stands in for the VMM, so the check is skipped only in that case.
+    const bool fake_vmm = static_cast<bool>(impl_->connector);
+    if (!fake_vmm && !exists("/dev/kvm")) {
         return ready_err<Handle>(std::string(
             "firecracker boot: /dev/kvm not present; cannot launch a microVM on this host"));
     }
-    // The rest (spawn firecracker/jailer, drive the API socket to configure
-    // machine/boot-source/drives, then start-instance) needs the binary + KVM.
-    return ready_err<Handle>(std::string(
-        "firecracker boot: pre-boot checks passed; live VM launch not available in this build "
-        "(api socket would be ") + impl_->ApiSocketPath(plan.sandbox_id) + ")");
+
+    const int64_t started_ms = now_ms();
+
+    // --- 1. work directory ---
+    const core::Expected<std::string, std::string> work_dir =
+        CreateFirecrackerWorkDir(core::Optional<std::string>(
+            impl_->cfg.chroot_base_dir + "/firecracker/" + plan.sandbox_id.ToString()));
+    if (!work_dir.ok()) {
+        return ready_err<Handle>(std::string("firecracker boot: ") + work_dir.error());
+    }
+
+    // --- 2. build the ordered sequence BEFORE spawning ---
+    //
+    // Deliberately before the spawn: the two `ensure!`s in here (a short
+    // prepared drive list, more volumes than reserved slots) are permanent
+    // misconfigurations, and finding them after a VMM is running means killing
+    // it again for something that was knowable up front.
+    ConfigurePlan cplan;
+    cplan.mem_size_mib = static_cast<uint32_t>(plan.mem_bytes / (1024 * 1024));
+    cplan.vcpu_count = static_cast<uint32_t>(plan.vcpus);
+    cplan.track_dirty_pages = impl_->cfg.track_dirty_pages;
+    cplan.log_level = impl_->cfg.log_level;
+    if (!impl_->cfg.log_level.empty()) {
+        cplan.log_path = work_dir.value() + "/firecracker.log";
+    }
+    cplan.cpu_config_json = impl_->cfg.cpu_config_json;
+    cplan.kernel_image = plan.kernel_path;
+    if (!plan.kernel_cmdline.empty()) {
+        cplan.boot_args = core::Optional<std::string>(plan.kernel_cmdline);
+    }
+    cplan.disk_rate_limit = impl_->cfg.disk_rate_limit;
+    cplan.physical_extra_drive_count = impl_->cfg.physical_extra_drive_count;
+    cplan.volume_drive_slots = impl_->cfg.volume_drive_slots;
+    // No network slot is allocated by this backend yet, so the interface, the
+    // MMDS config and the MMDS document are all left out together rather than
+    // configuring a document the guest could not reach.
+    cplan.has_network_slot = false;
+
+    const core::Expected<std::vector<ConfigureStep>, std::string> steps =
+        BuildConfigureSequence(cplan);
+    if (!steps.ok()) {
+        return ready_err<Handle>(std::string("firecracker boot: ") + steps.error());
+    }
+
+    // --- 3. spawn ---
+    core::Optional<std::string> stdout_path;
+    core::Optional<std::string> stderr_path;
+    WarmStdioPaths(work_dir.value(), impl_->cfg.capture_output, &stdout_path, &stderr_path);
+
+    std::shared_ptr<Connector> connector = impl_->connector;
+    if (!connector) connector = MakeUnixConnector();
+    std::unique_ptr<FirecrackerInstance> instance(
+        new FirecrackerInstance(work_dir.value(), connector));
+
+    const core::Expected<core::Unit, std::string> spawned = instance->Spawn(
+        impl_->cfg.firecracker_bin,
+        stdout_path.has_value() ? *stdout_path : std::string(),
+        stderr_path.has_value() ? *stderr_path : std::string());
+    if (!spawned.ok()) {
+        return ready_err<Handle>(std::string("firecracker boot: spawn: ") + spawned.error());
+    }
+
+    // From here on every failure must stop the VMM. A returned error with a
+    // live Firecracker still holding the work directory leaks both, and the
+    // next boot for this sandbox id would collide with it.
+    //
+    // `Stop` is best-effort on an already-dead child: it reaps, then removes
+    // the socket, so calling it after an early exit is correct rather than
+    // merely harmless.
+    struct Stopper {
+        FirecrackerInstance* inst;
+        bool armed;
+        explicit Stopper(FirecrackerInstance* i) : inst(i), armed(true) {}
+        ~Stopper() { if (armed && inst != NULL) inst->Stop(kPoolFirecrackerStopTimeoutMs); }
+    } stopper(instance.get());
+
+    // --- 4. wait for the API socket ---
+    const core::Expected<core::Unit, std::string> ready =
+        instance->WaitForReady(impl_->cfg.socket_timeout_ms, impl_->cfg.socket_poll_ms);
+    if (!ready.ok()) {
+        // WaitForReady already distinguishes "child exited" from "timed out"
+        // and quotes the captured stderr, which is the difference between a
+        // bad kernel path and a host that is merely slow.
+        return ready_err<Handle>(std::string("firecracker boot: ") + ready.error());
+    }
+
+    // --- 5. apply the sequence ---
+    const core::Expected<core::Unit, std::string> configured =
+        ApplyConfigureSequence(instance.get(), steps.value());
+    if (!configured.ok()) {
+        return ready_err<Handle>(std::string("firecracker boot: ") + configured.error());
+    }
+
+    // --- 6. start the microVM ---
+    const core::Expected<core::Unit, std::string> start = instance->Start();
+    if (!start.ok()) {
+        return ready_err<Handle>(std::string("firecracker boot: InstanceStart: ") +
+                                 start.error());
+    }
+
+    stopper.armed = false;  // booted; the instance is now owned by the backend
+
+    Handle handle;
+    handle.sandbox_id = plan.sandbox_id;
+    handle.backend_kind = kFirecrackerBackend;
+    handle.control_endpoint = instance->SocketPath();
+    handle.boot_ms = now_ms() - started_ms;
+
+    impl_->instances[plan.sandbox_id.ToString()] = std::move(instance);
+    return ready_ok<Handle>(handle);
+}
+
+void FirecrackerBackend::SetConnectorForTesting(std::shared_ptr<Connector> connector) {
+    impl_->connector = connector;
 }
 
 core::Expected<core::Unit, core::AnyError>

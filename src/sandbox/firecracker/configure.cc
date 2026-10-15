@@ -14,6 +14,7 @@
 // as data lets those rules be asserted without a VMM, a work dir or KVM.
 #include "agentenv/sandbox/firecracker/sandbox.h"
 
+#include "agentenv/sandbox/firecracker/instance.h"
 #include "agentenv/sandbox/firecracker/lifecycle.h"
 
 #include <cstdio>
@@ -48,6 +49,23 @@ void AppendExtraDrives(const std::vector<DriveMount>& mounts,
                                  /*is_root=*/false, mounts[i].read_only, /*direct=*/true,
                                  IoEngine::Async, core::nullopt));
     }
+}
+
+/// Names a step for an error message. The failing call is the first thing an
+/// operator needs, and the index alone does not survive a reordering.
+std::string ConfigureStepName(const ConfigureStep& step) {
+    switch (step.kind) {
+    case ConfigureStep::Kind::Logger:           return "PUT /logger";
+    case ConfigureStep::Kind::MachineConfig:    return "PUT /machine-config";
+    case ConfigureStep::Kind::CpuConfig:        return "PUT /cpu-config";
+    case ConfigureStep::Kind::BootSource:       return "PUT /boot-source";
+    case ConfigureStep::Kind::Drive:            return "PUT /drives/" + step.id;
+    case ConfigureStep::Kind::NetworkInterface: return "PUT /network-interfaces/" + step.id;
+    case ConfigureStep::Kind::MmdsConfig:       return "PUT /mmds/config";
+    case ConfigureStep::Kind::Mmds:             return "PUT /mmds";
+    case ConfigureStep::Kind::Balloon:          return "PUT /balloon";
+    }
+    return "unknown step";
 }
 
 }  // namespace
@@ -197,6 +215,77 @@ BuildConfigureSequence(const ConfigurePlan& plan) {
     }
 
     return steps;
+}
+
+core::Expected<core::Unit, std::string>
+ApplyConfigureSequence(FirecrackerInstance* instance,
+                       const std::vector<ConfigureStep>& steps) {
+    if (instance == NULL) {
+        return core::make_unexpected(std::string("no firecracker instance"));
+    }
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+        const ConfigureStep& step = steps[i];
+        core::Expected<core::Unit, std::string> r = core::Unit{};
+        switch (step.kind) {
+        case ConfigureStep::Kind::Logger:
+            r = instance->SetLogger(step.path, step.text);
+            break;
+        case ConfigureStep::Kind::MachineConfig:
+            r = instance->SetMachineConfig(step.mem_size_mib, step.vcpu_count, step.smt,
+                                           step.track_dirty_pages);
+            break;
+        case ConfigureStep::Kind::CpuConfig:
+            r = instance->SetCpuConfig(step.text);
+            break;
+        case ConfigureStep::Kind::BootSource:
+            // `initrd_path` is absent on this path; empty boot args stay absent
+            // rather than being sent as an empty string.
+            r = instance->SetBootSource(
+                step.path, core::nullopt,
+                step.text.empty() ? core::nullopt : core::Optional<std::string>(step.text));
+            break;
+        case ConfigureStep::Kind::Drive:
+            r = instance->AddDrive(step.id, step.path, step.is_root, step.read_only,
+                                   step.direct, step.io_engine, step.rate_limiter);
+            break;
+        case ConfigureStep::Kind::NetworkInterface:
+            r = instance->AddNetworkInterface(step.id, core::nullopt, step.path, core::nullopt,
+                                              core::nullopt);
+            break;
+        case ConfigureStep::Kind::MmdsConfig:
+            r = instance->SetMmdsConfig(step.id);
+            break;
+        case ConfigureStep::Kind::Mmds: {
+            // The plan carries the document serialized. Parse it back through
+            // `FromValue` rather than inventing a raw-text path: that keeps the
+            // reserved-key filter and the four required fields in force, which
+            // is the whole reason MmdsMetadata is a class and not a string.
+            const core::Expected<core::Json, core::AnyError> doc =
+                core::Json::Parse(step.text);
+            if (!doc.ok()) {
+                return core::make_unexpected(std::string("PUT /mmds: ") +
+                                             doc.error().chain());
+            }
+            const core::Expected<MmdsMetadata, std::string> metadata =
+                MmdsMetadata::FromValue(doc.value());
+            if (!metadata.ok()) {
+                return core::make_unexpected(std::string("PUT /mmds: ") + metadata.error());
+            }
+            r = instance->SetMmds(metadata.value());
+            break;
+        }
+        case ConfigureStep::Kind::Balloon:
+            r = instance->SetBalloon();
+            break;
+        }
+        if (!r.ok()) {
+            // Abort the rest. These are pre-boot calls and a later one cannot
+            // repair an earlier rejection, so continuing would only replace a
+            // precise error with a confusing one from further down.
+            return core::make_unexpected(ConfigureStepName(step) + ": " + r.error());
+        }
+    }
+    return core::Unit{};
 }
 
 }  // namespace firecracker

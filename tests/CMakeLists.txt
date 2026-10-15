@@ -115,3 +115,4 @@ agentenv_add_test(test_firecracker_factory test_firecracker_factory.cc agentenv-
 agentenv_add_test(test_firecracker_paused_state test_firecracker_paused_state.cc agentenv-sandbox)
 agentenv_add_test(test_firecracker_instance_api test_firecracker_instance_api.cc agentenv-sandbox)
 agentenv_add_test(test_firecracker_configure test_firecracker_configure.cc agentenv-sandbox)
+agentenv_add_test(test_firecracker_boot test_firecracker_boot.cc agentenv-sandbox)
