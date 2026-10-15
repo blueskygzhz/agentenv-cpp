@@ -311,12 +311,36 @@ class FirecrackerBackend final : public Backend {
     /// VMM: everything from spawn onwards is otherwise unreachable without
     /// KVM, which is exactly the part that was never executed before.
     void SetConnectorForTesting(std::shared_ptr<Connector> connector);
+
+    // The calls below act on the microVM `Boot` left behind for `id`. Unlike
+    // `FirecrackerSandboxBackend`, which owns exactly one VM, this interface is
+    // keyed by sandbox id, so each one looks its VM up first and reports the id
+    // it could not find.
+
+    /// Rust `stop` — SIGTERM, then SIGKILL after the timeout; drops the VM.
+    ///
+    /// Idempotent: an id this backend no longer holds is a success, so a
+    /// retried shutdown does not fail for work already done.
     core::Expected<core::Unit, core::AnyError>
         Shutdown(core::SandboxId id) override;
+
+    /// Rust `FirecrackerSandbox::pause`, minus the envd volume flush this
+    /// backend has nothing to flush for.
     core::Expected<core::Unit, core::AnyError>
         Pause(core::SandboxId id) override;
+
+    /// Rust `resume`. Forwarded unconditionally, which is where its
+    /// idempotence comes from: Firecracker accepts a resume on a running VM.
     core::Expected<core::Unit, core::AnyError>
         Resume(core::SandboxId id) override;
+
+    /// Rust `snapshot` — pause, capture, resume; returns the vm state path.
+    ///
+    /// State only. Rust pairs the capture with guest memory packaged into an
+    /// overlaybd layer; that half is not here, so `out_dir` is **not** yet
+    /// something `Restore` can boot from. On a failed capture the sandbox is
+    /// resumed before the error is returned, and the error says so explicitly
+    /// when it could not be.
     core::Expected<std::string, core::AnyError>
         Snapshot(core::SandboxId id, const std::string& out_dir) override;
     core::Expected<Handle, core::AnyError>

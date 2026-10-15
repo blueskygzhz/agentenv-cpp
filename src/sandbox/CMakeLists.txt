@@ -18,6 +18,8 @@ add_library(agentenv-sandbox STATIC
     network/egress_proxy.cc
     custom_extension.cc
     ublk.cc
+    # Rust: sandbox/ublk/device.rs :: UblkDeviceManager + SharedReadOnlyDevice
+    ublk/device.cc
     # firecracker sub-module (Rust: src/sandbox/firecracker/*.rs)
     firecracker/config.cc
     # Rust: the Serialize/Deserialize derives on the firecracker configs —
@@ -60,4 +62,6 @@ target_link_libraries(agentenv-sandbox PUBLIC
     # `storage::overlaybd::UpperModeToString` / `UpperModeParse`, so the
     # persisted spelling has exactly one definition.
     agentenv-overlaybd
+    # sandbox/ublk/device.cc drives the daemon over its wire protocol.
+    agentenv-ublk-daemon-protocol
 )

@@ -14,6 +14,7 @@
 #include <map>
 #include "agentenv/sandbox/firecracker/sandbox.h"
 #include "agentenv/sandbox/firecracker/config.h"
+#include "agentenv/core/fs.h"
 
 #include <sys/stat.h>
 
@@ -286,6 +287,17 @@ class FirecrackerBackend::Impl {
     std::string ApiSocketPath(const core::SandboxId& id) const {
         return ChrootPath(id) + "/run/firecracker.socket";
     }
+
+    /// The VM `Boot` left behind for this id, or null.
+    ///
+    /// Every post-boot call on this backend starts here: unlike
+    /// `FirecrackerSandboxBackend`, which owns exactly one microVM, the legacy
+    /// `Backend` interface is keyed by sandbox id and so must look its VM up.
+    FirecrackerInstance* Find(const core::SandboxId& id) {
+        const std::map<std::string, std::unique_ptr<FirecrackerInstance> >::iterator it =
+            instances.find(id.ToString());
+        return it == instances.end() ? NULL : it->second.get();
+    }
 };
 
 FirecrackerBackend::FirecrackerBackend(Config cfg)
@@ -416,20 +428,111 @@ void FirecrackerBackend::SetConnectorForTesting(std::shared_ptr<Connector> conne
 }
 
 core::Expected<core::Unit, core::AnyError>
-FirecrackerBackend::Shutdown(core::SandboxId /*id*/) {
-    return ready_err<core::Unit>("firecracker Shutdown: no live VM in this build");
+FirecrackerBackend::Shutdown(core::SandboxId id) {
+    const std::map<std::string, std::unique_ptr<FirecrackerInstance> >::iterator it =
+        impl_->instances.find(id.ToString());
+    // Idempotent, as Rust's `stop` is: an id this backend no longer holds has
+    // nothing left to release, and failing here would make a retried shutdown
+    // (or a shutdown racing a failed boot) report an error for work that is
+    // already done.
+    if (it == impl_->instances.end()) return ready_ok<core::Unit>(core::Unit());
+
+    const core::Expected<core::Unit, std::string> stopped =
+        it->second->Stop(kPoolFirecrackerStopTimeoutMs);
+    // Dropped whether or not the wait succeeded. `Stop` escalates to SIGKILL
+    // after the timeout, so the VMM is gone either way; keeping the entry
+    // would leave a later Pause/Snapshot talking to a socket with nothing
+    // behind it, and would make the id un-bootable for the process lifetime.
+    impl_->instances.erase(it);
+    if (!stopped.ok()) {
+        return ready_err<core::Unit>(std::string("firecracker Shutdown: ") + stopped.error());
+    }
+    return ready_ok<core::Unit>(core::Unit());
 }
+
 core::Expected<core::Unit, core::AnyError>
-FirecrackerBackend::Pause(core::SandboxId /*id*/) {
-    return ready_err<core::Unit>("firecracker Pause: no live VM in this build");
+FirecrackerBackend::Pause(core::SandboxId id) {
+    FirecrackerInstance* instance = impl_->Find(id);
+    if (instance == NULL) {
+        return ready_err<core::Unit>("firecracker Pause: no live VM for sandbox " + id.ToString());
+    }
+    // Rust `FirecrackerSandbox::pause` also flushes writable volumes through
+    // envd before pausing the VMM; this backend attaches no volumes and has no
+    // envd client, so there is nothing to flush.
+    const core::Expected<core::Unit, std::string> r = instance->Pause();
+    if (!r.ok()) return ready_err<core::Unit>(std::string("firecracker Pause: ") + r.error());
+    return ready_ok<core::Unit>(core::Unit());
 }
+
 core::Expected<core::Unit, core::AnyError>
-FirecrackerBackend::Resume(core::SandboxId /*id*/) {
-    return ready_err<core::Unit>("firecracker Resume: no live VM in this build");
+FirecrackerBackend::Resume(core::SandboxId id) {
+    FirecrackerInstance* instance = impl_->Find(id);
+    if (instance == NULL) {
+        return ready_err<core::Unit>("firecracker Resume: no live VM for sandbox " + id.ToString());
+    }
+    // Forwarded unconditionally, which is where Rust's idempotence comes from:
+    // Firecracker accepts a resume on a running VM. A local paused flag could
+    // only drift from the VMM's actual state.
+    const core::Expected<core::Unit, std::string> r = instance->Resume();
+    if (!r.ok()) return ready_err<core::Unit>(std::string("firecracker Resume: ") + r.error());
+    return ready_ok<core::Unit>(core::Unit());
 }
+
 core::Expected<std::string, core::AnyError>
-FirecrackerBackend::Snapshot(core::SandboxId /*id*/, const std::string& /*out_dir*/) {
-    return ready_err<std::string>("firecracker Snapshot: no live VM in this build");
+FirecrackerBackend::Snapshot(core::SandboxId id, const std::string& out_dir) {
+    FirecrackerInstance* instance = impl_->Find(id);
+    if (instance == NULL) {
+        return ready_err<std::string>("firecracker Snapshot: no live VM for sandbox " +
+                                      id.ToString());
+    }
+    const core::Expected<core::Unit, std::string> dir = core::fs::CreateDirAll(out_dir);
+    if (!dir.ok()) {
+        return ready_err<std::string>(std::string("firecracker Snapshot: ") + dir.error());
+    }
+
+    // Rust `snapshot` = `pause_to_dir` then `resume`: Firecracker refuses
+    // `PUT /snapshot/create` on a running VM, so the pause is part of taking a
+    // capture rather than a separate decision by the caller.
+    const core::Expected<core::Unit, std::string> paused = instance->Pause();
+    if (!paused.ok()) {
+        return ready_err<std::string>(std::string("firecracker Snapshot: ") + paused.error());
+    }
+
+    const std::string vm_state_path = core::fs::Join(out_dir, kVmStateFileName);
+    const core::Expected<core::Unit, std::string> captured =
+        instance->CreateStateOnlySnapshot(vm_state_path);
+    if (!captured.ok()) {
+        // Rust's `cleanup_failed_snapshot_dir`, narrowed: `out_dir` belongs to
+        // the caller here, so only the file this call may have half-written is
+        // removed. A truncated vm_state.bin left in place is worse than none,
+        // because a later restore would read it as a real capture.
+        core::fs::RemoveFile(vm_state_path);
+        // Rust's `recover_capture_failure`: a recoverable capture error must
+        // leave the sandbox running again before it is returned. Failing to
+        // resume turns it terminal, and the caller is told both halves --
+        // what failed, and that the VM is still paused.
+        const core::Expected<core::Unit, std::string> resumed = instance->Resume();
+        if (!resumed.ok()) {
+            return ready_err<std::string>(
+                "firecracker Snapshot: capture failed and sandbox could not be resumed: " +
+                captured.error() + "; resume error: " + resumed.error());
+        }
+        return ready_err<std::string>(std::string("firecracker Snapshot: ") + captured.error());
+    }
+
+    // The capture is state-only: Rust pairs it with guest memory packaged into
+    // an overlaybd layer (`snapshot_memory_to_overlaybd`), which this backend
+    // does not do. `out_dir` therefore holds the VM state alone and is not yet
+    // something `Restore` can boot from.
+    const core::Expected<core::Unit, std::string> resumed = instance->Resume();
+    if (!resumed.ok()) {
+        // Terminal in Rust: the capture exists but the source VM is stuck
+        // paused, so the caller must not keep treating it as runnable.
+        return ready_err<std::string>(
+            "firecracker Snapshot: capture succeeded but sandbox could not be resumed: " +
+            resumed.error());
+    }
+    return ready_ok<std::string>(vm_state_path);
 }
 core::Expected<Handle, core::AnyError>
 FirecrackerBackend::Restore(LaunchPlan /*plan*/, const std::string& /*snapshot_dir*/) {

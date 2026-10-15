@@ -11,6 +11,7 @@
 
 #include <cerrno>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -399,6 +400,176 @@ MT_TEST(a_failed_start_action_is_reported_as_such) {
     // Distinguished from a configuration rejection: everything was accepted
     // and the VM still would not start.
     MT_EXPECT_TRUE(r.error().chain().find("InstanceStart") != std::string::npos);
+}
+
+// ============================================================
+// the lifecycle past boot
+//
+// Boot leaves a real VM behind, keyed by sandbox id. These check that the
+// rest of the interface reaches *that* VM rather than reporting there is
+// none, which is what it used to do with the instance sitting in the map.
+// ============================================================
+
+namespace {
+
+/// The calls issued after `from`, so a post-boot assertion is not written
+/// against the boot sequence's own requests.
+std::vector<RecordingSocket::Call> CallsSince(
+    const std::vector<RecordingSocket::Call>& calls, std::size_t from) {
+    return std::vector<RecordingSocket::Call>(calls.begin() + static_cast<long>(from),
+                                              calls.end());
+}
+
+bool BodyHas(const RecordingSocket::Call& call, const char* needle) {
+    return call.body.find(needle) != std::string::npos;
+}
+
+}  // namespace
+
+MT_TEST(pause_and_resume_reach_the_booted_vm) {
+    const std::string dir = MakeTempDir();
+    if (dir.empty()) return;
+
+    FirecrackerBackend backend(ConfigFor(dir + "/chroot"));
+    RecordingConnector* conn = new RecordingConnector();
+    backend.SetConnectorForTesting(std::shared_ptr<Connector>(conn));
+
+    const LaunchPlan plan = PlanIn(dir);
+    core::Expected<Handle, core::AnyError> booted = backend.Boot(plan);
+    MT_EXPECT_TRUE(booted.ok());
+    if (!booted.ok()) return;
+    const std::size_t after_boot = conn->calls.size();
+
+    MT_EXPECT_TRUE(backend.Pause(plan.sandbox_id).ok());
+    MT_EXPECT_TRUE(backend.Resume(plan.sandbox_id).ok());
+
+    const std::vector<RecordingSocket::Call> after = CallsSince(conn->calls, after_boot);
+    MT_EXPECT_EQ(after.size(), static_cast<std::size_t>(2));
+    if (after.size() != 2) return;
+    // Both are `PATCH /vm`; only the body distinguishes them, so asserting on
+    // the path alone would pass even if resume re-sent a pause.
+    MT_EXPECT_EQ(after[0].method, std::string("PATCH"));
+    MT_EXPECT_EQ(after[0].path, std::string("/vm"));
+    MT_EXPECT_TRUE(BodyHas(after[0], "Paused"));
+    MT_EXPECT_EQ(after[1].method, std::string("PATCH"));
+    MT_EXPECT_EQ(after[1].path, std::string("/vm"));
+    MT_EXPECT_TRUE(BodyHas(after[1], "Resumed"));
+
+    backend.Shutdown(plan.sandbox_id);
+}
+
+MT_TEST(a_lifecycle_call_for_an_unknown_sandbox_names_the_id) {
+    const std::string dir = MakeTempDir();
+    if (dir.empty()) return;
+
+    FirecrackerBackend backend(ConfigFor(dir + "/chroot"));
+    backend.SetConnectorForTesting(std::shared_ptr<Connector>(new RecordingConnector()));
+
+    const core::SandboxId unknown = core::SandboxId::Fresh();
+    core::Expected<core::Unit, core::AnyError> paused = backend.Pause(unknown);
+    MT_EXPECT_TRUE(!paused.ok());
+    MT_EXPECT_TRUE(paused.error().chain().find("no live VM for sandbox") != std::string::npos);
+    // The id is in the message: with a backend holding several sandboxes,
+    // "no live VM" alone does not say which one the caller got wrong.
+    MT_EXPECT_TRUE(paused.error().chain().find(unknown.ToString()) != std::string::npos);
+
+    core::Expected<std::string, core::AnyError> snap = backend.Snapshot(unknown, dir + "/snap");
+    MT_EXPECT_TRUE(!snap.ok());
+    MT_EXPECT_TRUE(snap.error().chain().find("no live VM for sandbox") != std::string::npos);
+}
+
+MT_TEST(shutdown_stops_the_vmm_and_a_second_one_succeeds) {
+    const std::string dir = MakeTempDir();
+    if (dir.empty()) return;
+
+    FirecrackerBackend backend(ConfigFor(dir + "/chroot"));
+    PidCapturingConnector* conn = new PidCapturingConnector(std::string());
+    backend.SetConnectorForTesting(std::shared_ptr<Connector>(conn));
+
+    const LaunchPlan plan = PlanIn(dir);
+    MT_EXPECT_TRUE(backend.Boot(plan).ok());
+    MT_EXPECT_TRUE(conn->vmm_pid > 0);
+
+    MT_EXPECT_TRUE(backend.Shutdown(plan.sandbox_id).ok());
+    // ESRCH: the stand-in VMM sleeps for 30s, so it is gone because it was
+    // killed, not because it finished.
+    if (conn->vmm_pid > 0) MT_EXPECT_TRUE(::kill(conn->vmm_pid, 0) != 0);
+
+    // Idempotent, as Rust's `stop` is: the entry is gone, and a retried
+    // shutdown must not turn an already-released sandbox into an error.
+    MT_EXPECT_TRUE(backend.Shutdown(plan.sandbox_id).ok());
+    // The VM really was dropped, not merely stopped in place.
+    MT_EXPECT_TRUE(!backend.Pause(plan.sandbox_id).ok());
+}
+
+MT_TEST(snapshot_pauses_captures_then_resumes) {
+    const std::string dir = MakeTempDir();
+    if (dir.empty()) return;
+
+    FirecrackerBackend backend(ConfigFor(dir + "/chroot"));
+    RecordingConnector* conn = new RecordingConnector();
+    backend.SetConnectorForTesting(std::shared_ptr<Connector>(conn));
+
+    const LaunchPlan plan = PlanIn(dir);
+    MT_EXPECT_TRUE(backend.Boot(plan).ok());
+    const std::size_t after_boot = conn->calls.size();
+
+    const std::string out = dir + "/snap";
+    core::Expected<std::string, core::AnyError> r = backend.Snapshot(plan.sandbox_id, out);
+    MT_EXPECT_TRUE(r.ok());
+    if (!r.ok()) return;
+    MT_EXPECT_EQ(r.value(), out + "/vm_state.bin");
+
+    // Firecracker refuses `PUT /snapshot/create` on a running VM, so the order
+    // is the whole operation: a capture without the pause in front of it fails,
+    // and one without the resume behind it leaves the sandbox stopped.
+    const std::vector<RecordingSocket::Call> after = CallsSince(conn->calls, after_boot);
+    MT_EXPECT_EQ(after.size(), static_cast<std::size_t>(3));
+    if (after.size() != 3) return;
+    MT_EXPECT_TRUE(BodyHas(after[0], "Paused"));
+    MT_EXPECT_EQ(after[1].path, std::string("/snapshot/create"));
+    MT_EXPECT_TRUE(BodyHas(after[2], "Resumed"));
+
+    // The output directory is created by the call, not required up front.
+    struct stat st;
+    MT_EXPECT_TRUE(::stat(out.c_str(), &st) == 0);
+
+    backend.Shutdown(plan.sandbox_id);
+}
+
+MT_TEST(a_failed_capture_leaves_the_sandbox_running) {
+    // Rust's recoverable/terminal split: a capture that fails must put the VM
+    // back before returning, because the caller is entitled to keep using it.
+    const std::string dir = MakeTempDir();
+    if (dir.empty()) return;
+
+    FirecrackerBackend backend(ConfigFor(dir + "/chroot"));
+    // Boot issues no `/snapshot/create`, so only the capture is faulted.
+    RecordingConnector* conn = new RecordingConnector("/snapshot/create");
+    backend.SetConnectorForTesting(std::shared_ptr<Connector>(conn));
+
+    const LaunchPlan plan = PlanIn(dir);
+    MT_EXPECT_TRUE(backend.Boot(plan).ok());
+    const std::size_t after_boot = conn->calls.size();
+
+    const std::string out = dir + "/snap";
+    core::Expected<std::string, core::AnyError> r = backend.Snapshot(plan.sandbox_id, out);
+    MT_EXPECT_TRUE(!r.ok());
+    MT_EXPECT_TRUE(r.error().chain().find("fault injected") != std::string::npos);
+    // Not the terminal wording: the resume succeeded.
+    MT_EXPECT_TRUE(r.error().chain().find("could not be resumed") == std::string::npos);
+
+    const std::vector<RecordingSocket::Call> after = CallsSince(conn->calls, after_boot);
+    MT_EXPECT_EQ(after.size(), static_cast<std::size_t>(3));
+    if (after.size() != 3) return;
+    MT_EXPECT_TRUE(BodyHas(after[2], "Resumed"));
+
+    // A half-written vm_state.bin left behind would be read by a later restore
+    // as a real capture.
+    struct stat st;
+    MT_EXPECT_TRUE(::stat((out + "/vm_state.bin").c_str(), &st) != 0);
+
+    backend.Shutdown(plan.sandbox_id);
 }
 
 MT_MAIN
