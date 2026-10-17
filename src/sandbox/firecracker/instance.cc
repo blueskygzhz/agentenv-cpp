@@ -13,6 +13,8 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+// `setns` / `CLONE_NEWNET`, for entering a network slot's namespace.
+#include <sched.h>
 #include <signal.h>
 #include <unistd.h>
 
@@ -148,6 +150,14 @@ core::Expected<core::Unit, std::string>
 FirecrackerInstance::Spawn(const std::string& firecracker_binary,
      const std::string& stdout_path,
   const std::string& stderr_path) {
+    return SpawnWithNetns(firecracker_binary, stdout_path, stderr_path, std::string());
+}
+
+core::Expected<core::Unit, std::string>
+FirecrackerInstance::SpawnWithNetns(const std::string& firecracker_binary,
+     const std::string& stdout_path,
+  const std::string& stderr_path,
+     const std::string& netns_path) {
     if (child_pid_ > 0) {
         return core::make_unexpected(std::string("firecracker process already started"));
   }
@@ -155,13 +165,33 @@ FirecrackerInstance::Spawn(const std::string& firecracker_binary,
         ::unlink(socket_path_.c_str());
     }
 
+    // Opened in the parent, as Rust does, so a missing or unreadable namespace
+    // is reported here with its path. Done in the child it could only be an
+    // exit code, and the spawn would look like a Firecracker failure.
+    int netns_fd = -1;
+    if (!netns_path.empty()) {
+        netns_fd = ::open(netns_path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (netns_fd < 0) {
+            return core::make_unexpected(
+                std::string("open Firecracker network namespace ") + netns_path + ": " +
+                std::strerror(errno));
+        }
+    }
+
     int out_fd = -1, err_fd = -1;
     {
         auto o = OpenLogStdio(stdout_path);
-        if (!o.ok()) return core::make_unexpected(o.error());
+        if (!o.ok()) {
+            if (netns_fd >= 0) ::close(netns_fd);
+            return core::make_unexpected(o.error());
+        }
         out_fd = o.value();
         auto e = OpenLogStdio(stderr_path);
-     if (!e.ok()) { if (out_fd >= 0) ::close(out_fd); return core::make_unexpected(e.error()); }
+     if (!e.ok()) {
+            if (out_fd >= 0) ::close(out_fd);
+            if (netns_fd >= 0) ::close(netns_fd);
+            return core::make_unexpected(e.error());
+        }
     err_fd = e.value();
     }
     stderr_path_ = stderr_path;
@@ -170,10 +200,24 @@ FirecrackerInstance::Spawn(const std::string& firecracker_binary,
     if (pid < 0) {
         if (out_fd >= 0) ::close(out_fd);
    if (err_fd >= 0) ::close(err_fd);
+        if (netns_fd >= 0) ::close(netns_fd);
     return core::make_unexpected(std::string("fork() failed"));
  }
     if (pid == 0) {
         // child
+        // Rust `cmd.process_group(0)`. A terminal signal sent to the server's
+        // process group must not reach the VMM: the pool stops its processes
+        // deliberately, and a stray SIGINT killing them out from under it
+        // would leave warm entries whose slot and work dir are still held.
+        ::setpgid(0, 0);
+        // Before `exec`, because Firecracker creates its tap device when the
+        // guest network interface is configured and cannot change namespace
+        // afterwards. Fatal on failure: a VMM that silently started in the
+        // parent's namespace would get a working API socket and no guest
+        // connectivity, which looks like a guest-side fault.
+        if (netns_fd >= 0 && ::setns(netns_fd, CLONE_NEWNET) != 0) {
+            ::_exit(126);
+        }
         if (chdir(work_dir_.c_str()) != 0) { /* best effort */ }
      int devnull = -1;
         if (out_fd < 0 || err_fd < 0) devnull = ::open("/dev/null", O_WRONLY);
@@ -183,13 +227,19 @@ FirecrackerInstance::Spawn(const std::string& firecracker_binary,
         if (nullin >= 0) ::dup2(nullin, STDIN_FILENO);
 
         std::string sizelimit;
+        std::string max_payload;
         {
       char b[32]; std::snprintf(b, sizeof(b), "%zu", kMmdsSizeLimit); sizelimit = b;
+      char p[32]; std::snprintf(p, sizeof(p), "%zu", kHttpApiMaxPayloadSize); max_payload = p;
  }
         const char* argv[] = {
        firecracker_binary.c_str(),
  "--api-sock", socket_path_.c_str(),
             "--mmds-size-limit", sizelimit.c_str(),
+            // Rust passes this too. Without it a snapshot load body carrying
+            // the memory backend path and the network overrides can exceed
+            // Firecracker's default and be rejected by the VMM.
+            "--http-api-max-payload-size", max_payload.c_str(),
             nullptr
         };
         ::execvp(argv[0], const_cast<char* const*>(argv));
@@ -198,6 +248,7 @@ FirecrackerInstance::Spawn(const std::string& firecracker_binary,
     // parent
     if (out_fd >= 0) ::close(out_fd);
     if (err_fd >= 0) ::close(err_fd);
+    if (netns_fd >= 0) ::close(netns_fd);
     child_pid_ = pid;
 
     // Rust: set oom_score_adj = 1000 (best effort).

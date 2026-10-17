@@ -39,6 +39,15 @@ class Instance {
 /// Rust: firecracker/instance.rs :: MMDS_SIZE_LIMIT (1 MiB).
 static const size_t kMmdsSizeLimit = 1048576;
 
+/// Rust: firecracker/instance.rs :: HTTP_API_MAX_PAYLOAD_SIZE.
+///
+/// Defined as equal to the MMDS limit upstream, and passed on the command line
+/// because Firecracker's own default is far smaller. A snapshot load body
+/// carries the memory backend path and every network override, so the default
+/// is reachable in normal operation -- and the request is rejected by the VMM
+/// before any of this code sees it.
+static const size_t kHttpApiMaxPayloadSize = kMmdsSizeLimit;
+
 /// Rust: firecracker/instance.rs :: parse_log_level — case-insensitive.
 core::Expected<std::string, std::string> ParseLogLevel(const std::string& level);
 
@@ -158,8 +167,24 @@ class FirecrackerInstance : public Instance {
     /// Rust `pid`.
     core::Expected<int64_t, std::string> Pid() const;
 
-    /// Rust `spawn_with_netns` (netns omitted in this port). Spawns the given
-    /// binary with the firecracker api-sock args; rejects a duplicate start.
+    /// Rust `spawn_with_netns`. Spawns the given binary with the firecracker
+    /// api-sock args; rejects a duplicate start.
+    ///
+    /// `netns_path` is the bind-mounted namespace file from a network `Slot`.
+    /// It is opened in the parent and entered with `setns` in the child before
+    /// `exec`, which is the only point where that is possible: Firecracker
+    /// creates its tap device at configure time, and a VMM that started in the
+    /// wrong namespace cannot be moved into another one afterwards.
+    ///
+    /// Empty `netns_path` keeps the parent's namespace.
+    core::Expected<core::Unit, std::string>
+        SpawnWithNetns(const std::string& firecracker_binary,
+                       const std::string& stdout_path,
+                       const std::string& stderr_path,
+                       const std::string& netns_path);
+
+    /// `SpawnWithNetns` with no namespace, for callers that do not allocate a
+    /// network slot.
     core::Expected<core::Unit, std::string>
   Spawn(const std::string& firecracker_binary,
               const std::string& stdout_path,
