@@ -10,6 +10,10 @@ add_library(agentenv-overlaybd STATIC
     layer.cc
     prefetch.cc
     download_gate.cc
+    # Rust: src/{startup_pack,startup_manifest}.rs — the trace and manifest
+    # wire formats. Here rather than in agentenv-snapshot because the ublk
+    # read path is their other consumer.
+    startup_pack.cc
 )
 target_include_directories(agentenv-overlaybd PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-overlaybd PUBLIC agentenv-core agentenv-storage-util)
