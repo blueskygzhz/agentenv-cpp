@@ -747,7 +747,8 @@ Orchestrator::BuildSandbox(const LaunchPlan& plan) {
         const CreateLaunchPlan& create = *plan.create;
         if (create.source.kind == CreateLaunchSourceKind::Snapshot) {
             core::Expected<std::unique_ptr<sandbox::SandboxBackend>, core::AnyError>
-                built = factory_->BuildFromSnapshot(create.source.snapshot_id,
+                built = factory_->BuildFromSnapshot(create.source.snapshot,
+                                                    create.source.snapshot_manifest,
                                                     create.launch_config);
             if (!built.ok()) {
                 return core::make_unexpected(OrchestratorError::SandboxOperationFailed(
@@ -1139,8 +1140,20 @@ Orchestrator::CreateSandboxInner(const core::SandboxId& sandbox_id,
         metadata.startup                 = source.snapshot_startup;
         metadata.custom_extension_params = effective_params;
 
+        // Rust hands the backend the resolved `RunnableSnapshot`; here the two
+        // views it reads are assembled from the launch source, which already
+        // carries everything the record contributed.
+        sandbox::firecracker::RunnableSnapshotView snapshot_view;
+        snapshot_view.snapshot_id = source.snapshot_id;
+        snapshot_view.virtualization_mode = source.snapshot_virtualization_mode;
+        snapshot_view.tools_drive_version = source.snapshot_runtime_versions.tools_drive_version;
+        snapshot_view.envd_version = source.snapshot_runtime_versions.envd_version;
+        snapshot_view.env_vars = source.context.env_vars;
+        snapshot_view.workdir = source.context.workdir;
+        snapshot_view.user = source.context.user;
+
         plan = LaunchPlan::ForCreateFromSnapshot(
-            sandbox_id, source.snapshot_id, launch_config, metadata,
+            sandbox_id, snapshot_view, source.snapshot_manifest, launch_config, metadata,
             NewTimeout::Set(request.timeout_ms ? *request.timeout_ms
                                                : default_sandbox_timeout_ms_));
     } else {

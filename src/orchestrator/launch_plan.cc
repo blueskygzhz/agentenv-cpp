@@ -9,7 +9,8 @@ namespace orchestrator {
 
 LaunchPlan LaunchPlan::ForCreateFromSnapshot(
     core::SandboxId id,
-    std::string snapshot_id,
+    sandbox::firecracker::RunnableSnapshotView snapshot,
+    sandbox::firecracker::SnapshotManifestView manifest,
     sandbox::SandboxLaunchConfig launch_config,
     SandboxMetadata meta,
     NewTimeout timeout) {
@@ -18,7 +19,8 @@ LaunchPlan LaunchPlan::ForCreateFromSnapshot(
     p.create.reset(new CreateLaunchPlan);
     p.create->sandbox_id = id;
     p.create->source.kind = CreateLaunchSourceKind::Snapshot;
-    p.create->source.snapshot_id = std::move(snapshot_id);
+    p.create->source.snapshot = std::move(snapshot);
+    p.create->source.snapshot_manifest = std::move(manifest);
     p.create->launch_config = std::move(launch_config);
     p.create->metadata = std::move(meta);
     p.create->timeout = timeout;

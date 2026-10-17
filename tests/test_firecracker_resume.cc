@@ -648,4 +648,218 @@ MT_TEST(a_backend_built_from_a_paused_state_resumes_end_to_end) {
     MT_EXPECT_TRUE(built.value()->Stop().ok());
 }
 
+// ============================================================
+// Rust `snapshot_config_for_launch` + `build_from_snapshot`
+//
+// A committed snapshot is shared, so launching one is not the same as
+// reviving this node's own paused capture: the launch supplies the whole of
+// the new sandbox's identity, not just a corrected id.
+// ============================================================
+
+namespace {
+
+SandboxLaunchConfig LaunchConfigFor(const core::SandboxId& id) {
+    SandboxLaunchConfig config;
+    config.sandbox_id = id;
+    config.snapshot_id = "snap-committed";
+    return config;
+}
+
+/// A recorded config with room for two launch-time volumes.
+SnapshotConfig CommittedConfig() {
+    SnapshotConfig config = CapturedConfig();
+    config.common.volume_drive_slots = 2;
+    config.common.physical_extra_drive_count = 0;
+    return config;
+}
+
+}  // namespace
+
+MT_TEST(a_launch_replaces_the_committed_snapshots_identity) {
+    // The document the snapshot recorded names whichever sandbox captured it.
+    // A committed snapshot is launched by many sandboxes, so the identity is
+    // replaced wholesale rather than patched.
+    SnapshotConfig config = CommittedConfig();
+    SandboxLaunchConfig launch = LaunchConfigFor(ResumedId());
+    launch.envd_access_token =
+        core::Optional<EnvdAccessToken>(EnvdAccessToken("launch-token"));
+
+    MT_EXPECT_TRUE(ApplyLaunchToSnapshotConfig(&config, launch,
+                                               core::Optional<std::string>()).ok());
+
+    MT_EXPECT_TRUE(config.common.mmds_metadata.has_value());
+    MT_EXPECT_EQ(config.common.mmds_metadata->SandboxId(), ResumedId().ToString());
+    // The launch's snapshot id, not the capture's -- this is what the guest
+    // reports as the image it came from.
+    MT_EXPECT_EQ(config.common.mmds_metadata->SnapshotId(), std::string("snap-committed"));
+    MT_EXPECT_EQ(config.common.mmds_metadata->AccessTokenHash(),
+                 MmdsMetadata::HashAccessToken("launch-token"));
+    MT_EXPECT_TRUE(config.common.envd_access_token.has_value());
+}
+
+MT_TEST(a_launch_asking_for_more_volumes_than_slots_is_refused) {
+    // Firecracker cannot add a virtio-block device after a restore, so the
+    // shortfall can never be made up. Dropping the surplus would boot a
+    // sandbox whose caller finds its mount points empty.
+    SnapshotConfig config = CommittedConfig();
+    config.common.volume_drive_slots = 1;
+
+    SandboxLaunchConfig launch = LaunchConfigFor(ResumedId());
+    launch.extra_drives.push_back(Drive("v1", true));
+    launch.extra_drives.push_back(Drive("v2", true));
+
+    const core::Expected<core::Unit, std::string> r =
+        ApplyLaunchToSnapshotConfig(&config, launch, core::Optional<std::string>());
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+    MT_EXPECT_TRUE(r.error().find("at most 1") != std::string::npos);
+    MT_EXPECT_TRUE(r.error().find("requested 2") != std::string::npos);
+}
+
+MT_TEST(launch_volumes_are_appended_after_the_snapshots_own_drives) {
+    // The snapshot's drives keep their slots; the launch's take the reserved
+    // ones after them. Prepending would shift every recorded drive by one and
+    // the guest would mount each at its neighbour's path.
+    SnapshotConfig config = CommittedConfig();
+    config.common.extra_drives.push_back(Drive("recorded", false));
+    config.common.physical_extra_drive_count = 1;
+
+    SandboxLaunchConfig launch = LaunchConfigFor(ResumedId());
+    launch.extra_drives.push_back(Drive("launch-vol", true));
+
+    MT_EXPECT_TRUE(ApplyLaunchToSnapshotConfig(&config, launch,
+                                               core::Optional<std::string>()).ok());
+    MT_EXPECT_EQ(config.common.extra_drives.size(), static_cast<std::size_t>(2));
+    if (config.common.extra_drives.size() != 2) return;
+    MT_EXPECT_EQ(config.common.extra_drives[0].drive_id, std::string("recorded"));
+    MT_EXPECT_EQ(config.common.extra_drives[1].drive_id, std::string("launch-vol"));
+}
+
+MT_TEST(launch_env_vars_merge_over_the_snapshots_own) {
+    // Rust `get_or_insert_default().extend(..)`. Substituting instead of
+    // merging would drop the image's defaults for every key the launch does
+    // not name -- including the ones the guest needs to start at all.
+    SnapshotConfig config = CommittedConfig();
+    std::map<std::string, std::string> recorded;
+    recorded["PATH"] = "/usr/bin";
+    recorded["LANG"] = "C";
+    config.common.env_vars =
+        core::Optional<std::map<std::string, std::string> >(recorded);
+
+    SandboxLaunchConfig launch = LaunchConfigFor(ResumedId());
+    std::map<std::string, std::string> overrides;
+    overrides["LANG"] = "en_US.UTF-8";   // overrides
+    overrides["EXTRA"] = "1";            // adds
+    launch.env_vars =
+        core::Optional<std::map<std::string, std::string> >(overrides);
+
+    MT_EXPECT_TRUE(ApplyLaunchToSnapshotConfig(&config, launch,
+                                               core::Optional<std::string>()).ok());
+    MT_EXPECT_TRUE(config.common.env_vars.has_value());
+    if (!config.common.env_vars.has_value()) return;
+    MT_EXPECT_EQ((*config.common.env_vars)["PATH"], std::string("/usr/bin"));
+    MT_EXPECT_EQ((*config.common.env_vars)["LANG"], std::string("en_US.UTF-8"));
+    MT_EXPECT_EQ((*config.common.env_vars)["EXTRA"], std::string("1"));
+}
+
+MT_TEST(launch_custom_params_override_the_snapshots_otherwise_inherit) {
+    SnapshotConfig config = CommittedConfig();
+    SandboxLaunchConfig launch = LaunchConfigFor(ResumedId());
+
+    // Absent on the launch: the snapshot's value is inherited.
+    MT_EXPECT_TRUE(ApplyLaunchToSnapshotConfig(
+                       &config, launch,
+                       core::Optional<std::string>(std::string("{\"from\":\"snapshot\"}")))
+                       .ok());
+    MT_EXPECT_TRUE(config.common.custom_extension_params_json.has_value());
+    MT_EXPECT_EQ(*config.common.custom_extension_params_json,
+                 std::string("{\"from\":\"snapshot\"}"));
+
+    // Present on the launch: it wins.
+    custom_extension::Params params;
+    params.json_bytes = "{\"from\":\"launch\"}";
+    launch.custom_extension_params = core::Optional<custom_extension::Params>(params);
+    MT_EXPECT_TRUE(ApplyLaunchToSnapshotConfig(
+                       &config, launch,
+                       core::Optional<std::string>(std::string("{\"from\":\"snapshot\"}")))
+                       .ok());
+    MT_EXPECT_EQ(*config.common.custom_extension_params_json,
+                 std::string("{\"from\":\"launch\"}"));
+}
+
+MT_TEST(initial_guest_drive_mounts_start_after_the_physical_drives) {
+    // Slot indices begin at `physical_extra_drive_count`: a volume bound into
+    // a physical slot is mounted as the wrong filesystem.
+    SnapshotConfig config = CommittedConfig();
+    config.common.physical_extra_drive_count = 2;
+
+    SandboxLaunchConfig launch = LaunchConfigFor(ResumedId());
+    launch.extra_drives.push_back(Drive("v1", true));
+    launch.extra_drives.push_back(Drive("v2", true));
+
+    const std::vector<std::pair<std::size_t, ExtraDrive> > mounts =
+        InitialGuestDriveMountsForSnapshotLaunch(config, launch);
+    MT_EXPECT_EQ(mounts.size(), static_cast<std::size_t>(2));
+    if (mounts.size() != 2) return;
+    MT_EXPECT_EQ(mounts[0].first, static_cast<std::size_t>(2));
+    MT_EXPECT_EQ(mounts[1].first, static_cast<std::size_t>(3));
+    MT_EXPECT_EQ(mounts[0].second.drive_id, std::string("v1"));
+}
+
+MT_TEST(drives_already_in_the_snapshot_need_no_patch) {
+    // They were bound before the load, so patching them afterwards would
+    // repoint a drive Firecracker has already opened.
+    SnapshotConfig config = CommittedConfig();
+    SandboxLaunchConfig launch = LaunchConfigFor(ResumedId());
+    launch.extra_drives.push_back(Drive("v1", true));
+    launch.extra_drives_in_snapshot = true;
+
+    MT_EXPECT_TRUE(InitialGuestDriveMountsForSnapshotLaunch(config, launch).empty());
+}
+
+MT_TEST(build_from_snapshot_refuses_another_backends_capture) {
+    // A capture is restored by the VMM that took it, so this is not merely
+    // unsupported -- the vm_state is unreadable here.
+    Config cfg;
+    cfg.firecracker_bin = "/bin/sh";
+    cfg::AppConfig app;
+    app.firecracker.binary_path = std::string("/bin/sh");
+    app.kernel.image_path = std::string("vmlinux.bin");
+    app.tools.drive_path = std::string("tools.ext4");
+    app.tools.version = std::string("1.2.3");
+    FirecrackerSandboxFactory factory(cfg, app);
+
+    RunnableSnapshotView snapshot;
+    snapshot.snapshot_id = "snap-committed";
+    snapshot.tools_drive_version = "1.2.3";
+    SnapshotManifestView manifest;
+    manifest.backend = "cloud-hypervisor";
+    manifest.vm_state_path = "/snap/vm_state.bin";
+
+    const core::Expected<std::unique_ptr<SandboxBackend>, core::AnyError> r =
+        factory.BuildFromSnapshot(snapshot, manifest, LaunchConfigFor(ResumedId()));
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+    MT_EXPECT_TRUE(r.error().chain().find("cloud-hypervisor") != std::string::npos);
+}
+
+MT_TEST(build_from_snapshot_without_an_app_config_says_so) {
+    // The projection reads the node's own defaults (tools drive, kernel), so
+    // a factory without them can only refuse -- rather than invent paths an
+    // operator is supposed to choose.
+    Config cfg;
+    FirecrackerSandboxFactory factory(cfg);
+
+    RunnableSnapshotView snapshot;
+    snapshot.snapshot_id = "snap-committed";
+    SnapshotManifestView manifest;
+    manifest.backend = "firecracker";
+
+    const core::Expected<std::unique_ptr<SandboxBackend>, core::AnyError> r =
+        factory.BuildFromSnapshot(snapshot, manifest, LaunchConfigFor(ResumedId()));
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+    MT_EXPECT_TRUE(r.error().chain().find("AppConfig") != std::string::npos);
+}
+
 MT_MAIN

@@ -147,10 +147,66 @@ FirecrackerSandboxFactory::Build(const FreshSandboxBuildSpec& spec,
 }
 
 core::Expected<std::unique_ptr<SandboxBackend>, core::AnyError>
-FirecrackerSandboxFactory::BuildFromSnapshot(const std::string& /*snapshot_id*/,
-                                             const SandboxLaunchConfig& /*config*/) {
-    return core::make_unexpected(
-        NotPorted("BuildFromSnapshot", "snapshot repository + ublk device"));
+FirecrackerSandboxFactory::BuildFromSnapshot(const RunnableSnapshotView& snapshot,
+                                             const SnapshotManifestView& manifest,
+                                             const SandboxLaunchConfig& config) {
+    if (!impl_->has_app_config) {
+        return core::make_unexpected(core::err(
+            "FirecrackerSandboxFactory::BuildFromSnapshot needs the node AppConfig "
+            "(construct the factory with one)"));
+    }
+
+    // Rust `FirecrackerSnapshotConfig::from_runnable_snapshot`. This is where
+    // a capture from another VMM, or from another virtualization mode, is
+    // refused -- before anything is created, because neither can be fixed.
+    const CommonConfig base = CommonConfig::New(
+        impl_->app_config.ResolvedFirecrackerBinaryPath(),
+        snapshot.tools_drive_version.empty() ? impl_->app_config.ResolvedToolsVersion()
+                                             : snapshot.tools_drive_version,
+        RuntimePolicy::FromAppConfig(impl_->app_config));
+    core::Expected<SnapshotConfig, std::string> projected =
+        SnapshotConfigFromRunnable(base, impl_->app_config, snapshot, manifest);
+    if (!projected.ok()) {
+        return core::make_unexpected(
+            core::err("firecracker build from snapshot: " + projected.error()));
+    }
+    SnapshotConfig snapshot_config = projected.value();
+
+    // Rust `snapshot_config_for_launch` — this launch's identity, network
+    // policy and volumes layered over the recorded config.
+    const core::Expected<core::Unit, std::string> applied = ApplyLaunchToSnapshotConfig(
+        &snapshot_config, config, core::Optional<std::string>());
+    if (!applied.ok()) {
+        return core::make_unexpected(
+            core::err("firecracker build from snapshot: " + applied.error()));
+    }
+
+    ResumeStartSpec spec;
+    spec.snapshot_config = snapshot_config;
+    spec.firecracker_bin = snapshot_config.common.firecracker_binary.empty()
+                               ? impl_->cfg.firecracker_bin
+                               : snapshot_config.common.firecracker_binary;
+    spec.chroot_base_dir = impl_->cfg.chroot_base_dir;
+    spec.sandbox_id = config.sandbox_id;
+    spec.firecracker_work_dir = snapshot_config.common.firecracker_work_base_dir;
+    spec.capture_output = snapshot_config.common.firecracker_log_level.has_value();
+    spec.socket_timeout_ms =
+        static_cast<int64_t>(snapshot_config.common.runtime_policy.socket_timeout_ms);
+    spec.socket_poll_ms =
+        static_cast<int64_t>(snapshot_config.common.runtime_policy.socket_poll_interval_ms);
+    spec.envd_timeout_ms =
+        static_cast<int64_t>(snapshot_config.common.runtime_policy.envd_timeout_ms);
+    spec.envd_poll_ms =
+        static_cast<int64_t>(snapshot_config.common.runtime_policy.envd_poll_interval_ms);
+    // Same as the paused-state path: Rust acquires the shared memory device in
+    // `start_resume`, and this port has no ublk client, so the refusal lands
+    // at start where Rust's own `ensure!` fires.
+    spec.mem_device_path = impl_->mem_device_path_for_testing;
+
+    std::unique_ptr<SandboxBackend> backend(
+        FirecrackerSandboxBackend::NewResuming(spec, impl_->connector_for_testing));
+    return core::Expected<std::unique_ptr<SandboxBackend>, core::AnyError>(
+        std::move(backend));
 }
 
 core::Expected<std::unique_ptr<SandboxBackend>, core::AnyError>

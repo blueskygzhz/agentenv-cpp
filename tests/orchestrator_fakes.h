@@ -164,6 +164,7 @@ class FakeFactory : public sandbox::SandboxBackendFactory {
 
     bool        fail_build = false;
     std::string last_snapshot_id;
+    sandbox::firecracker::SnapshotManifestView last_snapshot_manifest;
     std::string last_image_config_path;
     int         build_calls = 0;
     int         build_from_snapshot_calls = 0;
@@ -184,10 +185,14 @@ class FakeFactory : public sandbox::SandboxBackendFactory {
         return Make();
     }
     core::Expected<std::unique_ptr<sandbox::SandboxBackend>, core::AnyError>
-        BuildFromSnapshot(const std::string& snapshot_id,
+        BuildFromSnapshot(const sandbox::firecracker::RunnableSnapshotView& snapshot,
+                          const sandbox::firecracker::SnapshotManifestView& manifest,
                           const sandbox::SandboxLaunchConfig& config) override {
         ++build_from_snapshot_calls;
-        last_snapshot_id = snapshot_id;
+        // The id now travels inside the resolved snapshot rather than as the
+        // whole argument, so the assertions that read it still work.
+        last_snapshot_id = snapshot.snapshot_id;
+        last_snapshot_manifest = manifest;
         last_launch_config = config;
         return Make();
     }

@@ -121,14 +121,26 @@ MT_TEST(launch_plan_create_from_snapshot) {
     meta.id = core::SandboxId::Fresh();
     meta.resources.cpu_count = 1;
 
+    // The plan carries the resolved snapshot, as Rust's does. An id alone
+    // would leave the backend with nothing to resume from.
+    sandbox::firecracker::RunnableSnapshotView snapshot;
+    snapshot.snapshot_id = "snap-abc";
+    sandbox::firecracker::SnapshotManifestView manifest;
+    manifest.backend = "firecracker";
+    manifest.vm_state_path = "/snap/vm_state.bin";
+
     LaunchPlan p = LaunchPlan::ForCreateFromSnapshot(
-        meta.id, "snap-abc", sandbox::SandboxLaunchConfig(), meta,
+        meta.id, snapshot, manifest, sandbox::SandboxLaunchConfig(), meta,
         NewTimeout::None());
 
     MT_EXPECT_TRUE(p.TransitionalState() == SandboxState::Creating);
     MT_EXPECT_TRUE(p.kind == LaunchPlanKind::Create);
     MT_EXPECT_TRUE(p.create->source.kind == CreateLaunchSourceKind::Snapshot);
-    MT_EXPECT_EQ(p.create->source.snapshot_id, std::string("snap-abc"));
+    MT_EXPECT_EQ(p.create->source.snapshot.snapshot_id, std::string("snap-abc"));
+    // The manifest travels too -- it is where the capture's artifact paths
+    // live, and the resume reads them rather than looking the snapshot up.
+    MT_EXPECT_EQ(p.create->source.snapshot_manifest.vm_state_path,
+                 std::string("/snap/vm_state.bin"));
 }
 
 MT_MAIN

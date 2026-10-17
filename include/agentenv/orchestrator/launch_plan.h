@@ -29,10 +29,17 @@ struct CreateLaunchSource {
 
     /// Live when kind == Snapshot.
     ///
-    /// Rust carries `snapshot: Box<RunnableSnapshot>`. The runnable-snapshot
-    /// runtime is not ported yet, so the plan carries the snapshot id that
-    /// `SandboxBackendFactory::BuildFromSnapshot` resolves.
-    std::string snapshot_id;
+    /// Rust carries `snapshot: Box<RunnableSnapshot>` — the *resolved* bundle,
+    /// not an id. The resolution happens upstream in both ports (the launch
+    /// source already carries the record's mode, versions and resources), so
+    /// the backend is handed what it needs to resume rather than a key it
+    /// would have to look up again.
+    ///
+    /// Split into the two views the projection reads, because the library
+    /// dependency runs snapshot → sandbox and the sandbox layer cannot name
+    /// `RunnableSnapshot` itself.
+    sandbox::firecracker::RunnableSnapshotView snapshot;
+    sandbox::firecracker::SnapshotManifestView snapshot_manifest;
 
     /// Live when kind == Fresh. Rust `build_spec: Box<FreshSandboxBuildSpec>`.
     std::shared_ptr<sandbox::FreshSandboxBuildSpec> build_spec;
@@ -66,11 +73,17 @@ struct LaunchPlan {
     std::shared_ptr<ResumeLaunchPlan> resume;
 
     /// Rust `LaunchPlan::for_create_from_snapshot`.
-    static LaunchPlan ForCreateFromSnapshot(core::SandboxId id,
-                                            std::string snapshot_id,
-                                            sandbox::SandboxLaunchConfig launch_config,
-                                            SandboxMetadata meta,
-                                            NewTimeout timeout);
+    ///
+    /// Takes the resolved snapshot, as Rust does. The id alone is not enough:
+    /// a resume needs the capture's own artifact paths, and nothing
+    /// downstream of here can resolve them.
+    static LaunchPlan ForCreateFromSnapshot(
+        core::SandboxId id,
+        sandbox::firecracker::RunnableSnapshotView snapshot,
+        sandbox::firecracker::SnapshotManifestView manifest,
+        sandbox::SandboxLaunchConfig launch_config,
+        SandboxMetadata meta,
+        NewTimeout timeout);
 
     /// Rust `LaunchPlan::for_create_fresh`.
     static LaunchPlan ForCreateFresh(core::SandboxId id,

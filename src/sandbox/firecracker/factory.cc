@@ -10,6 +10,83 @@ namespace agentenv {
 namespace sandbox {
 namespace firecracker {
 
+core::Expected<core::Unit, std::string> ApplyLaunchToSnapshotConfig(
+    SnapshotConfig* config, const SandboxLaunchConfig& launch_config,
+    const core::Optional<std::string>& snapshot_custom_extension_params) {
+    if (config == NULL) return core::make_unexpected(std::string("null snapshot config"));
+
+    // Checked before anything is layered on. Firecracker cannot add a
+    // virtio-block device after a restore, so every launch-time volume must
+    // occupy a slot the snapshot reserved on its first boot -- a shortfall can
+    // never be satisfied later, and dropping the surplus would boot a sandbox
+    // whose caller finds its mount points empty.
+    if (launch_config.extra_drives.size() > config->common.volume_drive_slots) {
+        std::ostringstream why;
+        why << "snapshot supports at most " << config->common.volume_drive_slots
+            << " launch-time volume drives, requested " << launch_config.extra_drives.size();
+        return core::make_unexpected(why.str());
+    }
+
+    // Appended, not replaced: the snapshot's own drives keep their slots and
+    // the launch's volumes take the reserved ones after them.
+    config->common.extra_drives.insert(config->common.extra_drives.end(),
+                                       launch_config.extra_drives.begin(),
+                                       launch_config.extra_drives.end());
+
+    // A committed snapshot is shared, so the document it recorded names
+    // whichever sandbox captured it. This launch's identity replaces it
+    // wholesale rather than being patched over, which is the difference from
+    // the paused-state path: there the capture is already this sandbox's.
+    //
+    // `WithExtra` drops reserved keys, so API-supplied extras cannot override
+    // the identity or the token hash.
+    config->common.mmds_metadata = core::Optional<MmdsMetadata>(
+        MmdsMetadata(launch_config.sandbox_id, launch_config.snapshot_id)
+            .WithAccessToken(launch_config.envd_access_token)
+            .WithExtra(launch_config.extra_mmds));
+    config->common.envd_access_token = launch_config.envd_access_token;
+    config->common.network_policy = launch_config.network;
+
+    // Launch-provided custom params override the snapshot's; absent inherits.
+    if (launch_config.custom_extension_params.has_value()) {
+        config->common.custom_extension_params_json =
+            core::Optional<std::string>(launch_config.custom_extension_params->json_bytes);
+    } else {
+        config->common.custom_extension_params_json = snapshot_custom_extension_params;
+    }
+
+    // Rust `get_or_insert_default().extend(..)` — merged over the snapshot's
+    // own, not substituted for them: the image's defaults still apply to every
+    // key this launch does not name.
+    if (launch_config.env_vars.has_value()) {
+        if (!config->common.env_vars.has_value()) {
+            config->common.env_vars =
+                core::Optional<std::map<std::string, std::string> >(
+                    std::map<std::string, std::string>());
+        }
+        for (std::map<std::string, std::string>::const_iterator it =
+                 launch_config.env_vars->begin();
+             it != launch_config.env_vars->end(); ++it) {
+            (*config->common.env_vars)[it->first] = it->second;
+        }
+    }
+    return core::Unit{};
+}
+
+std::vector<std::pair<std::size_t, ExtraDrive> >
+InitialGuestDriveMountsForSnapshotLaunch(const SnapshotConfig& config,
+                                         const SandboxLaunchConfig& launch_config) {
+    std::vector<std::pair<std::size_t, ExtraDrive> > mounts;
+    // Already bound before the load, so there is nothing to patch afterwards.
+    if (launch_config.extra_drives_in_snapshot) return mounts;
+
+    const std::size_t first_slot = config.common.physical_extra_drive_count;
+    for (std::size_t i = 0; i < launch_config.extra_drives.size(); ++i) {
+        mounts.push_back(std::make_pair(first_slot + i, launch_config.extra_drives[i]));
+    }
+    return mounts;
+}
+
 core::Expected<core::Unit, std::string> PrepareSnapshotConfigForResume(
     SnapshotConfig* config, const core::SandboxId& sandbox_id,
     const core::Optional<EnvdAccessToken>& envd_access_token) {

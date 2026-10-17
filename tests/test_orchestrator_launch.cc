@@ -185,13 +185,22 @@ MT_TEST(launch_sandbox_snapshot_source_dispatches_to_build_from_snapshot) {
     sandbox::SandboxLaunchConfig config;
     config.sandbox_id = meta.id;
 
+    sandbox::firecracker::RunnableSnapshotView snapshot;
+    snapshot.snapshot_id = "snap-42";
+    sandbox::firecracker::SnapshotManifestView manifest;
+    manifest.vm_state_path = "/snap/42/vm_state.bin";
+
     OrchestratorResult<SandboxMetadata> launched = f.orch->LaunchSandbox(
-        LaunchPlan::ForCreateFromSnapshot(meta.id, "snap-42", config, meta,
+        LaunchPlan::ForCreateFromSnapshot(meta.id, snapshot, manifest, config, meta,
                                           NewTimeout::None()));
     MT_EXPECT_TRUE(launched.ok());
     MT_EXPECT_EQ(f.factory->build_from_snapshot_calls, 1);
     MT_EXPECT_EQ(f.factory->build_calls, 0);
     MT_EXPECT_EQ(f.factory->last_snapshot_id, std::string("snap-42"));
+    // The manifest reaches the factory, not just the id: without it the
+    // backend has no capture to resume from.
+    MT_EXPECT_EQ(f.factory->last_snapshot_manifest.vm_state_path,
+                 std::string("/snap/42/vm_state.bin"));
 }
 
 MT_TEST(launch_sandbox_resume_plan_dispatches_to_build_from_paused_state) {

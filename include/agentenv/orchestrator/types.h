@@ -17,6 +17,9 @@
 #include "agentenv/core/virtualization.h"
 #include "agentenv/sandbox/custom_extension.h"
 #include "agentenv/sandbox/extra_drive.h"
+// `SnapshotManifestView` — the capture's artifact paths, carried on a snapshot
+// launch source. Header-only use: the view is a plain struct.
+#include "agentenv/sandbox/firecracker/config.h"
 #include "agentenv/sandbox/network/policy.h"
 #include "agentenv/sandbox/types.h"
 #include "agentenv/snapshot/record.h"
@@ -83,6 +86,14 @@ struct SandboxLaunchSource {
     core::Optional<sandbox::custom_extension::Params> snapshot_custom_extension_params;
     /// Rust `*snapshot.resources()`.
     sandbox::SandboxResources snapshot_resources;
+    /// Rust `snapshot.manifest()` — the hydrated node-local manifest, which is
+    /// where the capture's own artifact paths live.
+    ///
+    /// Rust's plan carries the whole `RunnableSnapshot` and the backend reads
+    /// the manifest off it. This port's plan used to carry only the snapshot
+    /// id, which left the backend nothing to resume *from*; the manifest
+    /// travels with the source for the same reason the resources do.
+    sandbox::firecracker::SnapshotManifestView snapshot_manifest;
 
     // ---- Kind::Image ----
     /// Rust `image_ref`.

@@ -34,6 +34,38 @@ namespace firecracker {
 ///
 /// Rust reads `ConfigManager::global_config()`; the config is a parameter here
 /// so the projection can be tested without installing a global.
+/// Rust `FirecrackerSandbox::snapshot_config_for_launch` — layer this launch's
+/// inputs onto a committed snapshot's recorded config.
+///
+/// Distinct from `PrepareSnapshotConfigForResume`, which revives *this node's
+/// own* paused capture: there the config is already this sandbox's and only
+/// the identity is restated, whereas here a shared committed snapshot is being
+/// launched as a brand-new sandbox, so the launch supplies the whole of its
+/// identity, its network policy and its extra drives.
+///
+/// The volume check comes first and is a hard error: Firecracker cannot add a
+/// virtio-block device after a restore, so a launch asking for more volumes
+/// than the snapshot reserved slots for can never be satisfied — and silently
+/// dropping the surplus would boot a sandbox whose caller finds its mount
+/// points empty.
+core::Expected<core::Unit, std::string> ApplyLaunchToSnapshotConfig(
+    SnapshotConfig* config, const SandboxLaunchConfig& launch_config,
+    const core::Optional<std::string>& snapshot_custom_extension_params);
+
+/// Rust `FirecrackerSandbox::initial_guest_drive_mounts_for_snapshot_launch`.
+///
+/// The `(slot_index, drive)` pairs for volumes that are *not* already in the
+/// source state and so were loaded as placeholders. Empty when
+/// `extra_drives_in_snapshot` is set, because those were bound before the load
+/// and need no patch afterwards.
+///
+/// Slot indices start at `physical_extra_drive_count`: the physical drives
+/// occupy the slots before it, and a volume bound into one of those would be
+/// mounted as the wrong filesystem.
+std::vector<std::pair<std::size_t, ExtraDrive> >
+    InitialGuestDriveMountsForSnapshotLaunch(const SnapshotConfig& config,
+                                             const SandboxLaunchConfig& launch_config);
+
 /// Rust `FirecrackerSandbox::from_snapshot_config_with_override` — prepare a
 /// captured config for a resume under a new sandbox id.
 ///

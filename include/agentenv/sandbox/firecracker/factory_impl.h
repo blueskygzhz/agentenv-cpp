@@ -70,8 +70,11 @@ class FirecrackerSandboxFactory : public SandboxBackendFactory {
     core::Expected<std::unique_ptr<SandboxBackend>, core::AnyError>
         Build(const FreshSandboxBuildSpec& spec, const SandboxLaunchConfig& config) override;
 
+    /// Rust `build_from_snapshot` — `snapshot_config_for_launch` then a
+    /// `LaunchMode::Resume` sandbox.
     core::Expected<std::unique_ptr<SandboxBackend>, core::AnyError>
-        BuildFromSnapshot(const std::string& snapshot_id,
+        BuildFromSnapshot(const RunnableSnapshotView& snapshot,
+                          const SnapshotManifestView& manifest,
                           const SandboxLaunchConfig& config) override;
 
     core::Expected<std::unique_ptr<SandboxBackend>, core::AnyError>

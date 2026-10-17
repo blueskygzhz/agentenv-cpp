@@ -31,6 +31,14 @@
 namespace agentenv {
 namespace sandbox {
 
+// Declared, not included: `firecracker/config.h` includes this header, so
+// naming these by definition would be circular. The factory only passes them
+// by reference, which a declaration is enough for.
+namespace firecracker {
+struct RunnableSnapshotView;
+struct SnapshotManifestView;
+}  // namespace firecracker
+
 // ---------------------------------------------------------------------------
 // Rust `RuntimeArtifactSet`
 // ---------------------------------------------------------------------------
@@ -258,9 +266,18 @@ class SandboxBackendFactory {
         Build(const FreshSandboxBuildSpec& spec,
               const SandboxLaunchConfig& config) = 0;
 
-    /// Rust `build_from_snapshot`.
+    /// Rust `build_from_snapshot(&RunnableSnapshot, SandboxLaunchConfig)`.
+    ///
+    /// Takes the *resolved* snapshot, not an id. Rust resolves it upstream and
+    /// hands the bundle down; this used to take an id, which left the backend
+    /// with a key and no way to look it up — so the method could only refuse.
+    ///
+    /// The bundle arrives as the two views the projection reads, because the
+    /// library dependency runs snapshot → sandbox and this layer cannot name
+    /// `RunnableSnapshot`.
     virtual core::Expected<std::unique_ptr<SandboxBackend>, core::AnyError>
-        BuildFromSnapshot(const std::string& snapshot_id,
+        BuildFromSnapshot(const firecracker::RunnableSnapshotView& snapshot,
+                          const firecracker::SnapshotManifestView& manifest,
                           const SandboxLaunchConfig& config) = 0;
 
     /// Rust `build_from_paused_state`.
