@@ -71,7 +71,11 @@ agentenv_add_test(test_p2p                 test_p2p.cc                 agentenv-
 # Rust: the catalog tests in src/p2p/iroh/{catalog,endpoint}.rs.
 agentenv_add_test(test_p2p_catalog         test_p2p_catalog.cc         agentenv-p2p)
 agentenv_add_test(test_storage_util        test_storage_util.cc        agentenv-storage-util)
+# Rust: storage/util/src/io_ring/ — the submission path ublk commands ride on
+agentenv_add_test(test_io_ring             test_io_ring.cc             agentenv-storage-util)
 agentenv_add_test(test_storage_overlaybd   test_storage_overlaybd.cc   agentenv-overlaybd agentenv-ublk)
+# Rust: storage/ublk/src/ctrl.rs — the eight control commands + ublk ABI layout
+agentenv_add_test(test_ublk_ctrl           test_ublk_ctrl.cc           agentenv-ublk)
 agentenv_add_test(test_lsmt                test_lsmt.cc                agentenv-overlaybd)
 agentenv_add_test(test_lsmt_bptree         test_lsmt_bptree.cc         agentenv-overlaybd)
 agentenv_add_test(test_scheduler           test_scheduler.cc           agentenv-scheduler-internal)

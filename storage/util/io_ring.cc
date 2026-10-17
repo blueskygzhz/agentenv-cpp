@@ -312,7 +312,7 @@ core::Expected<std::unique_ptr<Ring>, std::string> Ring::Open(const IoRingConfig
         }
     }
 
-    return ring;
+    return std::move(ring);
 }
 
 core::Expected<uint32_t, std::string> Ring::Submit(const SubmissionEntry& entry) {
@@ -339,6 +339,12 @@ core::Expected<uint32_t, std::string> Ring::SubmitAndWait(const SubmissionEntry&
         // Full. Reported rather than waited on: the caller owns the retry
         // policy, and blocking here on the thread that also reaps would
         // deadlock against the completions that would free a slot.
+        //
+        // NOTE: hard to reach from a single-threaded caller, since the kernel
+        // consumes entries as fast as they are staged. The test for it accepts
+        // either outcome, so this branch is reasoned-about rather than
+        // observed -- the unsigned subtraction is deliberate and handles the
+        // wrap of `tail` past UINT32_MAX.
         return core::make_unexpected(std::string("io_ring: submission queue full"));
     }
 
@@ -349,6 +355,11 @@ core::Expected<uint32_t, std::string> Ring::SubmitAndWait(const SubmissionEntry&
     if (sqe128_) {
         // Always written, even when the payload is short: the slot may hold a
         // previous command's tail, and the kernel reads all 80 bytes of `cmd`.
+        //
+        // NOTE: the doubled stride above and this copy are only exercised on a
+        // kernel with `IORING_SETUP_SQE128` (5.19+). On an older one the
+        // sqe128 tests skip, so a wrong stride here would not be caught --
+        // treat changes to either line as unverified until run on 5.19+.
         std::memcpy(slot + sizeof(Sqe), entry.CmdTail(), sizeof(Sqe));
     }
 
