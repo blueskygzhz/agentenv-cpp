@@ -14,44 +14,67 @@ SnapshotListFilter SnapshotListFilter::Templates() {
     return f;
 }
 
+SnapshotListFilter SnapshotListFilter::ByIds(const std::vector<core::SnapshotId>& ids) {
+    SnapshotListFilter f;
+    f.snapshot_ids = ids;
+    return f;
+}
+
 bool SnapshotListFilter::Matches(const SnapshotRecord& r) const {
+    // Rust leaves matching to each backend; the posix-fs catalog had the only
+    // correct implementation and every other backend would have needed its
+    // own copy. It lives here now so there is one set of rules, and the
+    // catalog's `MatchesRecordFilter` forwards to it.
     if (alias_prefix.has_value()) {
-        const std::string& pfx = *alias_prefix;
-        if (r.alias.compare(0, pfx.size(), pfx) != 0) return false;
+        // An unaliased record cannot match a prefix. The length test matters:
+        // `compare` on a short string would read past its end.
+        if (!r.alias.has_value()) return false;
+        const std::string alias = r.alias->ToString();
+        if (alias.size() < alias_prefix->size() ||
+            alias.compare(0, alias_prefix->size(), *alias_prefix) != 0) {
+            return false;
+        }
     }
+
     if (snapshot_ids.has_value()) {
-        const std::vector<std::string>& ids = *snapshot_ids;
         bool found = false;
-        for (size_t i = 0; i < ids.size(); ++i) {
-            if (ids[i] == r.id) { found = true; break; }
+        for (std::size_t i = 0; i < snapshot_ids->size(); ++i) {
+            if ((*snapshot_ids)[i] == r.id) { found = true; break; }
         }
         if (!found) return false;
     }
+
     if (snapshot_id_or_alias.has_value()) {
-        const std::string& v = *snapshot_id_or_alias;
-        if (r.id != v && r.alias != v) return false;
+        const bool id_matches = r.id.ToString() == *snapshot_id_or_alias;
+        const bool alias_matches =
+            r.alias.has_value() && r.alias->ToString() == *snapshot_id_or_alias;
+        if (!id_matches && !alias_matches) return false;
     }
+
     if (source_sandbox_id.has_value()) {
-        if (r.source != SnapshotSourceKind::Sandbox) return false;
-        if (r.source_sandbox_id != *source_sandbox_id) return false;
+        // Only a sandbox-sourced record can match; a template never does.
+        if (r.source.kind != SnapshotSourceKind::Sandbox) return false;
+        if (r.source.source_sandbox_id != *source_sandbox_id) return false;
     }
+
     if (sources.has_value()) {
-        const std::vector<SnapshotSourceKind>&ss = *sources;
         bool found = false;
-        for (size_t i = 0; i < ss.size(); ++i) {
-            if (ss[i] == r.source) { found = true; break; }
+        for (std::size_t i = 0; i < sources->size(); ++i) {
+            if ((*sources)[i] == r.source.kind) { found = true; break; }
         }
         if (!found) return false;
     }
+
     if (template_statuses.has_value()) {
-        if (r.source != SnapshotSourceKind::Template) return false;
-        const std::vector<TemplateBuildStatus>& ts = *template_statuses;
+        // A status filter implies a template: a sandbox record has no build.
+        if (r.source.kind != SnapshotSourceKind::Template) return false;
         bool found = false;
-        for (size_t i = 0; i < ts.size(); ++i) {
-            if (ts[i] == r.build_status) { found = true; break; }
+        for (std::size_t i = 0; i < template_statuses->size(); ++i) {
+            if ((*template_statuses)[i] == r.source.build.status) { found = true; break; }
         }
         if (!found) return false;
     }
+
     return true;
 }
 

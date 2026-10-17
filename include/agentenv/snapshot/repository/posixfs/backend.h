@@ -4,12 +4,12 @@
 // Bundles the durable POSIX repository state (catalog + artifact stores) with
 // the node-local runtime resolver.
 //
-// Porting note. Rust's `PosixFsBackend` also wraps both stores in a
-// `PosixFsSnapshotRepository` that implements the async `SnapshotRepository`
-// trait. That adapter is not ported yet — `repository::SnapshotRepository` in
-// `interfaces.h` is still the scaffold subset — so the backend exposes the two
-// stores directly. Callers get the same components; only the trait object is
-// missing.
+// Porting note. Rust's `PosixFsBackend` wraps both stores in a
+// `PosixFsSnapshotRepository` that implements the `SnapshotRepository` trait,
+// and so does this port now. That adapter was blocked for a long time because
+// `interfaces.h` carried a cut-down `SnapshotRecord` of its own, which no
+// object could satisfy alongside the catalog store's real one; with the two
+// unified, the adapter is a plain forward.
 #ifndef AGENTENV_SNAPSHOT_REPOSITORY_POSIXFS_BACKEND_H_
 #define AGENTENV_SNAPSHOT_REPOSITORY_POSIXFS_BACKEND_H_
 
@@ -18,6 +18,8 @@
 
 #include "agentenv/core/optional.h"
 #include "agentenv/snapshot/artifact_cache.h"
+// `SnapshotRepository` — `PosixFsSnapshotRepository` below implements it.
+#include "agentenv/snapshot/repository/interfaces.h"
 #include "agentenv/snapshot/repository/posixfs/artifacts.h"
 #include "agentenv/snapshot/repository/posixfs/catalog.h"
 #include "agentenv/snapshot/repository/posixfs/runtime.h"
@@ -65,11 +67,12 @@ class PosixFsSnapshotRepository : public SnapshotRepository {
     RepositoryResult<std::vector<SnapshotRecord> >
         List(const SnapshotListFilter& filter) override;
     RepositoryResult<core::Unit> Delete(const std::string& id_or_alias) override;
-    RepositoryResult<core::Optional<std::string> >
+    RepositoryResult<core::Optional<core::SnapshotId> >
         ResolveAlias(const std::string& alias) override;
-    RepositoryResult<SnapshotRecord> TryStartBuild(const std::string& id) override;
+    RepositoryResult<SnapshotRecord> TryStartBuild(const core::SnapshotId& id) override;
     RepositoryResult<core::Unit>
-        MarkBuildError(const std::string& id, const std::string& reason) override;
+        MarkBuildError(const core::SnapshotId& id,
+                       const TemplateBuildErrorReason& reason) override;
 
     // ---- volume catalog ---------------------------------------------------
     //

@@ -25,6 +25,9 @@
 #include "agentenv/core/optional.h"
 #include "agentenv/snapshot/record.h"
 #include "agentenv/snapshot/repository/errors.h"
+// `SnapshotListFilter` / `VolumeRecordPage` — shared with the repository
+// interface rather than redeclared here.
+#include "agentenv/snapshot/repository/interfaces.h"
 #include "agentenv/snapshot/repository/posixfs/layout.h"
 #include "agentenv/volume/record.h"
 
@@ -36,26 +39,10 @@ namespace posixfs {
 /// Rust `FILE_LOCK_TIMEOUT`.
 const int64_t kFileLockTimeoutMs = 10000;
 
-/// Rust `struct SnapshotListFilter` (src/snapshot/repository/interfaces.rs).
-///
-/// Every field is an independent conjunct: an absent one matches everything.
-struct SnapshotListFilter {
-    core::Optional<std::string> alias_prefix;
-    core::Optional<std::vector<core::SnapshotId> > snapshot_ids;
-    /// A single id *or* exact alias, whichever matches.
-    core::Optional<std::string> snapshot_id_or_alias;
-    /// Only matches records whose source is `Sandbox`.
-    core::Optional<std::string> source_sandbox_id;
-    core::Optional<std::vector<SnapshotSourceKind> > sources;
-    core::Optional<std::vector<TemplateBuildStatus> > template_statuses;
-};
-
-/// Rust `struct VolumeRecordPage`.
-struct VolumeRecordPage {
-    std::vector<volume::VolumeRecord> records;
-    /// Absent on the last page.
-    core::Optional<std::string> next_volume_id;
-};
+// `SnapshotListFilter` and `VolumeRecordPage` used to be declared again here,
+// field for field. They belong to the repository interface, not to this
+// backend, so they now come from `interfaces.h` — one definition, which is
+// what lets a `SnapshotRepository` adapter over this store typecheck at all.
 
 /// Rust `struct BuildCacheState` (src/snapshot/repository/build_cache.rs).
 struct BuildCacheState {

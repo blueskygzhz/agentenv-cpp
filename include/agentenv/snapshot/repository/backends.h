@@ -23,10 +23,12 @@ class InMemorySnapshotRepository : public SnapshotRepository {
     RepositoryResult<core::Optional<SnapshotRecord> > Get(const std::string& id_or_alias) override;
     RepositoryResult<std::vector<SnapshotRecord> > List(const SnapshotListFilter& filter) override;
     RepositoryResult<core::Unit> Delete(const std::string& id_or_alias) override;
-    RepositoryResult<core::Optional<std::string> > ResolveAlias(const std::string& alias) override;
-    RepositoryResult<SnapshotRecord> TryStartBuild(const std::string& id) override;
-    RepositoryResult<core::Unit> MarkBuildError(const std::string& id,
-                                                const std::string& reason) override;
+    RepositoryResult<core::Optional<core::SnapshotId> >
+        ResolveAlias(const std::string& alias) override;
+    RepositoryResult<SnapshotRecord> TryStartBuild(const core::SnapshotId& id) override;
+    RepositoryResult<core::Unit>
+        MarkBuildError(const core::SnapshotId& id,
+                       const TemplateBuildErrorReason& reason) override;
  private:
     core::Optional<SnapshotRecord> FindLocked(const std::string& id_or_alias) const;
     mutable std::mutex mu_;

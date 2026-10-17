@@ -572,64 +572,10 @@ RepositoryResult<core::Optional<SnapshotRecord> > PosixFsCatalogStore::Get(
 
 bool PosixFsCatalogStore::MatchesRecordFilter(const SnapshotRecord& record,
                                               const SnapshotListFilter& filter) {
-    if (filter.alias_prefix.has_value()) {
-        if (!record.alias.has_value()) return false;
-        const std::string alias = record.alias->ToString();
-        if (alias.size() < filter.alias_prefix->size() ||
-            alias.compare(0, filter.alias_prefix->size(), *filter.alias_prefix) != 0) {
-            return false;
-        }
-    }
-
-    if (filter.snapshot_ids.has_value()) {
-        bool found = false;
-        for (std::size_t i = 0; i < filter.snapshot_ids->size(); ++i) {
-            if ((*filter.snapshot_ids)[i] == record.id) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-
-    if (filter.snapshot_id_or_alias.has_value()) {
-        const bool id_matches = record.id.ToString() == *filter.snapshot_id_or_alias;
-        const bool alias_matches =
-            record.alias.has_value() && record.alias->ToString() == *filter.snapshot_id_or_alias;
-        if (!id_matches && !alias_matches) return false;
-    }
-
-    if (filter.source_sandbox_id.has_value()) {
-        // Only a sandbox-sourced record can match; a template never does.
-        if (record.source.kind != SnapshotSourceKind::Sandbox) return false;
-        if (record.source.source_sandbox_id != *filter.source_sandbox_id) return false;
-    }
-
-    if (filter.sources.has_value()) {
-        bool found = false;
-        for (std::size_t i = 0; i < filter.sources->size(); ++i) {
-            if ((*filter.sources)[i] == record.source.kind) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-
-    if (filter.template_statuses.has_value()) {
-        // A status filter implies a template: a sandbox record has no build.
-        if (record.source.kind != SnapshotSourceKind::Template) return false;
-        bool found = false;
-        for (std::size_t i = 0; i < filter.template_statuses->size(); ++i) {
-            if ((*filter.template_statuses)[i] == record.source.build.status) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) return false;
-    }
-
-    return true;
+    // The rules live on the filter itself now. They were here because this
+    // was the only backend that implemented them; keeping a second copy would
+    // mean a filter behaving differently depending on which backend ran it.
+    return filter.Matches(record);
 }
 
 namespace {
