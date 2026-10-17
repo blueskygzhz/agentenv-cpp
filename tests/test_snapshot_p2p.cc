@@ -3,6 +3,7 @@
 #include "agentenv/snapshot/p2p.h"
 
 #include <cstdio>
+#include <fstream>
 #include <set>
 #include <string>
 #include <vector>
@@ -385,6 +386,130 @@ MT_TEST(snapshot_p2p_publish_to_disabled_transport_succeeds) {
     // accepts it as a no-op.
     MT_EXPECT_TRUE(SnapshotP2pArtifact::Fixed(id.value(), "vm_state.bin", "/tmp/vm")
                        .Publish(transport).ok());
+}
+
+// ============================================================
+// Rust: storage/overlaybd/src/layer/layer_metadata.rs ::
+//   resolve_local_layer_path / read_overlaybd_layer_is_sparse_rw
+//
+// Both were missing from the port while `lsmt.h` already carried the
+// underlying `IsSparseRw()` bit read -- the wrappers over it were never
+// written. This file already builds a sealed layer, so it is where they can
+// be exercised against real bytes.
+// ============================================================
+
+MT_TEST(resolve_local_layer_path_prefers_an_explicit_file) {
+    storage::overlaybd::LayerConfig layer;
+    layer.file = "/img/explicit.commit";
+    layer.dir = "/img/ignored";
+    const core::Optional<std::string> resolved =
+        storage::overlaybd::ResolveLocalLayerPath(layer);
+    MT_EXPECT_TRUE(resolved.has_value());
+    if (resolved.has_value()) MT_EXPECT_EQ(*resolved, std::string("/img/explicit.commit"));
+}
+
+MT_TEST(resolve_local_layer_path_refuses_a_remote_file) {
+    // A `file` carrying a scheme names a remote blob. Returning it would hand
+    // a URL to a caller that is about to open(2) it, and the failure would
+    // name a path that was never a path.
+    storage::overlaybd::LayerConfig layer;
+    layer.file = "https://registry.example/blobs/sha256:abc";
+    MT_EXPECT_TRUE(!storage::overlaybd::ResolveLocalLayerPath(layer).has_value());
+}
+
+MT_TEST(resolve_local_layer_path_probes_commit_then_sealed) {
+    TempRoot root;
+    storage::overlaybd::LayerConfig layer;
+    layer.dir = root.path;
+
+    // Neither file present: nothing, rather than a path that cannot be opened.
+    MT_EXPECT_TRUE(!storage::overlaybd::ResolveLocalLayerPath(layer).has_value());
+
+    // Only sealed present: it is found.
+    const std::string sealed =
+        core::fs::Join(root.path, storage::overlaybd::kSealedFileName);
+    { std::ofstream f(sealed.c_str()); f << "x"; }
+    const core::Optional<std::string> only_sealed =
+        storage::overlaybd::ResolveLocalLayerPath(layer);
+    MT_EXPECT_TRUE(only_sealed.has_value());
+    if (only_sealed.has_value()) MT_EXPECT_EQ(*only_sealed, sealed);
+
+    // With both present, commit wins -- the probe order is part of the
+    // contract, not an accident of which file happens to exist.
+    const std::string commit =
+        core::fs::Join(root.path, storage::overlaybd::kCommitFileName);
+    { std::ofstream f(commit.c_str()); f << "x"; }
+    const core::Optional<std::string> both =
+        storage::overlaybd::ResolveLocalLayerPath(layer);
+    MT_EXPECT_TRUE(both.has_value());
+    if (both.has_value()) MT_EXPECT_EQ(*both, commit);
+}
+
+MT_TEST(resolve_local_layer_path_with_nothing_set_is_absent) {
+    MT_EXPECT_TRUE(
+        !storage::overlaybd::ResolveLocalLayerPath(storage::overlaybd::LayerConfig())
+             .has_value());
+}
+
+MT_TEST(is_sparse_rw_reads_the_header_not_the_trailer) {
+    // The flag is written when the layer is created. Reading it from the
+    // trailer would fail on exactly the layers this predicate identifies: an
+    // RW layer has no sealed trailer at all.
+    TempRoot root;
+    const std::string plain = core::fs::Join(root.path, "plain.commit");
+    WriteSealedLayer(plain, "0192f3a1-4c5d-7e80-9abc-def012345678");
+
+    const core::Expected<bool, std::string> not_sparse =
+        storage::overlaybd::ReadOverlaybdLayerIsSparseRw(plain);
+    MT_EXPECT_TRUE(not_sparse.ok());
+    if (not_sparse.ok()) MT_EXPECT_TRUE(!not_sparse.value());
+}
+
+MT_TEST(is_sparse_rw_sees_the_flag_when_set) {
+    using storage::overlaybd::lsmt::HeaderTrailer;
+    TempRoot root;
+    const std::string path = core::fs::Join(root.path, "sparse.commit");
+
+    // Header only, with the sparse-RW bit set and no trailer -- the shape of a
+    // live RW layer.
+    const size_t block = static_cast<size_t>(HeaderTrailer::kSpace);
+    std::vector<uint8_t> image(block, 0);
+    HeaderTrailer header = HeaderTrailer::New();
+    header.SetHeader();
+    header.SetDataFile();
+    header.SetSparseRw();
+    header.virtual_size = block;
+    uint8_t bytes[HeaderTrailer::kOnDiskSize];
+    header.Serialize(bytes);
+    for (size_t i = 0; i < sizeof(bytes); ++i) image[i] = bytes[i];
+    {
+        std::ofstream f(path.c_str(), std::ios::binary);
+        f.write(reinterpret_cast<const char*>(&image[0]),
+                static_cast<std::streamsize>(image.size()));
+    }
+
+    const core::Expected<bool, std::string> sparse =
+        storage::overlaybd::ReadOverlaybdLayerIsSparseRw(path);
+    MT_EXPECT_TRUE(sparse.ok());
+    if (sparse.ok()) MT_EXPECT_TRUE(sparse.value());
+}
+
+MT_TEST(is_sparse_rw_rejects_a_file_that_is_not_a_layer) {
+    TempRoot root;
+    const std::string garbage = core::fs::Join(root.path, "garbage.bin");
+    {
+        std::ofstream f(garbage.c_str(), std::ios::binary);
+        const std::vector<char> filler(
+            static_cast<size_t>(storage::overlaybd::lsmt::HeaderTrailer::kSpace), 'q');
+        f.write(&filler[0], static_cast<std::streamsize>(filler.size()));
+    }
+    // Magic fails, so this is an error rather than a silent `false` -- which
+    // a caller would read as "a normal sealed layer".
+    MT_EXPECT_TRUE(!storage::overlaybd::ReadOverlaybdLayerIsSparseRw(garbage).ok());
+
+    const std::string tiny = core::fs::Join(root.path, "tiny.bin");
+    { std::ofstream f(tiny.c_str()); f << "short"; }
+    MT_EXPECT_TRUE(!storage::overlaybd::ReadOverlaybdLayerIsSparseRw(tiny).ok());
 }
 
 int main() { return microtest::RunAll(); }

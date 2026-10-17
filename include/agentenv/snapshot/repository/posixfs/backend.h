@@ -101,6 +101,11 @@ class PosixFsBackend {
     const std::shared_ptr<PosixFsCatalogStore>&  catalog_store() const { return catalog_store_; }
     const std::shared_ptr<PosixFsArtifactStore>& artifact_store() const { return artifact_store_; }
 
+    /// Rust `repository()` — the `SnapshotRepository` face over this
+    /// backend's catalog. Built on first use and shared thereafter, so every
+    /// caller talks to the same catalog and its file locks.
+    std::shared_ptr<SnapshotRepository> repository();
+
     /// Rust `runtime_resolver`.
     const std::shared_ptr<PosixFsRuntimeResolver>& runtime_resolver() const {
         return runtime_resolver_;
@@ -110,6 +115,8 @@ class PosixFsBackend {
     std::shared_ptr<PosixFsCatalogStore>   catalog_store_;
     std::shared_ptr<PosixFsArtifactStore>  artifact_store_;
     std::shared_ptr<PosixFsRuntimeResolver> runtime_resolver_;
+    /// Built lazily by `repository()`.
+    std::shared_ptr<SnapshotRepository>    repository_;
 };
 
 }  // namespace posixfs
