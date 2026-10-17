@@ -149,6 +149,36 @@ MT_TEST(a_missing_node_is_waited_for_then_given_up_on) {
     ::rmdir(dir.c_str());
 }
 
+MT_TEST(a_node_that_exists_but_is_not_yet_readable_is_waited_for) {
+    if (::geteuid() == 0) {
+        // root bypasses the mode bits, so the EACCES this needs cannot be
+        // produced.
+        Skip("permission retry", "running as root; EACCES is not reachable");
+        return;
+    }
+    const std::string dir = MakeTempDir();
+    if (dir.empty()) return;
+    const std::string path = dir + "/cdev";
+    const int made = ::open(path.c_str(), O_CREAT | O_RDWR, 0600);
+    MT_EXPECT_TRUE(made >= 0);
+    if (made >= 0) ::close(made);
+    // Present but unopenable. udev creates the node first and fixes its
+    // ownership a moment later, so this is the second half of the same race
+    // ENOENT covers -- not retrying it fails on every host where udev is
+    // slower than the kernel.
+    MT_EXPECT_TRUE(::chmod(path.c_str(), 0) == 0);
+
+    core::Expected<int, std::string> fd = OpenCharDeviceWithRetry(path, 2, 1);
+    MT_EXPECT_TRUE(!fd.ok());
+    // Reported as an exhausted retry budget, which is what distinguishes it
+    // from an error that was refused outright.
+    MT_EXPECT_TRUE(fd.error().find("2 times") != std::string::npos);
+
+    ::chmod(path.c_str(), 0600);
+    ::unlink(path.c_str());
+    ::rmdir(dir.c_str());
+}
+
 MT_TEST(an_error_that_waiting_cannot_fix_is_not_retried) {
     const std::string dir = MakeTempDir();
     if (dir.empty()) return;
@@ -268,31 +298,34 @@ MT_TEST(the_extra_buffer_is_always_a_user_buffer) {
 }
 
 MT_TEST(an_unaligned_extra_buffer_is_refused) {
-    std::shared_ptr<util::Ring> ring = MakeRing();
-    if (!ring) {
-        Skip("extra alignment", kNoSparse);
-        return;
-    }
+    // No ring needed: the size is a property of the request, so it is
+    // rejected before anything is allocated. That also keeps this verifiable
+    // on hosts without the sparse registration opcodes.
+    //
     // Refused rather than rounded up. The target asked for this size because
     // it is what its own arithmetic needs; enlarging it silently would hide a
     // bug there, and the kernel rejects the unaligned transfer anyway.
     core::Expected<SlotBuffers, std::string> b =
-        AllocateSlotBuffers(ring, DevInfo(1, 16, 4096, 0),
+        AllocateSlotBuffers(std::shared_ptr<util::Ring>(), DevInfo(1, 16, 4096, 0),
                             core::Optional<std::size_t>(1000));
     MT_EXPECT_TRUE(!b.ok());
     MT_EXPECT_TRUE(b.error().find("not aligned") != std::string::npos);
+
+    // 512 and its multiples pass this gate (and then need a ring).
+    core::Expected<SlotBuffers, std::string> ok =
+        AllocateSlotBuffers(std::shared_ptr<util::Ring>(), DevInfo(1, 16, 4096, 0),
+                            core::Optional<std::size_t>(1024));
+    MT_EXPECT_TRUE(!ok.ok());
+    MT_EXPECT_TRUE(ok.error().find("not aligned") == std::string::npos);
 }
 
 MT_TEST(a_zero_sized_io_buffer_is_refused) {
-    std::shared_ptr<util::Ring> ring = MakeRing();
-    if (!ring) {
-        Skip("zero bufsize", kNoSparse);
-        return;
-    }
     // `max_io_buf_bytes` of zero means the kernel granted no buffer at all,
-    // so every request would be unserviceable.
-    core::Expected<SlotBuffers, std::string> b = AllocateSlotBuffers(
-        ring, DevInfo(1, 16, 0, 0), core::Optional<std::size_t>());
+    // so every request would be unserviceable. Checked before the ring is
+    // touched, for the same reason as above.
+    core::Expected<SlotBuffers, std::string> b =
+        AllocateSlotBuffers(std::shared_ptr<util::Ring>(), DevInfo(1, 16, 0, 0),
+                            core::Optional<std::size_t>());
     MT_EXPECT_TRUE(!b.ok());
     MT_EXPECT_TRUE(b.error().find("max_io_buf_bytes") != std::string::npos);
 }

@@ -37,12 +37,16 @@ core::Expected<int, std::string> OpenCharDeviceWithRetry(const std::string& path
         if (fd >= 0) return fd;
 
         const int err = errno;
-        // Only these two are retried. The node is created by udev *after* the
-        // kernel answers ADD_DEV, so on a busy host the first open commonly
-        // loses that race and the permissions land a moment later still.
-        // Anything else -- ENODEV, EBUSY -- is a real failure that waiting
-        // cannot fix, and retrying it would turn an instant error into a
-        // 1.6-second one.
+        // Only these three are retried. The node is created by udev *after*
+        // the kernel answers ADD_DEV, so on a busy host the first open
+        // commonly loses that race -- ENOENT while the node is still
+        // missing, EACCES/EPERM in the window before udev fixes its
+        // ownership. Anything else -- ENODEV, EBUSY -- is a real failure
+        // that waiting cannot fix, and retrying it would turn an instant
+        // error into a 1.6-second one.
+        //
+        // NOTE: the EACCES/EPERM half is only exercised by a test that needs
+        // a non-root user, so it is unverified on a root-only CI host.
         if (err != ENOENT && err != EACCES && err != EPERM) {
             std::ostringstream why;
             why << "open " << path << " failed: " << std::strerror(err) << " (errno " << err
@@ -88,6 +92,13 @@ core::Expected<SlotBuffers, std::string> AllocateSlotBuffers(
     // The device's negotiated mode decides the shape, not a local preference:
     // under AUTO_BUF_REG the kernel supplies the pages and the server must
     // only reserve a slot, while without it the server owns the memory.
+    //
+    // NOTE: which branch is taken is only observable with a ring that has
+    // sparse buffer tables (Linux 5.13+), so on older hosts the test suite
+    // skips it and an inverted condition here would go unnoticed. The
+    // consequence on a real device is severe -- a zero `cmd_addr` on a plain
+    // device points the kernel at address zero -- so treat changes to this
+    // condition as unverified until run on 5.13 or newer.
     if ((dev_info.flags & abi::kFAutoBufReg) != 0) {
         const core::Expected<std::shared_ptr<AutoRegBuffer>, std::string> b =
             AutoRegBuffer::Create(ring, bufsize);
