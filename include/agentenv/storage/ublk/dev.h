@@ -166,6 +166,12 @@ class UblkDevBuilder {
 
     UblkDevBuilder& SetTarget(std::shared_ptr<UblkTarget> target);
     /// Overrides how queue workers are started.
+    ///
+    /// Left unset, `Build` installs the real threaded launcher -- Rust has
+    /// only `spawn_queue_worker_thread`, so a device that silently had no
+    /// way to start its queues would not correspond to anything upstream.
+    /// This exists for tests, which cannot spawn workers against a device
+    /// that was never added.
     UblkDevBuilder& SetLauncher(std::shared_ptr<QueueWorkerLauncher> launcher);
 
     /// Rust `build` — ADD_DEV, then open the char device.

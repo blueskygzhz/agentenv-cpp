@@ -2,6 +2,8 @@
 // Rust: storage/ublk/src/dev.rs
 #include "agentenv/storage/ublk/dev.h"
 
+#include "agentenv/storage/ublk/queue_worker.h"
+
 #include <fcntl.h>
 #include <time.h>
 #include <unistd.h>
@@ -297,7 +299,15 @@ core::Expected<std::unique_ptr<UblkDev>, std::string> UblkDevBuilder::Build() {
     dev->tgt_name_ = tgt_->DevName();
     dev->params_ = params;
     dev->cdev_fd_ = fd.value();
-    dev->launcher_ = launcher_;
+    // The real launcher unless a caller supplied one. Rust has exactly one
+    // implementation, so defaulting to anything else -- including nothing --
+    // would make a built device silently unable to start.
+    //
+    // Constructed here rather than in the builder because it needs the char
+    // device fd, which does not exist until the open above succeeds.
+    dev->launcher_ = launcher_ ? launcher_
+                               : std::shared_ptr<QueueWorkerLauncher>(
+                                     new ThreadedQueueWorkerLauncher(fd.value(), tgt_));
     dev->ctrl_.reset(ctrl_.release());
     return std::move(dev);
 }

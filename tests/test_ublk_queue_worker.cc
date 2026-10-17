@@ -171,17 +171,48 @@ MT_TEST(a_worker_needs_a_target) {
     MT_EXPECT_TRUE(r.error().find("null target") != std::string::npos);
 }
 
+namespace {
+
+/// The smallest target that satisfies the interface, so construction checks
+/// can be reached rather than short-circuited by the null-target guard.
+class NullTarget : public UblkTarget {
+ public:
+    std::string DevName() const override { return "null"; }
+    core::Expected<core::Unit, std::string> Init(uint16_t, util::Ring*) override {
+        return core::Unit();
+    }
+    core::Optional<std::size_t> PerSlotExtraBufLen() const override {
+        return core::Optional<std::size_t>();
+    }
+    abi::Params DevParams(const abi::CtrlDevInfo& info) const override {
+        return BuildParams(2048, 9, 12, info.max_io_buf_bytes, false);
+    }
+    int32_t HandleIoRequest(uint16_t, uint16_t, const abi::IoDesc&, IoBuffer*, IoBuffer*,
+                            util::Ring*) override {
+        return 0;
+    }
+};
+
+}  // namespace
+
 MT_TEST(a_worker_needs_a_nonzero_depth) {
-    // Checked before the ring is built: a depth of zero sizes every table at
-    // zero, and the failure would surface as an opaque EINVAL from setup.
+    // A real target, so this reaches the depth check instead of stopping at
+    // the null-target guard -- which is what an earlier version of this test
+    // did, leaving the depth check unverified.
+    std::shared_ptr<UblkTarget> target(new NullTarget());
+
     abi::CtrlDevInfo info;
     std::memset(&info, 0, sizeof(info));
     info.nr_hw_queues = 1;
     info.queue_depth = 0;
 
+    // Checked before the ring is built: a depth of zero sizes every table at
+    // zero, and the failure would otherwise surface as an opaque EINVAL out
+    // of io_uring_setup.
     core::Expected<std::unique_ptr<QueueWorker>, std::string> r =
-        QueueWorker::Create(0, info, -1, std::shared_ptr<UblkTarget>(NULL));
+        QueueWorker::Create(0, info, -1, target);
     MT_EXPECT_TRUE(!r.ok());
+    MT_EXPECT_TRUE(r.error().find("zero queue depth") != std::string::npos);
 }
 
 MT_MAIN
