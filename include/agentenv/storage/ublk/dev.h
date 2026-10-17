@@ -13,6 +13,7 @@
 #define AGENTENV_STORAGE_UBLK_DEV_H_
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -87,6 +88,26 @@ class QueueWorkerLauncher {
     /// Waits for every started worker to finish.
     virtual void Join() = 0;
 };
+
+/// What `Start` does, with its three collaborators named explicitly.
+///
+/// Separated from `UblkDev::Start` because the ordering *is* the logic and it
+/// is otherwise unreachable without a real ADD_DEV: workers must be armed
+/// before the block device is published, and the geometry set before that.
+/// Neither mistake is an error on a live kernel -- the first publishes a disk
+/// nobody is serving, the second is silently refused.
+struct StartPlan {
+    /// Reads the current device info. Rust's `get_dev_info`.
+    std::function<core::Expected<abi::CtrlDevInfo, std::string>()> read_dev_info;
+    /// Starts one queue worker.
+    std::function<core::Expected<core::Unit, std::string>(uint16_t,
+                                                          const abi::CtrlDevInfo&)> spawn;
+    std::function<core::Expected<core::Unit, std::string>(const abi::Params&)> set_params;
+    std::function<core::Expected<core::Unit, std::string>()> start_dev;
+};
+
+core::Expected<core::Unit, std::string> RunStartSequence(const StartPlan& plan,
+                                                          const abi::Params& params);
 
 /// Rust `UVMUblkDev`.
 class UblkDev {

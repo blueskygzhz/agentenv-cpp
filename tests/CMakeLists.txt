@@ -78,6 +78,8 @@ agentenv_add_test(test_storage_overlaybd   test_storage_overlaybd.cc   agentenv-
 agentenv_add_test(test_ublk_ctrl           test_ublk_ctrl.cc           agentenv-ublk)
 # Rust: storage/ublk/src/{queue,io_buffer}.rs — the queue plane
 agentenv_add_test(test_ublk_queue          test_ublk_queue.cc          agentenv-ublk)
+# Rust: storage/ublk/src/dev.rs — build + the start sequence
+agentenv_add_test(test_ublk_dev            test_ublk_dev.cc            agentenv-ublk)
 agentenv_add_test(test_lsmt                test_lsmt.cc                agentenv-overlaybd)
 agentenv_add_test(test_lsmt_bptree         test_lsmt_bptree.cc         agentenv-overlaybd)
 agentenv_add_test(test_scheduler           test_scheduler.cc           agentenv-scheduler-internal)

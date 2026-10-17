@@ -63,12 +63,25 @@ core::Expected<int, std::string> OpenCharDeviceWithRetry(const std::string& path
 core::Expected<SlotBuffers, std::string> AllocateSlotBuffers(
     std::shared_ptr<util::Ring> ring, const abi::CtrlDevInfo& dev_info,
     const core::Optional<std::size_t>& extra_len) {
-    if (!ring) {
-        return core::make_unexpected(std::string("slot buffers: null ring"));
-    }
     const std::size_t bufsize = static_cast<std::size_t>(dev_info.max_io_buf_bytes);
+    // Both arguments are checked before anything is allocated. They are
+    // properties of the request, not of the ring, so failing on them first
+    // keeps the diagnosis away from allocation errors -- and means a bad
+    // size is reported identically whatever the host supports.
     if (bufsize == 0) {
         return core::make_unexpected(std::string("slot buffers: zero max_io_buf_bytes"));
+    }
+    if (extra_len.has_value() && *extra_len % 512 != 0) {
+        // Rejected rather than rounded. The target asked for this size
+        // because it is what its own arithmetic needs; silently enlarging it
+        // would hide a bug there, and the kernel would reject the unaligned
+        // transfer anyway.
+        std::ostringstream why;
+        why << "extra buffer length (" << *extra_len << ") not aligned";
+        return core::make_unexpected(why.str());
+    }
+    if (!ring) {
+        return core::make_unexpected(std::string("slot buffers: null ring"));
     }
 
     SlotBuffers out;
@@ -95,21 +108,11 @@ core::Expected<SlotBuffers, std::string> AllocateSlotBuffers(
     }
 
     if (extra_len.has_value()) {
-        const std::size_t size = *extra_len;
-        // Rejected rather than rounded. The target asked for this size
-        // because it is what its own arithmetic needs; silently enlarging it
-        // would hide a bug there, and the kernel would reject the unaligned
-        // transfer anyway.
-        if (size % 512 != 0) {
-            std::ostringstream why;
-            why << "extra buffer length (" << size << ") not aligned";
-            return core::make_unexpected(why.str());
-        }
         // Always a user buffer, even on an auto-reg device: the extra buffer
         // is the target's own scratch space and the kernel knows nothing
         // about it, so there is no slot for it to fill.
         const core::Expected<std::shared_ptr<UserBuffer>, std::string> e =
-            UserBuffer::Create(ring, size, 512);
+            UserBuffer::Create(ring, *extra_len, 512);
         if (!e.ok()) {
             return core::make_unexpected(std::string("allocate extra buffer: ") + e.error());
         }
@@ -134,19 +137,21 @@ UblkDev::~UblkDev() {
     if (cdev_fd_ >= 0) ::close(cdev_fd_);
 }
 
-core::Expected<core::Unit, std::string> UblkDev::Start() {
-    if (!ctrl_) {
-        return core::make_unexpected(std::string("ublk dev: no control channel"));
+core::Expected<core::Unit, std::string> RunStartSequence(const StartPlan& plan,
+                                                          const abi::Params& params) {
+    if (!plan.read_dev_info || !plan.spawn || !plan.set_params || !plan.start_dev) {
+        return core::make_unexpected(std::string("ublk dev: incomplete start plan"));
     }
+
     // Refreshed from the kernel rather than trusted: `state` is kernel-owned
     // and the local copy is from ADD_DEV, which says nothing about what has
     // happened since.
-    const core::Expected<core::Unit, std::string> info = ctrl_->GetDevInfo();
+    const core::Expected<abi::CtrlDevInfo, std::string> info = plan.read_dev_info();
     if (!info.ok()) {
         return core::make_unexpected(std::string("read dev info when starting: ") +
                                      info.error());
     }
-    const abi::CtrlDevInfo dev_info = ctrl_->DevInfo();
+    const abi::CtrlDevInfo dev_info = info.value();
     if (dev_info.state != abi::kDevStateDead) {
         // Not a formality: starting a live device spawns a second set of
         // workers against queues the first set is already serving, and both
@@ -159,36 +164,59 @@ core::Expected<core::Unit, std::string> UblkDev::Start() {
     // Workers before START_DEV. The kernel publishes /dev/ublkbN on that
     // command and expects the slots to be armed already; the other order
     // exposes a disk nothing is waiting to serve.
-    if (!launcher_) {
-        return core::make_unexpected(std::string("ublk dev: no queue worker launcher"));
-    }
     for (uint16_t qid = 0; qid < dev_info.nr_hw_queues; ++qid) {
-        const core::Expected<core::Unit, std::string> spawned =
-            launcher_->Spawn(qid, dev_info);
+        const core::Expected<core::Unit, std::string> spawned = plan.spawn(qid, dev_info);
         if (!spawned.ok()) {
             std::ostringstream why;
             why << "spawn ublk queue worker dev_id=" << dev_info.dev_id << " qid=" << qid
                 << " nr_hw_queues=" << dev_info.nr_hw_queues
                 << " queue_depth=" << dev_info.queue_depth << ": " << spawned.error();
             // Already-started workers are left running and joined by the
-            // destructor. Killing them here would race their own setup, and
-            // the device has not been published, so they have nothing to
-            // serve and will exit on their own.
+            // caller's teardown. Killing them here would race their own
+            // setup, and the device was never published, so they have
+            // nothing to serve and exit on their own.
             return core::make_unexpected(why.str());
         }
     }
 
     // Geometry before publication: once /dev/ublkbN exists its parameters
     // cannot be changed, so a SET_PARAMS after START_DEV would be refused.
-    const core::Expected<core::Unit, std::string> set = ctrl_->SetParams(params_);
+    const core::Expected<core::Unit, std::string> set = plan.set_params(params);
     if (!set.ok()) {
         return core::make_unexpected(std::string("set params when starting: ") + set.error());
     }
-    const core::Expected<core::Unit, std::string> started = ctrl_->StartDev();
+    const core::Expected<core::Unit, std::string> started = plan.start_dev();
     if (!started.ok()) {
         return core::make_unexpected(std::string("start the device: ") + started.error());
     }
     return core::Unit();
+}
+
+core::Expected<core::Unit, std::string> UblkDev::Start() {
+    if (!ctrl_) {
+        return core::make_unexpected(std::string("ublk dev: no control channel"));
+    }
+    if (!launcher_) {
+        return core::make_unexpected(std::string("ublk dev: no queue worker launcher"));
+    }
+
+    UblkCtrl* ctrl = ctrl_.get();
+    QueueWorkerLauncher* launcher = launcher_.get();
+
+    StartPlan plan;
+    plan.read_dev_info =
+        [ctrl]() -> core::Expected<abi::CtrlDevInfo, std::string> {
+            const core::Expected<core::Unit, std::string> r = ctrl->GetDevInfo();
+            if (!r.ok()) return core::make_unexpected(r.error());
+            return ctrl->DevInfo();
+        };
+    plan.spawn = [launcher](uint16_t qid, const abi::CtrlDevInfo& info) {
+        return launcher->Spawn(qid, info);
+    };
+    plan.set_params = [ctrl](const abi::Params& p) { return ctrl->SetParams(p); };
+    plan.start_dev = [ctrl]() { return ctrl->StartDev(); };
+
+    return RunStartSequence(plan, params_);
 }
 
 core::Expected<core::Unit, std::string> UblkDev::Del() {
