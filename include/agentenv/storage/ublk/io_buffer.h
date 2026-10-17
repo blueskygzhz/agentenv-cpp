@@ -96,6 +96,26 @@ class AutoRegBuffer {
     std::size_t size_;
 };
 
+/// Where a slot's memory is named, for one buffer shape.
+///
+/// The two fields are mutually exclusive and that is the protocol: Linux
+/// requires `ublksrv_io_cmd::addr` to be zero under `UBLK_F_AUTO_BUF_REG`
+/// (the kernel owns the pages there), and the reserved slot travels in the
+/// SQE's `addr` instead. Getting it backwards is either a rejected command or
+/// a kernel pointed at address zero.
+struct BufferAddrs {
+    uint64_t cmd_addr;
+    bool     has_sqe_addr;
+    uint64_t sqe_addr;
+
+    BufferAddrs() : cmd_addr(0), has_sqe_addr(false), sqe_addr(0) {}
+};
+
+/// Rust `prep_slot`'s `match buf { User(b) => b.as_ptr(), ... }` arm.
+BufferAddrs AddrsForUserBuffer(const void* data);
+/// Rust's `AutoReg(b)` arm: `addr` zero, the slot packed into the SQE.
+BufferAddrs AddrsForAutoReg(const abi::AutoBufReg& reg);
+
 /// Rust `enum IOBuffer` — whichever of the two a slot was armed with.
 ///
 /// A tagged pair rather than a base class with virtuals: the queue does not

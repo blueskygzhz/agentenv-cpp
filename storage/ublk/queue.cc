@@ -83,6 +83,8 @@ QueueIoDescs::~QueueIoDescs() {
 core::Expected<std::unique_ptr<QueueIoDescs>, std::string> QueueIoDescs::Map(
     uint16_t queue_id, uint32_t queue_depth, int cdev_fd) {
     if (queue_depth == 0) {
+        // `mmap` would fail on a zero length anyway; this is here so the
+        // error says "zero depth" instead of a bare EINVAL from the mapping.
         return core::make_unexpected(std::string("ublk queue: zero depth"));
     }
     if (queue_depth > abi::kMaxQueueDepth) {
@@ -149,6 +151,16 @@ core::Expected<std::unique_ptr<UblkQueue>, std::string> UblkQueue::Create(
     if (!ring) {
         return core::make_unexpected(std::string("ublk queue: null io_uring"));
     }
+    // Checked before the ring's capabilities: asking for a queue the device
+    // does not have is wrong on every host, while the sqe128 requirement
+    // below depends on the kernel. Reporting the environment-independent bug
+    // first keeps a caller from going to upgrade a kernel over a bad id.
+    if (queue_id >= dev_info.nr_hw_queues) {
+        std::ostringstream why;
+        why << "ublk queue: queue id " << queue_id << " is past nr_hw_queues "
+            << dev_info.nr_hw_queues;
+        return core::make_unexpected(why.str());
+    }
     // Every queue command is an `IORING_OP_URING_CMD` carrying a 16-byte
     // `ublksrv_io_cmd`, which does fit a 64-byte SQE -- but the ring is shared
     // with the control plane in practice, and a 64-byte ring would fail there
@@ -156,12 +168,6 @@ core::Expected<std::unique_ptr<UblkQueue>, std::string> UblkQueue::Create(
     if (!ring->Sqe128()) {
         return core::make_unexpected(std::string(
             "ublk queue: needs an sqe128 io_uring"));
-    }
-    if (queue_id >= dev_info.nr_hw_queues) {
-        std::ostringstream why;
-        why << "ublk queue: queue id " << queue_id << " is past nr_hw_queues "
-            << dev_info.nr_hw_queues;
-        return core::make_unexpected(why.str());
     }
 
     core::Expected<std::unique_ptr<QueueIoDescs>, std::string> descs =
@@ -238,6 +244,11 @@ core::Expected<core::Unit, std::string> UblkQueue::SendIoCmd(const char* what,
 
 core::Expected<core::Unit, std::string> UblkQueue::PrepSlot(uint16_t tag,
                                                             const IoBuffer& buf) {
+    // NOTE: reaching this needs a constructed queue, which needs a mapped
+    // descriptor area and therefore a real ublk char device. The bound is
+    // unverified by the test suite on a host without one -- `QueueIoDescs::At`
+    // bounds-checks reads independently, so the cost of losing this check is a
+    // nonsense command sent to the kernel rather than an out-of-range read.
     if (static_cast<uint32_t>(tag) >= depth_) {
         std::ostringstream why;
         why << "ublk queue: tag " << tag << " is past depth " << depth_;

@@ -1,5 +1,15 @@
 // SPDX-License-Identifier: MIT
-// Rust: storage/ublk/  — userspace ublk target trait.
+// An early abstraction with no counterpart in the Rust tree.
+//
+// SUPERSEDED by `UblkTarget` in `dev.h`, which is the port of Rust's
+// `UVMUblkTarget`. The differences are not cosmetic: this one has no queue
+// id, no per-slot buffers and no notion of the auto-registered buffer mode,
+// so it cannot express what the data plane actually asks of a target.
+// `TargetRunner` has no Rust counterpart at all -- Rust drives queues from
+// `UVMUblkDev`, not from a runner object.
+//
+// Kept only because `impls.h` still names these types. Nothing in the
+// production path constructs either, and new code should use `dev.h`.
 #ifndef AGENTENV_STORAGE_UBLK_TARGET_H_
 #define AGENTENV_STORAGE_UBLK_TARGET_H_
 

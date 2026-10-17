@@ -148,21 +148,36 @@ uint16_t IoBuffer::UringBufIndex() const {
     return 0;
 }
 
+BufferAddrs AddrsForUserBuffer(const void* data) {
+    BufferAddrs out;
+    // The command names the memory, and the SQE's `addr` is left alone: this
+    // mode has no registered slot to put there.
+    out.cmd_addr = reinterpret_cast<uint64_t>(data);
+    out.has_sqe_addr = false;
+    return out;
+}
+
+BufferAddrs AddrsForAutoReg(const abi::AutoBufReg& reg) {
+    BufferAddrs out;
+    // Zero, and Linux enforces it: the kernel supplies the pages under
+    // AUTO_BUF_REG and treats a non-zero `addr` as a protocol violation.
+    out.cmd_addr = 0;
+    out.has_sqe_addr = true;
+    out.sqe_addr = abi::AutoBufRegToSqeAddr(reg);
+    return out;
+}
+
 uint64_t IoBuffer::CmdAddr() const {
-    // Linux requires `addr` to be unset under AUTO_BUF_REG, ZERO_COPY and
-    // USER_COPY: the kernel owns the pages in those modes, and a non-zero
-    // value here is rejected as a protocol violation.
-    if (auto_reg_) return 0;
-    if (user_) return reinterpret_cast<uint64_t>(user_->Data());
+    if (auto_reg_) return AddrsForAutoReg(auto_reg_->Raw()).cmd_addr;
+    if (user_) return AddrsForUserBuffer(user_->Data()).cmd_addr;
     return 0;
 }
 
 bool IoBuffer::SqeAddr(uint64_t* out) const {
     if (!auto_reg_) return false;
-    // The reserved slot rides in the SQE's `addr` instead, packed the way the
-    // kernel unpacks it.
-    if (out != NULL) *out = abi::AutoBufRegToSqeAddr(auto_reg_->Raw());
-    return true;
+    const BufferAddrs addrs = AddrsForAutoReg(auto_reg_->Raw());
+    if (out != NULL) *out = addrs.sqe_addr;
+    return addrs.has_sqe_addr;
 }
 
 }  // namespace ublk

@@ -2,13 +2,21 @@
 // Rust: storage/ublk/src/impls/*.rs — skeleton targets.
 #include "agentenv/storage/ublk/impls.h"
 
+#include <cstring>
+
 namespace agentenv {
 namespace storage {
 namespace ublk {
 
 namespace {
-// A trivial zero-filled target used as a placeholder for both COW and overlaybd
-// until the real backends are ported.
+// A placeholder for both COW and overlaybd until the real backends are
+// ported. Reads are served as zeroes, which is a defensible answer for an
+// unwritten device.
+//
+// Writes are *refused*, not silently dropped: reporting bytes written for
+// data that went nowhere is the failure this codebase avoids everywhere else
+// -- the guest would consider the write durable and only discover otherwise
+// on a later read, by which time nothing connects the two.
 class ZeroTarget : public Target {
  public:
     explicit ZeroTarget(int64_t bytes) : bytes_(bytes) {}
@@ -16,11 +24,20 @@ class ZeroTarget : public Target {
     IoResult Handle(const IoRequest& req) override {
         IoResult r;
     r.tag = req.tag;
-      if (req.op == 0 /*read*/ && req.buffer && req.length) {
-            for (uint32_t i = 0; i < req.length; ++i)
-         static_cast<uint8_t*>(req.buffer)[i] = 0;
+        if (req.op == 0 /*read*/) {
+            if (req.buffer && req.length) {
+                std::memset(req.buffer, 0, req.length);
+            }
+            r.status = static_cast<int32_t>(req.length);
+            return r;
         }
-        r.status = static_cast<int32_t>(req.length);
+        if (req.op == 2 /*flush*/) {
+            // Nothing is buffered, so a flush has genuinely completed.
+            r.status = 0;
+            return r;
+        }
+        // -EROFS: this target has no backing store to write to.
+        r.status = -30;
         return r;
     }
  private:
