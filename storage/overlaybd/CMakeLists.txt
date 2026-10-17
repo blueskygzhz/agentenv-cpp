@@ -1,6 +1,9 @@
 add_library(agentenv-overlaybd STATIC
-    layer_reader.cc
-    index_tree.cc
+    # `layer_reader.cc` / `index_tree.cc` are gone: they implemented a
+    # `LayerReader` / `IndexTree` / `HeaderTrailer` trio that has no counterpart
+    # anywhere in the Rust tree, and whose `HeaderTrailer` and `SegmentMapping`
+    # collided by name with the real `lsmt::` ones while describing a different
+    # on-disk layout. The real LSMT read path is `lsmt.cc`.
     config.cc
     lsmt.cc
     zfile.cc

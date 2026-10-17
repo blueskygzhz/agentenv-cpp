@@ -42,6 +42,54 @@ struct PosixFsBackendConfig {
 /// Rust `shared_runtime_cache_root` — the node-local default.
 std::string SharedRuntimeCacheRoot();
 
+/// Rust `PosixFsSnapshotRepository` (backend.rs).
+///
+/// The `SnapshotRepository` face of the posix-fs backend. `PosixFsBackend`
+/// itself is only a bag of parts — it does not implement the trait, and in
+/// Rust it does not either; `backend.repository()` hands back this separate
+/// type, which forwards each trait method to the catalog store.
+///
+/// Having it be a distinct object is what lets the catalog be shared: the
+/// runtime resolver and the artifact store hold the same `catalog_store_`
+/// without going through the repository interface.
+class PosixFsSnapshotRepository : public SnapshotRepository {
+ public:
+    explicit PosixFsSnapshotRepository(std::shared_ptr<PosixFsCatalogStore> catalog_store)
+        : catalog_store_(std::move(catalog_store)) {}
+
+    // ---- snapshot records -------------------------------------------------
+
+    RepositoryResult<SnapshotRecord> Create(const SnapshotRecord& record) override;
+    RepositoryResult<core::Optional<SnapshotRecord> >
+        Get(const std::string& id_or_alias) override;
+    RepositoryResult<std::vector<SnapshotRecord> >
+        List(const SnapshotListFilter& filter) override;
+    RepositoryResult<core::Unit> Delete(const std::string& id_or_alias) override;
+    RepositoryResult<core::Optional<std::string> >
+        ResolveAlias(const std::string& alias) override;
+    RepositoryResult<SnapshotRecord> TryStartBuild(const std::string& id) override;
+    RepositoryResult<core::Unit>
+        MarkBuildError(const std::string& id, const std::string& reason) override;
+
+    // ---- volume catalog ---------------------------------------------------
+    //
+    // The base class defaults these to "unsupported". Forwarded here because
+    // the catalog store does implement them durably, and leaving the defaults
+    // would make a configured posix-fs node report no volume support at all.
+
+    RepositoryResult<core::Optional<volume::VolumeRecord> >
+        GetVolume(const std::string& reference) override;
+    RepositoryResult<VolumeRecordPage>
+        ListVolumesPage(const core::Optional<std::string>& after_volume_id,
+                        std::size_t limit) override;
+    RepositoryResult<core::Unit> CreateVolume(const volume::VolumeRecord& record) override;
+    RepositoryResult<core::Unit> PutVolume(const volume::VolumeRecord& record) override;
+    RepositoryResult<core::Unit> DeleteVolume(const std::string& volume_id) override;
+
+ private:
+    std::shared_ptr<PosixFsCatalogStore> catalog_store_;
+};
+
 /// Rust `struct PosixFsBackend`.
 class PosixFsBackend {
  public:
