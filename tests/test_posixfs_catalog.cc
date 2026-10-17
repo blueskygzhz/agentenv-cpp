@@ -334,7 +334,7 @@ MT_TEST(list_orders_newest_first_with_an_id_tiebreak) {
     MT_EXPECT_TRUE(store.Create(newest).ok());
 
     const repository::RepositoryResult<std::vector<snapshot::SnapshotRecord> > records =
-        store.List(posixfs::SnapshotListFilter());
+        store.List(repository::SnapshotListFilter());
     MT_EXPECT_TRUE(records.ok());
     MT_EXPECT_EQ(records.value().size(), static_cast<std::size_t>(4));
     MT_EXPECT_TRUE(records.value()[0].id == newest.id);
@@ -359,7 +359,7 @@ MT_TEST(list_skips_lock_files_in_the_records_directory) {
 
     // A lock file is not a record, so it must not be parsed as one.
     const repository::RepositoryResult<std::vector<snapshot::SnapshotRecord> > records =
-        store.List(posixfs::SnapshotListFilter());
+        store.List(repository::SnapshotListFilter());
     MT_EXPECT_TRUE(records.ok());
     MT_EXPECT_EQ(records.value().size(), static_cast<std::size_t>(1));
 }
@@ -509,7 +509,7 @@ MT_TEST(filter_matches_on_alias_prefix) {
         FreshId(), Optional<snapshot::SnapshotAlias>(Alias("prod-api")),
         sandbox::SandboxResources());
 
-    posixfs::SnapshotListFilter filter;
+    repository::SnapshotListFilter filter;
     filter.alias_prefix = Optional<std::string>(std::string("prod"));
     MT_EXPECT_TRUE(Store::MatchesRecordFilter(record, filter));
 
@@ -527,7 +527,7 @@ MT_TEST(filter_matches_on_id_set_and_id_or_alias) {
     const snapshot::SnapshotRecord record = snapshot::SnapshotRecord::TemplateWaiting(
         id, Optional<snapshot::SnapshotAlias>(Alias("prod")), sandbox::SandboxResources());
 
-    posixfs::SnapshotListFilter by_ids;
+    repository::SnapshotListFilter by_ids;
     by_ids.snapshot_ids =
         Optional<std::vector<SnapshotId> >(std::vector<SnapshotId>(1, id));
     MT_EXPECT_TRUE(Store::MatchesRecordFilter(record, by_ids));
@@ -537,7 +537,7 @@ MT_TEST(filter_matches_on_id_set_and_id_or_alias) {
     MT_EXPECT_TRUE(!Store::MatchesRecordFilter(record, by_ids));
 
     // `snapshot_id_or_alias` matches either spelling.
-    posixfs::SnapshotListFilter by_either;
+    repository::SnapshotListFilter by_either;
     by_either.snapshot_id_or_alias = Optional<std::string>(id.ToString());
     MT_EXPECT_TRUE(Store::MatchesRecordFilter(record, by_either));
     by_either.snapshot_id_or_alias = Optional<std::string>(std::string("prod"));
@@ -552,20 +552,20 @@ MT_TEST(filter_matches_on_source_and_status) {
     snapshot::SnapshotRecord sandbox_record = template_record;
     sandbox_record.source = snapshot::SnapshotSource::Sandbox("sbx-1");
 
-    posixfs::SnapshotListFilter by_sandbox;
+    repository::SnapshotListFilter by_sandbox;
     by_sandbox.source_sandbox_id = Optional<std::string>(std::string("sbx-1"));
     MT_EXPECT_TRUE(Store::MatchesRecordFilter(sandbox_record, by_sandbox));
     // A template never matches a source-sandbox filter.
     MT_EXPECT_TRUE(!Store::MatchesRecordFilter(template_record, by_sandbox));
 
-    posixfs::SnapshotListFilter by_kind;
+    repository::SnapshotListFilter by_kind;
     by_kind.sources = Optional<std::vector<snapshot::SnapshotSourceKind> >(
         std::vector<snapshot::SnapshotSourceKind>(1,
                                                   snapshot::SnapshotSourceKind::Template));
     MT_EXPECT_TRUE(Store::MatchesRecordFilter(template_record, by_kind));
     MT_EXPECT_TRUE(!Store::MatchesRecordFilter(sandbox_record, by_kind));
 
-    posixfs::SnapshotListFilter by_status;
+    repository::SnapshotListFilter by_status;
     by_status.template_statuses = Optional<std::vector<snapshot::TemplateBuildStatus> >(
         std::vector<snapshot::TemplateBuildStatus>(1,
                                                    snapshot::TemplateBuildStatus::Waiting));
@@ -579,7 +579,7 @@ MT_TEST(filter_conjuncts_are_combined) {
     const snapshot::SnapshotRecord record = snapshot::SnapshotRecord::TemplateWaiting(
         id, Optional<snapshot::SnapshotAlias>(Alias("prod")), sandbox::SandboxResources());
 
-    posixfs::SnapshotListFilter filter;
+    repository::SnapshotListFilter filter;
     filter.alias_prefix = Optional<std::string>(std::string("prod"));
     filter.template_statuses = Optional<std::vector<snapshot::TemplateBuildStatus> >(
         std::vector<snapshot::TemplateBuildStatus>(1,
@@ -800,7 +800,7 @@ MT_TEST(list_volumes_page_walks_in_id_order) {
     MT_EXPECT_TRUE(store.CreateVolume(Volume("vol_a", "a")).ok());
     MT_EXPECT_TRUE(store.CreateVolume(Volume("vol_b", "b")).ok());
 
-    const repository::RepositoryResult<posixfs::VolumeRecordPage> first =
+    const repository::RepositoryResult<repository::VolumeRecordPage> first =
         store.ListVolumesPage(Optional<std::string>(), 2);
     MT_EXPECT_TRUE(first.ok());
     MT_EXPECT_EQ(first.value().records.size(), static_cast<std::size_t>(2));
@@ -809,7 +809,7 @@ MT_TEST(list_volumes_page_walks_in_id_order) {
     MT_EXPECT_TRUE(first.value().next_volume_id.has_value());
     MT_EXPECT_EQ(*first.value().next_volume_id, std::string("vol_b"));
 
-    const repository::RepositoryResult<posixfs::VolumeRecordPage> second =
+    const repository::RepositoryResult<repository::VolumeRecordPage> second =
         store.ListVolumesPage(first.value().next_volume_id, 2);
     MT_EXPECT_TRUE(second.ok());
     MT_EXPECT_EQ(second.value().records.size(), static_cast<std::size_t>(1));
@@ -821,7 +821,7 @@ MT_TEST(list_volumes_page_walks_in_id_order) {
 MT_TEST(list_volumes_page_rejects_a_zero_limit) {
     TempRoot root;
     Store store(root.path);
-    const repository::RepositoryResult<posixfs::VolumeRecordPage> page =
+    const repository::RepositoryResult<repository::VolumeRecordPage> page =
         store.ListVolumesPage(Optional<std::string>(), 0);
     MT_EXPECT_TRUE(!page.ok());
     MT_EXPECT_TRUE(page.error().message.find("greater than zero") != std::string::npos);

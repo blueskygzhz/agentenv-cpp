@@ -45,24 +45,36 @@ class FakeVolumeRepository : public repo::SnapshotRepository {
     explicit FakeVolumeRepository(const std::string& store_root) : store_root_(store_root) {}
 
     // --- snapshot half: unused here, so minimally satisfied ----------------
-    repo::RepositoryResult<repo::SnapshotRecord> Create(const repo::SnapshotRecord& record) {
+    //
+    // Every one carries `override`. Without it these were plain member
+    // functions that merely resembled the interface: when `ResolveAlias`,
+    // `TryStartBuild` and `MarkBuildError` changed to take ids and a
+    // structured reason, the fake silently stopped overriding anything and
+    // became abstract, which is what broke the build here rather than any
+    // mismatch being reported at the declaration.
+    repo::RepositoryResult<repo::SnapshotRecord> Create(
+        const repo::SnapshotRecord& record) override {
         return record;
     }
-    repo::RepositoryResult<Optional<repo::SnapshotRecord> > Get(const std::string&) {
+    repo::RepositoryResult<Optional<repo::SnapshotRecord> > Get(const std::string&) override {
         return Optional<repo::SnapshotRecord>();
     }
     repo::RepositoryResult<std::vector<repo::SnapshotRecord> > List(
-        const repo::SnapshotListFilter&) {
+        const repo::SnapshotListFilter&) override {
         return std::vector<repo::SnapshotRecord>();
     }
-    repo::RepositoryResult<Unit> Delete(const std::string&) { return Unit(); }
-    repo::RepositoryResult<Optional<std::string> > ResolveAlias(const std::string&) {
-        return Optional<std::string>();
+    repo::RepositoryResult<Unit> Delete(const std::string&) override { return Unit(); }
+    repo::RepositoryResult<Optional<agentenv::core::SnapshotId> > ResolveAlias(
+        const std::string&) override {
+        return Optional<agentenv::core::SnapshotId>();
     }
-    repo::RepositoryResult<repo::SnapshotRecord> TryStartBuild(const std::string&) {
+    repo::RepositoryResult<repo::SnapshotRecord> TryStartBuild(
+        const agentenv::core::SnapshotId&) override {
         return repo::SnapshotRecord();
     }
-    repo::RepositoryResult<Unit> MarkBuildError(const std::string&, const std::string&) {
+    repo::RepositoryResult<Unit> MarkBuildError(
+        const agentenv::core::SnapshotId&,
+        const agentenv::snapshot::TemplateBuildErrorReason&) override {
         return Unit();
     }
 

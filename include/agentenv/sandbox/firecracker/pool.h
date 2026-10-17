@@ -13,6 +13,8 @@
 #include "agentenv/sandbox/backend.h"
 #include "agentenv/sandbox/firecracker/config.h"
 #include "agentenv/sandbox/firecracker/instance.h"
+// `kPoolFirecrackerStopTimeoutMs`, `kPoolPrimePollIntervalMs`, `WarmStdioPaths`.
+#include "agentenv/sandbox/firecracker/lifecycle.h"
 #include "agentenv/sandbox/network/slot.h"
 #include "agentenv/warm-pool/pool.h"
 

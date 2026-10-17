@@ -111,6 +111,13 @@ std::size_t FirecrackerPool::RunMaintenanceCycle() {
  }
  case warmpool::PoolMaintenanceKind::Drain: {
      std::size_t drained = 0;
+            // Reachable only when two maintenance cycles overlap: the fill
+            // target is clamped to the high watermark and acquire only
+            // removes, so a single-threaded pool never rises above it. Kept
+            // because `ComputeMaintenanceAction` is shared with the network
+            // manager, which *does* return slots to its pool and can exceed
+            // the watermark -- and because a pool that silently ignored a
+            // Drain would hold VMM processes nothing asked it to keep.
       for (std::size_t i = 0; i < action.count; ++i) {
   std::shared_ptr<WarmFirecracker> victim;
           if (!pool_.TryDrainOne(&victim)) break;

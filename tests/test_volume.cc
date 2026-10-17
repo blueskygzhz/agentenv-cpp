@@ -675,24 +675,33 @@ MT_TEST(unsupported_repository_reports_the_upstream_feature_names) {
     // A backend that implements only the snapshot half must fail loudly.
     class SnapshotOnlyRepository : public repo::SnapshotRepository {
      public:
-        repo::RepositoryResult<repo::SnapshotRecord> Create(const repo::SnapshotRecord& r) {
+        // `override` throughout: without it these were lookalike members, the
+        // class quietly stayed abstract when the interface changed, and the
+        // mismatch surfaced at the `new` below instead of at the declaration.
+        repo::RepositoryResult<repo::SnapshotRecord> Create(
+            const repo::SnapshotRecord& r) override {
             return r;
         }
-        repo::RepositoryResult<Optional<repo::SnapshotRecord> > Get(const std::string&) {
+        repo::RepositoryResult<Optional<repo::SnapshotRecord> > Get(
+            const std::string&) override {
             return Optional<repo::SnapshotRecord>();
         }
         repo::RepositoryResult<std::vector<repo::SnapshotRecord> > List(
-            const repo::SnapshotListFilter&) {
+            const repo::SnapshotListFilter&) override {
             return std::vector<repo::SnapshotRecord>();
         }
-        repo::RepositoryResult<Unit> Delete(const std::string&) { return Unit(); }
-        repo::RepositoryResult<Optional<std::string> > ResolveAlias(const std::string&) {
-            return Optional<std::string>();
+        repo::RepositoryResult<Unit> Delete(const std::string&) override { return Unit(); }
+        repo::RepositoryResult<Optional<agentenv::core::SnapshotId> > ResolveAlias(
+            const std::string&) override {
+            return Optional<agentenv::core::SnapshotId>();
         }
-        repo::RepositoryResult<repo::SnapshotRecord> TryStartBuild(const std::string&) {
+        repo::RepositoryResult<repo::SnapshotRecord> TryStartBuild(
+            const agentenv::core::SnapshotId&) override {
             return repo::SnapshotRecord();
         }
-        repo::RepositoryResult<Unit> MarkBuildError(const std::string&, const std::string&) {
+        repo::RepositoryResult<Unit> MarkBuildError(
+            const agentenv::core::SnapshotId&,
+            const agentenv::snapshot::TemplateBuildErrorReason&) override {
             return Unit();
         }
     };

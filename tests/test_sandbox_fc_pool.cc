@@ -8,6 +8,7 @@
 
 using namespace agentenv::sandbox::firecracker;
 namespace warmpool = agentenv::warmpool;
+namespace core = agentenv::core;
 
 // SHA-512("") known FIPS vector.
 MT_TEST(sha512_empty_vector) {
@@ -156,78 +157,216 @@ MT_TEST(mmds_deserialize_requires_core_fields) {
     MT_EXPECT_TRUE(!MmdsMetadata::FromValue(J("[]")).ok());
 }
 
-// ---- FirecrackerPool watermark management ----
-// A trivial Instance stub; the pool only needs to hold/hand out shared_ptrs.
-struct StubInstance : public Instance {
-    agentenv::core::Expected<agentenv::core::Unit, std::string> Boot() override {
-    return agentenv::core::Unit{};
-    }
-    agentenv::core::Expected<agentenv::core::Unit, std::string> Shutdown() override {
-        return agentenv::core::Unit{};
-    }
-  agentenv::core::Expected<agentenv::core::Unit, std::string>
-    SetMmds(const MmdsMetadata&) override { return agentenv::core::Unit{}; }
+// ---- FirecrackerPool ----
+//
+// A warm entry is `slot + VMM process + work dir` and is handed out as one
+// unit, never returned. These cover the two things that makes easy to get
+// wrong: that every entry taken out of the pool is destroyed exactly once
+// (nothing leaks a slot or a work dir), and that an entry is only handed to a
+// caller whose stdio expectations match the one it was spawned with.
+
+namespace {
+
+/// A warm entry with no live kernel state behind it. Paired with a fake
+/// cleanup, so the null slot is never dereferenced.
+std::shared_ptr<WarmFirecracker> FakeWarm(const std::string& tag) {
+    std::shared_ptr<FirecrackerInstance> inst(
+        new FirecrackerInstance("/tmp/agentenv-fc-test-" + tag, std::shared_ptr<Connector>()));
+    return std::shared_ptr<WarmFirecracker>(
+        new WarmFirecracker(NULL, inst, "/tmp/agentenv-fc-test-" + tag));
+}
+
+FirecrackerPool::Options OptionsFor(std::size_t low, std::size_t high) {
+    FirecrackerPool::Options o;
+    o.pool.low_watermark = low;
+    o.pool.high_watermark = high;
+    o.pool.maintenance_enabled = true;
+    return o;
+}
+
+/// Records what the pool created and destroyed, so a test can assert that the
+/// two balance rather than only that the count came out right.
+///
+/// Held by `shared_ptr` and captured by value, because `~FirecrackerPool` runs
+/// `Shutdown` and therefore calls these callbacks: anything they touch has to
+/// outlive the pool, which a stack local declared after it does not.
+struct SpawnLedger {
+    int spawned;
+    int cleaned;
+    int sync_cleanups;
+    int fail_after;          ///< spawn fails once this many have succeeded
+    std::string cleanup_err; ///< non-empty makes every cleanup fail
+
+    SpawnLedger() : spawned(0), cleaned(0), sync_cleanups(0), fail_after(-1) {}
 };
 
-static warmpool::PoolConfig make_cfg(std::size_t low, std::size_t high) {
-  warmpool::PoolConfig c;
-    c.low_watermark = low;
-    c.high_watermark = high;
- c.maintenance_enabled = true;
-    return c;
+std::shared_ptr<SpawnLedger> InstallLedger(FirecrackerPool* pool) {
+    std::shared_ptr<SpawnLedger> self(new SpawnLedger());
+    pool->SetSpawnForTesting(
+        [self]() -> core::Expected<std::shared_ptr<WarmFirecracker>, std::string> {
+            if (self->fail_after >= 0 && self->spawned >= self->fail_after) {
+                return core::make_unexpected(std::string("no free slot"));
+            }
+            ++self->spawned;
+            char tag[32];
+            std::snprintf(tag, sizeof(tag), "%d", self->spawned);
+            return FakeWarm(tag);
+        },
+        [self](const std::shared_ptr<WarmFirecracker>&, bool sync)
+            -> core::Expected<core::Unit, std::string> {
+            ++self->cleaned;
+            if (sync) ++self->sync_cleanups;
+            if (!self->cleanup_err.empty()) {
+                return core::make_unexpected(self->cleanup_err);
+            }
+            return core::Unit();
+        });
+    return self;
 }
+
+}  // namespace
 
 MT_TEST(pool_prime_fills_to_low_watermark) {
-    int created = 0;
-    FirecrackerPool pool(make_cfg(2, 4), [&]() -> std::shared_ptr<Instance> {
-        ++created;
-    return std::shared_ptr<Instance>(new StubInstance());
-    });
+    FirecrackerPool pool(OptionsFor(2, 4), NULL, NULL);
+    std::shared_ptr<SpawnLedger> ledger = InstallLedger(&pool);
+
     MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 0);
     pool.Prime();
     MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 2);
-    MT_EXPECT_EQ(created, 2);
+    MT_EXPECT_EQ(ledger->spawned, 2);
+    // Nothing was destroyed on the way: an entry cleaned up during a fill is
+    // one whose slot and work dir were allocated for nothing.
+    MT_EXPECT_EQ(ledger->cleaned, 0);
 }
 
-MT_TEST(pool_acquire_hands_out_and_empties) {
-    FirecrackerPool pool(make_cfg(2, 4), []() -> std::shared_ptr<Instance> {
-    return std::shared_ptr<Instance>(new StubInstance());
-    });
+MT_TEST(pool_acquire_hands_out_the_whole_unit_and_empties) {
+    FirecrackerPool pool(OptionsFor(2, 4), NULL, NULL);
+    std::shared_ptr<SpawnLedger> ledger = InstallLedger(&pool);
     pool.Prime();
     MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 2);
-    auto a = pool.Acquire();
+
+    core::Expected<std::shared_ptr<WarmFirecracker>, std::string> a = pool.Acquire();
     MT_EXPECT_TRUE(a.ok());
-    auto b = pool.Acquire();
-    MT_EXPECT_TRUE(b.ok());
+    if (a.ok()) {
+        // The three members travel together. A caller given the process alone
+        // would have a VM with no namespace and no socket directory.
+        MT_EXPECT_TRUE(a.value()->GetInstance() != NULL);
+        MT_EXPECT_TRUE(!a.value()->WorkDir().empty());
+    }
+    MT_EXPECT_TRUE(pool.Acquire().ok());
     MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 0);
-    // now empty -> cold path error
-    auto c = pool.Acquire();
+
+    // Empty is an error, not a wait: the caller's fallback is a cold spawn,
+    // which is slower but correct, so blocking here would be worse.
+    core::Expected<std::shared_ptr<WarmFirecracker>, std::string> c = pool.Acquire();
     MT_EXPECT_TRUE(!c.ok());
+    MT_EXPECT_TRUE(c.error().find("cold path") != std::string::npos);
+
+    // Acquired entries are the caller's now; the pool never cleaned them up.
+    MT_EXPECT_EQ(ledger->cleaned, 0);
 }
 
-MT_TEST(pool_maintenance_drains_above_high_watermark) {
-    FirecrackerPool pool(make_cfg(1, 2), []() -> std::shared_ptr<Instance> {
-      return std::shared_ptr<Instance>(new StubInstance());
-    });
-    // Release 4 entries (maintenance_enabled lets it exceed high watermark).
-    for (int i = 0; i < 4; ++i) pool.Release(std::shared_ptr<Instance>(new StubInstance()));
-    MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 4);
-    std::size_t drained = pool.RunMaintenanceCycle();
-    MT_EXPECT_EQ(static_cast<int>(drained), 2);  // down to high watermark 2
-    MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 2);
+MT_TEST(pool_refuses_an_entry_whose_stdio_does_not_match) {
+    FirecrackerPool::Options o = OptionsFor(1, 2);
+    o.capture_output = false;
+    FirecrackerPool pool(o, NULL, NULL);
+    std::shared_ptr<SpawnLedger> ledger = InstallLedger(&pool);
+    pool.Prime();
+    MT_EXPECT_TRUE(static_cast<int>(pool.WarmLen()) > 0);
+
+    // Refused rather than served: stdout/stderr destinations are fixed when
+    // the process is spawned, so this entry can never produce the log file the
+    // caller is asking for. Serving it would lose the diagnostics silently.
+    core::Expected<std::shared_ptr<WarmFirecracker>, std::string> want_capture =
+        pool.AcquireFor(true);
+    MT_EXPECT_TRUE(!want_capture.ok());
+    MT_EXPECT_TRUE(want_capture.error().find("capture_output") != std::string::npos);
+    // And the refusal did not consume the entry.
+    MT_EXPECT_TRUE(static_cast<int>(pool.WarmLen()) > 0);
+    MT_EXPECT_TRUE(pool.AcquireFor(false).ok());
 }
 
-MT_TEST(pool_factory_failure_stops_fill) {
-    int calls = 0;
-    warmpool::PoolConfig fc; fc.low_watermark = 3; fc.high_watermark = 5; fc.maintenance_enabled = true;
-    FirecrackerPool pool(fc, [&]() -> std::shared_ptr<Instance> {
-        ++calls;
-        if (calls >= 2) return std::shared_ptr<Instance>();  // fail on 2nd
-        return std::shared_ptr<Instance>(new StubInstance());
-    });
-    std::size_t created = pool.RunMaintenanceCycle();
-    MT_EXPECT_EQ(static_cast<int>(created), 1);  // only first succeeded
+MT_TEST(pool_fill_never_overshoots_the_high_watermark) {
+    FirecrackerPool pool(OptionsFor(1, 2), NULL, NULL);
+    std::shared_ptr<SpawnLedger> ledger = InstallLedger(&pool);
+
+    // Driven well past the point where it should stop.
+    for (int i = 0; i < 6; ++i) pool.RunMaintenanceCycle();
+
+    MT_EXPECT_TRUE(pool.WarmLen() <= 2);
+    // Nothing was spawned only to be destroyed. Each entry costs a network
+    // slot, a work dir and a VMM process, so creating one above the ceiling
+    // and immediately tearing it down is pure waste -- and the teardown is
+    // where a leaked slot would come from.
+    MT_EXPECT_EQ(ledger->cleaned, 0);
+    MT_EXPECT_EQ(ledger->spawned, static_cast<int>(pool.WarmLen()));
+}
+
+MT_TEST(pool_destructor_destroys_what_is_left) {
+    // The entries a running pool still holds are live VMM processes with live
+    // network slots. Dropping the pool without tearing them down leaves them
+    // with no owner and nothing to identify them as abandoned.
+    std::shared_ptr<SpawnLedger> ledger;
+    {
+        FirecrackerPool pool(OptionsFor(2, 4), NULL, NULL);
+        ledger = InstallLedger(&pool);
+        pool.Prime();
+        MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 2);
+        MT_EXPECT_EQ(ledger->cleaned, 0);
+    }
+    MT_EXPECT_EQ(ledger->cleaned, 2);
+    // The destructor is a process-teardown path, so it takes the synchronous
+    // route: the graceful stop it would otherwise await may have no runtime
+    // left to await on.
+    MT_EXPECT_EQ(ledger->sync_cleanups, 2);
+}
+
+MT_TEST(pool_spawn_failure_stops_further_batches) {
+    FirecrackerPool::Options o = OptionsFor(3, 5);
+    o.fill_concurrency = 1;
+    FirecrackerPool pool(o, NULL, NULL);
+    std::shared_ptr<SpawnLedger> ledger = InstallLedger(&pool);
+    ledger->fail_after = 1;  // the second spawn fails
+
+    const std::size_t created = pool.RunMaintenanceCycle();
+    MT_EXPECT_EQ(static_cast<int>(created), 1);
     MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 1);
+    // A failing spawn is nearly always a resource that will not appear within
+    // this cycle (no free slot, no KVM), so retrying it now only multiplies
+    // the cost. Exactly one failed attempt, not three.
+    MT_EXPECT_EQ(ledger->spawned, 1);
+}
+
+MT_TEST(pool_shutdown_destroys_every_entry_and_reports_all_failures) {
+    FirecrackerPool pool(OptionsFor(3, 4), NULL, NULL);
+    std::shared_ptr<SpawnLedger> ledger = InstallLedger(&pool);
+    pool.Prime();
+    MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 3);
+
+    ledger->cleanup_err = "slot busy";
+    core::Expected<core::Unit, std::string> r = pool.Shutdown(true);
+    MT_EXPECT_TRUE(!r.ok());
+    // Every entry was attempted even though the first failed: each holds a
+    // distinct slot and work dir, so stopping at the first failure leaks the
+    // rest with no record of them.
+    MT_EXPECT_EQ(ledger->cleaned, 3);
+    MT_EXPECT_EQ(ledger->sync_cleanups, 3);
+    MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 0);
+    // All three reported, not just the first -- an operator needs the full
+    // list to know what leaked.
+    std::size_t at = 0, joins = 0;
+    while ((at = r.error().find(" | ", at)) != std::string::npos) { ++joins; at += 3; }
+    MT_EXPECT_EQ(static_cast<int>(joins), 2);
+}
+
+MT_TEST(real_spawn_without_a_network_manager_is_an_error) {
+    // Not a silent fallback to the parent namespace: a VMM spawned outside its
+    // slot gets a working API socket and no guest connectivity, which shows up
+    // later as a guest-side fault.
+    FirecrackerPool pool(OptionsFor(1, 2), NULL, NULL);
+    const std::size_t created = pool.RunMaintenanceCycle();
+    MT_EXPECT_EQ(static_cast<int>(created), 0);
+    MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 0);
 }
 
 MT_MAIN
