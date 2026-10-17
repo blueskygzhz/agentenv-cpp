@@ -213,6 +213,90 @@ const uint8_t kIoOpFlush = 2;
 const uint8_t kIoOpDiscard = 3;
 const uint8_t kIoOpWriteSame = 4;
 const uint8_t kIoOpWriteZeroes = 5;
+// Zoned ops start at 10, not 6: the kernel leaves 6..9 unused, so numbering
+// them consecutively would silently map every zone request to the wrong one.
+const uint8_t kIoOpZoneOpen = 10;
+const uint8_t kIoOpZoneClose = 11;
+const uint8_t kIoOpZoneFinish = 12;
+const uint8_t kIoOpZoneAppend = 13;
+const uint8_t kIoOpZoneResetAll = 14;
+const uint8_t kIoOpZoneReset = 15;
+const uint8_t kIoOpReportZones = 18;
+
+// ---- queue plane ----------------------------------------------------------
+
+/// `UBLK_MAX_QUEUE_DEPTH`.
+///
+/// Not the depth this server uses -- it is the stride the kernel lays the
+/// per-queue descriptor areas out with. Every queue's region is sized for the
+/// maximum whether or not it uses it, so this is what queue N's mmap offset is
+/// computed from.
+const uint32_t kMaxQueueDepth = 4096;
+
+/// `UBLKSRV_CMD_BUF_OFFSET` — base mmap offset of the descriptor areas.
+const uint64_t kCmdBufOffset = 0;
+/// `UBLKSRV_IO_BUF_OFFSET` — base mmap offset of the data buffers.
+const uint64_t kIoBufOffset = 0x80000000ull;
+
+/// `struct ublksrv_io_cmd` — 16 bytes, the payload of every queue command.
+///
+/// Half the size of a control command, which is why the IO command numbers
+/// below encode 16 rather than 32: the size is part of the ioctl number, so
+/// reusing the control encoding would produce commands the kernel rejects.
+struct IoCmd {
+    uint16_t q_id;    ///< @0
+    uint16_t tag;     ///< @2
+    /// @4 — the result of the *previous* request in this slot. Meaningless on
+    /// FETCH_REQ, which has no previous request to report.
+    int32_t  result;
+    /// @8 — where the data lives. Must be zero under AUTO_BUF_REG, ZERO_COPY
+    /// or USER_COPY: the kernel supplies the buffer in those modes and reads a
+    /// non-zero value here as a protocol violation.
+    uint64_t addr;
+};
+
+/// `struct ublk_auto_buf_reg` — 8 bytes.
+///
+/// Travels in the SQE's `addr` field rather than in the command payload, so
+/// it is packed by `AutoBufRegToSqeAddr` instead of being written out.
+struct AutoBufReg {
+    uint16_t index;
+    uint8_t  flags;
+    uint8_t  reserved0;
+    uint32_t reserved1;
+};
+
+/// `ublk_auto_buf_reg_to_sqe_addr` — the same bit packing the kernel unpacks.
+///
+/// Field order is load-bearing: the kernel reads the index out of the low 16
+/// bits, so packing them in any other order hands it another slot's buffer.
+inline uint64_t AutoBufRegToSqeAddr(const AutoBufReg& b) {
+    return static_cast<uint64_t>(b.index) | (static_cast<uint64_t>(b.flags) << 16) |
+           (static_cast<uint64_t>(b.reserved0) << 24) |
+           (static_cast<uint64_t>(b.reserved1) << 32);
+}
+
+/// `sizeof(struct ublksrv_io_cmd)`.
+const uint32_t kIoCmdSize = 16;
+
+/// `_IOWR('u', nr, struct ublksrv_io_cmd)` — the IO-command encoding.
+inline uint32_t IowrIo(uint32_t nr) {
+    return (3u << 30) | (kIoCmdSize << 16) | (static_cast<uint32_t>('u') << 8) | nr;
+}
+
+/// `UBLK_U_IO_FETCH_REQ` — arm a slot and wait for the kernel to fill it.
+inline uint32_t IoCmdFetchReq() { return IowrIo(0x20); }
+/// `UBLK_U_IO_COMMIT_AND_FETCH_REQ` — report one result and re-arm the slot.
+///
+/// One command, not two, and that is the point: a separate commit would leave
+/// a window where the slot is neither serving a request nor waiting for one,
+/// and the queue would lose depth every round.
+inline uint32_t IoCmdCommitAndFetchReq() { return IowrIo(0x21); }
+/// `UBLK_U_IO_NEED_GET_DATA`.
+inline uint32_t IoCmdNeedGetData() { return IowrIo(0x22); }
+/// `UBLK_U_IO_REGISTER_IO_BUF` / `UBLK_U_IO_UNREGISTER_IO_BUF`.
+inline uint32_t IoCmdRegisterIoBuf() { return IowrIo(0x23); }
+inline uint32_t IoCmdUnregisterIoBuf() { return IowrIo(0x24); }
 
 }  // namespace abi
 }  // namespace ublk

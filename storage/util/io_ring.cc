@@ -168,12 +168,27 @@ SubmissionEntry& SubmissionEntry::UserData(uint64_t token) {
     return *this;
 }
 
+SubmissionEntry& SubmissionEntry::UseFixedFile(bool fixed) {
+    if (fixed) {
+        sqe_.flags |= kSqeFixedFile;
+    } else {
+        sqe_.flags &= static_cast<uint8_t>(~kSqeFixedFile);
+    }
+    return *this;
+}
+
+SubmissionEntry& SubmissionEntry::OverrideAddr(uint64_t addr) {
+    sqe_.addr = addr;
+    return *this;
+}
+
 // ---------------------------------------------------------------------------
 // Ring
 // ---------------------------------------------------------------------------
 
 Ring::Ring()
     : ring_fd_(-1), sqe128_(false), sq_entries_(0), cq_entries_(0),
+      sparse_files_(0), sparse_buffers_(0),
       sq_ring_(NULL), sq_ring_len_(0), sqes_(NULL), sqes_len_(0),
       cq_ring_(NULL), cq_ring_len_(0), cq_shares_sq_(false),
       sq_head_(NULL), sq_tail_(NULL), sq_mask_(0), sq_array_(NULL), sq_dropped_(NULL),
@@ -301,6 +316,8 @@ core::Expected<std::unique_ptr<Ring>, std::string> Ring::Open(const IoRingConfig
         if (SysRegister(ring->ring_fd_, kRegisterFiles2, &reg, sizeof(reg)) < 0) {
             return core::make_unexpected(Errno("io_ring: register_files_sparse"));
         }
+        ring->sparse_files_ = config.sparse_files;
+        ring->file_ids_.reset(new ReloadableIDAllocator(0));
     }
     if (config.sparse_buffers > 0) {
         RsrcRegister reg;
@@ -310,6 +327,8 @@ core::Expected<std::unique_ptr<Ring>, std::string> Ring::Open(const IoRingConfig
         if (SysRegister(ring->ring_fd_, kRegisterBuffers2, &reg, sizeof(reg)) < 0) {
             return core::make_unexpected(Errno("io_ring: register_buffers_sparse"));
         }
+        ring->sparse_buffers_ = config.sparse_buffers;
+        ring->buffer_ids_.reset(new ReloadableIDAllocator(0));
     }
 
     return std::move(ring);
@@ -460,6 +479,131 @@ core::Expected<core::Unit, std::string> Ring::UpdateFile(uint32_t index, int fd)
     if (SysRegister(ring_fd_, kRegisterFilesUpdate, &update, 1) < 0) {
         return core::make_unexpected(Errno("io_ring: register_files_update"));
     }
+    return core::Unit();
+}
+
+core::Expected<uint32_t, std::string> Ring::RegisterFd(int fd) {
+    if (sparse_files_ == 0 || !file_ids_) {
+        return core::make_unexpected(
+            std::string("io_ring: no sparse file table (set sparse_files at Open)"));
+    }
+    const uint32_t idx = file_ids_->Allocate();
+    if (idx >= sparse_files_) {
+        // Returned to the pool: leaking it would shrink the table by one on
+        // every overflow, so a transient burst would permanently cost slots.
+        file_ids_->Recycle(idx);
+        return core::make_unexpected(
+            std::string("io_ring: sparse file table is full"));
+    }
+    const core::Expected<core::Unit, std::string> installed = UpdateFile(idx, fd);
+    if (!installed.ok()) {
+        file_ids_->Recycle(idx);
+        return core::make_unexpected(installed.error());
+    }
+    return idx;
+}
+
+core::Expected<core::Unit, std::string> Ring::UnregisterFd(uint32_t index) {
+    if (!file_ids_ || file_ids_->IsFree(index)) {
+        // Refused rather than ignored: an index this ring never handed out
+        // belongs to nobody, and clearing the slot would pull the fd out from
+        // under whichever caller does own it.
+        return core::make_unexpected(
+            std::string("io_ring: unregister of an unregistered file index"));
+    }
+    // -1 is how the kernel is told to empty a slot.
+    const core::Expected<core::Unit, std::string> cleared = UpdateFile(index, -1);
+    if (!cleared.ok()) return core::make_unexpected(cleared.error());
+    file_ids_->Recycle(index);
+    return core::Unit();
+}
+
+core::Expected<uint32_t, std::string> Ring::RegisterBuffer(void* buf, std::size_t len) {
+    if (sparse_buffers_ == 0 || !buffer_ids_) {
+        return core::make_unexpected(
+            std::string("io_ring: no sparse buffer table (set sparse_buffers at Open)"));
+    }
+    if (buf == NULL || len == 0) {
+        return core::make_unexpected(std::string("io_ring: empty buffer registration"));
+    }
+    const uint32_t idx = buffer_ids_->Allocate();
+    if (idx >= sparse_buffers_) {
+        buffer_ids_->Recycle(idx);
+        return core::make_unexpected(std::string("io_ring: sparse buffer table is full"));
+    }
+
+    struct IoVec {
+        void* base;
+        std::size_t len;
+    } vec;
+    vec.base = buf;
+    vec.len = len;
+
+    // `IORING_REGISTER_BUFFERS_UPDATE` takes `io_uring_rsrc_update2` and the
+    // kernel requires `nr_args` to be that struct's size, not the number of
+    // buffers -- the count rides in the struct's own `nr`.
+    RsrcUpdate2 up;
+    std::memset(&up, 0, sizeof(up));
+    up.offset = idx;
+    up.data = reinterpret_cast<uint64_t>(&vec);
+    up.nr = 1;
+    if (SysRegister(ring_fd_, kRegisterBuffersUpdate, &up, sizeof(up)) < 0) {
+        const std::string why = Errno("io_ring: register_buffers_update");
+        buffer_ids_->Recycle(idx);
+        return core::make_unexpected(why);
+    }
+    return idx;
+}
+
+core::Expected<core::Unit, std::string> Ring::UnregisterBuffer(uint32_t index) {
+    if (!buffer_ids_ || buffer_ids_->IsFree(index)) {
+        return core::make_unexpected(
+            std::string("io_ring: unregister of an unregistered buffer index"));
+    }
+    // A zero-length iovec is how a slot is emptied; the kernel unpins the
+    // pages it was holding for it.
+    struct IoVec {
+        void* base;
+        std::size_t len;
+    } vec;
+    vec.base = NULL;
+    vec.len = 0;
+
+    RsrcUpdate2 up;
+    std::memset(&up, 0, sizeof(up));
+    up.offset = index;
+    up.data = reinterpret_cast<uint64_t>(&vec);
+    up.nr = 1;
+    if (SysRegister(ring_fd_, kRegisterBuffersUpdate, &up, sizeof(up)) < 0) {
+        return core::make_unexpected(Errno("io_ring: unregister buffer"));
+    }
+    buffer_ids_->Recycle(index);
+    return core::Unit();
+}
+
+core::Expected<uint32_t, std::string> Ring::OccupySparseBufferIndex() {
+    if (sparse_buffers_ == 0 || !buffer_ids_) {
+        return core::make_unexpected(
+            std::string("io_ring: no sparse buffer table (set sparse_buffers at Open)"));
+    }
+    const uint32_t idx = buffer_ids_->Allocate();
+    if (idx >= sparse_buffers_) {
+        buffer_ids_->Recycle(idx);
+        return core::make_unexpected(std::string("io_ring: sparse buffer table is full"));
+    }
+    // Nothing is registered. The slot is reserved so that nothing else claims
+    // it while the kernel fills it on request delivery -- which is the whole
+    // contract of `UBLK_F_AUTO_BUF_REG`.
+    return idx;
+}
+
+core::Expected<core::Unit, std::string> Ring::ReleaseSparseBufferIndex(uint32_t index) {
+    if (!buffer_ids_ || buffer_ids_->IsFree(index)) {
+        return core::make_unexpected(
+            std::string("io_ring: release of an unoccupied buffer index"));
+    }
+    // No kernel call: nothing was ever registered in this slot.
+    buffer_ids_->Recycle(index);
     return core::Unit();
 }
 

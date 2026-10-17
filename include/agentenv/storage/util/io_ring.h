@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "agentenv/core/expected.h"
+#include "agentenv/storage/util/id_allocator.h"
 #include "agentenv/storage/util/io_uring_abi.h"
 
 namespace agentenv {
@@ -94,6 +95,20 @@ class SubmissionEntry {
     /// Rust `.user_data(...)` — the token echoed back in the completion.
     SubmissionEntry& UserData(uint64_t token);
 
+    /// Rust `types::Fixed(idx)` — the `fd` field is an index into the
+    /// registered-file table rather than a real descriptor.
+    ///
+    /// A separate flag because the kernel cannot tell the two apart from the
+    /// value: fd 3 and fixed-slot 3 are both plausible, and without this the
+    /// command goes to whatever file descriptor 3 happens to be.
+    SubmissionEntry& UseFixedFile(bool fixed);
+
+    /// Rust `override_sqe!(&mut sqe, addr, value)`.
+    ///
+    /// Only `UBLK_F_AUTO_BUF_REG` needs it: the buffer slot travels in the
+    /// SQE's `addr` while the command payload's own `addr` must stay zero.
+    SubmissionEntry& OverrideAddr(uint64_t addr);
+
     /// Bytes of `cmd` this entry actually uses; decides whether it needs a
     /// 128-byte SQE.
     std::size_t CmdLen() const { return cmd_len_; }
@@ -166,6 +181,36 @@ class Ring {
     /// Rust `register_files_update` — fill one slot of a sparse table.
     core::Expected<core::Unit, std::string> UpdateFile(uint32_t index, int fd);
 
+    /// Rust `register_fd` — take the next free slot of the sparse file table
+    /// and install `fd` in it, returning the index.
+    ///
+    /// The index, not the fd, is what a submission refers to afterwards
+    /// (`Fixed(idx)`), which is how the kernel skips the fd lookup per
+    /// request. Fails when the table was not sized for it at `Open`.
+    core::Expected<uint32_t, std::string> RegisterFd(int fd);
+    /// Rust `unregister_fd_sync` — release the slot and the index.
+    core::Expected<core::Unit, std::string> UnregisterFd(uint32_t index);
+
+    /// Rust `register_buffer` — take the next free sparse buffer slot and
+    /// register `buf` into it.
+    ///
+    /// The buffer must stay at this address and length until unregistered:
+    /// the kernel pins its pages, so moving or freeing it leaves the ring
+    /// pointing at memory this process no longer owns.
+    core::Expected<uint32_t, std::string> RegisterBuffer(void* buf, std::size_t len);
+    /// Rust `unregister_buffer`.
+    core::Expected<core::Unit, std::string> UnregisterBuffer(uint32_t index);
+
+    /// Rust `occupy_sparse_buffer_index` — reserve an index *without*
+    /// registering anything in it.
+    ///
+    /// What `UBLK_F_AUTO_BUF_REG` needs: the kernel installs the buffer into
+    /// the slot itself when it delivers a request, so the server must only
+    /// make sure nothing else claims that index meanwhile.
+    core::Expected<uint32_t, std::string> OccupySparseBufferIndex();
+    /// Rust `release_sparse_buffer_index`.
+    core::Expected<core::Unit, std::string> ReleaseSparseBufferIndex(uint32_t index);
+
     /// Completions the kernel discarded because the CQ was full.
     ///
     /// Surfaced rather than hidden: a non-zero value means some I/O will never
@@ -185,6 +230,14 @@ class Ring {
     bool sqe128_;
     uint32_t sq_entries_;
     uint32_t cq_entries_;
+    /// Table sizes from `Open`; zero means the table was never created, which
+    /// the registration calls report instead of letting the kernel answer a
+    /// bare EINVAL.
+    uint32_t sparse_files_;
+    uint32_t sparse_buffers_;
+    /// Rust's `ReloadableIDAllocator` pair, one per sparse table.
+    std::unique_ptr<ReloadableIDAllocator> file_ids_;
+    std::unique_ptr<ReloadableIDAllocator> buffer_ids_;
 
     void* sq_ring_;
     std::size_t sq_ring_len_;

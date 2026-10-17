@@ -3,6 +3,8 @@ add_library(agentenv-ublk STATIC
     ctrl.cc
     dev.cc
     io_buffer.cc
+    # Rust: src/queue.rs — the descriptor mapping + FETCH/COMMIT_AND_FETCH
+    queue.cc
     impls.cc
 )
 target_include_directories(agentenv-ublk PUBLIC ${CMAKE_SOURCE_DIR}/include)

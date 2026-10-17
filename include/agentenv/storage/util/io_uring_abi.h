@@ -53,6 +53,11 @@ const uint32_t kSetupCqe32 = 1u << 11;
 /// slow, which is why submission is confined to the ring's own thread.
 const uint32_t kSetupSingleIssuer = 1u << 12;
 
+// ---- sqe flags ------------------------------------------------------------
+
+/// `IOSQE_FIXED_FILE` — `fd` is an index into the registered-file table.
+const uint8_t kSqeFixedFile = 1u << 0;
+
 // ---- features -------------------------------------------------------------
 
 /// The SQ and CQ rings live in one mapping, so the second `mmap` is skipped
@@ -83,6 +88,7 @@ const uint32_t kRegisterFilesUpdate = 6;
 /// to be sized before any of them are known.
 const uint32_t kRegisterFiles2 = 13;
 const uint32_t kRegisterBuffers2 = 15;
+const uint32_t kRegisterBuffersUpdate = 16;
 
 /// `IORING_RSRC_REGISTER_SPARSE`.
 const uint32_t kRsrcRegisterSparse = 1u << 0;
@@ -172,6 +178,20 @@ struct RsrcRegister {
     uint64_t resv2;
     uint64_t data;
     uint64_t tags;
+};
+
+/// `struct io_uring_rsrc_update2`, for `kRegisterBuffersUpdate`.
+///
+/// The kernel wants `nr_args` to be this struct's *size*, not the number of
+/// entries -- the count rides in `nr`. Passing the count instead is answered
+/// with EINVAL and nothing more.
+struct RsrcUpdate2 {
+    uint32_t offset;
+    uint32_t resv;
+    uint64_t data;
+    uint64_t tags;
+    uint32_t nr;
+    uint32_t resv2;
 };
 
 }  // namespace uring_abi
