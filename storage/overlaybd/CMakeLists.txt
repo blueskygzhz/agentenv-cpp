@@ -36,6 +36,7 @@ add_library(agentenv-overlaybd STATIC
     cache_pool.cc
     http_transport.cc
     s3_signer.cc
+    oss.cc
 )
 target_include_directories(agentenv-overlaybd PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-overlaybd PUBLIC agentenv-core agentenv-storage-util)
