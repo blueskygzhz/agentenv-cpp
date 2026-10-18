@@ -53,6 +53,22 @@ class ApiImpl {
     core::Expected<GetSandboxResp, ApiError>
         ResumeSandbox(const std::string& sandbox_id);
 
+    /// Rust `sandboxes_sandbox_id_fork_post`.
+    ///
+    /// Returns 201 with one entry per child even when every child failed: the
+    /// children are independent, and a single status could not say that two of
+    /// three booted. Only a failure of the *fork itself* -- a missing or
+    /// non-running source -- comes back as an `ApiError`.
+    ///
+    /// Deviation: Rust additionally forks the source's volumes, giving each
+    /// child its own writable clone (`prepare_volume_fork_specs`). That needs a
+    /// `VolumeManager`, which this handler bundle does not hold, so a source
+    /// with volume mounts is refused rather than forked without them -- sharing
+    /// one exclusive volume between parent and child would let two VMs write
+    /// the same image.
+    core::Expected<ForkSandboxResp, ApiError>
+        ForkSandbox(const std::string& sandbox_id, const ForkSandboxReq& req);
+
     // Snapshot handlers (Rust: src/api/impls/snapshot.rs).
     core::Expected<core::Unit, ApiError>
         CreateSnapshot(const std::string& sandbox_id);

@@ -143,6 +143,32 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc)
         WriteJson(r.value().ToJson(), resp);
     });
 
+    server->Route("POST", "/sandboxes/{id}/fork",
+                  [impl](const HttpRequest& req, HttpResponse* resp) {
+        // The body is optional: Rust's parameter is
+        // `Option<SandboxForkRequest>`, and an absent one forks once with the
+        // source's timeout. An empty body is therefore not an error.
+        ForkSandboxReq parsed;
+        if (!req.body.empty()) {
+            core::Json body;
+            if (!ParseBody(req, &body, resp)) return;
+            const core::Expected<ForkSandboxReq, core::AnyError> decoded =
+                ForkSandboxReq::FromJson(body);
+            if (!decoded.ok()) {
+                return WriteError(ApiError::Make(400, decoded.error().chain()), resp);
+            }
+            parsed = decoded.value();
+        }
+        const core::Expected<ForkSandboxResp, ApiError> r =
+            impl->ForkSandbox(Param(req, "id"), parsed);
+        if (!r.ok()) return WriteError(r.error(), resp);
+        // 201, and the per-child results are in the body. A child that failed
+        // is reported there rather than by the status, which describes the
+        // fork as a whole.
+        WriteJson(r.value().ToJson(), resp);
+        resp->status = 201;
+    });
+
     server->Route("POST", "/sandboxes/{id}/snapshot",
                   [impl](const HttpRequest& req, HttpResponse* resp) {
         const core::Expected<core::Unit, ApiError> r =

@@ -437,16 +437,103 @@ MT_TEST(unported_capture_methods_report_failure) {
     // it refuses. Leaving it here would have kept passing for the wrong
     // reason -- it still fails without a spawned child, but from the Pid()
     // read rather than from being unported.
+    //
+    // `Fork` left for the same reason: it now pauses, resumes and builds each
+    // child, so it fails here from having no live microVM rather than from
+    // being unported. Asserting it refuses would no longer say anything about
+    // whether it is implemented. See `fork_without_a_live_vm_is_terminal`.
     MT_EXPECT_TRUE(!backend->SnapshotVolumes().ok());
     MT_EXPECT_TRUE(!backend->FreezeAndSnapshotVolumes().ok());
     MT_EXPECT_TRUE(!backend->ThawVolumes().ok());
     MT_EXPECT_TRUE(!backend->Start().ok());
     MT_EXPECT_TRUE(!backend->StartNowait().ok());
     MT_EXPECT_TRUE(!backend->WaitForReady().ok());
-    MT_EXPECT_TRUE(!backend->Fork(std::vector<SandboxForkSpec>()).ok());
     MT_EXPECT_TRUE(!backend->UpdateNetworkPolicy(core::nullopt).ok());
     // No API call was made by any of them.
     MT_EXPECT_EQ(conn->calls.size(), static_cast<std::size_t>(0));
+}
+
+MT_TEST(fork_pauses_and_resumes_the_source_around_the_capture) {
+    ScriptedConnector* conn = new ScriptedConnector();
+    std::unique_ptr<FirecrackerSandboxBackend> backend = MakeBackend(conn);
+
+    // No children, so nothing is built -- but the capture still happens, and
+    // the ordering of those two VMM calls is the point.
+    const SandboxCaptureResult<std::vector<SandboxForkResult> > forked =
+        backend->Fork(std::vector<SandboxForkSpec>());
+    MT_EXPECT_TRUE(forked.ok());
+    if (forked.ok()) MT_EXPECT_TRUE(forked.value().empty());
+
+    // Paused then resumed, in that order and both before any child is built.
+    // Resuming only after the children had booted would hold the parent frozen
+    // for the whole fork; not resuming at all would leave it frozen for good
+    // while the orchestrator puts its record back to Running.
+    MT_EXPECT_EQ(conn->calls.size(), static_cast<std::size_t>(2));
+    if (conn->calls.size() == 2) {
+        MT_EXPECT_TRUE(conn->calls[0].find("Paused") != std::string::npos);
+        MT_EXPECT_TRUE(conn->calls[1].find("Resumed") != std::string::npos);
+    }
+}
+
+MT_TEST(a_fork_whose_resume_fails_is_terminal) {
+    // The capture already happened and the VM is paused. Nothing here can get
+    // it running again.
+    ScriptedConnector* conn = new ScriptedConnector("Resumed");
+    std::unique_ptr<FirecrackerSandboxBackend> backend = MakeBackend(conn);
+
+    const SandboxCaptureResult<std::vector<SandboxForkResult> > forked =
+        backend->Fork(std::vector<SandboxForkSpec>());
+    MT_EXPECT_TRUE(!forked.ok());
+    if (!forked.ok()) {
+        // Terminal, not recoverable. Recoverable means "the source is still
+        // serving", and the orchestrator acts on that by putting the record
+        // back to Running -- which for a VM stuck paused would advertise a
+        // sandbox that answers nothing. Terminal makes it stop and remove the
+        // source instead.
+        MT_EXPECT_TRUE(forked.error().IsTerminal());
+        MT_EXPECT_TRUE(forked.error().Message().find("resume") != std::string::npos);
+    }
+}
+
+MT_TEST(a_fork_whose_pause_fails_resumes_before_reporting) {
+    ScriptedConnector* conn = new ScriptedConnector("Paused");
+    std::unique_ptr<FirecrackerSandboxBackend> backend = MakeBackend(conn);
+
+    const SandboxCaptureResult<std::vector<SandboxForkResult> > forked =
+        backend->Fork(std::vector<SandboxForkSpec>());
+    MT_EXPECT_TRUE(!forked.ok());
+
+    // Routed through `RecoverCaptureFailure`, which resumes before reporting
+    // anything recoverable. Reporting a recoverable error while the VM is
+    // still paused would tell the orchestrator the sandbox is fine when it is
+    // frozen -- so the resume attempt must happen, and it shows up as a
+    // second call even though the pause failed.
+    MT_EXPECT_TRUE(conn->calls.size() >= 2);
+    if (conn->calls.size() >= 2) {
+        MT_EXPECT_TRUE(conn->calls[0].find("Paused") != std::string::npos);
+        MT_EXPECT_TRUE(conn->calls[1].find("Resumed") != std::string::npos);
+    }
+}
+
+MT_TEST(fork_without_a_live_vm_is_terminal) {
+    // A backend with no instance at all, as the fresh (not yet started) form
+    // is. `MakeBackend` hands one an instance, so this builds the other shape.
+    FreshStartSpec spec;
+    spec.sandbox_id = TestSandboxId();
+    std::unique_ptr<FirecrackerSandboxBackend> backend(
+        new FirecrackerSandboxBackend(spec, SnapshotConfig(),
+                                      std::shared_ptr<Connector>()));
+
+    const SandboxCaptureResult<std::vector<SandboxForkResult> > forked =
+        backend->Fork(std::vector<SandboxForkSpec>());
+    MT_EXPECT_TRUE(!forked.ok());
+    if (!forked.ok()) {
+        // Terminal, not recoverable. A recoverable error tells the
+        // orchestrator the source is still serving and hands its record back
+        // to Running; with no instance there is nothing serving, so that would
+        // leave a Running record for a sandbox that does not exist.
+        MT_EXPECT_TRUE(forked.error().IsTerminal());
+    }
 }
 
 MT_TEST(runtime_info_leaves_an_unrecorded_rootfs_size_absent) {

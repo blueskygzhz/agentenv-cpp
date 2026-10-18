@@ -91,6 +91,31 @@ core::Expected<core::Unit, std::string> PrepareSnapshotConfigForResume(
     SnapshotConfig* config, const core::SandboxId& sandbox_id,
     const core::Optional<EnvdAccessToken>& envd_access_token);
 
+/// Rust `snapshot_config_for_fork` — rewrite a captured config's drive list
+/// for one fork child.
+///
+/// A fork resumes every child from the *same* capture, so the only thing that
+/// may differ between them is which volume each drive slot points at. This
+/// substitutes by value rather than by id: Firecracker reopens each serialized
+/// slot path on load, so the replacement's image config, mount path and size
+/// all have to be in the config before the load, not patched afterwards.
+///
+/// Three things are refused rather than accommodated:
+///
+///  * A **duplicate replacement id** — two slots pointing at one volume would
+///    give the child the same filesystem twice, and for a writable volume that
+///    is two mounts racing on one image.
+///  * A **replacement not present in `extra_drives`** — the id alone carries
+///    no image path, so there would be nothing to put in the slot.
+///  * An **appended drive** — a slot that the capture does not already contain
+///    cannot be added, because the guest's device names are fixed by the
+///    serialized layout. Appending would shift every later device.
+///
+/// An empty `replace_drive_ids` *and* `extra_drives` is the common case and
+/// returns the source config unchanged.
+core::Expected<SnapshotConfig, std::string> SnapshotConfigForFork(
+    const SnapshotConfig& source, const SandboxForkSpec& child);
+
 /// Rust `FirecrackerSandbox::new_with_id` — the drive partitioning it does
 /// before handing the config to `build`.
 ///

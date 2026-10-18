@@ -125,6 +125,81 @@ ApiImpl::GetSandbox(const std::string& sandbox_id) {
     return ToGetSandboxResp(*r.value());
 }
 
+// Rust `sandboxes_sandbox_id_fork_post`.
+core::Expected<ForkSandboxResp, ApiError>
+ApiImpl::ForkSandbox(const std::string& sandbox_id, const ForkSandboxReq& req) {
+    const core::Expected<core::SandboxId, ApiError> id = ParseId(sandbox_id);
+    if (!id.ok()) return core::make_unexpected(id.error());
+
+    // Fetched before validating `count` so a missing sandbox is a 404 rather
+    // than a 400 about the body, matching Rust's ordering. The source is also
+    // needed to see whether it has volume mounts.
+    const orchestrator::OrchestratorResult<
+        core::Optional<orchestrator::SandboxMetadata> > source =
+        svc_->GetSandbox(id.value());
+    if (!source.ok()) return core::make_unexpected(ToApiError(source.error()));
+    if (!source.value()) return core::make_unexpected(SandboxNotFound(sandbox_id));
+
+    // Rust: `body.count.unwrap_or(1)` then `(1..=100).contains`.
+    const uint32_t count = req.count.has_value() ? *req.count : 1;
+    if (count < 1 || count > 100) {
+        return core::make_unexpected(
+            ApiError::Make(400, "count must be between 1 and 100"));
+    }
+
+    // Deviation, and a refusal rather than a silent downgrade. Rust clones each
+    // exclusive volume for every child so the parent keeps sole ownership of
+    // its own. Without a `VolumeManager` here there is nothing to clone with,
+    // and forking anyway would hand the child the parent's volume ids -- two
+    // live VMs writing one image. See the header.
+    if (!source.value()->volume_mounts.empty()) {
+        return core::make_unexpected(ApiError::Make(
+            501, "forking a sandbox with volume mounts is not available in this build"));
+    }
+
+    // Seconds on the wire, milliseconds internally. An absent timeout inherits
+    // the source's, which is why this is not defaulted to a number.
+    const orchestrator::NewTimeout timeout =
+        req.timeout_secs.has_value()
+            ? orchestrator::NewTimeout::Set(static_cast<int64_t>(*req.timeout_secs) * 1000)
+            : orchestrator::NewTimeout::UseExisting();
+
+    const orchestrator::OrchestratorResult<
+        std::vector<orchestrator::SandboxForkOutcome> > outcomes =
+        svc_->ForkSandbox(id.value(), count, timeout);
+    if (!outcomes.ok()) {
+        // A failure of the fork itself, not of a child.
+        //
+        // `InvalidSandboxState` is overridden to 409 here. The generic mapping
+        // gives it 400, which is right for a request that cannot ever apply --
+        // but a sandbox that is merely paused or still creating will be
+        // forkable shortly, and 400 tells the client to stop trying. Rust
+        // makes the same exception for this one handler, with this wording.
+        if (outcomes.error().kind ==
+            orchestrator::OrchestratorErrorKind::InvalidSandboxState) {
+            return core::make_unexpected(ApiError::Make(
+                409, std::string("sandbox cannot be forked from ") +
+                         orchestrator::SandboxStateName(outcomes.error().state) +
+                         " state"));
+        }
+        return core::make_unexpected(ToApiError(outcomes.error()));
+    }
+
+    ForkSandboxResp resp;
+    for (std::size_t i = 0; i < outcomes.value().size(); ++i) {
+        ForkSandboxResultEntry entry;
+        if (outcomes.value()[i].ok()) {
+            entry.sandbox = core::Optional<GetSandboxResp>(
+                ToGetSandboxResp(outcomes.value()[i].value()));
+        } else {
+            entry.error = core::Optional<ApiError>(
+                ToApiError(outcomes.value()[i].error()));
+        }
+        resp.results.push_back(entry);
+    }
+    return resp;
+}
+
 core::Expected<ListSandboxesResp, ApiError>
 ApiImpl::ListSandboxes() {
     const orchestrator::OrchestratorResult<

@@ -10,6 +10,7 @@
 #include "agentenv/core/error.h"
 #include "agentenv/core/expected.h"
 #include "agentenv/core/json.h"
+#include "agentenv/core/optional.h"
 
 namespace agentenv {
 namespace api {
@@ -97,6 +98,40 @@ struct ApiError {
 
     core::Json ToJson() const;
 };
+
+/// POST /sandboxes/{id}/fork  request body.
+///
+/// Rust `models::SandboxForkRequest`. Both fields are optional, and the
+/// defaults differ in kind: an absent `count` means one child, while an absent
+/// `timeout` means *inherit the source's*, which is not the same as no timeout.
+struct ForkSandboxReq {
+    /// Rust `count: Option<u32>`, validated to 1..=100.
+    core::Optional<uint32_t> count;
+    /// Rust `timeout: Option<u32>` in **seconds**.
+    core::Optional<uint32_t> timeout_secs;
+
+    core::Json ToJson() const;
+    static core::Expected<ForkSandboxReq, core::AnyError> FromJson(const core::Json& j);
+};
+
+/// One entry of the fork response.
+///
+/// Rust `models::SandboxForkResult`: exactly one of the two is set. A fork of
+/// N children reports N of these, because each child succeeds or fails on its
+/// own -- collapsing them into one status would lose the children that worked.
+struct ForkSandboxResultEntry {
+    core::Optional<GetSandboxResp> sandbox;
+    core::Optional<ApiError>       error;
+
+    core::Json ToJson() const;
+};
+
+/// POST /sandboxes/{id}/fork  response body (HTTP 201).
+struct ForkSandboxResp {
+    std::vector<ForkSandboxResultEntry> results;
+    core::Json ToJson() const;
+};
+
 
 }  // namespace api
 }  // namespace agentenv

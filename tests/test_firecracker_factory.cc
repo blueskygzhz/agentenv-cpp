@@ -557,4 +557,160 @@ MT_TEST(a_physical_drive_count_past_the_letters_yields_no_slots) {
     MT_EXPECT_TRUE(!PartitionExtraDrives(&config, 4).ok());
 }
 
+
+// ============================================================
+// snapshot_config_for_fork
+// ============================================================
+// Rust `snapshot_config_for_fork`. Every child of a fork resumes the *same*
+// capture, so the only thing that may differ is which volume a drive slot
+// points at -- and the substitutions below are the only way a child gets its
+// own volumes at all.
+
+namespace {
+
+SnapshotConfig ForkSource() {
+    SnapshotConfig config;
+    config.common.extra_drives.push_back(Drive("phys-a", "/mnt/p1"));
+    config.common.extra_drives.push_back(VolumeDrive("vol-a", "/mnt/a"));
+    config.common.extra_drives.push_back(VolumeDrive("vol-b", "/mnt/b"));
+    // The first drive is physical; the rest are volume slots.
+    config.common.physical_extra_drive_count = 1;
+    return config;
+}
+
+SandboxForkSpec ChildSpec() {
+    SandboxForkSpec spec;
+    spec.sandbox_id = core::SandboxId::Fresh();
+    return spec;
+}
+
+}  // namespace
+
+MT_TEST(fork_config_without_substitutions_is_the_source_unchanged) {
+    const SnapshotConfig source = ForkSource();
+    const core::Expected<SnapshotConfig, std::string> forked =
+        SnapshotConfigForFork(source, ChildSpec());
+    MT_EXPECT_TRUE(forked.ok());
+    if (!forked.ok()) return;
+    // The common case. Children that share the parent's volumes resume the
+    // capture verbatim.
+    MT_EXPECT_TRUE(DriveIds(forked.value().common.extra_drives) ==
+                   DriveIds(source.common.extra_drives));
+}
+
+MT_TEST(fork_config_replaces_a_volume_slot_in_place) {
+    const SnapshotConfig source = ForkSource();
+    SandboxForkSpec child = ChildSpec();
+    ExtraDrive replacement = VolumeDrive("vol-child", "/mnt/a");
+    replacement.image_config_path = "/img/child-a.json";
+    child.extra_drives.push_back(replacement);
+    child.replace_drive_ids.push_back(std::make_pair("vol-a", "vol-child"));
+
+    const core::Expected<SnapshotConfig, std::string> forked =
+        SnapshotConfigForFork(source, child);
+    MT_EXPECT_TRUE(forked.ok());
+    if (!forked.ok()) return;
+
+    // Substituted in place: the slot ordering the guest names devices by is
+    // untouched, so `vol-child` is mounted where `vol-a` was.
+    const std::vector<std::string> ids = DriveIds(forked.value().common.extra_drives);
+    MT_EXPECT_EQ(static_cast<int>(ids.size()), 3);
+    MT_EXPECT_EQ(ids[0], std::string("phys-a"));
+    MT_EXPECT_EQ(ids[1], std::string("vol-child"));
+    MT_EXPECT_EQ(ids[2], std::string("vol-b"));
+
+    // Substituted by value, not by id. Firecracker reopens every serialized
+    // slot path during the load, so the image config has to be in the config
+    // before the load -- carrying only the id forward would resume the child
+    // on the parent's image.
+    MT_EXPECT_EQ(forked.value().common.extra_drives[1].image_config_path,
+                 std::string("/img/child-a.json"));
+}
+
+MT_TEST(fork_config_refuses_a_duplicate_replacement) {
+    const SnapshotConfig source = ForkSource();
+    SandboxForkSpec child = ChildSpec();
+    child.extra_drives.push_back(VolumeDrive("vol-child", "/mnt/a"));
+    child.replace_drive_ids.push_back(std::make_pair("vol-a", "vol-child"));
+    child.replace_drive_ids.push_back(std::make_pair("vol-b", "vol-child"));
+
+    // Refused rather than deduplicated. Two slots resolving to one volume
+    // would mount the same image twice, and for a writable volume that is two
+    // mounts racing on one device.
+    const core::Expected<SnapshotConfig, std::string> forked =
+        SnapshotConfigForFork(source, child);
+    MT_EXPECT_TRUE(!forked.ok());
+    if (!forked.ok()) {
+        MT_EXPECT_TRUE(forked.error().find("duplicate") != std::string::npos);
+    }
+}
+
+MT_TEST(fork_config_refuses_a_replacement_it_was_not_given) {
+    const SnapshotConfig source = ForkSource();
+    SandboxForkSpec child = ChildSpec();
+    // Names a replacement but does not supply the drive, so there is no image
+    // path to put in the slot. The id alone carries nothing.
+    child.replace_drive_ids.push_back(std::make_pair("vol-a", "vol-missing"));
+
+    const core::Expected<SnapshotConfig, std::string> forked =
+        SnapshotConfigForFork(source, child);
+    MT_EXPECT_TRUE(!forked.ok());
+    if (!forked.ok()) {
+        MT_EXPECT_TRUE(forked.error().find("missing") != std::string::npos);
+    }
+}
+
+MT_TEST(fork_config_refuses_a_source_slot_that_does_not_exist) {
+    const SnapshotConfig source = ForkSource();
+    SandboxForkSpec child = ChildSpec();
+    child.extra_drives.push_back(VolumeDrive("vol-child", "/mnt/x"));
+    child.replace_drive_ids.push_back(std::make_pair("vol-nope", "vol-child"));
+
+    const core::Expected<SnapshotConfig, std::string> forked =
+        SnapshotConfigForFork(source, child);
+    MT_EXPECT_TRUE(!forked.ok());
+    if (!forked.ok()) {
+        MT_EXPECT_TRUE(forked.error().find("does not exist") != std::string::npos);
+    }
+}
+
+MT_TEST(fork_config_refuses_to_append_a_drive) {
+    const SnapshotConfig source = ForkSource();
+    SandboxForkSpec child = ChildSpec();
+    // A drive with no slot to go into, and no replacement naming it.
+    child.extra_drives.push_back(VolumeDrive("vol-extra", "/mnt/extra"));
+
+    // Appending is refused because the guest's device names come from the
+    // serialized layout: Firecracker has no slot to load this into, and
+    // making room would rename every later device.
+    const core::Expected<SnapshotConfig, std::string> forked =
+        SnapshotConfigForFork(source, child);
+    MT_EXPECT_TRUE(!forked.ok());
+    if (!forked.ok()) {
+        MT_EXPECT_TRUE(forked.error().find("append") != std::string::npos);
+    }
+}
+
+MT_TEST(fork_config_allows_replacing_every_volume_slot_at_once) {
+    const SnapshotConfig source = ForkSource();
+    SandboxForkSpec child = ChildSpec();
+    child.extra_drives.push_back(VolumeDrive("c-a", "/mnt/a"));
+    child.extra_drives.push_back(VolumeDrive("c-b", "/mnt/b"));
+    child.replace_drive_ids.push_back(std::make_pair("vol-a", "c-a"));
+    child.replace_drive_ids.push_back(std::make_pair("vol-b", "c-b"));
+
+    const core::Expected<SnapshotConfig, std::string> forked =
+        SnapshotConfigForFork(source, child);
+    MT_EXPECT_TRUE(forked.ok());
+    if (!forked.ok()) return;
+    const std::vector<std::string> ids = DriveIds(forked.value().common.extra_drives);
+    MT_EXPECT_EQ(ids[0], std::string("phys-a"));
+    MT_EXPECT_EQ(ids[1], std::string("c-a"));
+    MT_EXPECT_EQ(ids[2], std::string("c-b"));
+    // The physical count is carried through: it is what tells the resume
+    // which slots are volumes.
+    MT_EXPECT_EQ(forked.value().common.physical_extra_drive_count,
+                 static_cast<std::size_t>(1));
+}
+
 MT_MAIN

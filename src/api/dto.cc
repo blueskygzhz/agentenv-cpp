@@ -179,5 +179,57 @@ core::Json ApiError::ToJson() const {
     return j;
 }
 
+
+// -------- ForkSandboxReq --------
+//
+// Both fields are omitted when unset rather than written as a sentinel: Rust
+// has `skip_serializing_if = "Option::is_none"` on each, and an explicit 0
+// would mean something different in both cases -- a `count` of zero is invalid
+// and a `timeout` of zero is "expire immediately", not "inherit".
+core::Json ForkSandboxReq::ToJson() const {
+    core::Json j;
+    if (count.has_value()) j["count"] = core::Json(static_cast<int64_t>(*count));
+    if (timeout_secs.has_value()) {
+        j["timeout"] = core::Json(static_cast<int64_t>(*timeout_secs));
+    }
+    return j;
+}
+core::Expected<ForkSandboxReq, core::AnyError>
+ForkSandboxReq::FromJson(const core::Json& j) {
+    ForkSandboxReq r;
+    // Absence is the documented default for both, so a missing field is not an
+    // error. The range check on `count` belongs to the handler, which is where
+    // Rust validates it and where a 400 can be returned.
+    const core::Json& c = j["count"];
+    if (c.kind() == core::Json::Kind::Int && c.as_int() >= 0) {
+        r.count = core::Optional<uint32_t>(static_cast<uint32_t>(c.as_int()));
+    }
+    const core::Json& t = j["timeout"];
+    if (t.kind() == core::Json::Kind::Int && t.as_int() >= 0) {
+        r.timeout_secs = core::Optional<uint32_t>(static_cast<uint32_t>(t.as_int()));
+    }
+    return r;
+}
+
+// -------- ForkSandboxResultEntry --------
+core::Json ForkSandboxResultEntry::ToJson() const {
+    core::Json j;
+    // Exactly one side is written. Emitting both keys with one null would make
+    // a caller checking `if (error)` see a present-but-empty object.
+    if (sandbox.has_value()) j["sandbox"] = sandbox->ToJson();
+    if (error.has_value()) j["error"] = error->ToJson();
+    return j;
+}
+
+// -------- ForkSandboxResp --------
+core::Json ForkSandboxResp::ToJson() const {
+    // A bare array, matching Rust's `Vec<SandboxForkResult>` response body.
+    core::JsonArray arr;
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        arr.push_back(results[i].ToJson());
+    }
+    return core::Json(arr);
+}
+
 }  // namespace api
 }  // namespace agentenv

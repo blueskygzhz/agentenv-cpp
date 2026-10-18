@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Rust: src/sandbox/firecracker/factory.rs
+#include <set>
 #include "agentenv/sandbox/firecracker/factory.h"
 
 #include <cstdint>
@@ -267,6 +268,90 @@ DecodeFirecrackerPausedState(const std::string& artifact_root, const std::string
         FirecrackerPausedState::Decode(artifact_root, value.value());
     if (!decoded.ok()) return core::make_unexpected(core::err(decoded.error()));
     return std::shared_ptr<PausedSandboxState>(new FirecrackerPausedState(decoded.value()));
+}
+
+
+// Rust `snapshot_config_for_fork`.
+core::Expected<SnapshotConfig, std::string> SnapshotConfigForFork(
+    const SnapshotConfig& source, const SandboxForkSpec& child) {
+    SnapshotConfig snapshot = source;
+
+    // The common case: every child resumes the capture as-is.
+    //
+    // A shortcut, not a behavioural branch: with both lists empty the loops
+    // below iterate nothing and return the same config, so no test can tell
+    // this apart. Kept because it is the overwhelmingly common path -- a fork
+    // whose children share the parent's volumes -- and it states that plainly.
+    if (child.replace_drive_ids.empty() && child.extra_drives.empty()) {
+        return snapshot;
+    }
+
+    std::set<std::string> replacement_ids;
+    for (std::size_t i = 0; i < child.replace_drive_ids.size(); ++i) {
+        const std::string& drive_id = child.replace_drive_ids[i].first;
+        const std::string& replacement_id = child.replace_drive_ids[i].second;
+
+        // Refused, not deduplicated: two slots resolving to one volume would
+        // mount the same image twice, and for a writable volume that is two
+        // mounts racing on one device.
+        if (!replacement_ids.insert(replacement_id).second) {
+            return core::make_unexpected(
+                std::string("duplicate fork replacement drive ") + replacement_id);
+        }
+
+        // Substituted by value. The id alone carries no image config path,
+        // mount path or size, and Firecracker reopens each serialized slot
+        // path during the load -- so the whole drive has to be in the config
+        // before the load rather than patched into a running VM.
+        const ExtraDrive* replacement = 0;
+        for (std::size_t k = 0; k < child.extra_drives.size(); ++k) {
+            if (child.extra_drives[k].drive_id == replacement_id) {
+                replacement = &child.extra_drives[k];
+                break;
+            }
+        }
+        if (replacement == 0) {
+            return core::make_unexpected(
+                std::string("missing fork replacement drive ") + replacement_id);
+        }
+
+        std::size_t index = snapshot.common.extra_drives.size();
+        for (std::size_t k = 0; k < snapshot.common.extra_drives.size(); ++k) {
+            if (snapshot.common.extra_drives[k].drive_id == drive_id) {
+                index = k;
+                break;
+            }
+        }
+        if (index == snapshot.common.extra_drives.size()) {
+            return core::make_unexpected(
+                std::string("fork source drive ") + drive_id + " does not exist");
+        }
+        // Replaced in place, so the slot ordering the guest names devices by
+        // is untouched.
+        snapshot.common.extra_drives[index] = *replacement;
+    }
+
+    // Anything the child brings must already have a slot. Appending is refused
+    // because the guest's device names come from the serialized layout: a new
+    // trailing drive would be fine, but Firecracker has no slot to load it
+    // into, and reordering to make room would rename every later device.
+    for (std::size_t i = 0; i < child.extra_drives.size(); ++i) {
+        const std::string& id = child.extra_drives[i].drive_id;
+        bool present = false;
+        for (std::size_t k = 0; k < snapshot.common.extra_drives.size(); ++k) {
+            if (snapshot.common.extra_drives[k].drive_id == id) {
+                present = true;
+                break;
+            }
+        }
+        if (!present) {
+            return core::make_unexpected(
+                std::string("fork cannot append drive ") + id +
+                " to captured Firecracker state");
+        }
+    }
+
+    return snapshot;
 }
 
 }  // namespace firecracker

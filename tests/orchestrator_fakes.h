@@ -73,6 +73,17 @@ struct BackendScript {
 
     /// The specs the last `Fork` call received.
     std::vector<sandbox::SandboxForkSpec> last_fork_specs;
+
+    BackendScript() {}
+    ~BackendScript() {
+        for (std::size_t i = 0; i < fork_children.size(); ++i) delete fork_children[i];
+    }
+
+ private:
+    // Owned child scripts make this non-copyable; it is always held as a local
+    // and passed by pointer, so nothing needs the copy.
+    BackendScript(const BackendScript&);
+    BackendScript& operator=(const BackendScript&);
 };
 
 class FakeSandbox : public sandbox::SandboxBackend {
@@ -138,9 +149,45 @@ class FakeSandbox : public sandbox::SandboxBackend {
             return core::make_unexpected(
                 sandbox::SandboxCaptureError::Terminal("fake: fork broke the runtime"));
         }
-        // Default: recoverable error. Use FakeForkableSandbox for success tests.
-        return core::make_unexpected(
-            sandbox::SandboxCaptureError::Recoverable("fake: fork unsupported"));
+        if (!script_->succeed_fork) {
+            return core::make_unexpected(
+                sandbox::SandboxCaptureError::Recoverable("fake: fork unsupported"));
+        }
+
+        // The whole-call result succeeds and each child carries its own
+        // result, which is the shape the real backend returns: a fork can
+        // partially succeed, and the orchestrator is expected to keep the
+        // children that started rather than unwind the ones that did.
+        //
+        // Built by moving locals in: `SandboxForkResult` holds a `unique_ptr`,
+        // so it is move-only and neither `resize` nor a `push_back` of a
+        // copyable temporary compiles.
+        std::vector<sandbox::SandboxForkResult> results;
+        results.reserve(specs.size());
+        for (std::size_t i = 0; i < specs.size(); ++i) {
+            const bool starts = i < script_->fork_child_outcomes.size()
+                                    ? script_->fork_child_outcomes[i]
+                                    : true;
+            if (!starts) {
+                sandbox::SandboxForkResult failed = core::make_unexpected(
+                    core::err("fake: forked child failed to start"));
+                results.push_back(std::move(failed));
+                // No script is recorded for a child that never existed, so
+                // `fork_children` only ever holds the children the caller
+                // actually received.
+                continue;
+            }
+            BackendScript* child = new BackendScript();
+            script_->fork_children.push_back(child);
+            sandbox::SandboxForkResult started(
+                std::unique_ptr<sandbox::SandboxBackend>(new FakeSandbox(child)));
+            results.push_back(std::move(started));
+        }
+        // Moved, not returned by name: `Expected`'s `const T&` constructor is
+        // viable here and GCC 4.8 picks it, which copies the vector and so
+        // copies a move-only element.
+        return sandbox::SandboxCaptureResult<std::vector<sandbox::SandboxForkResult> >(
+            std::move(results));
     }
     core::Expected<core::Unit, core::AnyError> Stop() override {
         ++script_->stop_calls;
@@ -266,6 +313,44 @@ struct Fixture {
 
     Fixture()
         : store(new orchestrator::InMemoryMetadataStore()),
+          factory(new FakeFactory(&script)),
+          persister(new orchestrator::DisabledSandboxPersister()),
+          orch(new orchestrator::Orchestrator(store, factory, persister)) {}
+};
+
+/// Rust `ScriptedStore` — an in-memory store that can be told to refuse one
+/// `Add`.
+///
+/// Needed because the fork path checks for pre-existing children *before*
+/// calling the backend, so a child-registration failure cannot be staged by
+/// seeding the id: by the time `Add` runs, the id has already been shown to be
+/// free. The failure has to be injected at the call itself.
+class ScriptedAddStore : public orchestrator::InMemoryMetadataStore {
+ public:
+    /// The id whose `Add` must fail. Empty means every `Add` succeeds.
+    std::string fail_add_for;
+
+    core::Expected<core::Unit, orchestrator::StoreError>
+        Add(orchestrator::SandboxMetadata meta) override {
+        if (!fail_add_for.empty() && meta.id.ToString() == fail_add_for) {
+            return core::make_unexpected(orchestrator::StoreError::Backend(
+                "injected store failure during child registration"));
+        }
+        return orchestrator::InMemoryMetadataStore::Add(meta);
+    }
+};
+
+/// `Fixture` over a `ScriptedAddStore`, so a test can reach the branch where a
+/// forked child starts but cannot be registered.
+struct ScriptedStoreFixture {
+    BackendScript                                   script;
+    std::shared_ptr<ScriptedAddStore>               store;
+    std::shared_ptr<FakeFactory>                    factory;
+    std::shared_ptr<orchestrator::SandboxPersister> persister;
+    std::shared_ptr<orchestrator::Orchestrator>     orch;
+
+    ScriptedStoreFixture()
+        : store(new ScriptedAddStore()),
           factory(new FakeFactory(&script)),
           persister(new orchestrator::DisabledSandboxPersister()),
           orch(new orchestrator::Orchestrator(store, factory, persister)) {}

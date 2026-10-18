@@ -8,6 +8,8 @@
 #include <dirent.h>
 #include "agentenv/sandbox/firecracker/sandbox_backend.h"
 
+#include "agentenv/core/logging.h"
+#include "agentenv/sandbox/firecracker/factory.h"
 #include "agentenv/sandbox/firecracker/process_vm.h"
 
 #include "agentenv/sandbox/firecracker/lifecycle.h"
@@ -642,10 +644,141 @@ SandboxCaptureResult<core::Unit> FirecrackerSandboxBackend::FreezeAndSnapshotVol
 core::Expected<core::Unit, core::AnyError> FirecrackerSandboxBackend::ThawVolumes() {
     return core::make_unexpected(NotAvailable("thaw_volumes"));
 }
+// Rust `fork`.
+//
+// The source is paused to get a consistent capture, resumed immediately, and
+// each child is then built from that one capture. Two orderings here are
+// load-bearing:
+//
+//  * The source is resumed **before** any child is built. Rust does the same,
+//    and it is what keeps a fork from holding the parent frozen for as long as
+//    the children take to boot. A build failure after this point is a child's
+//    problem, not the parent's.
+//  * A pause failure goes through `RecoverCaptureFailure`, which resumes the
+//    VM before reporting anything recoverable. Reporting a recoverable error
+//    while the VM is still paused would tell the orchestrator the sandbox is
+//    fine when it is frozen.
+//
+// A failed *resume* is terminal: the capture happened, the VM is paused, and
+// nothing here can get it running again -- so the source must not be treated
+// as still serving.
 SandboxCaptureResult<std::vector<SandboxForkResult> >
-FirecrackerSandboxBackend::Fork(const std::vector<SandboxForkSpec>& /*specs*/) {
-    return core::make_unexpected(
-        SandboxCaptureError::Recoverable("fork: not available in this build"));
+FirecrackerSandboxBackend::Fork(const std::vector<SandboxForkSpec>& specs) {
+    if (!impl_->instance) {
+        return core::make_unexpected(
+            SandboxCaptureError::Terminal("fork: no live microVM"));
+    }
+
+    const core::Expected<core::Unit, std::string> paused = impl_->instance->Pause();
+    if (!paused.ok()) {
+        return core::make_unexpected(
+            impl_->RecoverCaptureFailure("fork snapshot", ClassifyCaptureError(paused.error())));
+    }
+    const SnapshotConfig captured = impl_->snapshot_config;
+
+    const core::Expected<core::Unit, std::string> resumed = impl_->instance->Resume();
+    if (!resumed.ok()) {
+        return core::make_unexpected(SandboxCaptureError::Terminal(
+            std::string("fork: failed to resume source after capture: ") + resumed.error()));
+    }
+
+    std::vector<SandboxForkResult> results;
+    results.reserve(specs.size());
+    for (std::size_t i = 0; i < specs.size(); ++i) {
+        const SandboxForkSpec& child = specs[i];
+
+        // A replacement may only target a *volume* slot. The physical drives
+        // occupy the slots before `physical_extra_drive_count`, and the guest
+        // names devices positionally -- so swapping a volume into a physical
+        // slot would mount it as the rootfs or a layer, not as the volume.
+        bool targets_physical = false;
+        const std::size_t physical_count = captured.common.physical_extra_drive_count;
+        for (std::size_t k = 0; k < child.replace_drive_ids.size() && !targets_physical; ++k) {
+            const std::string& target = child.replace_drive_ids[k].first;
+            const std::size_t limit = physical_count < captured.common.extra_drives.size()
+                                          ? physical_count
+                                          : captured.common.extra_drives.size();
+            for (std::size_t d = 0; d < limit; ++d) {
+                if (captured.common.extra_drives[d].drive_id == target) {
+                    targets_physical = true;
+                    break;
+                }
+            }
+        }
+        if (targets_physical) {
+            SandboxForkResult refused = core::make_unexpected(core::err(
+                "fork replacement drives must refer to launch-time volume drives"));
+            results.push_back(std::move(refused));
+            continue;
+        }
+
+        core::Expected<SnapshotConfig, std::string> child_config =
+            SnapshotConfigForFork(captured, child);
+        if (!child_config.ok()) {
+            SandboxForkResult failed = core::make_unexpected(core::err(child_config.error()));
+            results.push_back(std::move(failed));
+            continue;
+        }
+
+        // Rust's `from_snapshot_config_with_override`: the child's identity and
+        // its own envd token replace the captured ones. Skipping this would
+        // leave the child announcing the source's id through MMDS and holding
+        // the source's live credential.
+        SnapshotConfig prepared = child_config.value();
+        const core::Expected<core::Unit, std::string> ready =
+            PrepareSnapshotConfigForResume(&prepared, child.sandbox_id,
+                                           child.envd_access_token);
+        if (!ready.ok()) {
+            SandboxForkResult failed = core::make_unexpected(
+                core::err(std::string("build forked sandbox: ") + ready.error()));
+            results.push_back(std::move(failed));
+            continue;
+        }
+
+        // The launch parameters come from this sandbox's own spec, so a child
+        // uses the same binary, chroot base and timeouts as its parent.
+        ResumeStartSpec spec;
+        spec.snapshot_config = prepared;
+        spec.firecracker_bin = impl_->spec.firecracker_bin;
+        spec.chroot_base_dir = impl_->spec.chroot_base_dir;
+        spec.sandbox_id = child.sandbox_id;
+        spec.firecracker_work_dir = impl_->spec.firecracker_work_dir;
+        spec.capture_output = impl_->spec.capture_output;
+        spec.socket_timeout_ms = impl_->spec.socket_timeout_ms;
+        spec.socket_poll_ms = impl_->spec.socket_poll_ms;
+        spec.envd_timeout_ms = impl_->spec.envd_timeout_ms;
+        spec.envd_poll_ms = impl_->spec.envd_poll_ms;
+        // Inherited from the resume spec when this sandbox was itself resumed.
+        // Empty on a sandbox that booted fresh, and the resume path reports
+        // that as its own error rather than guessing a path.
+        spec.mem_device_path = impl_->resume_spec.mem_device_path;
+
+        std::unique_ptr<SandboxBackend> backend(
+            FirecrackerSandboxBackend::NewResuming(spec, impl_->connector));
+
+        // Started here, and stopped on failure before being dropped: a child
+        // whose start failed may still have left a VMM process behind, and
+        // dropping the backend would leak it with nothing holding its id.
+        const core::Expected<core::Unit, core::AnyError> started = backend->Start();
+        if (!started.ok()) {
+            const core::Expected<core::Unit, core::AnyError> stopped = backend->Stop();
+            if (!stopped.ok()) {
+                AGENTENV_WARN("failed to stop fork child after start failure: "
+                              << stopped.error().chain());
+            }
+            SandboxForkResult failed = core::make_unexpected(
+                core::err(std::string("start forked sandbox: ") + started.error().chain()));
+            results.push_back(std::move(failed));
+            continue;
+        }
+
+        results.push_back(SandboxForkResult(std::move(backend)));
+    }
+
+    // The call succeeds even when every child failed: a per-child failure is
+    // reported inside the vector, and failing the whole call would tell the
+    // orchestrator the *source* broke.
+    return SandboxCaptureResult<std::vector<SandboxForkResult> >(std::move(results));
 }
 core::Optional<std::string> FirecrackerSandboxBackend::HostInteractionIp() const {
     // No network slot is allocated by this port, so there is no address to
