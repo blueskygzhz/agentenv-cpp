@@ -34,6 +34,42 @@ MMapRegion::Open(const std::string& path, bool writable) {
     return core::Expected<MMapRegion, std::string>(std::move(r));
 }
 
+core::Expected<MMapRegion, std::string>
+MMapRegion::FromFd(int fd, uint64_t offset, size_t len) {
+    // Refused rather than mapped as empty: a caller deriving `len` from a
+    // file size needs an empty file reported as such, not as an mmap error.
+    if (len == 0) {
+        return core::make_unexpected(std::string("MMapRegion: length must be > 0"));
+    }
+    if (fd < 0) {
+        return core::make_unexpected(std::string("MMapRegion: invalid descriptor"));
+    }
+
+    // Read-write and shared unconditionally, matching Rust. The cache writes
+    // refilled blocks through this mapping, and a private mapping would keep
+    // those stores out of the file entirely.
+    void* p = ::mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_FILE | MAP_SHARED, fd,
+                     static_cast<off_t>(offset));
+    if (p == MAP_FAILED) return core::make_unexpected(std::string("mmap failed"));
+
+    // The descriptor is *not* closed here, unlike in `Open`: it belongs to the
+    // caller, which keeps using it for fsync, fallocate and hole punching long
+    // after the mapping exists.
+    MMapRegion r;
+    r.base_ = static_cast<uint8_t*>(p);
+    r.len_ = len;
+    return core::Expected<MMapRegion, std::string>(std::move(r));
+}
+
+uint8_t* MMapRegion::GetMut(size_t offset, size_t len) {
+    if (base_ == nullptr) return nullptr;
+    // Checked before returning, because the consequence of getting this wrong
+    // is a store past the mapping -- a segfault, not a failed write.
+    if (len == 0) return nullptr;
+    if (offset > len_ || len > len_ - offset) return nullptr;
+    return base_ + offset;
+}
+
 MMapRegion::MMapRegion(MMapRegion&& o) noexcept : base_(o.base_), len_(o.len_) {
     o.base_ = nullptr;
     o.len_ = 0;

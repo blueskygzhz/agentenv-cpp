@@ -92,6 +92,27 @@ SysResult<core::Unit>::type EvictPageCache(int fd, uint64_t offset, uint64_t len
 /// Real syscall failures do surface, unlike the eviction hint above.
 SysResult<core::Unit>::type ReleaseSpaceHint(int fd, uint64_t offset, uint64_t len);
 
+/// Rust `reserve_space` — allocate storage for a byte range, keeping the
+/// logical file size unchanged.
+///
+/// The inverse of `ReleaseSpaceHint`, and unlike it **not** a hint: success
+/// means the blocks are reserved, so a later store into the range cannot fail
+/// for want of space.
+///
+/// That guarantee is the whole point. The full-file cache writes refilled
+/// blocks through a shared mmap over a *sparse* file, and storing into an
+/// unallocated hole makes the kernel allocate at page-fault time -- where
+/// there is no way to report `ENOSPC` to the faulting instruction. Linux turns
+/// it into `SIGBUS` and kills the process. Reserving up front moves that
+/// failure to a plain error return.
+///
+/// Callers must treat `SysError::Unsupported` as "nothing was reserved"
+/// rather than as a failure, and keep working without the guarantee: a
+/// filesystem without `fallocate` (tmpfs, some network filesystems) reports
+/// it, and so does every non-Linux platform. Refusing would break those
+/// callers outright instead of degrading them.
+SysResult<core::Unit>::type ReserveSpace(int fd, uint64_t offset, uint64_t len);
+
 /// Rust `sparse.rs :: sparse_extents_are_reliable` — whether this platform
 /// guarantees that never-written regions are reported as holes.
 ///

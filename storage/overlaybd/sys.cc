@@ -154,6 +154,47 @@ core::Expected<core::Unit, SysError> ReleaseSpaceHint(int fd, uint64_t offset,
 #endif
 }
 
+core::Expected<core::Unit, SysError> ReserveSpace(int fd, uint64_t offset, uint64_t len) {
+    // Rust returns early: `fallocate` rejects a zero length with EINVAL, and
+    // there is nothing to reserve anyway.
+    if (len == 0) return core::Unit();
+
+    // Same reasoning as the punch above: refused rather than clamped, so a
+    // malformed request cannot become a shorter well-formed one covering a
+    // range the caller never named.
+    if (offset > (~static_cast<uint64_t>(0)) - len) {
+        return core::make_unexpected(SysError::FromErrno(EOVERFLOW));
+    }
+
+    off_t off = 0, l = 0;
+    if (!ToOffT(offset, &off) || !ToOffT(len, &l)) {
+        return core::make_unexpected(SysError::FromErrno(EOVERFLOW));
+    }
+
+#if defined(FALLOC_FL_KEEP_SIZE)
+    // `KEEP_SIZE` alone -- no `PUNCH_HOLE`. The reservation must never move
+    // the file length: callers size the file up front and validate it on
+    // reload, so a growing file would fail that check.
+    const int ret = ::fallocate(fd, FALLOC_FL_KEEP_SIZE, off, l);
+    if (ret == 0) return core::Unit();
+
+    const int err = errno;
+    // The filesystem has no fallocate. Distinguished from a real failure
+    // because the caller has to keep working without the reservation --
+    // degraded, but not broken.
+    if (err == EOPNOTSUPP || err == ENOSYS) {
+        return core::make_unexpected(SysError::Unsupported("reserve_space"));
+    }
+    return core::make_unexpected(SysError::FromErrno(err));
+#else
+    // No `fallocate` at build time. Note this cannot be emulated with a
+    // preallocate-style call that only extends past EOF: reserving an
+    // *interior* range requires actually writing it, which is I/O a
+    // primitive should not perform behind the caller's back.
+    return core::make_unexpected(SysError::Unsupported("reserve_space"));
+#endif
+}
+
 bool SparseExtentsAreReliable() {
     // Linux only, and that is the whole point of the function existing rather
     // than the callers assuming it.
