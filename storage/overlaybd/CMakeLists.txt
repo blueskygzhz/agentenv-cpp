@@ -34,9 +34,14 @@ add_library(agentenv-overlaybd STATIC
     cache_meta.cc
     cache_entry.cc
     cache_pool.cc
+    http_transport.cc
+    s3_signer.cc
 )
 target_include_directories(agentenv-overlaybd PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-overlaybd PUBLIC agentenv-core agentenv-storage-util)
 if(AGENTENV_WITH_ZSTD)
     target_link_libraries(agentenv-overlaybd PUBLIC ${ZSTD_LIB} ${LZ4_LIB})
+endif()
+if(AGENTENV_WITH_CURL)
+    target_link_libraries(agentenv-overlaybd PUBLIC CURL::libcurl)
 endif()

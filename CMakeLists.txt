@@ -33,6 +33,10 @@ option(AGENTENV_WITH_ROCKSDB     "Use RocksDB for orchestrator store" OFF)
 # options here guard optional backends; this one guards a format the image
 # path cannot do without.
 option(AGENTENV_WITH_ZSTD        "Enable zstd/lz4 in overlaybd"       ON)
+# On by default for the same reason as the codecs: without it the remote
+# backends compile to stubs that refuse every request, which makes any image
+# that is not already on local disk unreadable.
+option(AGENTENV_WITH_CURL        "Enable HTTP via libcurl"            ON)
 
 # ---- output layout -------------------------------------------------------
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
@@ -74,6 +78,14 @@ if(AGENTENV_WITH_ZSTD)
     find_library(ZSTD_LIB zstd REQUIRED)
     find_library(LZ4_LIB lz4 REQUIRED)
     add_compile_definitions(AGENTENV_WITH_ZSTD=1)
+endif()
+
+if(AGENTENV_WITH_CURL)
+    # The remote storage backends speak HTTPS to registries and object
+    # stores. `core/http.h` cannot serve them: it does plain HTTP over a Unix
+    # socket or TCP with no TLS at all.
+    find_package(CURL REQUIRED)
+    add_compile_definitions(AGENTENV_WITH_CURL=1)
 endif()
 
 # ---- subdirectories: order matters (deps go first) ----------------------
