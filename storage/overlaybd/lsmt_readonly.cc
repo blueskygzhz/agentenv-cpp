@@ -177,6 +177,11 @@ core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> LsmtReadOnlyFile:
 
     std::shared_ptr<LsmtReadOnlyFile> f(new LsmtReadOnlyFile());
     f->index_ = index;
+    // Recovered rather than stored separately. Rust holds `index` and
+    // `index_view` as two fields but assigns one `Arc<ReadOnlyIndex>` to both,
+    // so the view is just the concrete type of the same object. A cast keeps
+    // that invariant by construction -- two independent fields could drift.
+    f->index_view_ = std::dynamic_pointer_cast<ReadOnlyIndex>(index);
     f->layers_ = layers;
     f->virtual_size_ = virtual_size;
     f->uuids_.resize(layers.size());
@@ -584,6 +589,66 @@ core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> OpenFilesRo(
     if (!merged.ok()) return core::make_unexpected(merged.error());
 
     return BuildReadonlyStackFromMerged(files, metadata.value(), merged.value());
+}
+
+
+// ---------------------------------------------------------------------------
+// probes
+// ---------------------------------------------------------------------------
+
+int IsLsmt(VirtualFile* file) {
+    if (file == 0) return 0;
+    const core::Expected<uint64_t, std::string> size = file->Size();
+    if (!size.ok()) return 0;
+
+    // The header first: without it the file is not LSMT-shaped at all, and
+    // checking the trailer alone could match arbitrary trailing bytes.
+    if (!VerifyHt(file, false, size.value()).ok()) return 0;
+    // Then the trailer, which is what says the layer was sealed. A header
+    // without one is an upper still being appended to -- readable as a file,
+    // but not as a finished layer.
+    if (VerifyHt(file, true, size.value()).ok()) return 1;
+    return 0;
+}
+
+core::Expected<std::shared_ptr<ReadOnlyIndex>, std::string> OpenFileIndex(VirtualFile* file) {
+    if (file == 0) {
+        return core::make_unexpected(std::string("open_file_index: null file"));
+    }
+    const core::Expected<uint64_t, std::string> size = file->Size();
+    if (!size.ok()) return core::make_unexpected(size.error());
+
+    // Through the trailer, so an unsealed file is refused: the index of an
+    // upper still being written has no fixed offset to read from.
+    const core::Expected<HeaderTrailer, std::string> trailer =
+        VerifyHt(file, true, size.value());
+    if (!trailer.ok()) return core::make_unexpected(trailer.error());
+
+    const uint64_t index_offset = trailer.value().index_offset;
+    const uint64_t index_count = trailer.value().index_size;
+    const uint64_t region_bytes = index_count * sizeof(DiskSegmentMapping);
+    if (index_count != 0 && region_bytes / index_count != sizeof(DiskSegmentMapping)) {
+        return core::make_unexpected(std::string("open_file_index: index size overflow"));
+    }
+    if (region_bytes > static_cast<uint64_t>(static_cast<size_t>(-1))) {
+        return core::make_unexpected(std::string("open_file_index: index too large"));
+    }
+
+    const core::Expected<ByteBuffer, std::string> raw =
+        file->ReadAt(index_offset, static_cast<size_t>(region_bytes));
+    if (!raw.ok()) return core::make_unexpected(raw.error());
+    if (raw.value().size() != static_cast<size_t>(region_bytes)) {
+        return core::make_unexpected(
+            std::string("open_file_index: short read of index region"));
+    }
+
+    // Tags are reset to 0 because this index describes one layer read on its
+    // own. A tag inherited from whatever stack produced the file would index
+    // into a layer vector this caller does not have.
+    const std::vector<SegmentMapping> mappings = LoadIndexAndResetTags(
+        region_bytes == 0 ? 0 : &raw.value()[0], static_cast<size_t>(region_bytes),
+        static_cast<size_t>(index_count));
+    return std::shared_ptr<ReadOnlyIndex>(new ReadOnlyIndex(mappings));
 }
 
 }  // namespace overlaybd

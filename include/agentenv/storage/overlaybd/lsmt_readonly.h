@@ -126,6 +126,26 @@ class LsmtReadOnlyFile : public VirtualFile {
     std::shared_ptr<LogIndex> Index() const { return index_; }
     const std::vector<std::shared_ptr<VirtualFile> >& Layers() const { return layers_; }
 
+    /// Rust `index_view` — the index as a concrete `ReadOnlyIndex`.
+    ///
+    /// Rust keeps this as a second field alongside `index`, but both always
+    /// hold the *same object*: `open` and `from_merged_layers` each clone one
+    /// `Arc<ReadOnlyIndex>` into both. So this is not extra state, it is the
+    /// concrete type recovered from the polymorphic one -- which is what
+    /// `StackFiles` needs, because an upper stacks onto a read-only index
+    /// specifically, not onto any `LogIndex`.
+    ///
+    /// Null when the index is some other kind (a mutable or combo index), in
+    /// which case there is nothing sealed to stack onto.
+    std::shared_ptr<ReadOnlyIndex> IndexView() const { return index_view_; }
+
+    /// Rust `uuids` — one per layer, in the same order as `Layers`.
+    ///
+    /// That order is the merged index's (tag 0 newest), not the order the
+    /// caller passed to `OpenFilesRo`; a mapping's tag indexes straight into
+    /// both vectors, so they have to agree.
+    const std::vector<std::string>& Uuids() const { return uuids_; }
+
     /// Rust `get_uuid`.
     core::Expected<std::string, std::string> GetUuid(size_t layer_idx) const;
 
@@ -162,6 +182,9 @@ class LsmtReadOnlyFile : public VirtualFile {
                                                            size_t len);
 
     std::shared_ptr<LogIndex> index_;
+    /// The same object as `index_` when it is a `ReadOnlyIndex`; see
+    /// `IndexView`.
+    std::shared_ptr<ReadOnlyIndex> index_view_;
     std::vector<std::shared_ptr<VirtualFile> > layers_;
     uint64_t virtual_size_;
     size_t max_io_size_;
@@ -210,6 +233,26 @@ core::Expected<std::vector<ReadOnlyLayerMetadata>, std::string> LoadReadonlyLaye
 /// is newest), so the layer vector is reversed to match. Hand them over in
 /// the wrong order and every read silently resolves to the wrong layer --
 /// no error, just the contents of some other version of the image.
+/// Rust `stack.rs :: is_lsmt` — 1 when `file` is a sealed LSMT layer, 0
+/// otherwise.
+///
+/// Returns 0 rather than an error for anything unreadable, matching Rust.
+/// This is a probe used to decide how to open a file, so "cannot tell" and
+/// "not one" lead to the same next step; propagating an error would make a
+/// caller handle a failure it is about to ignore anyway.
+///
+/// Both ends of the file are checked, and the order is the test: a valid
+/// *header* says the file is LSMT-shaped, and a valid *trailer* says it was
+/// sealed. A file with only the header is an unsealed upper, which is still
+/// being written and must not be read as a finished layer.
+int IsLsmt(VirtualFile* file);
+
+/// Rust `stack.rs :: open_file_index` — load just the index of a sealed layer.
+///
+/// Reads through the trailer, so it refuses an unsealed file: the index of an
+/// upper still being appended to has no fixed location to read from.
+core::Expected<std::shared_ptr<ReadOnlyIndex>, std::string> OpenFileIndex(VirtualFile* file);
+
 core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> OpenFilesRo(
     const std::vector<std::shared_ptr<VirtualFile> >& files);
 

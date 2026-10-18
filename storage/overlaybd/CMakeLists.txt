@@ -18,6 +18,10 @@ add_library(agentenv-overlaybd STATIC
     virtual_file.cc
     # Rust: src/sys/{open_flags,page_cache,release_space,xattr}.rs
     sys.cc
+    # Rust: src/image/helper.rs — config path rewriting + runtime upper setup
+    image_helper.cc
+    # Rust: src/backend/tar.rs — tar detection (the TarFile wrapper is not ported)
+    tar.cc
     # Rust: src/backend/local.rs — the first concrete VirtualFile
     local_file.cc
     # Rust: src/lsmt/file/readonly.rs — the merged read view

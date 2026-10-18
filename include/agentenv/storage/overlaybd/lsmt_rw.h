@@ -151,6 +151,27 @@ HeaderTrailer BuildRwHeader(uint64_t virtual_size, RwLayout layout, const std::s
                              const std::string& parent_uuid, const uint8_t* user_tag,
                              size_t user_tag_len);
 
+/// Rust `helper.rs :: initialize_file_rw_paths` — lay down a brand-new upper.
+///
+/// Creates (truncating) the data file and writes its header, then does the one
+/// extra step the layout needs:
+///
+///  * **Sparse** — the file is extended to `virtual_size + kSpace`, because a
+///    sparse upper addresses its blocks by offset with no index to redirect
+///    them. The extension is a hole, so it costs nothing until written.
+///  * **Log-structured / hybrid** — a second file is created for the index,
+///    carrying the same header marked as an index file with its offset set to
+///    the unsealed position. `index_path` is required here and refused when
+///    absent rather than defaulted: a log-structured upper with no index has
+///    no way to find any block it writes.
+///
+/// A fresh UUID is minted per call. It is what later identifies this layer, so
+/// reusing one would make two uppers indistinguishable to anything that reads
+/// the identity out of the header.
+core::Expected<core::Unit, std::string> InitializeFileRwPaths(
+    const std::string& data_path, const core::Optional<std::string>& index_path,
+    uint64_t virtual_size, RwLayout layout);
+
 /// Rust `helper.rs :: write_header_block` — write a header into its reserved
 /// 4096-byte region.
 core::Expected<core::Unit, std::string> WriteHeaderBlock(VirtualFile* file,
@@ -210,6 +231,29 @@ class LsmtFile : public VirtualFile {
     /// the process dies, so the data they describe reads as a hole on reopen.
     void SetIndexGroupCommit(size_t buffer_size) { group_commit_size_ = buffer_size; }
     size_t GetIndexGroupCommitSize() const { return group_commit_size_; }
+
+    /// Rust `rw_data_file` / `rw_index_file` — the upper's own two files.
+    ///
+    /// Exposed for `StackFiles`, which reopens this upper over a set of lower
+    /// layers. It hands these back to `Open` rather than duplicating them: the
+    /// upper being stacked is the same upper, and opening its path a second
+    /// time would give the stack a separate handle with its own append offset.
+    std::shared_ptr<VirtualFile> RwDataFile() const { return rw_data_file_; }
+    std::shared_ptr<VirtualFile> RwIndexFile() const { return rw_index_file_; }
+
+    /// Rust `uuids` — layer identities, ordered `[lowers..., upper]`.
+    ///
+    /// The upper is last, matching the layer vector: a mapping's tag indexes
+    /// into both, so the upper's tag has to be the largest.
+    const std::vector<std::string>& Uuids() const { return uuids_; }
+
+    /// Rust's `stacked.uuids = uuids` in `stack_files`.
+    ///
+    /// Set wholesale because stacking replaces the identity list entirely:
+    /// `Open` fills in one entry for the upper, and the stacked file needs
+    /// `[lowers..., upper]`. Appending instead would leave the upper's own
+    /// entry at index 0, where a lower's tag points.
+    void SetUuids(const std::vector<std::string>& uuids) { uuids_ = uuids; }
 
     /// Rust `get_uuid`.
     core::Expected<std::string, std::string> GetUuid(size_t layer_idx) const;
@@ -310,6 +354,83 @@ class LsmtFile : public VirtualFile {
     bool has_append_digest_;
     AppendDigestTracker append_digest_;
 };
+
+// ---------------------------------------------------------------------------
+// Rust: lsmt/file/stack.rs — the open/stack entry points
+// ---------------------------------------------------------------------------
+
+/// Rust `stack.rs :: create_file_rw` — a fresh upper from a layer description.
+///
+/// A thin alias for `CreateWithMetadata`; it exists so callers that already
+/// hold a `LayerInfo`-shaped set of arguments do not have to unpack it.
+core::Expected<std::shared_ptr<LsmtFile>, std::string> CreateFileRw(
+    std::shared_ptr<VirtualFile> fdata, std::shared_ptr<VirtualFile> findex,
+    uint64_t virtual_size, RwLayout layout, const std::string& uuid,
+    const std::string& parent_uuid, const uint8_t* user_tag, size_t user_tag_len);
+
+/// Rust `stack.rs :: open_file_rw` — reopen an upper with no lowers under it.
+///
+/// The empty lower vector is the point: this is the single-layer case, where
+/// every mapping resolves into the upper itself.
+core::Expected<std::shared_ptr<LsmtFile>, std::string> OpenFileRw(
+    std::shared_ptr<VirtualFile> fdata, std::shared_ptr<VirtualFile> findex);
+
+/// Rust `stack.rs :: open_file_ro` — open one sealed layer.
+core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> OpenFileRo(
+    std::shared_ptr<VirtualFile> file);
+
+/// Rust `stack.rs :: verify_layer_order` — check that each layer names the one
+/// below it as its parent.
+///
+/// Walks from `start_layer` upward, comparing each layer's uuid against the
+/// `parent_uuid` recorded in the previous layer's header. A mismatch means the
+/// stack was assembled from layers that do not belong together, and reading it
+/// would silently resolve blocks against the wrong base image.
+///
+/// The last layer is not probed for a parent: nothing sits above it to check
+/// against, and its header is not read at all. `start_layer >= layers.size()`
+/// succeeds trivially, which is what lets a caller skip the newest layer by
+/// passing 1 without special-casing a one-layer stack.
+core::Expected<core::Unit, std::string> VerifyLayerOrder(
+    const std::vector<std::shared_ptr<VirtualFile> >& layers,
+    const std::vector<std::string>& uuids, size_t start_layer);
+
+/// Rust `stack.rs :: stack_files` — reopen `upper` on top of `lowers`.
+///
+/// `lowers` must be in the merged index's order (newest first), which is what
+/// `OpenFilesRo` already produces. The returned file reads a block from the
+/// upper when the upper owns it and falls through to the lowers otherwise.
+///
+/// Three things carry over from the inputs rather than being re-derived:
+///
+///  * The **virtual size** is taken from the lowers only when the upper does
+///    not declare one. A fresh upper is created with size 0 and inherits the
+///    image's; an upper that was resized keeps its own, because shrinking it
+///    back to the lowers' would hide blocks it already owns.
+///  * The upper's **max io size** and **group commit size**, so stacking does
+///    not silently reset tuning the caller applied.
+///  * The **uuids**, as `[lowers..., upper]` — the same order as the layer
+///    vector, since a mapping's tag indexes into both.
+///
+/// Requires the lowers to carry a read-only index view; a stack over a
+/// mutable index has nothing sealed underneath it to resolve against.
+core::Expected<std::shared_ptr<LsmtFile>, std::string> StackFiles(
+    const std::shared_ptr<LsmtFile>& upper,
+    const std::shared_ptr<LsmtReadOnlyFile>& lowers, bool check_order);
+
+/// Rust `stack.rs :: merge_files_ro` — flatten several sealed layers into one.
+///
+/// Opens the layers as a stack, asks the merged index for every mapping across
+/// the whole virtual size, and compacts those into a single self-contained
+/// layer at `output_path`.
+///
+/// The query covers the entire image rather than only the mapped parts,
+/// because a merge has to resolve shadowing: a block present in two layers
+/// must come out as the newer one's, which is what the merged index's lookup
+/// already decides.
+core::Expected<core::Unit, std::string> MergeFilesRo(
+    const std::vector<std::shared_ptr<VirtualFile> >& src_files,
+    const std::string& output_path, const lsmt::CompactCommitArgs& args);
 
 }  // namespace overlaybd
 }  // namespace storage

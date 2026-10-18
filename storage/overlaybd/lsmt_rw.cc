@@ -5,6 +5,8 @@
 #include <cstring>
 #include <sstream>
 
+#include "agentenv/core/identity.h"
+#include "agentenv/storage/overlaybd/local_file.h"
 #include "agentenv/storage/overlaybd/sys.h"
 
 namespace agentenv {
@@ -463,6 +465,11 @@ core::Expected<std::shared_ptr<LsmtFile>, std::string> LsmtFile::CreateWithMetad
         }
         HeaderTrailer idx_header = header;
         idx_header.SetIndexFile();
+        // Rust `set_unsealed_index_offset`: the index starts right after its
+        // own header block. Left at zero it would point into the header, so a
+        // reader recovering this upper would parse the header bytes as index
+        // entries rather than finding the first real one.
+        idx_header.index_offset = HeaderTrailer::kSpace;
         const core::Expected<core::Unit, std::string> iw =
             WriteHeaderBlock(rw_index_file.get(), idx_header);
         if (!iw.ok()) return core::make_unexpected(iw.error());
@@ -1378,6 +1385,281 @@ core::Expected<core::Optional<LayerDescriptor>, std::string> LsmtFile::CloseSeal
         return core::Optional<LayerDescriptor>();
     }
     return core::Optional<LayerDescriptor>(append_digest_.Descriptor());
+}
+
+
+// ---------------------------------------------------------------------------
+// initialize_file_rw_paths
+// ---------------------------------------------------------------------------
+
+core::Expected<core::Unit, std::string> InitializeFileRwPaths(
+    const std::string& data_path, const core::Optional<std::string>& index_path,
+    uint64_t virtual_size, RwLayout layout) {
+    const core::Expected<RwLayout, std::string> checked = EnsureRwLayoutSupported(layout);
+    if (!checked.ok()) return core::make_unexpected(checked.error());
+
+    // A fresh identity per upper. This is what later distinguishes this layer
+    // from any other, so minting it here rather than taking it from the caller
+    // keeps two initializations from ever colliding.
+    const std::string uuid = core::Uuid::GenV7().ToString();
+
+    const HeaderTrailer header =
+        BuildRwHeader(virtual_size, layout, uuid, std::string(), 0, 0);
+
+    // Truncating open, matching Rust's `open_truncated_rw_file`: an
+    // initialization starts from nothing, and reusing whatever was at the path
+    // would leave stale blocks behind the new header.
+    core::Expected<std::shared_ptr<LocalFile>, std::string> data =
+        LocalFile::New(data_path);
+    if (!data.ok()) {
+        return core::make_unexpected(std::string("create overlaybd upper file ") + data_path +
+                                     ": " + data.error());
+    }
+    const core::Expected<core::Unit, std::string> hw =
+        WriteHeaderBlock(data.value().get(), header);
+    if (!hw.ok()) {
+        return core::make_unexpected(std::string("initialize overlaybd upper data ") +
+                                     data_path + ": " + hw.error());
+    }
+
+    if (layout == kRwSparse) {
+        // Extended to cover the whole virtual disk. A sparse upper writes at
+        // its logical offset with no index to redirect it, so the range has to
+        // be addressable up front -- and because the extension is a hole it
+        // costs nothing until something writes into it.
+        if (virtual_size > ~static_cast<uint64_t>(0) - kHdr) {
+            return core::make_unexpected(std::string("sparse overlaybd upper size overflow"));
+        }
+        const core::Expected<core::Unit, std::string> t =
+            data.value()->Truncate(virtual_size + kHdr);
+        if (!t.ok()) {
+            return core::make_unexpected(std::string("truncate sparse overlaybd upper ") +
+                                         data_path + ": " + t.error());
+        }
+        return core::Unit();
+    }
+
+    // Log-structured and hybrid both keep their index in a second file.
+    // Refused when absent rather than silently skipped: such an upper records
+    // where each block went in the index, so without one nothing it writes
+    // could be found again.
+    if (!index_path.has_value()) {
+        return core::make_unexpected(std::string(
+            "log-structured overlaybd upper requires an index path during initialization"));
+    }
+    core::Expected<std::shared_ptr<LocalFile>, std::string> index =
+        LocalFile::New(*index_path);
+    if (!index.ok()) {
+        return core::make_unexpected(std::string("create overlaybd upper file ") + *index_path +
+                                     ": " + index.error());
+    }
+
+    HeaderTrailer index_header = header;
+    index_header.SetIndexFile();
+    // The index begins immediately after its own header block. Zero would
+    // point back into the header, and a reader recovering this upper would
+    // then read header bytes as index entries.
+    index_header.index_offset = HeaderTrailer::kSpace;
+    const core::Expected<core::Unit, std::string> iw =
+        WriteHeaderBlock(index.value().get(), index_header);
+    if (!iw.ok()) {
+        return core::make_unexpected(std::string("initialize overlaybd upper index ") +
+                                     *index_path + ": " + iw.error());
+    }
+    return core::Unit();
+}
+
+
+// ---------------------------------------------------------------------------
+// Rust: lsmt/file/stack.rs
+// ---------------------------------------------------------------------------
+
+core::Expected<std::shared_ptr<LsmtFile>, std::string> CreateFileRw(
+    std::shared_ptr<VirtualFile> fdata, std::shared_ptr<VirtualFile> findex,
+    uint64_t virtual_size, RwLayout layout, const std::string& uuid,
+    const std::string& parent_uuid, const uint8_t* user_tag, size_t user_tag_len) {
+    return LsmtFile::CreateWithMetadata(fdata, findex, virtual_size, layout, uuid,
+                                        parent_uuid, user_tag, user_tag_len);
+}
+
+core::Expected<std::shared_ptr<LsmtFile>, std::string> OpenFileRw(
+    std::shared_ptr<VirtualFile> fdata, std::shared_ptr<VirtualFile> findex) {
+    // No lower index and no lower layers: every mapping this upper holds
+    // resolves into the upper itself.
+    return LsmtFile::Open(fdata, findex, std::shared_ptr<ReadOnlyIndex>(),
+                          std::vector<std::shared_ptr<VirtualFile> >());
+}
+
+core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> OpenFileRo(
+    std::shared_ptr<VirtualFile> file) {
+    return LsmtReadOnlyFile::Open(file);
+}
+
+core::Expected<core::Unit, std::string> VerifyLayerOrder(
+    const std::vector<std::shared_ptr<VirtualFile> >& layers,
+    const std::vector<std::string>& uuids, size_t start_layer) {
+    if (layers.size() != uuids.size()) {
+        return core::make_unexpected(std::string("layers and uuids size mismatch"));
+    }
+    // Nothing to check past the end. This is what lets a caller skip the
+    // newest layer with `start_layer = 1` even on a one-layer stack.
+    if (start_layer >= layers.size()) return core::Unit();
+
+    bool have_parent = false;
+    std::string parent_uuid;
+    for (size_t i = start_layer; i < layers.size(); ++i) {
+        if (have_parent && uuids[i] != parent_uuid) {
+            // Refused rather than repaired. A stack whose layers do not name
+            // each other was assembled from unrelated images, and reading it
+            // would resolve blocks against the wrong base.
+            std::ostringstream o;
+            o << "parent uuid mismatch at layer " << i << ": got " << uuids[i]
+              << ", expected " << parent_uuid;
+            return core::make_unexpected(o.str());
+        }
+
+        // The last layer's header is not read: nothing sits above it whose
+        // parent it would have to be.
+        if (i + 1 < layers.size()) {
+            if (!layers[i]) {
+                std::ostringstream o;
+                o << "verify layer order: null layer " << i;
+                return core::make_unexpected(o.str());
+            }
+            const core::Expected<uint64_t, std::string> size = layers[i]->Size();
+            if (!size.ok()) return core::make_unexpected(size.error());
+            const core::Expected<HeaderTrailer, std::string> ht =
+                VerifyHt(layers[i].get(), false, size.value());
+            if (!ht.ok()) return core::make_unexpected(ht.error());
+
+            // Rust `parse_uuid_field`: the field is a NUL-terminated string
+            // inside a fixed 37-byte slot, and an empty one means "no parent"
+            // rather than the empty uuid.
+            const char* raw = reinterpret_cast<const char*>(ht.value().parent_uuid);
+            const size_t len = ::strnlen(raw, sizeof(ht.value().parent_uuid));
+            if (len == 0) {
+                have_parent = false;
+                parent_uuid.clear();
+            } else {
+                have_parent = true;
+                parent_uuid.assign(raw, len);
+            }
+        }
+    }
+    return core::Unit();
+}
+
+core::Expected<std::shared_ptr<LsmtFile>, std::string> StackFiles(
+    const std::shared_ptr<LsmtFile>& upper,
+    const std::shared_ptr<LsmtReadOnlyFile>& lowers, bool check_order) {
+    if (!upper) return core::make_unexpected(std::string("stack files: null upper"));
+    if (!lowers) return core::make_unexpected(std::string("stack files: null lowers"));
+
+    if (check_order) {
+        // From layer 1: layer 0 is the newest lower, and its parent is the
+        // upper, which is not part of this vector.
+        const core::Expected<core::Unit, std::string> ordered =
+            VerifyLayerOrder(lowers->Layers(), lowers->Uuids(), 1);
+        if (!ordered.ok()) return core::make_unexpected(ordered.error());
+    }
+
+    const std::shared_ptr<ReadOnlyIndex> lower_index = lowers->IndexView();
+    if (!lower_index) {
+        return core::make_unexpected(std::string("missing lower readonly index"));
+    }
+
+    // The upper's own two handles are reused rather than reopened: this is the
+    // same upper, and a second handle would carry its own append offset.
+    core::Expected<std::shared_ptr<LsmtFile>, std::string> stacked = LsmtFile::Open(
+        upper->RwDataFile(), upper->RwIndexFile(), lower_index, lowers->Layers());
+    if (!stacked.ok()) return stacked;
+
+    // Only when the upper does not declare one. A fresh upper is created with
+    // size 0 and inherits the image's; one that was resized keeps its own,
+    // because shrinking back to the lowers' would hide blocks it already owns.
+    if (stacked.value()->VirtualSize() == 0) {
+        const core::Expected<core::Unit, std::string> sized =
+            stacked.value()->UpdateVsize(lowers->VirtualSize());
+        if (!sized.ok()) return core::make_unexpected(sized.error());
+    }
+
+    // Carried over so stacking does not reset tuning the caller applied.
+    const core::Expected<core::Unit, std::string> io =
+        stacked.value()->SetMaxIoSize(upper->GetMaxIoSize());
+    if (!io.ok()) return core::make_unexpected(io.error());
+    stacked.value()->SetIndexGroupCommit(upper->GetIndexGroupCommitSize());
+
+    // `[lowers..., upper]`, matching the layer vector so a mapping's tag
+    // indexes into both. The upper contributes its first uuid, or the nil one
+    // when it has none -- Rust's `unwrap_or_else(Uuid::nil)`.
+    std::vector<std::string> uuids = lowers->Uuids();
+    uuids.push_back(upper->Uuids().empty() ? std::string() : upper->Uuids()[0]);
+    stacked.value()->SetUuids(uuids);
+    return stacked;
+}
+
+
+namespace {
+
+/// A `CompactSource` over a stack's layer vector, selecting by tag.
+///
+/// The tag is the index into the same vector `OpenFilesRo` built, so this is
+/// the one place that invariant is cashed in. An out-of-range tag is a corrupt
+/// index and is refused rather than clamped: clamping would silently read
+/// another layer's bytes into the merged output.
+class LayerStackCompactSource : public lsmt::CompactSource {
+ public:
+    explicit LayerStackCompactSource(const std::vector<std::shared_ptr<VirtualFile> >& layers)
+        : layers_(layers) {}
+
+    bool ReadAt(uint8_t tag, uint64_t src_byte_off, uint8_t* dst, uint64_t len) {
+        if (static_cast<size_t>(tag) >= layers_.size()) return false;
+        VirtualFile* file = layers_[tag].get();
+        if (file == 0) return false;
+        const core::Expected<size_t, std::string> got =
+            file->ReadAtInto(src_byte_off, dst, static_cast<size_t>(len));
+        // A short read is a failure, not a partial success: the compacted
+        // output would otherwise carry whatever was already in the buffer.
+        return got.ok() && got.value() == static_cast<size_t>(len);
+    }
+
+ private:
+    const std::vector<std::shared_ptr<VirtualFile> >& layers_;
+};
+
+}  // namespace
+
+core::Expected<core::Unit, std::string> MergeFilesRo(
+    const std::vector<std::shared_ptr<VirtualFile> >& src_files,
+    const std::string& output_path, const lsmt::CompactCommitArgs& args) {
+    if (src_files.empty()) {
+        return core::make_unexpected(std::string("empty src files"));
+    }
+
+    const core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> lower =
+        OpenFilesRo(src_files);
+    if (!lower.ok()) return core::make_unexpected(lower.error());
+
+    // The whole virtual size, rounded up to a block. Querying only the mapped
+    // ranges would miss nothing, but it would also have to be derived from the
+    // same index this is about to ask -- so the full span is both simpler and
+    // what Rust does (`virtual_size.div_ceil(ALIGNMENT)`).
+    const uint64_t vsize = lower.value()->VirtualSize();
+    const uint64_t blocks = (vsize + kLsmtAlignment - 1) / kLsmtAlignment;
+    if (blocks > static_cast<uint64_t>(~static_cast<uint32_t>(0))) {
+        return core::make_unexpected(std::string("merge: virtual size too large to query"));
+    }
+
+    std::vector<lsmt::SegmentMapping> mappings;
+    lower.value()->Index()->Lookup(
+        lsmt::Segment(0, static_cast<uint32_t>(blocks)), &mappings);
+
+    LayerStackCompactSource source(lower.value()->Layers());
+    std::string err;
+    if (!lsmt::CompactTo(output_path, &source, mappings, vsize, args, &err)) {
+        return core::make_unexpected(std::string("merge files ro: ") + err);
+    }
+    return core::Unit();
 }
 
 }  // namespace overlaybd

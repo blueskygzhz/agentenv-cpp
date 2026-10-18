@@ -518,9 +518,40 @@ OpenIndexFile(const std::string& path, uint64_t* virtual_size_out, std::string* 
 }
 
 // ---------------- CompactTo (write path) ----------------
+namespace {
+
+// Rust `HeaderTrailer::set_uuid` / `fill_uuid_field`: the uuid slot holds the
+// 36-character hyphenated text plus a NUL, not the 16 raw bytes.
+const char* const kNilUuidText = "00000000-0000-0000-0000-000000000000";
+
+void FillUuidField(uint8_t* dst, size_t cap, const std::string& text) {
+    for (size_t i = 0; i < cap; ++i) dst[i] = 0;
+    if (text.empty()) return;
+    // One byte is reserved for the terminator, matching Rust's
+    // `dst.len().saturating_sub(1)`.
+    const size_t n = text.size() < cap - 1 ? text.size() : cap - 1;
+    for (size_t i = 0; i < n; ++i) dst[i] = static_cast<uint8_t>(text[i]);
+}
+
+// Rust `fill_user_tag` — the whole slot is usable here; a tag is opaque bytes
+// rather than text, so no terminator is reserved.
+void FillUserTagField(uint8_t* dst, size_t cap, const std::vector<uint8_t>& tag) {
+    for (size_t i = 0; i < cap; ++i) dst[i] = 0;
+    const size_t n = tag.size() < cap ? tag.size() : cap;
+    for (size_t i = 0; i < n; ++i) dst[i] = tag[i];
+}
+
+}  // namespace
+
 bool CompactTo(const std::string& path, CompactSource* source,
         const std::vector<SegmentMapping>& mappings,
          uint64_t virtual_size, std::string* err) {
+    return CompactTo(path, source, mappings, virtual_size, CompactCommitArgs(), err);
+}
+
+bool CompactTo(const std::string& path, CompactSource* source,
+        const std::vector<SegmentMapping>& mappings,
+         uint64_t virtual_size, const CompactCommitArgs& args, std::string* err) {
     auto set_err = [&](const std::string& m) { if (err) *err = m; };
     if (source == nullptr) { set_err("null CompactSource"); return false; }
 
@@ -537,6 +568,17 @@ bool CompactTo(const std::string& path, CompactSource* source,
     header.SetHeader();
     header.SetDataFile();
     header.SetSealed();
+
+    // Rust `commit_args.uuid.unwrap_or_else(Uuid::nil)` then `set_uuid`: an
+    // unnamed layer is stamped with the nil uuid *written out as text*, not
+    // left zeroed. The two are different bytes on disk, and the zeroed form
+    // reads back as "no uuid" rather than as the nil one.
+    FillUuidField(header.uuid, sizeof(header.uuid),
+                  args.uuid.empty() ? std::string(kNilUuidText) : args.uuid);
+    // The parent is genuinely optional, so an empty one stays zeroed -- that
+    // is what tells a layer-order check there is nothing below to match.
+    FillUuidField(header.parent_uuid, sizeof(header.parent_uuid), args.parent_uuid);
+    FillUserTagField(header.user_tag, sizeof(header.user_tag), args.user_tag);
 
     std::vector<uint8_t> header_buf(static_cast<size_t>(HEADER_SIZE), 0);
     {

@@ -343,6 +343,41 @@ class CompactSource {
 /// Packs non-zeroed mappings sequentially after the 4096B header, records zeroed
 /// mappings without consuming space, compresses the index, writes an aligned
 /// index array + sealed trailer. Writes a self-contained LSMT file at `path`.
+/// Rust `types.rs :: CommitArgs` — the identity a compacted layer is stamped
+/// with.
+///
+/// Only the fields that reach the header are here. Rust's `writer` and
+/// `concurrency` are absent by construction: this port writes the output
+/// itself and does so sequentially, which is the `concurrency = 1` default.
+struct CompactCommitArgs {
+    /// Empty means the nil uuid is written, *not* that the field is left
+    /// blank -- see `CompactTo`.
+    std::string uuid;
+    /// Empty leaves the field zeroed, which reads back as "no parent".
+    std::string parent_uuid;
+    std::vector<uint8_t> user_tag;
+};
+
+/// Rust: lsmt/file/helper.rs :: compact_to (single-threaded, no zero-detection
+/// path — i.e. COMPACT_ZERO_DETECTION_ENABLED == false).
+/// Packs non-zeroed mappings sequentially after the 4096B header, records zeroed
+/// mappings without consuming space, compresses the index, writes an aligned
+/// index array + sealed trailer. Writes a self-contained LSMT file at `path`.
+///
+/// `args.uuid` empty is **not** the same as leaving the field zeroed: Rust does
+/// `commit_args.uuid.unwrap_or_else(Uuid::nil)` and then writes it as text, so
+/// an unnamed layer still carries the nil uuid spelled out. Its comment says
+/// this keeps parity with the upstream OverlayBD C++ implementation, so the
+/// zeroed field is a different value on disk, not an equivalent one.
+bool CompactTo(const std::string& path,
+           CompactSource* source,
+               const std::vector<SegmentMapping>& mappings,
+   uint64_t virtual_size,
+         const CompactCommitArgs& args,
+         std::string* err);
+
+/// As above with no commit identity: the layer gets the nil uuid, no parent
+/// and no user tag.
 bool CompactTo(const std::string& path,
            CompactSource* source,
                const std::vector<SegmentMapping>& mappings,
