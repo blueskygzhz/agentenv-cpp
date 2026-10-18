@@ -1663,6 +1663,11 @@ Orchestrator::ForkSandbox(const core::SandboxId& source_id, uint32_t count,
 }
 
 // Rust `fork_sandbox_with_specs`.
+//
+// Deviation: Rust wraps this in `run_cancellation_safe`, which spawns the work
+// on its own task so a caller that stops awaiting does not abort a fork
+// half-way through. A synchronous call cannot be cancelled mid-flight, so the
+// wrapper has no counterpart here -- the same collapse as `DeleteSandbox`.
 OrchestratorResult<std::vector<SandboxForkOutcome> >
 Orchestrator::ForkSandboxWithSpecs(
     const core::SandboxId& source_id,
@@ -1680,6 +1685,14 @@ Orchestrator::ForkSandboxInner(
     OrchestratorResult<core::Unit> accepting = EnsureAcceptingLifecycleOperations();
     if (!accepting.ok()) return core::make_unexpected(accepting.error());
 
+    // Rust `u32::try_from(child_specs.len())`. Out of reach in practice, but
+    // checked rather than cast: `count` is what the failure path reports to
+    // the metrics counters, and a truncated value would make
+    // `count - successes` underflow into a vast bogus failure count.
+    if (child_specs.size() > 0xFFFFFFFFull) {
+        return core::make_unexpected(
+            OrchestratorError::InternalError("too many fork children"));
+    }
     const uint32_t count = static_cast<uint32_t>(child_specs.size());
 
     // Every child id must be unique, differ from the source, and not already

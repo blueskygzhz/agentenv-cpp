@@ -46,6 +46,19 @@ struct BackendScript {
     // network / custom-extension branches
     bool fail_update_network = false;
 
+    // fork branches
+    //
+    // `fork_child_outcomes` scripts one result per child, so a test can make
+    // some children start and others fail -- which is the case the orchestrator
+    // handles with `continue` rather than by abandoning the whole fork, and the
+    // only way to observe that siblings survive.
+    bool succeed_fork = false;  // off by default (FakeSandbox returns unsupported)
+    /// Per-child: true starts, false fails. Short vectors fall back to `true`.
+    std::vector<bool> fork_child_outcomes;
+    /// Children the fork handed back, in order, so a test can assert the
+    /// orchestrator stopped the ones it could not register.
+    std::vector<BackendScript*> fork_children;
+
     // observed
     int start_calls    = 0;
     int wait_calls     = 0;
