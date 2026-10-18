@@ -73,13 +73,30 @@ MT_TEST(id_allocator_occupy_reload) {
     }
 }
 
-MT_TEST(compact_writer_le_encoding) {
+MT_TEST(le_buffer_writer_encoding) {
+    // Was named `CompactWriter`, which is a different abstraction in Rust (a
+    // positional file writer). This is the little-endian append helper.
     CompactBuffer buf;
-    CompactWriter w(&buf);
+    LeBufferWriter w(&buf);
     w.PutU32(0x01020304u);
     MT_EXPECT_EQ(static_cast<int>(buf[0]), 0x04);
     MT_EXPECT_EQ(static_cast<int>(buf[3]), 0x01);
     MT_EXPECT_EQ(static_cast<int>(buf.size()), 4);
+
+    // The other three widths, which had no coverage at all.
+    w.PutU8(0xAB);
+    MT_EXPECT_EQ(static_cast<int>(buf[4]), 0xAB);
+    w.PutU64(0x0102030405060708ull);
+    MT_EXPECT_EQ(static_cast<int>(buf[5]), 0x08);
+    MT_EXPECT_EQ(static_cast<int>(buf[12]), 0x01);
+    const uint8_t blob[3] = {0xDE, 0xAD, 0xBE};
+    w.PutBytes(blob, 3);
+    MT_EXPECT_EQ(static_cast<int>(buf[13]), 0xDE);
+    MT_EXPECT_EQ(static_cast<int>(buf[15]), 0xBE);
+
+    // Position tracks the buffer, which is what a caller patching a
+    // back-reference later relies on.
+    MT_EXPECT_EQ(static_cast<int>(w.Position()), 16);
 }
 
 MT_MAIN

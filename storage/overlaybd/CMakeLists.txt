@@ -14,6 +14,10 @@ add_library(agentenv-overlaybd STATIC
     # wire formats. Here rather than in agentenv-snapshot because the ublk
     # read path is their other consumer.
     startup_pack.cc
+    # Rust: src/io/virtual_file.rs — the abstraction the whole stack layers on
+    virtual_file.cc
+    # Rust: src/sys/{open_flags,page_cache,release_space,xattr}.rs
+    sys.cc
 )
 target_include_directories(agentenv-overlaybd PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-overlaybd PUBLIC agentenv-core agentenv-storage-util)

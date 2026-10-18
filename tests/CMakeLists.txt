@@ -39,6 +39,10 @@ agentenv_add_test(test_packages            test_packages.cc            agentenv-
 agentenv_add_test(test_overlaybd_setup     test_overlaybd_setup.cc     agentenv-rootmod)
 # Rust: src/{startup_pack,startup_manifest}.rs — the two startup wire formats
 agentenv_add_test(test_startup_pack_codec  test_startup_pack_codec.cc  agentenv-overlaybd)
+# Rust: storage/overlaybd/src/io/virtual_file.rs
+agentenv_add_test(test_overlaybd_virtual_file test_overlaybd_virtual_file.cc agentenv-overlaybd)
+# Rust: storage/overlaybd/src/sys/*.rs
+agentenv_add_test(test_overlaybd_sys test_overlaybd_sys.cc agentenv-overlaybd)
 agentenv_add_test(test_deps                test_deps.cc                agentenv-rootmod)
 agentenv_add_test(test_overlaybd_p2p       test_overlaybd_p2p.cc       agentenv-overlaybd-p2p)
 agentenv_add_test(test_mpsc_queue          test_mpsc_queue.cc          agentenv-core)
