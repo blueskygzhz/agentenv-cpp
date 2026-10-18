@@ -85,10 +85,28 @@ MT_TEST(record_and_alias_paths_follow_the_rust_naming) {
 
     MT_EXPECT_EQ(Layout::RecordPath(root, id),
                  std::string("/repo/catalog/records/") + id.ToString() + ".json");
-    // The alias file has no extension: the listing code filters records by
-    // `.json`, which is what keeps aliases out of a record scan.
+    MT_EXPECT_EQ(Layout::VolumeRecordPath(root, "vol1"),
+                 std::string("/repo/volumes/records/vol1.json"));
+
+    // Aliases carry no extension, and both of them are pinned here because
+    // the reason is easy to get backwards. Rust defines two layouts: `path`,
+    // the shared one the OSS backend uses, spells an alias
+    // `catalog/aliases/{alias}.json`, while `posix_path` -- which is what
+    // `backends/posixfs` actually calls -- spells it `catalog/aliases/{alias}`.
+    // The POSIX layout predates the shared one and keeps the older spelling
+    // so that aliases already on disk stay addressable. Adding `.json` to
+    // match the other half would strand every one of them.
     MT_EXPECT_EQ(Layout::AliasPath(root, FixtureAlias("prod")),
                  std::string("/repo/catalog/aliases/prod"));
+    MT_EXPECT_EQ(Layout::VolumeAliasPath(root, "data"),
+                 std::string("/repo/volumes/aliases/data"));
+
+    // The alias and its lock differ only by the suffix the lock adds, so an
+    // extension appearing on the alias would collide with nothing and fail
+    // silently -- hence the explicit assertions above rather than a
+    // round-trip through both.
+    MT_EXPECT_TRUE(Layout::VolumeAliasPath(root, "data") !=
+                   Layout::VolumeAliasLockPath(root, "data"));
 }
 
 MT_TEST(lock_paths_sit_beside_what_they_guard) {

@@ -8,6 +8,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "agentenv/cfg.h"
 #include "agentenv/core/fs.h"
 #include "agentenv/core/identity.h"
 #include "agentenv/core/logging.h"
@@ -78,11 +79,20 @@ std::string DescribeStatus(int code) {
 // ---------------------------------------------------------------------------
 
 VolumeLimits VolumeLimits::Default() {
-    // Rust reads `cfg::VolumeConfig::default()`: `max_size_mb` defaults to
-    // `DEFAULT_VOLUME_SIZE_MB` and `max_volume_count` to `MAX_VOLUME_MOUNTS`.
+    // Rust: `let config = cfg::VolumeConfig::default()`, then `max_size_mb`
+    // from `config.max_size_mb` and `max_mounts` from `config.max_volume_count`.
+    //
+    // Read from the config struct rather than restated as literals here. The
+    // two are easy to confuse with the constants that sit next to them, and
+    // doing so has a direction: `kDefaultVolumeSizeMb` is the size a *new
+    // volume* gets when the caller names none, and `kMaxVolumeMounts` is the
+    // hard ceiling the config validator checks against -- neither is a
+    // default limit. Taking them from `cfg::VolumeConfig` leaves exactly one
+    // definition, which is also where an operator override lands.
+    const cfg::VolumeConfig config;
     VolumeLimits limits;
-    limits.max_size_mb = kDefaultVolumeSizeMb;
-    limits.max_mounts = kMaxVolumeMounts;
+    limits.max_size_mb = config.max_size_mb;
+    limits.max_mounts = config.max_volume_count;
     return limits;
 }
 

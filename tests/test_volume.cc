@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "agentenv/cfg.h"
 #include "agentenv/core/digest.h"
 #include "agentenv/core/fs.h"
 #include "agentenv/snapshot/layers.h"
@@ -201,8 +202,129 @@ MT_TEST(layer_ref_equality_distinguishes_variants) {
 }
 
 // ---------------------------------------------------------------------------
+// Durable record format
+// ---------------------------------------------------------------------------
+//
+// These assert literal key spellings against the Rust shape rather than
+// round-tripping `ToJson` through `FromJson`. A round-trip is self-consistent
+// by construction: rename every key on both sides and it still passes, which
+// is exactly how this file came to be written in snake_case while the record
+// it has to interoperate with is `#[serde(rename_all = "camelCase")]`.
+
+MT_TEST(record_serialises_the_camel_case_keys_rust_persists) {
+    VolumeRecord record;
+    record.id = "vol_abc";
+    record.name = "demo";
+    record.mode = VolumeMode::Exclusive;
+    record.size_mb = 1024;
+    record.status = VolumeStatus::Ready;
+
+    const std::string json = record.ToJson().ToString();
+
+    // The four multi-word fields. Rust's `encode_record` writes this same
+    // document to `volumes/records/<id>.json`, and `size_mb` carries no
+    // `#[serde(default)]`, so a snake_case key here is not a cosmetic
+    // difference -- it makes the record unreadable to the other side.
+    MT_EXPECT_TRUE(json.find("\"sizeMb\":1024") != std::string::npos);
+    MT_EXPECT_TRUE(json.find("\"reservedBySandboxId\":") != std::string::npos);
+    MT_EXPECT_TRUE(json.find("\"backingLayers\":") != std::string::npos);
+    MT_EXPECT_TRUE(json.find("\"readOnlyMounts\":") != std::string::npos);
+
+    // And none of the snake_case spellings survive anywhere in the document.
+    MT_EXPECT_TRUE(json.find("size_mb") == std::string::npos);
+    MT_EXPECT_TRUE(json.find("reserved_by_sandbox_id") == std::string::npos);
+    MT_EXPECT_TRUE(json.find("backing_layers") == std::string::npos);
+    MT_EXPECT_TRUE(json.find("read_only_mounts") == std::string::npos);
+
+    // The enum values follow different rules from the keys, and both are
+    // deliberate: `VolumeMode` has no `rename_all` and stays PascalCase,
+    // `VolumeStatus` is `rename_all = "lowercase"`.
+    MT_EXPECT_TRUE(json.find("\"mode\":\"Exclusive\"") != std::string::npos);
+    MT_EXPECT_TRUE(json.find("\"status\":\"ready\"") != std::string::npos);
+
+    // `deleting` is `skip_serializing_if = "std::ops::Not::not"`, so a false
+    // value is absent rather than written as `false`.
+    MT_EXPECT_TRUE(json.find("deleting") == std::string::npos);
+    record.deleting = true;
+    MT_EXPECT_TRUE(record.ToJson().ToString().find("\"deleting\":true") != std::string::npos);
+}
+
+MT_TEST(record_parses_a_document_written_by_rust) {
+    // Copied from the upstream fixture at
+    // crates/e2e-tests/tests/snapshot_oss_e2e_test.rs `volume_record`, which
+    // feeds it to `serde_json::from_value::<VolumeRecord>` -- so this is the
+    // shape Rust both writes and accepts, not a guess at it.
+    const char* rust_document =
+        "{\"id\":\"vol_abc\",\"name\":\"demo\",\"mode\":\"Exclusive\",\"sizeMb\":1024,"
+        "\"status\":\"ready\",\"reservedBySandboxId\":null,\"backingLayers\":[],"
+        "\"readOnlyMounts\":[]}";
+
+    const agentenv::core::Expected<agentenv::core::Json, agentenv::core::AnyError> parsed =
+        agentenv::core::Json::Parse(rust_document);
+    MT_EXPECT_TRUE(parsed.ok());
+    if (!parsed.ok()) return;
+
+    const agentenv::core::Expected<VolumeRecord, std::string> record =
+        VolumeRecord::FromJson(parsed.value());
+    MT_EXPECT_TRUE(record.ok());
+    if (!record.ok()) return;
+
+    MT_EXPECT_EQ(record.value().id, std::string("vol_abc"));
+    MT_EXPECT_EQ(record.value().size_mb, static_cast<uint64_t>(1024));
+    MT_EXPECT_EQ(record.value().mode, VolumeMode::Exclusive);
+    MT_EXPECT_EQ(record.value().status, VolumeStatus::Ready);
+    // An explicit null reads as absent, not as the string "null".
+    MT_EXPECT_TRUE(!record.value().reserved_by_sandbox_id.has_value());
+
+    // Re-encoding reproduces the same keys, which is what makes the record
+    // survive a read-modify-write by this implementation.
+    const std::string back = record.value().ToJson().ToString();
+    MT_EXPECT_TRUE(back.find("\"sizeMb\":1024") != std::string::npos);
+}
+
+MT_TEST(a_snake_case_document_is_rejected_rather_than_silently_defaulted) {
+    const char* legacy = "{\"id\":\"vol_abc\",\"name\":\"demo\",\"size_mb\":1024}";
+    const agentenv::core::Expected<agentenv::core::Json, agentenv::core::AnyError> parsed =
+        agentenv::core::Json::Parse(legacy);
+    MT_EXPECT_TRUE(parsed.ok());
+    if (!parsed.ok()) return;
+
+    // Rust would fail the same way -- `size_mb` has no `#[serde(default)]`,
+    // so a missing `sizeMb` is a hard parse error. Defaulting it to zero
+    // instead would hand back a record claiming a zero-byte volume.
+    const agentenv::core::Expected<VolumeRecord, std::string> record =
+        VolumeRecord::FromJson(parsed.value());
+    MT_EXPECT_TRUE(!record.ok());
+    if (!record.ok()) MT_EXPECT_EQ(record.error(), std::string("missing field `sizeMb`"));
+}
+
+// ---------------------------------------------------------------------------
 // Manager behaviour
 // ---------------------------------------------------------------------------
+
+MT_TEST(default_limits_come_from_the_volume_config) {
+    const agentenv::volume::VolumeLimits limits = agentenv::volume::VolumeLimits::Default();
+
+    // Rust's `impl Default for VolumeLimits` reads `cfg::VolumeConfig`, whose
+    // defaults are 262144 MiB and 4 mounts. Pinned as literals because the
+    // two constants sitting next to them are tempting and wrong:
+    // `kDefaultVolumeSizeMb` (65536) is the size a new volume gets when the
+    // request names none, and `kMaxVolumeMounts` (24) is the hardware ceiling
+    // the config validator clamps against. Using either here moves a real
+    // limit -- too small a cap refuses legitimate volumes, too large a mount
+    // count stops enforcing the policy altogether.
+    MT_EXPECT_EQ(limits.max_size_mb, static_cast<uint64_t>(262144));
+    MT_EXPECT_EQ(limits.max_mounts, static_cast<std::size_t>(4));
+
+    const agentenv::cfg::VolumeConfig config;
+    MT_EXPECT_EQ(limits.max_size_mb, config.max_size_mb);
+    MT_EXPECT_EQ(limits.max_mounts, config.max_volume_count);
+
+    // The default sits below the ceiling, so the clamp in
+    // `OpenWithRepositoryAndLimits` is a guard on operator input rather than
+    // something the default itself depends on.
+    MT_EXPECT_TRUE(limits.max_mounts < agentenv::volume::kMaxVolumeMounts);
+}
 
 MT_TEST(open_requires_a_catalog_path_with_a_parent) {
     std::shared_ptr<FakeVolumeRepository> repository(new FakeVolumeRepository("/tmp/unused"));

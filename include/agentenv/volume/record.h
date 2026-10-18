@@ -22,10 +22,13 @@
 namespace agentenv {
 namespace volume {
 
-/// Rust `DEFAULT_VOLUME_SIZE_MB`.
+/// Rust `DEFAULT_VOLUME_SIZE_MB` — the size a new volume gets when the request
+/// names none. Not a limit: the ceiling is `cfg::VolumeConfig::max_size_mb`.
 const uint64_t kDefaultVolumeSizeMb = 64ULL * 1024ULL;
-/// Rust `MAX_VOLUME_MOUNTS` — Firecracker exposes /dev/vdc through /dev/vdz
-/// for extra drives, so 24 is a hardware-shaped ceiling, not a policy knob.
+/// Rust `cfg::MAX_VOLUME_MOUNTS` — Firecracker exposes /dev/vdc through
+/// /dev/vdz for extra drives, so 24 is a hardware-shaped ceiling that clamps
+/// whatever an operator configures. The *default* mount limit is
+/// `cfg::VolumeConfig::max_volume_count`, which is much lower.
 const std::size_t kMaxVolumeMounts = 24;
 /// Rust `DEFAULT_VOLUME_PAGE_SIZE`.
 const std::size_t kDefaultVolumePageSize = 100;

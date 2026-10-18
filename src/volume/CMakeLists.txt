@@ -9,4 +9,7 @@ target_link_libraries(agentenv-volume PUBLIC
     agentenv-volume-record
     agentenv-snapshot
     agentenv-overlaybd
+    # `VolumeLimits::Default` mirrors Rust's, which reads `cfg::VolumeConfig`
+    # defaults. Taking them from there keeps one definition of the two values.
+    agentenv-cfg
 )

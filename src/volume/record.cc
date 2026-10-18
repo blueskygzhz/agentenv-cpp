@@ -454,23 +454,39 @@ core::Expected<core::Unit, VolumeError> ValidateVolumeId(const std::string& id) 
 
 // ---- serialisation --------------------------------------------------------
 
+// The key spellings come from `#[serde(rename_all = "camelCase")]` on the Rust
+// struct, so the four multi-word fields are `sizeMb`, `reservedBySandboxId`,
+// `backingLayers` and `readOnlyMounts` rather than their snake_case field
+// names. This is the durable catalog format -- Rust's `encode_record` is a
+// plain `serde_json::to_vec_pretty(record)` into `volumes/records/<id>.json`,
+// the same path this writes -- so a mismatched key is not a cosmetic
+// difference: the field is required, and the other implementation's parse
+// fails outright on a record this one wrote.
+//
+// Note that the *values* follow different rules, and both are deliberate:
+// `VolumeMode` carries no `rename_all` and stays PascalCase (`"Exclusive"`),
+// while `VolumeStatus` is `rename_all = "lowercase"` (`"ready"`). The nested
+// layer refs are snake_case for the same reason as the mode -- no rename on
+// `ManagedLayer` / `ExternalLayer`.
 core::Json VolumeRecord::ToJson() const {
     core::JsonObject object;
     object["id"] = core::Json(id);
     object["name"] = core::Json(name);
     object["mode"] = core::Json(VolumeModeToString(mode));
-    object["size_mb"] = core::Json(static_cast<int64_t>(size_mb));
+    object["sizeMb"] = core::Json(static_cast<int64_t>(size_mb));
     object["status"] = core::Json(VolumeStatusToString(status));
-    object["reserved_by_sandbox_id"] = reserved_by_sandbox_id.has_value()
-                                           ? core::Json(*reserved_by_sandbox_id)
-                                           : core::Json();
-    object["backing_layers"] = snapshot::LayerRefsToJson(backing_layers);
+    // Written as an explicit null when unset: there is no
+    // `skip_serializing_if` on this field, unlike `deleting` below.
+    object["reservedBySandboxId"] = reserved_by_sandbox_id.has_value()
+                                        ? core::Json(*reserved_by_sandbox_id)
+                                        : core::Json();
+    object["backingLayers"] = snapshot::LayerRefsToJson(backing_layers);
 
     core::JsonArray mounts;
     for (std::size_t i = 0; i < read_only_mounts.size(); ++i) {
         mounts.push_back(core::Json(read_only_mounts[i]));
     }
-    object["read_only_mounts"] = core::Json(mounts);
+    object["readOnlyMounts"] = core::Json(mounts);
 
     // `skip_serializing_if = "std::ops::Not::not"`: only written when true.
     if (deleting) object["deleting"] = core::Json(true);
@@ -505,10 +521,10 @@ core::Expected<VolumeRecord, std::string> VolumeRecord::FromJson(const core::Jso
         record.mode = parsed.value();
     }
 
-    const core::JsonObject::const_iterator size_field = fields.find("size_mb");
+    const core::JsonObject::const_iterator size_field = fields.find("sizeMb");
     if (size_field == fields.end() || size_field->second.kind() != core::Json::Kind::Int ||
         size_field->second.as_int() < 0) {
-        return core::make_unexpected(std::string("missing field `size_mb`"));
+        return core::make_unexpected(std::string("missing field `sizeMb`"));
     }
     record.size_mb = static_cast<uint64_t>(size_field->second.as_int());
 
@@ -521,13 +537,13 @@ core::Expected<VolumeRecord, std::string> VolumeRecord::FromJson(const core::Jso
         record.status = parsed.value();
     }
 
-    const core::JsonObject::const_iterator reserved = fields.find("reserved_by_sandbox_id");
+    const core::JsonObject::const_iterator reserved = fields.find("reservedBySandboxId");
     if (reserved != fields.end() && reserved->second.kind() == core::Json::Kind::String) {
         record.reserved_by_sandbox_id =
             core::Optional<std::string>(reserved->second.as_string());
     }
 
-    const core::JsonObject::const_iterator layers = fields.find("backing_layers");
+    const core::JsonObject::const_iterator layers = fields.find("backingLayers");
     if (layers != fields.end()) {
         const core::Expected<std::vector<snapshot::OverlaybdLayerRef>, std::string> parsed =
             snapshot::LayerRefsFromJson(layers->second);
@@ -535,13 +551,13 @@ core::Expected<VolumeRecord, std::string> VolumeRecord::FromJson(const core::Jso
         record.backing_layers = parsed.value();
     }
 
-    const core::JsonObject::const_iterator mounts = fields.find("read_only_mounts");
+    const core::JsonObject::const_iterator mounts = fields.find("readOnlyMounts");
     if (mounts != fields.end() && mounts->second.kind() == core::Json::Kind::Array) {
         const core::JsonArray& values = mounts->second.as_array();
         for (std::size_t i = 0; i < values.size(); ++i) {
             if (values[i].kind() != core::Json::Kind::String) {
                 return core::make_unexpected(
-                    std::string("field `read_only_mounts` must contain strings"));
+                    std::string("field `readOnlyMounts` must contain strings"));
             }
             record.read_only_mounts.push_back(values[i].as_string());
         }

@@ -40,9 +40,8 @@ struct VolumeLimits {
     std::size_t max_mounts = 0;
 
     /// Rust `impl Default for VolumeLimits`, which reads `cfg::VolumeConfig`
-    /// defaults. Those are duplicated as literals here so this header does not
-    /// depend on `cfg.h`; `VolumeLimitsFromConfig` is the wiring point when a
-    /// real `AppConfig` is available.
+    /// defaults. The implementation does the same rather than restating the
+    /// two numbers, so an operator override and this default cannot disagree.
     static VolumeLimits Default();
 };
 

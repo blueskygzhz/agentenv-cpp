@@ -76,6 +76,12 @@ std::string PosixFsSnapshotArtifactLayout::VolumeRecordPath(const std::string& r
 
 std::string PosixFsSnapshotArtifactLayout::VolumeAliasPath(const std::string& root,
                                                            const std::string& alias) {
+    // No extension, matching Rust's `posix_path`, which spells aliases
+    // `volumes/aliases/{name}` while `path` -- the shared layout the OSS
+    // backend uses -- spells them `volumes/aliases/{name}.json`. The two
+    // disagree deliberately: the POSIX layout predates the shared one, and
+    // renaming the file would strand every alias already on disk. Do not
+    // "fix" this against `path`; it is the wrong half of the pair.
     return core::fs::Join(VolumeAliasesDir(root), alias);
 }
 
