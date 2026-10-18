@@ -148,6 +148,222 @@ struct OverlaybdConfig {
     int32_t               log_rotate_num = 3;
 };
 
+
+// ---------------------------------------------------------------------------
+// Rust: config.rs — the daemon-wide global config (`overlaybd.json`)
+// ---------------------------------------------------------------------------
+//
+// Every struct below is `#[serde(default, rename_all = "camelCase")]` on the
+// Rust side, so a missing key keeps its default rather than failing the parse.
+// The three `cacheSizeGB` / `logSizeMB` spellings carry an explicit `rename`
+// because camelCase would turn them into `cacheSizeGb` / `logSizeMb`.
+
+/// Rust `env!("CARGO_PKG_VERSION")` as used for `GlobalConfig::user_agent`.
+///
+/// The overlaybd crate's own version, not this project's: it identifies the
+/// storage implementation to a registry, and the two version independently.
+extern const char* const kOverlaybdUserAgent;
+
+/// Rust `P2PConfig`.
+struct P2PConfig {
+    bool enable;
+    std::string address;
+
+    P2PConfig() : enable(false), address("http://localhost:9731/accelerator") {}
+};
+
+/// Rust `GzipCacheConfig`.
+struct GzipCacheConfig {
+    bool enable;
+    std::string cache_dir;
+    /// Rust `#[serde(rename = "cacheSizeGB")]`.
+    uint32_t cache_size_gb;
+    uint32_t refill_size;
+
+    GzipCacheConfig()
+        : enable(false),
+          cache_dir("/opt/overlaybd/gzip_cache"),
+          cache_size_gb(4),
+          refill_size(1024 * 1024) {}
+};
+
+/// Rust `OssConfig`.
+struct OssConfig {
+    bool enable;
+    std::string access_key_id;
+    std::string secret_access_key;
+    std::string security_token;
+    std::string credential_process;
+    std::string default_region;
+    std::string default_endpoint;
+    /// `"virtual"`, `"path"`, or empty for endpoint-based auto-detection.
+    std::string default_addressing_style;
+    /// Per-request timeout in seconds (connect + transfer).
+    uint64_t timeout_secs;
+    /// Retries on transient failures.
+    uint32_t retry_count;
+
+    OssConfig() : enable(false), timeout_secs(30), retry_count(3) {}
+};
+
+/// Rust `ExporterConfig`.
+struct ExporterConfig {
+    bool enable;
+    std::string uri_prefix;
+    int32_t port;
+    /// Microseconds, not milliseconds -- the default is 60 seconds.
+    uint64_t update_interval;
+
+    ExporterConfig()
+        : enable(false), uri_prefix("/metrics"), port(9863),
+          update_interval(60ULL * 1000ULL * 1000ULL) {}
+};
+
+/// Rust `CredentialConfig`.
+struct CredentialConfig {
+    /// `""`, `"file"` or `"http"`.
+    std::string mode;
+    std::string path;
+    int32_t timeout;
+
+    CredentialConfig() : timeout(1) {}
+};
+
+/// Rust `CacheConfig`.
+struct CacheConfig {
+    std::string cache_type;
+    std::string cache_dir;
+    /// Rust `#[serde(rename = "cacheSizeGB")]`.
+    uint32_t cache_size_gb;
+    /// Both the I/O unit and the bitmap granularity. Must be a power of two
+    /// >= 4096.
+    uint32_t refill_size;
+    /// Under capacity pressure, open entries idle longer than this may have
+    /// their blocks reclaimed; the entry survives and refills on demand. 0
+    /// disables open-entry eviction.
+    uint64_t open_evict_idle_secs;
+
+    CacheConfig()
+        : cache_dir("/opt/overlaybd/registry_cache"),
+          cache_size_gb(4),
+          refill_size(262144),
+          open_evict_idle_secs(600) {}
+};
+
+/// Rust `LogConfig`.
+struct LogConfig {
+    uint32_t log_level;
+    std::string log_path;
+    /// Rust `#[serde(rename = "logSizeMB")]`.
+    uint32_t log_size_mb;
+    int32_t log_rotate_num;
+
+    LogConfig() : log_level(1), log_size_mb(10), log_rotate_num(3) {}
+};
+
+/// Rust `PrefetchConfig`.
+struct PrefetchConfig {
+    int32_t concurrency;
+
+    PrefetchConfig() : concurrency(16) {}
+};
+
+/// Rust `CertConfig`.
+struct CertConfig {
+    std::string cert_file;
+    std::string key_file;
+};
+
+/// Rust `GlobalConfig` — the daemon-wide settings, one per host.
+///
+/// The first seven fields are legacy: newer equivalents live in
+/// `cache_config`, `log_config` and `credential_config`, and
+/// `NormalizeCompatFields` folds the old spellings into the new ones. They are
+/// kept because configs written against the old shape are still in the wild.
+struct GlobalConfig {
+    // -- legacy fields -----------------------------------------------------
+    std::string registry_cache_dir;
+    std::string credential_file_path;
+    /// Rust `#[serde(rename = "registryCacheSizeGB")]`.
+    uint32_t registry_cache_size_gb;
+    uint32_t io_engine;
+    std::string cache_type;
+    uint32_t log_level;
+    std::string log_path;
+
+    // -- current fields ----------------------------------------------------
+    DownloadConfig download;
+    bool enable_audit;
+    bool enable_thread;
+    P2PConfig p2p_config;
+    ExporterConfig exporter_config;
+    std::string audit_path;
+    std::string registry_fs_version;
+    CacheConfig cache_config;
+    GzipCacheConfig gzip_cache_config;
+    OssConfig oss_config;
+    LogConfig log_config;
+    PrefetchConfig prefetch_config;
+    CertConfig cert_config;
+    std::string user_agent;
+    CredentialConfig credential_config;
+
+    /// Legacy compatibility field. Local files no longer allocate io_uring
+    /// workers through the image service; ublk owns its queue-local rings.
+    std::size_t nr_io_rings;
+
+    /// Rust `remote_io_workers` — worker threads of the dedicated runtime
+    /// driving remote image I/O.
+    ///
+    /// Carried for config fidelity only: it has no effect here. Rust needs it
+    /// because its remote backends spawn per-connection tokio tasks whose
+    /// lifetime would otherwise bind to whichever device runtime happened to
+    /// poll them; a synchronous port has no runtimes to pin work to. Dropping
+    /// the field instead would make a round-tripped config differ from its
+    /// input.
+    std::size_t remote_io_workers;
+
+    GlobalConfig()
+        : registry_cache_dir("/opt/overlaybd/registry_cache"),
+          credential_file_path("/opt/overlaybd/cred.json"),
+          registry_cache_size_gb(4),
+          io_engine(0),
+          cache_type("file"),
+          log_level(1),
+          log_path("/var/log/overlaybd.log"),
+          enable_audit(true),
+          enable_thread(false),
+          audit_path("/var/log/overlaybd-audit.log"),
+          registry_fs_version("v2"),
+          nr_io_rings(4),
+          remote_io_workers(0) {}
+
+    /// Rust `normalize_compat_fields` — fold the legacy spellings into the
+    /// current ones.
+    ///
+    /// Each fold is conditional on the *new* field being unset, so a config
+    /// that sets both keeps the new value. The order matters for cache: the
+    /// legacy block is applied first, then a still-empty type falls back to
+    /// `"file"`.
+    void NormalizeCompatFields();
+};
+
+/// Rust `validate_global_config`.
+core::Expected<core::Unit, std::string> ValidateGlobalConfig(const GlobalConfig& cfg);
+
+/// Rust `serde_json::from_str::<GlobalConfig>` — parses an `overlaybd.json`.
+///
+/// Does *not* normalize or validate; `LoadGlobalConfig` does both. Split so a
+/// caller can inspect exactly what the file said.
+core::Expected<GlobalConfig, std::string> ParseGlobalConfig(const std::string& text);
+
+/// Rust `load_global_config` — read, parse, normalize, then validate.
+core::Expected<GlobalConfig, std::string> LoadGlobalConfig(const std::string& path);
+
+/// Serializes to the camelCase shape serde produces, honouring the three
+/// explicit renames.
+std::string GlobalConfigToJson(const GlobalConfig& config);
+
 }  // namespace overlaybd
 }  // namespace storage
 }  // namespace agentenv

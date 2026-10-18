@@ -29,6 +29,7 @@ add_library(agentenv-overlaybd STATIC
     # Rust: src/lsmt/file/readwrite.rs — the writable upper layer
     lsmt_rw.cc
     switch_file.cc
+    layer_metadata.cc
 )
 target_include_directories(agentenv-overlaybd PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-overlaybd PUBLIC agentenv-core agentenv-storage-util)
