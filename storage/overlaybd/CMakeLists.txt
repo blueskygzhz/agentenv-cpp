@@ -18,6 +18,10 @@ add_library(agentenv-overlaybd STATIC
     virtual_file.cc
     # Rust: src/sys/{open_flags,page_cache,release_space,xattr}.rs
     sys.cc
+    # Rust: src/backend/local.rs — the first concrete VirtualFile
+    local_file.cc
+    # Rust: src/lsmt/file/readonly.rs — the merged read view
+    lsmt_readonly.cc
 )
 target_include_directories(agentenv-overlaybd PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-overlaybd PUBLIC agentenv-core agentenv-storage-util)
