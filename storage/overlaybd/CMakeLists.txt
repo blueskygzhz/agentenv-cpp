@@ -33,6 +33,7 @@ add_library(agentenv-overlaybd STATIC
     roaring.cc
     cache_meta.cc
     cache_entry.cc
+    cache_pool.cc
 )
 target_include_directories(agentenv-overlaybd PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-overlaybd PUBLIC agentenv-core agentenv-storage-util)

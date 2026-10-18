@@ -113,6 +113,35 @@ std::vector<uint32_t> RoaringBitmap::ToVector() const {
     return out;
 }
 
+std::vector<uint32_t> RoaringBitmap::Range(uint32_t lo, uint32_t hi) const {
+    std::vector<uint32_t> out;
+    if (lo > hi) return out;
+
+    const uint16_t lo_high = static_cast<uint16_t>(lo >> 16);
+    const uint16_t hi_high = static_cast<uint16_t>(hi >> 16);
+
+    // Only the buckets the range touches are visited, which is the point of
+    // having this rather than filtering everything.
+    std::map<uint16_t, std::vector<uint16_t> >::const_iterator it =
+        buckets_.lower_bound(lo_high);
+    for (; it != buckets_.end() && it->first <= hi_high; ++it) {
+        const uint32_t high = static_cast<uint32_t>(it->first) << 16;
+        // The bounds only clamp in the first and last bucket; the ones in
+        // between are wholly inside the range.
+        const uint32_t bucket_lo = (it->first == lo_high) ? (lo & 0xFFFF) : 0;
+        const uint32_t bucket_hi = (it->first == hi_high) ? (hi & 0xFFFF) : 0xFFFF;
+
+        const std::vector<uint16_t>& values = it->second;
+        const std::vector<uint16_t>::const_iterator begin = std::lower_bound(
+            values.begin(), values.end(), static_cast<uint16_t>(bucket_lo));
+        for (std::vector<uint16_t>::const_iterator v = begin; v != values.end(); ++v) {
+            if (static_cast<uint32_t>(*v) > bucket_hi) break;
+            out.push_back(high | static_cast<uint32_t>(*v));
+        }
+    }
+    return out;
+}
+
 size_t RoaringBitmap::SerializedSize() const {
     const size_t count = buckets_.size();
     // cookie + container count + (key, cardinality) per container + offsets.

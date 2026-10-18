@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/statvfs.h>
 #include <sys/xattr.h>
 #include <unistd.h>
 
@@ -193,6 +194,30 @@ core::Expected<core::Unit, SysError> ReserveSpace(int fd, uint64_t offset, uint6
     // primitive should not perform behind the caller's back.
     return core::make_unexpected(SysError::Unsupported("reserve_space"));
 #endif
+}
+
+core::Expected<FsSpace, SysError> FsSpaceOf(const std::string& path) {
+    struct statvfs st;
+    if (::statvfs(path.c_str(), &st) != 0) {
+        return core::make_unexpected(SysError::Last());
+    }
+
+    // `f_frsize` is the fragment size the block counts are expressed in, not
+    // `f_bsize`: the two differ on some filesystems, and using the wrong one
+    // scales every answer.
+    const uint64_t frsize = static_cast<uint64_t>(st.f_frsize);
+    FsSpace out;
+    // Saturating: the product is only used for comparisons against a budget,
+    // so a wrapped value would read as "plenty of room" on a huge volume.
+    const uint64_t max = ~static_cast<uint64_t>(0);
+    const uint64_t blocks = static_cast<uint64_t>(st.f_blocks);
+    const uint64_t bavail = static_cast<uint64_t>(st.f_bavail);
+    out.capacity_bytes = (frsize != 0 && blocks > max / frsize) ? max : frsize * blocks;
+    // `f_bavail`, not `f_bfree`: the root-reserved blocks in the difference
+    // are not available to this user, and counting them would make the cache
+    // believe it can still write when it cannot.
+    out.avail_bytes = (frsize != 0 && bavail > max / frsize) ? max : frsize * bavail;
+    return out;
 }
 
 bool SparseExtentsAreReliable() {

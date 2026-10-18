@@ -53,6 +53,15 @@ class RoaringBitmap {
     /// is at most a few thousand blocks.
     std::vector<uint32_t> ToVector() const;
 
+    /// Rust `RoaringBitmap::range(lo..=hi)` — values within an inclusive
+    /// range, ascending.
+    ///
+    /// Used by the cache to find which blocks of a requested read are already
+    /// present. Narrowing here rather than filtering `ToVector` matters for a
+    /// large bitmap: a read touches a handful of blocks out of possibly tens
+    /// of thousands.
+    std::vector<uint32_t> Range(uint32_t lo, uint32_t hi) const;
+
     /// Rust `RoaringBitmap::serialize_into` — the portable format.
     ///
     /// Run containers are never emitted. The Rust side does not run-optimize

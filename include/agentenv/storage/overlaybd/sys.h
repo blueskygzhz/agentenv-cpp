@@ -113,6 +113,21 @@ SysResult<core::Unit>::type ReleaseSpaceHint(int fd, uint64_t offset, uint64_t l
 /// callers outright instead of degrading them.
 SysResult<core::Unit>::type ReserveSpace(int fd, uint64_t offset, uint64_t len);
 
+/// Rust `FsSpace` — total and available bytes of a filesystem.
+struct FsSpace {
+    uint64_t capacity_bytes;
+    uint64_t avail_bytes;
+
+    FsSpace() : capacity_bytes(0), avail_bytes(0) {}
+};
+
+/// Rust `fs_space` — query the filesystem holding `path`.
+///
+/// `avail_bytes` is what is available to *this* user (`f_bavail`), not the
+/// total free space: the cache has to decide whether it can still write, and
+/// root-reserved blocks it cannot touch would make it believe it can.
+SysResult<FsSpace>::type FsSpaceOf(const std::string& path);
+
 /// Rust `sparse.rs :: sparse_extents_are_reliable` — whether this platform
 /// guarantees that never-written regions are reported as holes.
 ///

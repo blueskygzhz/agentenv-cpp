@@ -237,6 +237,15 @@ class CacheEntry {
     bool HasBlock(uint64_t block_id) const;
     uint64_t CachedBlockCount() const { return index_.Cardinality(); }
 
+    /// Block ids present within an inclusive range, ascending.
+    ///
+    /// Narrowed through the bitmap rather than scanning every block of the
+    /// range: a read touches a handful of blocks out of what may be tens of
+    /// thousands in a large layer.
+    std::vector<uint32_t> PresentBlocksInRange(uint32_t lo, uint32_t hi) const {
+        return index_.Range(lo, hi);
+    }
+
  private:
     friend class ReservedRange;
 
