@@ -28,7 +28,11 @@ option(AGENTENV_WITH_LIBURING    "Enable io_uring backend"            OFF)
 option(AGENTENV_WITH_GRPC        "Build gRPC scheduler/gateway"       OFF)
 option(AGENTENV_WITH_HTTPLIB     "Use cpp-httplib for HTTP server"    OFF)
 option(AGENTENV_WITH_ROCKSDB     "Use RocksDB for orchestrator store" OFF)
-option(AGENTENV_WITH_ZSTD        "Enable zstd in overlaybd"           OFF)
+# On by default: the zfile reader needs both codecs to open a real layer, and
+# with this off it compiles to a stub that refuses every file. The other
+# options here guard optional backends; this one guards a format the image
+# path cannot do without.
+option(AGENTENV_WITH_ZSTD        "Enable zstd/lz4 in overlaybd"       ON)
 
 # ---- output layout -------------------------------------------------------
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
@@ -63,7 +67,12 @@ if(AGENTENV_WITH_GRPC)
 endif()
 
 if(AGENTENV_WITH_ZSTD)
+    # Both codecs, despite the option name: the zfile format picks between LZ4
+    # and ZSTD per file via its header, so a reader built with only one of them
+    # would fail on half the inputs. Rust depends on `lz4-sys` and `zstd`
+    # together for the same reason.
     find_library(ZSTD_LIB zstd REQUIRED)
+    find_library(LZ4_LIB lz4 REQUIRED)
     add_compile_definitions(AGENTENV_WITH_ZSTD=1)
 endif()
 

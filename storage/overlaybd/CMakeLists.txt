@@ -28,9 +28,10 @@ add_library(agentenv-overlaybd STATIC
     lsmt_readonly.cc
     # Rust: src/lsmt/file/readwrite.rs — the writable upper layer
     lsmt_rw.cc
+    switch_file.cc
 )
 target_include_directories(agentenv-overlaybd PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-overlaybd PUBLIC agentenv-core agentenv-storage-util)
 if(AGENTENV_WITH_ZSTD)
-    target_link_libraries(agentenv-overlaybd PUBLIC ${ZSTD_LIB})
+    target_link_libraries(agentenv-overlaybd PUBLIC ${ZSTD_LIB} ${LZ4_LIB})
 endif()
