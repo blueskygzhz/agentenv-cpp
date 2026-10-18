@@ -113,6 +113,26 @@ class Sha256Ctx {
         h_[4]+=e; h_[5]+=f; h_[6]+=g; h_[7]+=hh;
     }
 
+    // State transfer for `Sha256Stream`, which keeps the same four fields in
+    // its own header-visible struct. Declared here rather than making the
+    // whole class public so the block state stays out of the header.
+ public:
+    void LoadState(const uint32_t h[8], const uint8_t buf[64], std::size_t buf_len,
+                   uint64_t total) {
+        for (int i = 0; i < 8; ++i) h_[i] = h[i];
+        for (int i = 0; i < 64; ++i) buffer_[i] = buf[i];
+        buffer_len_ = buf_len;
+        total_len_ = total;
+    }
+    void SaveState(uint32_t h[8], uint8_t buf[64], std::size_t* buf_len,
+                   uint64_t* total) const {
+        for (int i = 0; i < 8; ++i) h[i] = h_[i];
+        for (int i = 0; i < 64; ++i) buf[i] = buffer_[i];
+        *buf_len = buffer_len_;
+        *total = total_len_;
+    }
+
+ private:
     uint32_t h_[8];
     uint8_t  buffer_[64];
   std::size_t buffer_len_;
@@ -130,6 +150,40 @@ std::string HexOf(const uint8_t* bytes, std::size_t n) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Sha256Stream
+// ---------------------------------------------------------------------------
+
+Sha256Stream::Sha256Stream() : buffer_len_(0), total_len_(0) {
+    Sha256Ctx fresh;
+    fresh.SaveState(h_, buffer_, &buffer_len_, &total_len_);
+}
+
+void Sha256Stream::Update(const void* data, std::size_t len) {
+    if (data == 0 || len == 0) return;
+    Sha256Ctx ctx;
+    ctx.LoadState(h_, buffer_, buffer_len_, total_len_);
+    ctx.Update(static_cast<const uint8_t*>(data), len);
+    ctx.SaveState(h_, buffer_, &buffer_len_, &total_len_);
+}
+
+void Sha256Stream::PeekFinal(uint8_t out[32]) const {
+    // On a copy, because finalizing appends the padding and the length block
+    // to the state. Doing it in place would make the first `PeekFinal` the
+    // last useful call, and a caller that reports a running digest while
+    // still absorbing would silently hash the padding into its next result.
+    Sha256Ctx ctx;
+    ctx.LoadState(h_, buffer_, buffer_len_, total_len_);
+    ctx.Final(out);
+}
+
+std::string Sha256Stream::PeekHex() const {
+    uint8_t raw[32];
+    PeekFinal(raw);
+    return std::string("sha256:") + HexEncode(raw, sizeof(raw));
+}
+
 
 Digest::Digest(const uint8_t bytes[32]) {
     std::memcpy(bytes_.data(), bytes, 32);

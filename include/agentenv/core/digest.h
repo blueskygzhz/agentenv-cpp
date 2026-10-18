@@ -15,6 +15,31 @@
 namespace agentenv {
 namespace core {
 
+/// Incremental SHA-256, for data that arrives in pieces.
+///
+/// The one-shot helpers below need the whole input in memory at once. An
+/// append-only layer file is hashed as it is written -- megabytes at a time,
+/// over the lifetime of the upper -- so buffering it to hash at the end would
+/// mean holding the entire layer.
+class Sha256Stream {
+ public:
+    Sha256Stream();
+    void Update(const void* data, std::size_t len);
+    /// Finish and write the 32-byte digest. The state is left usable, so a
+    /// caller can keep absorbing and finalize again later -- which is what
+    /// reporting a running digest requires.
+    void PeekFinal(uint8_t out[32]) const;
+    /// Lowercase `sha256:<hex>` of `PeekFinal`.
+    std::string PeekHex() const;
+
+ private:
+    // Opaque, so the block state does not become part of this header.
+    uint32_t h_[8];
+    uint8_t buffer_[64];
+    std::size_t buffer_len_;
+    uint64_t total_len_;
+};
+
 /// A SHA256 digest, kept as 32 raw bytes. Rendered as "sha256:<hex>".
 class Digest {
  public:

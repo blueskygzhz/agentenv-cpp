@@ -414,7 +414,7 @@ LsmtReadOnlyFile::FromMergedLayers(std::shared_ptr<LogIndex> index,
                                      const std::vector<std::shared_ptr<VirtualFile> >& layers,
                                      uint64_t virtual_size,
                                      const std::vector<std::string>& uuids) {
-    if (false) { /*MUTOK*/
+    if (uuids.size() != layers.size()) {
         // Refused rather than padded. The uuid is how a caller identifies
         // which layer a mapping came from, so a vector that does not line up
         // with the layers would answer `GetUuid` with another layer's

@@ -154,6 +154,16 @@ core::Expected<core::Unit, SysError> ReleaseSpaceHint(int fd, uint64_t offset,
 #endif
 }
 
+bool SparseExtentsAreReliable() {
+    // Linux only, and that is the whole point of the function existing rather
+    // than the callers assuming it.
+#if defined(__linux__)
+    return true;
+#else
+    return false;
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // xattr
 // ---------------------------------------------------------------------------

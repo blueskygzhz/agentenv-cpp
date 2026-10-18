@@ -43,9 +43,15 @@ using lsmt::kLsmtHeaderSize;
 const size_t kLsmtMaxIoSize = 4 * 1024 * 1024;
 
 /// Rust `types.rs :: LSMTFileType`.
+///
+/// The three writable kinds are not interchangeable: they decide where a
+/// write lands and whether the layer can be hashed as it grows, so the write
+/// path branches on this rather than on a separate flag.
 enum LsmtFileType {
     kLsmtFileReadOnly = 0,
-    kLsmtFileWritable = 1
+    kLsmtFileWritable = 1,
+    kLsmtFileSparseWritable = 2,
+    kLsmtFileHybridWritable = 3
 };
 
 /// Rust `types.rs :: DataStat`.

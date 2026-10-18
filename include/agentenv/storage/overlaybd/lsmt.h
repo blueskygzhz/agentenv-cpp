@@ -239,6 +239,12 @@ class ComboIndex : public LogIndex {
                uint8_t ro_layers_count);
     void Insert(SegmentMapping m) { upper_.Insert(m); }
     size_t UpperLen() const { return upper_.Len(); }
+
+    /// Rust accesses `idx.upper` directly. The writable file needs it for two
+    /// things the combined view cannot answer: planning a hybrid write, which
+    /// must see only what *this* layer already owns, and sealing, which must
+    /// emit only this layer's mappings.
+    const MutableIndex& Upper() const { return upper_; }
     size_t Lookup(Segment query, std::vector<SegmentMapping>* dst) const override;
 
  private:

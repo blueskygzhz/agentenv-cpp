@@ -56,6 +56,7 @@ struct ImageBuilder {
     bool corrupt_header_magic;
     uint64_t index_size_override;    ///< 0 = use mappings.size()
     bool use_index_size_override;
+    std::string uuid;                ///< written into the trailer
 
     ImageBuilder()
         : virtual_size(0), seal_trailer(true), data_file_trailer(true),
@@ -99,6 +100,9 @@ struct ImageBuilder {
         t.index_offset = index_off;
         t.index_size = use_index_size_override ? index_size_override : mappings.size();
         t.virtual_size = virtual_size;
+        for (size_t i = 0; i < uuid.size() && i + 1 < sizeof(t.uuid); ++i) {
+            t.uuid[i] = static_cast<uint8_t>(uuid[i]);
+        }
         uint8_t tb[HeaderTrailer::kOnDiskSize];
         t.Serialize(tb);
         image.resize(static_cast<size_t>(trailer_off + kHdr), 0);
@@ -796,11 +800,13 @@ MT_TEST(uuids_follow_the_merged_layer_order_not_the_input_order) {
     ImageBuilder lo;
     lo.data = DataBlocks(1, 0x11);
     lo.virtual_size = 8 * kBlk;
+    lo.uuid = "oldest-layer";
     lo.mappings.push_back(SegmentMapping(0, 1, 8, false, 0));
 
     ImageBuilder hi;
     hi.data = DataBlocks(1, 0x99);
     hi.virtual_size = 8 * kBlk;
+    hi.uuid = "newest-layer";
     hi.mappings.push_back(SegmentMapping(1, 1, 8, false, 0));
 
     std::vector<std::shared_ptr<VirtualFile> > files;
@@ -813,11 +819,51 @@ MT_TEST(uuids_follow_the_merged_layer_order_not_the_input_order) {
 
     // Layer 0 is the newest, matching tag 0. The uuids were reversed
     // alongside the layers, so asking layer 0 for its identity names the
-    // same file a tag-0 mapping reads from.
-    MT_EXPECT_TRUE(f.value()->GetUuid(0).ok());
-    MT_EXPECT_TRUE(f.value()->GetUuid(1).ok());
+    // same file a tag-0 mapping reads from. Leave the uuids in input order
+    // and every mapping would be attributed to the wrong layer -- which is
+    // exactly what a caller uses this for when deciding which layer to
+    // re-fetch or invalidate.
+    core::Expected<std::string, std::string> u0 = f.value()->GetUuid(0);
+    core::Expected<std::string, std::string> u1 = f.value()->GetUuid(1);
+    MT_EXPECT_TRUE(u0.ok());
+    MT_EXPECT_TRUE(u1.ok());
+    if (u0.ok()) MT_EXPECT_TRUE(u0.value() == "newest-layer");
+    if (u1.ok()) MT_EXPECT_TRUE(u1.value() == "oldest-layer");
     MT_EXPECT_TRUE(!f.value()->GetUuid(2).ok());
     MT_EXPECT_EQ(static_cast<int>(f.value()->Layers().size()), 2);
+}
+
+MT_TEST(a_layer_recorded_tag_is_discarded_when_it_is_restacked) {
+    // A layer carries tags relative to the stack it was *built* in. Opened
+    // into a different stack those numbers are meaningless, so they are
+    // reset before the merge reassigns them by position. This layer claims
+    // tag 7 -- a layer that does not exist here.
+    ImageBuilder lo;
+    lo.data = DataBlocks(1, 0x11);
+    lo.virtual_size = 8 * kBlk;
+    lo.mappings.push_back(SegmentMapping(0, 1, 8, false, 7));
+
+    ImageBuilder hi;
+    hi.data = DataBlocks(1, 0x99);
+    hi.virtual_size = 8 * kBlk;
+    hi.mappings.push_back(SegmentMapping(1, 1, 8, false, 5));
+
+    std::vector<std::shared_ptr<VirtualFile> > files;
+    files.push_back(std::shared_ptr<VirtualFile>(new MemFile(lo.Build())));
+    files.push_back(std::shared_ptr<VirtualFile>(new MemFile(hi.Build())));
+
+    core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> f = OpenFilesRo(files);
+    MT_EXPECT_TRUE(f.ok());
+    if (!f.ok()) return;
+
+    std::vector<uint8_t> dst(static_cast<size_t>(2 * kBlk), 0);
+    core::Expected<size_t, std::string> n = f.value()->ReadAtInto(0, &dst[0], dst.size());
+    // Kept the stale tags and this would be "Layer index 7 out of range",
+    // or worse -- a tag that happens to be in range and reads the wrong file.
+    MT_EXPECT_TRUE(n.ok());
+    if (!n.ok()) return;
+    MT_EXPECT_EQ(static_cast<int>(dst[0]), 0x11);
+    MT_EXPECT_EQ(static_cast<int>(dst[static_cast<size_t>(kBlk)]), 0x99);
 }
 
 MT_TEST(the_virtual_size_is_the_newest_layer_that_declares_one) {

@@ -92,6 +92,19 @@ SysResult<core::Unit>::type EvictPageCache(int fd, uint64_t offset, uint64_t len
 /// Real syscall failures do surface, unlike the eviction hint above.
 SysResult<core::Unit>::type ReleaseSpaceHint(int fd, uint64_t offset, uint64_t len);
 
+/// Rust `sparse.rs :: sparse_extents_are_reliable` — whether this platform
+/// guarantees that never-written regions are reported as holes.
+///
+/// The sparse RW layout recovers *which blocks the upper owns* from the file's
+/// extent map. Getting this wrong is not a slowdown: a filesystem that reports
+/// its whole range as data yields an index claiming every block belongs to the
+/// upper, which masks every lower layer with zeros.
+///
+/// True on Linux, where a region with no allocated extent is a hole
+/// mechanically. Rust returns false for macOS/APFS, where sparseness is a
+/// filesystem heuristic the application cannot control.
+bool SparseExtentsAreReliable();
+
 // -- xattr ------------------------------------------------------------------
 
 /// Rust `fgetxattr` / `flistxattr` / `fsetxattr` / `fremovexattr`.
