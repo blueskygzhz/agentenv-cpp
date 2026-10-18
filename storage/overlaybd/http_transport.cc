@@ -192,6 +192,17 @@ core::Expected<Response, std::string> Perform(const Request& request) {
     ::curl_easy_setopt(handle, CURLOPT_CONNECTTIMEOUT, request.connect_timeout_secs);
     ::curl_easy_setopt(handle, CURLOPT_FOLLOWLOCATION,
                        request.follow_redirects ? 1L : 0L);
+    // Mutual TLS. Both or neither: libcurl would otherwise send a certificate
+    // it cannot prove ownership of, which fails the handshake outright rather
+    // than degrading to anonymous TLS.
+    if (!request.client_cert_file.empty() && !request.client_key_file.empty()) {
+        ::curl_easy_setopt(handle, CURLOPT_SSLCERT, request.client_cert_file.c_str());
+        ::curl_easy_setopt(handle, CURLOPT_SSLKEY, request.client_key_file.c_str());
+        // Rust builds the identity from a concatenated cert+key PEM, so both
+        // files are PEM here too.
+        ::curl_easy_setopt(handle, CURLOPT_SSLCERTTYPE, "PEM");
+        ::curl_easy_setopt(handle, CURLOPT_SSLKEYTYPE, "PEM");
+    }
     ::curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, WriteBody);
     ::curl_easy_setopt(handle, CURLOPT_WRITEDATA, &response.body);
     ::curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, WriteHeader);

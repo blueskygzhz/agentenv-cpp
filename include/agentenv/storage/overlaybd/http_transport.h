@@ -75,6 +75,15 @@ struct Request {
     /// Follow 3xx. On for registries, which redirect blob reads to a CDN.
     bool follow_redirects;
 
+    /// Rust `Client::builder().identity(...)` — a client certificate for
+    /// mutual TLS. Both empty disables it.
+    ///
+    /// Carried per request rather than per transport because this layer has no
+    /// persistent client object; the pair is applied together, since a cert
+    /// without its key cannot complete a handshake.
+    std::string client_cert_file;
+    std::string client_key_file;
+
     Request()
         : method("GET"),
           has_range(false),

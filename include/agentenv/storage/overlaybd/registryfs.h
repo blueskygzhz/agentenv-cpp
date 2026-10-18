@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -184,9 +185,17 @@ class RegistryFs {
     core::Expected<std::shared_ptr<RegistryFile>, std::string> OpenFile(
         const std::string& url, uint64_t size_hint);
 
-    /// Rust `refresh_token` — drop the cached token for a URL's scope so the
-    /// next request re-authenticates.
-    core::Expected<core::Unit, std::string> RefreshToken(const std::string& url);
+    /// Rust `refresh_token` — mint a new token for a URL and cache it.
+    ///
+    /// Reports absence rather than failing when the endpoint needs no token
+    /// (anonymous or Basic): there is nothing to refresh, which is not an
+    /// error.
+    ///
+    /// Probed with the *push* flavour, as Rust does, so the challenge comes
+    /// back scoped for `pull,push` and the token is usable for an upload. A
+    /// pull probe would yield a pull-only token, defeating the purpose.
+    core::Expected<core::Optional<std::string>, std::string> RefreshToken(
+        const std::string& url);
 
  private:
     friend class RegistryFile;
@@ -235,8 +244,24 @@ class RegistryFs {
 
     core::Expected<RegistryAuthChallenge, std::string> GetOrCreateRegistryChallenge(
         const BlobAuthContext& ctx);
+
+    /// Rust `get_scope_auth_for` — probe one endpoint for its challenge.
+    ///
+    /// `push` selects a POST probe instead of a ranged GET, because a
+    /// registry only answers with a `pull,push` scope when asked about a
+    /// write.
+    core::Expected<RegistryAuthChallenge, std::string> GetScopeAuth(const std::string& url,
+                                                                       bool push);
+
+    /// Rust `get_token` — fetch a token, bypassing the cache.
+    core::Expected<std::string, std::string> GetToken(const std::string& remote_url,
+                                                         const std::string& auth_url);
+    /// Rust `get_or_create_token` — cached variant of the above.
     core::Expected<std::string, std::string> GetOrCreateToken(const std::string& remote_url,
                                                                  const std::string& auth_url);
+
+    /// Attach `cert_file`/`key_file` to a request, when both are configured.
+    void ApplyClientCert(http::Request* request) const;
 
     core::Expected<PreparedAuth, std::string> PrepareCachedAuth(const std::string& url,
                                                                    const BlobAuthContext& ctx);
@@ -245,19 +270,40 @@ class RegistryFs {
 
     core::Expected<UrlInfo, std::string> GetOrCreateUrlInfo(const std::string& url);
     core::Expected<UrlInfo, std::string> GetActualUrl(const std::string& url);
+    /// One resolution attempt with a given credential. Shared by the main
+    /// path and the per-URL probe fallback so the two cannot drift.
+    core::Expected<UrlInfo, std::string> ResolveWithAuth(const std::string& url,
+                                                            const PreparedAuth& auth);
 
     /// One ranged GET against the resolved URL, with the accelerator applied
     /// when configured.
     core::Expected<http::Response, std::string> FetchRange(const std::string& url,
-                                                              uint64_t offset, size_t count);
+                                                              uint64_t offset, size_t count,
+                                                              long timeout_secs);
 
     core::Expected<ByteBuffer, std::string> ReadRange(const std::string& url, uint64_t offset,
                                                          size_t count);
+    /// Rust `read_range_into` — fill a caller-owned buffer.
+    ///
+    /// Separate from `ReadRange` because Rust streams this one chunk by chunk
+    /// into `dst` and refuses an over-long response outright, instead of
+    /// materialising a buffer it would then have to copy.
+    core::Expected<size_t, std::string> ReadRangeInto(const std::string& url, uint64_t offset,
+                                                         uint8_t* dst, size_t len);
     core::Expected<uint64_t, std::string> GetLength(const std::string& url);
 
-    void InvalidateUrlInfo(const std::string& url) { url_infos_.erase(url); }
-    void InvalidateToken(const std::string& key) { tokens_.erase(key); }
-    void InvalidateSize(const std::string& url) { sizes_.erase(url); }
+    void InvalidateUrlInfo(const std::string& url) {
+        std::lock_guard<std::mutex> lk(cache_mu_);
+        url_infos_.erase(url);
+    }
+    void InvalidateToken(const std::string& key) {
+        std::lock_guard<std::mutex> lk(cache_mu_);
+        tokens_.erase(key);
+    }
+    void InvalidateSize(const std::string& url) {
+        std::lock_guard<std::mutex> lk(cache_mu_);
+        sizes_.erase(url);
+    }
     void MarkProbePerUrl(const std::string& origin);
 
     RegistryFsOptions options_;
@@ -267,6 +313,22 @@ class RegistryFs {
     bool static_credentials_;
     std::string static_username_;
     std::string static_password_;
+
+    /// Guards the four caches below.
+    ///
+    /// Rust reaches for `DashMap`, which is concurrent by construction; a bare
+    /// `std::map` is not, and these are read on every blob request. One mutex
+    /// rather than four because the critical sections are map lookups, so the
+    /// contention saved by splitting them would not pay for the risk of
+    /// taking two in the wrong order.
+    ///
+    /// Note this is *not* Rust's per-key `bearer_token_locks` /
+    /// `registry_auth_locks`: those serialise the token *fetch* so a burst of
+    /// readers issues one network request instead of N. Holding a mutex
+    /// across a blocking HTTP call here would serialise unrelated blobs, so
+    /// the duplicate-fetch collapsing is deliberately not ported -- a
+    /// redundant token request is cheaper than a convoyed reader.
+    mutable std::mutex cache_mu_;
 
     /// Keyed by the *full* token-endpoint URL (realm + service + scope), so
     /// tokens for different registries or repositories never collide -- even

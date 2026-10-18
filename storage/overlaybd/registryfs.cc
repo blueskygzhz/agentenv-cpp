@@ -7,6 +7,7 @@
 #include <cstring>
 #include <sstream>
 #include <sys/time.h>
+#include <time.h>
 
 #include "agentenv/core/base64.h"
 #include "agentenv/core/json.h"
@@ -22,6 +23,33 @@ uint64_t NowMs() {
     ::gettimeofday(&tv, 0);
     return static_cast<uint64_t>(tv.tv_sec) * 1000ULL +
            static_cast<uint64_t>(tv.tv_usec) / 1000ULL;
+}
+
+/// Rust `remaining_timeout` — what is left of the deadline.
+///
+/// An exhausted deadline is an error rather than a zero timeout: zero means
+/// "no limit" to libcurl, so passing it through would turn a timed-out read
+/// into one that blocks indefinitely.
+core::Expected<long, std::string> RemainingTimeoutSecs(uint64_t deadline_ms) {
+    const uint64_t now = NowMs();
+    if (now >= deadline_ms) {
+        return core::make_unexpected(std::string("operation timed out"));
+    }
+    const uint64_t left_ms = deadline_ms - now;
+    // Rounded up: libcurl's timeout is in whole seconds, and rounding down
+    // would floor a sub-second remainder to "no limit".
+    return static_cast<long>((left_ms + 999ULL) / 1000ULL);
+}
+
+/// Rust `RETRY_BACKOFF` — 1ms between attempts.
+///
+/// Short on purpose: it exists to let a transient connection reset clear, not
+/// to back off a loaded server.
+void SleepRetryBackoff() {
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 1000000L;  // 1ms
+    ::nanosleep(&ts, 0);
 }
 
 std::string Trim(const std::string& s) {
@@ -151,56 +179,106 @@ std::string AppendQueryPair(const std::string& url, const std::string& key,
            http::EncodeQueryValue(value);
 }
 
-/// Rust `parse_auths` — pick the entry of a Docker-style `auths` map that
-/// matches the blob's host, and split its base64 `auth` field.
+/// Rust `parse_blob_segments` — the address prefixes a credential entry may be
+/// keyed by.
+///
+/// For `https://host/v2/library/nginx/blobs/sha256:x` this yields
+/// `[host, library, nginx, blobs]`: the host, then the path words between
+/// `v2` and the digest. `blobs` is included because Rust slices
+/// `words[2..len-1]` without filtering it out, and the prefixes built from
+/// this list are compared verbatim -- dropping it here would stop matching a
+/// key that a Rust-written config can legitimately contain.
+std::vector<std::string> ParseBlobSegments(const std::string& remote_url) {
+    std::string without_scheme;
+    if (remote_url.compare(0, 7, "http://") == 0) {
+        without_scheme = remote_url.substr(7);
+    } else if (remote_url.compare(0, 8, "https://") == 0) {
+        without_scheme = remote_url.substr(8);
+    } else {
+        return std::vector<std::string>();
+    }
+
+    std::vector<std::string> words;
+    std::string::size_type i = 0;
+    while (i < without_scheme.size()) {
+        const std::string::size_type slash = without_scheme.find('/', i);
+        const std::string::size_type end =
+            slash == std::string::npos ? without_scheme.size() : slash;
+        if (end > i) words.push_back(without_scheme.substr(i, end - i));
+        i = end == without_scheme.size() ? end : end + 1;
+    }
+    if (words.empty()) return std::vector<std::string>();
+
+    std::vector<std::string> seg;
+    seg.push_back(words[0]);
+    if (words.size() > 3) {
+        for (size_t k = 2; k + 1 < words.size(); ++k) seg.push_back(words[k]);
+    }
+    return seg;
+}
+
+/// Rust `address_matches` — the key must equal one of the `/`-joined prefixes.
+///
+/// Exact equality against each prefix, never a substring test: a substring
+/// match would let a key like `evil.example.com/registry.io` match a blob on
+/// `registry.io`, and the credential would be sent to the wrong registry.
+bool AddressMatches(const std::string& addr, const std::vector<std::string>& seg) {
+    std::string prefix;
+    for (size_t i = 0; i < seg.size(); ++i) {
+        if (!prefix.empty()) prefix += "/";
+        prefix += seg[i];
+        if (addr == prefix) return true;
+    }
+    return false;
+}
+
+/// Rust `parse_auths` — pick the credential entry whose key addresses this
+/// blob, and read either its base64 `auth` field or its explicit
+/// `username`/`password` pair.
 void ParseAuths(const core::Json& auths, const std::string& remote_url,
                 std::string* username, std::string* password) {
     username->clear();
     password->clear();
     if (auths.kind() != core::Json::Kind::Object) return;
 
-    SplitUrl parts;
-    if (!SplitUrlParts(remote_url, &parts)) return;
+    const std::vector<std::string> seg = ParseBlobSegments(remote_url);
 
     const core::JsonObject& members = auths.as_object();
     for (core::JsonObject::const_iterator it = members.begin(); it != members.end(); ++it) {
-        // The key may be a bare host or a URL; both have to match the blob's
-        // host, which is why it is compared by substring of the registry key
-        // rather than parsed as a URL.
-        const std::string key = it->first;
-        if (key != parts.host && key.find(parts.host) == std::string::npos) continue;
+        if (!AddressMatches(it->first, seg)) continue;
         if (it->second.kind() != core::Json::Kind::Object) continue;
-
         const core::JsonObject& entry = it->second.as_object();
-        const core::JsonObject::const_iterator found = entry.find("auth");
-        if (found == entry.end() || found->second.kind() != core::Json::Kind::String) continue;
 
-        // The field is `user:password` in base64, standard alphabet.
-        const core::Expected<std::string, std::string> decoded =
-            core::Base64UrlDecode(found->second.as_string());
-        std::string raw;
-        if (decoded.ok()) {
-            raw = decoded.value();
-        } else {
-            // Docker writes the standard alphabet; the URL-safe decoder only
-            // accepts it when no byte landed on index 62/63. Translating and
-            // retrying covers the rest without a second decoder.
-            std::string translated = found->second.as_string();
-            for (size_t i = 0; i < translated.size(); ++i) {
-                if (translated[i] == '+') translated[i] = '-';
-                if (translated[i] == '/') translated[i] = '_';
+        // `auth` first, as Rust does: a config carrying both is answered from
+        // the combined field.
+        const core::JsonObject::const_iterator packed = entry.find("auth");
+        if (packed != entry.end() && packed->second.kind() == core::Json::Kind::String) {
+            // Standard alphabet by definition of the Docker config format.
+            const core::Expected<std::string, std::string> decoded =
+                core::Base64StandardDecode(packed->second.as_string());
+            if (decoded.ok()) {
+                const std::string::size_type colon = decoded.value().find(':');
+                if (colon != std::string::npos) {
+                    *username = decoded.value().substr(0, colon);
+                    *password = decoded.value().substr(colon + 1);
+                    return;
+                }
             }
-            const core::Expected<std::string, std::string> second =
-                core::Base64UrlDecode(translated);
-            if (!second.ok()) continue;
-            raw = second.value();
         }
 
-        const std::string::size_type colon = raw.find(':');
-        if (colon == std::string::npos) continue;
-        *username = raw.substr(0, colon);
-        *password = raw.substr(colon + 1);
-        return;
+        // Only when `auth` was absent or unusable. A malformed `auth` falls
+        // through to these rather than failing the lookup, matching Rust's
+        // `if cred.is_none()`.
+        const core::JsonObject::const_iterator u = entry.find("username");
+        const core::JsonObject::const_iterator pw = entry.find("password");
+        if (u != entry.end() && u->second.kind() == core::Json::Kind::String &&
+            pw != entry.end() && pw->second.kind() == core::Json::Kind::String) {
+            *username = u->second.as_string();
+            *password = pw->second.as_string();
+            return;
+        }
+
+        // Rust keeps scanning later keys when this entry yielded nothing.
     }
 }
 
@@ -419,6 +497,7 @@ core::Expected<core::Unit, std::string> RegistryFs::ResolveCredentials(
                                    ? 1
                                    : static_cast<long>(options_.credential.timeout);
         if (!options_.user_agent.empty()) request.headers["User-Agent"] = options_.user_agent;
+        ApplyClientCert(&request);
 
         const core::Expected<http::Response, std::string> response = http::Perform(request);
         if (!response.ok()) {
@@ -474,7 +553,18 @@ core::Expected<core::Unit, std::string> RegistryFs::ResolveCredentials(
 // Auth challenge and token
 // ---------------------------------------------------------------------------
 
+void RegistryFs::ApplyClientCert(http::Request* request) const {
+    // Rust `build_http_client`: the identity is attached only when *both*
+    // paths are set. One without the other cannot form a PEM identity, and
+    // sending a cert with no key would fail the handshake rather than fall
+    // back to anonymous TLS.
+    if (options_.cert_file.empty() || options_.key_file.empty()) return;
+    request->client_cert_file = options_.cert_file;
+    request->client_key_file = options_.key_file;
+}
+
 void RegistryFs::MarkProbePerUrl(const std::string& origin) {
+    std::lock_guard<std::mutex> lk(cache_mu_);
     CachedChallenge entry;
     entry.challenge.kind = kRegistryAuthProbePerUrl;
     // Shorter TTL than a real answer: this is a fallback after the ping
@@ -485,10 +575,13 @@ void RegistryFs::MarkProbePerUrl(const std::string& origin) {
 
 core::Expected<RegistryAuthChallenge, std::string> RegistryFs::GetOrCreateRegistryChallenge(
     const BlobAuthContext& ctx) {
-    const std::map<std::string, CachedChallenge>::const_iterator found =
-        challenges_.find(ctx.origin);
-    if (found != challenges_.end() && found->second.expire_at_ms > NowMs()) {
-        return found->second.challenge;
+    {
+        std::lock_guard<std::mutex> lk(cache_mu_);
+        const std::map<std::string, CachedChallenge>::const_iterator found =
+            challenges_.find(ctx.origin);
+        if (found != challenges_.end() && found->second.expire_at_ms > NowMs()) {
+            return found->second.challenge;
+        }
     }
 
     http::Request request;
@@ -498,6 +591,7 @@ core::Expected<RegistryAuthChallenge, std::string> RegistryFs::GetOrCreateRegist
     if (!options_.user_agent.empty()) request.headers["User-Agent"] = options_.user_agent;
     // The challenge rides on the 401 itself, so a redirect would hide it.
     request.follow_redirects = false;
+    ApplyClientCert(&request);
 
     RegistryAuthChallenge challenge;
     const core::Expected<http::Response, std::string> response = http::Perform(request);
@@ -506,7 +600,9 @@ core::Expected<RegistryAuthChallenge, std::string> RegistryFs::GetOrCreateRegist
         // rather than failing the read: some registries answer `/v2/`
         // differently from the blob endpoint.
         MarkProbePerUrl(ctx.origin);
-        return challenges_[ctx.origin].challenge;
+        RegistryAuthChallenge probe;
+        probe.kind = kRegistryAuthProbePerUrl;
+        return probe;
     }
 
     const long status = response.value().status;
@@ -518,14 +614,18 @@ core::Expected<RegistryAuthChallenge, std::string> RegistryFs::GetOrCreateRegist
             response.value().headers.find("WWW-Authenticate");
         if (header == response.value().headers.end()) {
             MarkProbePerUrl(ctx.origin);
-            return challenges_[ctx.origin].challenge;
+            RegistryAuthChallenge probe;
+            probe.kind = kRegistryAuthProbePerUrl;
+            return probe;
         }
         // Scope dropped: this challenge is cached per origin.
         const core::Expected<RegistryAuthChallenge, std::string> parsed =
             ParseRegistryAuthChallenge(header->second, false);
         if (!parsed.ok()) {
             MarkProbePerUrl(ctx.origin);
-            return challenges_[ctx.origin].challenge;
+            RegistryAuthChallenge probe;
+            probe.kind = kRegistryAuthProbePerUrl;
+            return probe;
         }
         challenge = parsed.value();
     }
@@ -533,17 +633,64 @@ core::Expected<RegistryAuthChallenge, std::string> RegistryFs::GetOrCreateRegist
     CachedChallenge entry;
     entry.challenge = challenge;
     entry.expire_at_ms = NowMs() + kRegistryAuthChallengeLifeSecs * 1000ULL;
-    challenges_[ctx.origin] = entry;
+    {
+        std::lock_guard<std::mutex> lk(cache_mu_);
+        challenges_[ctx.origin] = entry;
+    }
     return challenge;
 }
 
-core::Expected<std::string, std::string> RegistryFs::GetOrCreateToken(
-    const std::string& remote_url, const std::string& auth_url) {
-    const std::map<std::string, CachedToken>::const_iterator found = tokens_.find(auth_url);
-    if (found != tokens_.end() && found->second.expire_at_ms > NowMs()) {
-        return found->second.token;
+core::Expected<RegistryAuthChallenge, std::string> RegistryFs::GetScopeAuth(
+    const std::string& url, bool push) {
+    http::Request request;
+    if (push) {
+        // Rust probes the push path with a POST so the challenge comes back
+        // scoped for `pull,push`; a GET would only ever be answered with a
+        // pull scope, and a token minted from it could not upload.
+        request.method = "POST";
+        request.headers["Content-Type"] = "application/octet-stream";
+    } else {
+        // A one-byte range: the cheapest GET that still reaches the blob
+        // handler and provokes its challenge.
+        request.method = "GET";
+        request.has_range = true;
+        request.range_begin = 0;
+        request.range_end = 0;
+    }
+    request.url = url;
+    request.timeout_secs = static_cast<long>(options_.timeout_secs);
+    if (!options_.user_agent.empty()) request.headers["User-Agent"] = options_.user_agent;
+    // The challenge rides on the 401 itself, so a followed redirect would
+    // replace it with the CDN's answer.
+    request.follow_redirects = false;
+    ApplyClientCert(&request);
+
+    const core::Expected<http::Response, std::string> response = http::Perform(request);
+    if (!response.ok()) {
+        return core::make_unexpected("challenge request failed for " + url + ": " +
+                                     response.error());
     }
 
+    RegistryAuthChallenge out;
+    const long status = response.value().status;
+    if (status != 401 && status != 403) {
+        // Anything else means the endpoint did not ask for credentials.
+        out.kind = kRegistryAuthNone;
+        return out;
+    }
+
+    const http::HeaderMap::const_iterator header =
+        response.value().headers.find("WWW-Authenticate");
+    if (header == response.value().headers.end()) {
+        return core::make_unexpected(std::string("no WWW-Authenticate in response"));
+    }
+    // Scope kept: a per-URL challenge names the repository being accessed, and
+    // the token has to be requested for exactly it.
+    return ParseRegistryAuthChallenge(header->second, true);
+}
+
+core::Expected<std::string, std::string> RegistryFs::GetToken(const std::string& remote_url,
+                                                                 const std::string& auth_url) {
     std::string username, password;
     const core::Expected<core::Unit, std::string> creds =
         ResolveCredentials(remote_url, &username, &password);
@@ -566,6 +713,7 @@ core::Expected<std::string, std::string> RegistryFs::GetOrCreateToken(
     if (has_credentials) {
         request.headers["Authorization"] = BuildBasicAuthHeader(username, password);
     }
+    ApplyClientCert(&request);
 
     const core::Expected<http::Response, std::string> response = http::Perform(request);
     if (!response.ok()) {
@@ -592,26 +740,46 @@ core::Expected<std::string, std::string> RegistryFs::GetOrCreateToken(
 
     // `token` is the Docker Distribution spelling, `access_token` the OAuth2
     // one; registries differ, so both are accepted.
-    std::string token;
     core::JsonObject::const_iterator field = root.find("token");
     if (field != root.end() && field->second.kind() == core::Json::Kind::String) {
-        token = field->second.as_string();
-    } else {
-        field = root.find("access_token");
-        if (field != root.end() && field->second.kind() == core::Json::Kind::String) {
-            token = field->second.as_string();
+        return field->second.as_string();
+    }
+    field = root.find("access_token");
+    if (field != root.end() && field->second.kind() == core::Json::Kind::String) {
+        return field->second.as_string();
+    }
+    return core::make_unexpected(std::string("token response missing token/access_token"));
+}
+
+core::Expected<std::string, std::string> RegistryFs::GetOrCreateToken(
+    const std::string& remote_url, const std::string& auth_url) {
+    // Keyed by the full token-endpoint URL, so tokens for different
+    // registries or repositories never collide -- even when a challenge omits
+    // `scope` and the key is therefore realm+service alone.
+    {
+        std::lock_guard<std::mutex> lk(cache_mu_);
+        const std::map<std::string, CachedToken>::const_iterator found =
+            tokens_.find(auth_url);
+        if (found != tokens_.end() && found->second.expire_at_ms > NowMs()) {
+            return found->second.token;
         }
     }
-    if (token.empty()) {
-        return core::make_unexpected(
-            std::string("token response missing token/access_token"));
-    }
+
+    // The fetch happens outside the lock. Rust serialises it per key so a
+    // burst issues one request; holding this mutex across a blocking HTTP
+    // call would instead stall every other blob, so a duplicate token
+    // request is accepted as the cheaper outcome.
+    const core::Expected<std::string, std::string> token = GetToken(remote_url, auth_url);
+    if (!token.ok()) return token;
 
     CachedToken entry;
-    entry.token = token;
+    entry.token = token.value();
     entry.expire_at_ms = NowMs() + kRegistryMinTokenLifeSecs * 1000ULL;
-    tokens_[auth_url] = entry;
-    return token;
+    {
+        std::lock_guard<std::mutex> lk(cache_mu_);
+        tokens_[auth_url] = entry;
+    }
+    return token.value();
 }
 
 core::Expected<RegistryFs::PreparedAuth, std::string> RegistryFs::PrepareCachedAuth(
@@ -666,48 +834,25 @@ core::Expected<RegistryFs::PreparedAuth, std::string> RegistryFs::PrepareCachedA
 
 core::Expected<RegistryFs::PreparedAuth, std::string> RegistryFs::PrepareLegacyAuth(
     const std::string& url) {
-    // A one-byte range rather than a HEAD: some registries answer HEAD without
-    // the challenge, and this is also the cheapest GET that still reaches the
-    // blob handler.
-    http::Request request;
-    request.method = "GET";
-    request.url = url;
-    request.has_range = true;
-    request.range_begin = 0;
-    request.range_end = 0;
-    request.timeout_secs = static_cast<long>(options_.timeout_secs);
-    if (!options_.user_agent.empty()) request.headers["User-Agent"] = options_.user_agent;
-    request.follow_redirects = false;
+    // Pull flavour: this is the read path, so a GET probe is what Rust's
+    // `get_scope_auth` (i.e. `get_scope_auth_for(url, false)`) sends.
+    const core::Expected<RegistryAuthChallenge, std::string> challenge =
+        GetScopeAuth(url, false);
+    if (!challenge.ok()) return core::make_unexpected(challenge.error());
 
     PreparedAuth out;
-    const core::Expected<http::Response, std::string> response = http::Perform(request);
-    if (!response.ok()) {
-        return core::make_unexpected("challenge request failed for " + url + ": " +
-                                     response.error());
-    }
-
-    const long status = response.value().status;
-    if (status != 401 && status != 403) {
+    if (challenge.value().kind == kRegistryAuthNone) {
         out.kind = kRegistryAuthNone;
         return out;
     }
 
-    const http::HeaderMap::const_iterator header =
-        response.value().headers.find("WWW-Authenticate");
-    if (header == response.value().headers.end()) {
-        return core::make_unexpected(std::string("no WWW-Authenticate in response"));
-    }
-    // Scope kept here: a per-URL challenge names the repository being read,
-    // and the token must be requested for exactly it.
-    const core::Expected<RegistryAuthChallenge, std::string> parsed =
-        ParseRegistryAuthChallenge(header->second, true);
-    if (!parsed.ok()) return core::make_unexpected(parsed.error());
-
-    if (parsed.value().kind == kRegistryAuthBasic) {
+    if (challenge.value().kind == kRegistryAuthBasic) {
         std::string username, password;
         const core::Expected<core::Unit, std::string> creds =
             ResolveCredentials(url, &username, &password);
         if (!creds.ok()) return core::make_unexpected(creds.error());
+        // No credentials for a Basic challenge is anonymous access, not a
+        // failure: the registry may still serve public blobs.
         if (username.empty()) {
             out.kind = kRegistryAuthNone;
             return out;
@@ -718,7 +863,7 @@ core::Expected<RegistryFs::PreparedAuth, std::string> RegistryFs::PrepareLegacyA
     }
 
     const core::Expected<std::string, std::string> auth_url = BuildBearerAuthUrl(
-        parsed.value().realm, parsed.value().service, parsed.value().scope);
+        challenge.value().realm, challenge.value().service, challenge.value().scope);
     if (!auth_url.ok()) return core::make_unexpected(auth_url.error());
     const core::Expected<std::string, std::string> token =
         GetOrCreateToken(url, auth_url.value());
@@ -732,6 +877,56 @@ core::Expected<RegistryFs::PreparedAuth, std::string> RegistryFs::PrepareLegacyA
 // ---------------------------------------------------------------------------
 // URL resolution
 // ---------------------------------------------------------------------------
+
+core::Expected<RegistryFs::UrlInfo, std::string> RegistryFs::ResolveWithAuth(
+    const std::string& url, const PreparedAuth& auth) {
+    http::Request request;
+    request.method = "GET";
+    request.url = url;
+    // A one-byte range: the cheapest request that still reaches the blob
+    // handler and reveals whether it redirects.
+    request.has_range = true;
+    request.range_begin = 0;
+    request.range_end = 0;
+    request.timeout_secs = static_cast<long>(options_.timeout_secs);
+    if (!options_.user_agent.empty()) request.headers["User-Agent"] = options_.user_agent;
+    if (!auth.header.empty()) request.headers["Authorization"] = auth.header;
+    // Not followed: a redirect *is* the answer here, and following it would
+    // also forward the Authorization header to the CDN.
+    request.follow_redirects = false;
+    ApplyClientCert(&request);
+
+    const core::Expected<http::Response, std::string> response = http::Perform(request);
+    if (!response.ok()) return core::make_unexpected(response.error());
+
+    const long status = response.value().status;
+    if (status >= 300 && status < 400) {
+        const http::HeaderMap::const_iterator location =
+            response.value().headers.find("Location");
+        if (location == response.value().headers.end()) {
+            return core::make_unexpected(std::string("redirect without Location"));
+        }
+        UrlInfo info;
+        info.mode = kRegistryUrlRedirect;
+        info.info = location->second;
+        info.expire_at_ms = NowMs() + kRegistryMinUrlInfoLifeSecs * 1000ULL;
+        return info;
+    }
+
+    if (status == 200 || status == 206) {
+        UrlInfo info;
+        info.mode = kRegistryUrlSelfAuth;
+        // The header is stored, not the URL: range requests go to the same
+        // blob endpoint and must repeat exactly this credential.
+        info.info = auth.header;
+        info.expire_at_ms = NowMs() + kRegistryMinUrlInfoLifeSecs * 1000ULL;
+        return info;
+    }
+
+    std::ostringstream o;
+    o << "failed to resolve actual url for " << url << ": http status " << status;
+    return core::make_unexpected(o.str());
+}
 
 core::Expected<RegistryFs::UrlInfo, std::string> RegistryFs::GetActualUrl(
     const std::string& url) {
@@ -813,6 +1008,28 @@ core::Expected<RegistryFs::UrlInfo, std::string> RegistryFs::GetActualUrl(
                     continue;
                 }
             }
+
+            // Last resort: probe this URL directly. The registry-wide
+            // challenge can be wrong for an individual blob -- a repository
+            // may demand Basic where the ping offered Bearer, or name a scope
+            // the ping cannot know -- and the blob's own 401 carries the
+            // challenge that actually applies. Failing here instead would
+            // make those registries unreadable.
+            if (ctx.has_value() && auth.kind != kRegistryAuthProbePerUrl) {
+                const core::Expected<PreparedAuth, std::string> legacy =
+                    PrepareLegacyAuth(url);
+                if (legacy.ok() && legacy.value().kind != kRegistryAuthProbePerUrl) {
+                    const core::Expected<UrlInfo, std::string> probed =
+                        ResolveWithAuth(url, legacy.value());
+                    if (probed.ok()) {
+                        // Remember that this origin needs per-URL probing, so
+                        // the next blob skips the ping that just misled us.
+                        MarkProbePerUrl(ctx->origin);
+                        return probed.value();
+                    }
+                }
+            }
+
             std::ostringstream o;
             o << "failed to resolve actual url for " << url << ": http status " << status;
             return core::make_unexpected(o.str());
@@ -829,13 +1046,19 @@ core::Expected<RegistryFs::UrlInfo, std::string> RegistryFs::GetActualUrl(
 
 core::Expected<RegistryFs::UrlInfo, std::string> RegistryFs::GetOrCreateUrlInfo(
     const std::string& url) {
-    const std::map<std::string, UrlInfo>::const_iterator found = url_infos_.find(url);
-    if (found != url_infos_.end() && found->second.expire_at_ms > NowMs()) {
-        return found->second;
+    {
+        std::lock_guard<std::mutex> lk(cache_mu_);
+        const std::map<std::string, UrlInfo>::const_iterator found = url_infos_.find(url);
+        if (found != url_infos_.end() && found->second.expire_at_ms > NowMs()) {
+            return found->second;
+        }
     }
     const core::Expected<UrlInfo, std::string> info = GetActualUrl(url);
     if (!info.ok()) return info;
-    url_infos_[url] = info.value();
+    {
+        std::lock_guard<std::mutex> lk(cache_mu_);
+        url_infos_[url] = info.value();
+    }
     return info.value();
 }
 
@@ -845,7 +1068,8 @@ core::Expected<RegistryFs::UrlInfo, std::string> RegistryFs::GetOrCreateUrlInfo(
 
 core::Expected<http::Response, std::string> RegistryFs::FetchRange(const std::string& url,
                                                                       uint64_t offset,
-                                                                      size_t count) {
+                                                                      size_t count,
+                                                                      long timeout_secs) {
     const core::Expected<UrlInfo, std::string> info = GetOrCreateUrlInfo(url);
     if (!info.ok()) return core::make_unexpected(info.error());
 
@@ -872,9 +1096,12 @@ core::Expected<http::Response, std::string> RegistryFs::FetchRange(const std::st
     request.range_begin = offset;
     // Inclusive, so the last byte is `offset + count - 1`.
     request.range_end = offset + static_cast<uint64_t>(count) - 1;
-    request.timeout_secs = static_cast<long>(options_.timeout_secs);
+    // The deadline's remainder, so the retry loop as a whole stays inside
+    // `options_.timeout_secs`.
+    request.timeout_secs = timeout_secs;
     if (!options_.user_agent.empty()) request.headers["User-Agent"] = options_.user_agent;
     if (!auth_header.empty()) request.headers["Authorization"] = auth_header;
+    ApplyClientCert(&request);
 
     const core::Expected<http::Response, std::string> response = http::Perform(request);
     if (!response.ok()) {
@@ -896,25 +1123,64 @@ core::Expected<http::Response, std::string> RegistryFs::FetchRange(const std::st
 core::Expected<ByteBuffer, std::string> RegistryFs::ReadRange(const std::string& url,
                                                                  uint64_t offset,
                                                                  size_t count) {
+    // One deadline for the whole retry loop, not per attempt. Rust takes
+    // `remaining_timeout(deadline)` before each try, so `timeout` bounds the
+    // entire read -- otherwise N retries could take N * timeout, and a caller
+    // that set 30s would wait 120s.
+    const uint64_t deadline_ms = NowMs() + options_.timeout_secs * 1000ULL;
+
     std::string last_error;
     for (uint32_t attempt = 0; attempt <= options_.retry_count; ++attempt) {
+        const core::Expected<long, std::string> remaining = RemainingTimeoutSecs(deadline_ms);
+        if (!remaining.ok()) return core::make_unexpected(remaining.error());
+
         const core::Expected<http::Response, std::string> response =
-            FetchRange(url, offset, count);
+            FetchRange(url, offset, count, remaining.value());
         if (response.ok()) {
-            ByteBuffer body = response.value().body;
-            // A server that ignored the range answers 200 with the whole
-            // blob; the window is taken out of it rather than returned whole.
-            if (response.value().status == 200 && body.size() > count) {
-                if (offset >= body.size()) return ByteBuffer();
-                const size_t avail = body.size() - static_cast<size_t>(offset);
-                const size_t take = avail < count ? avail : count;
-                return ByteBuffer(body.begin() + static_cast<size_t>(offset),
-                                  body.begin() + static_cast<size_t>(offset) + take);
-            }
-            if (body.size() > count) body.resize(count);
-            return body;
+            // Returned as received. Rust hands back `resp.bytes()` whole and
+            // does not slice a 200 that ignored the range: a registry that
+            // does that is non-conforming, and silently re-windowing its
+            // answer here would differ from the Rust reader on the same
+            // server.
+            return response.value().body;
         }
         last_error = response.error();
+        if (attempt != options_.retry_count) SleepRetryBackoff();
+    }
+    return core::make_unexpected(last_error.empty()
+                                     ? std::string("range request failed")
+                                     : last_error);
+}
+
+core::Expected<size_t, std::string> RegistryFs::ReadRangeInto(const std::string& url,
+                                                                 uint64_t offset, uint8_t* dst,
+                                                                 size_t len) {
+    const uint64_t deadline_ms = NowMs() + options_.timeout_secs * 1000ULL;
+
+    std::string last_error;
+    for (uint32_t attempt = 0; attempt <= options_.retry_count; ++attempt) {
+        const core::Expected<long, std::string> remaining = RemainingTimeoutSecs(deadline_ms);
+        if (!remaining.ok()) return core::make_unexpected(remaining.error());
+
+        const core::Expected<http::Response, std::string> response =
+            FetchRange(url, offset, len, remaining.value());
+        if (response.ok()) {
+            const ByteBuffer& body = response.value().body;
+            // Refused, not truncated. Rust bails with "range response larger
+            // than requested" while streaming, because more bytes than asked
+            // for means the server ignored the range -- so the surplus is not
+            // the tail of the window, it is a different region, and keeping
+            // the first `len` bytes would hand back the wrong data.
+            if (body.size() > len) {
+                std::ostringstream o;
+                o << "range response larger than requested for " << url << " at " << offset;
+                return core::make_unexpected(o.str());
+            }
+            if (!body.empty()) std::memcpy(dst, &body[0], body.size());
+            return body.size();
+        }
+        last_error = response.error();
+        if (attempt != options_.retry_count) SleepRetryBackoff();
     }
     return core::make_unexpected(last_error.empty()
                                      ? std::string("range request failed")
@@ -922,72 +1188,106 @@ core::Expected<ByteBuffer, std::string> RegistryFs::ReadRange(const std::string&
 }
 
 core::Expected<uint64_t, std::string> RegistryFs::GetLength(const std::string& url) {
-    const std::map<std::string, CachedSize>::const_iterator found = sizes_.find(url);
-    if (found != sizes_.end() && found->second.expire_at_ms > NowMs()) {
-        return found->second.size;
+    {
+        std::lock_guard<std::mutex> lk(cache_mu_);
+        const std::map<std::string, CachedSize>::const_iterator found = sizes_.find(url);
+        if (found != sizes_.end() && found->second.expire_at_ms > NowMs()) {
+            return found->second.size;
+        }
     }
+
+    const uint64_t deadline_ms = NowMs() + options_.timeout_secs * 1000ULL;
 
     std::string last_error;
     for (uint32_t attempt = 0; attempt <= options_.retry_count; ++attempt) {
-        const core::Expected<http::Response, std::string> response = FetchRange(url, 0, 1);
+        const core::Expected<long, std::string> remaining = RemainingTimeoutSecs(deadline_ms);
+        if (!remaining.ok()) {
+            InvalidateSize(url);
+            return core::make_unexpected(remaining.error());
+        }
+
+        // A one-byte range: the size arrives in `Content-Range` without
+        // transferring the blob.
+        const core::Expected<http::Response, std::string> response =
+            FetchRange(url, 0, 1, remaining.value());
         if (!response.ok()) {
             last_error = response.error();
+            if (attempt == options_.retry_count) break;
+            SleepRetryBackoff();
             continue;
         }
 
         uint64_t size = 0;
-        bool known = false;
         // `Content-Range` first: on a 206 the `Content-Length` is the length
         // of the one-byte slice, so only the `/total` suffix gives the blob's
         // size.
-        if (response.value().ContentRangeTotal(&size)) {
-            known = true;
-        } else if (response.value().status == 200 &&
-                   response.value().ContentLength(&size)) {
-            // A 200 means the range was ignored and the whole blob was sent,
-            // so its Content-Length *is* the size.
-            known = true;
-        } else {
-            // Last resort: whatever arrived. Only correct because the range
-            // was ignored, which is the only way to get here.
-            size = static_cast<uint64_t>(response.value().body.size());
-            known = true;
+        if (!response.value().ContentRangeTotal(&size)) {
+            if (response.value().status == 200 && response.value().ContentLength(&size)) {
+                // A 200 means the range was ignored and the whole blob was
+                // sent, so its `Content-Length` is the size.
+            } else {
+                // Rust's final fallback: the body that arrived. Only
+                // meaningful because reaching here means the range was
+                // ignored, so what arrived is the whole blob.
+                size = static_cast<uint64_t>(response.value().body.size());
+            }
         }
 
-        if (known) {
-            CachedSize entry;
-            entry.size = size;
-            entry.expire_at_ms = NowMs() + kRegistryMinMetaLifeSecs * 1000ULL;
+        CachedSize entry;
+        entry.size = size;
+        entry.expire_at_ms = NowMs() + kRegistryMinMetaLifeSecs * 1000ULL;
+        {
+            std::lock_guard<std::mutex> lk(cache_mu_);
             sizes_[url] = entry;
-            return size;
         }
+        return size;
     }
 
+    // Dropped on failure so a later call re-probes rather than serving a
+    // stale entry that happens to still be inside its TTL.
     InvalidateSize(url);
     return core::make_unexpected(last_error.empty()
                                      ? std::string("failed to get blob length")
                                      : last_error);
 }
 
-core::Expected<core::Unit, std::string> RegistryFs::RefreshToken(const std::string& url) {
-    const std::string normalized = NormalizeUrl(url);
-    const core::Optional<BlobAuthContext> ctx = ParseBlobAuthContext(normalized);
-    if (!ctx.has_value()) {
-        return core::make_unexpected("not a registry blob url: " + url);
+core::Expected<core::Optional<std::string>, std::string> RegistryFs::RefreshToken(
+    const std::string& url) {
+    // Probed with the push flavour, as Rust does. A push challenge names the
+    // `pull,push` scope, so the token this returns is usable for an upload --
+    // which is the only reason a caller asks for a refresh rather than
+    // letting the read path renew its own token lazily.
+    const core::Expected<RegistryAuthChallenge, std::string> challenge =
+        GetScopeAuth(url, true);
+    if (!challenge.ok()) return core::make_unexpected(challenge.error());
+
+    // Nothing to refresh: neither anonymous nor Basic access involves a
+    // token, so this reports absence rather than failing.
+    if (challenge.value().kind != kRegistryAuthBearer) {
+        return core::Optional<std::string>();
     }
 
-    // The cached challenge is kept: only the token is stale. Dropping the
-    // challenge too would force an extra ping on every refresh.
-    const std::map<std::string, CachedChallenge>::const_iterator found =
-        challenges_.find(ctx->origin);
-    if (found != challenges_.end() && found->second.challenge.kind == kRegistryAuthBearer) {
-        const core::Expected<std::string, std::string> auth_url = BuildBearerAuthUrl(
-            found->second.challenge.realm, found->second.challenge.service, ctx->scope);
-        if (auth_url.ok()) InvalidateToken(auth_url.value());
+    const core::Expected<std::string, std::string> auth_url = BuildBearerAuthUrl(
+        challenge.value().realm, challenge.value().service, challenge.value().scope);
+    if (!auth_url.ok()) return core::make_unexpected(auth_url.error());
+
+    // Fetched directly, bypassing the cache: the point of a refresh is to
+    // replace whatever is cached, so consulting it first would return the
+    // stale token this call exists to displace.
+    const core::Expected<std::string, std::string> token = GetToken(url, auth_url.value());
+    if (!token.ok()) return core::make_unexpected(token.error());
+    if (token.value().empty()) {
+        return core::make_unexpected(std::string("failed to get token"));
     }
-    // The resolved URL goes too: a self-auth entry holds the old header.
-    InvalidateUrlInfo(normalized);
-    return core::Unit();
+
+    CachedToken entry;
+    entry.token = token.value();
+    entry.expire_at_ms = NowMs() + kRegistryMinTokenLifeSecs * 1000ULL;
+    {
+        std::lock_guard<std::mutex> lk(cache_mu_);
+        tokens_[auth_url.value()] = entry;
+    }
+    return core::Optional<std::string>(token.value());
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,11 +1336,17 @@ core::Expected<ByteBuffer, std::string> RegistryFile::ReadAt(uint64_t offset, si
 core::Expected<size_t, std::string> RegistryFile::ReadAtInto(uint64_t offset, uint8_t* dst,
                                                                 size_t len) {
     if (len == 0) return static_cast<size_t>(0);
-    const core::Expected<ByteBuffer, std::string> data = ReadAt(offset, len);
-    if (!data.ok()) return core::make_unexpected(data.error());
-    const size_t n = data.value().size() < len ? data.value().size() : len;
-    if (n > 0) std::memcpy(dst, &data.value()[0], n);
-    return n;
+
+    const core::Expected<uint64_t, std::string> size = Size();
+    if (!size.ok()) return core::make_unexpected(size.error());
+    if (offset >= size.value()) return static_cast<size_t>(0);
+
+    // Clamped to the blob, then handed straight to the backend. Rust fills
+    // `dst[..count]` by streaming rather than materialising a buffer first,
+    // so this must not route through `ReadAt`.
+    const uint64_t remain = size.value() - offset;
+    const size_t count = static_cast<size_t>(remain < len ? remain : len);
+    return backend_->ReadRangeInto(url_, offset, dst, count);
 }
 
 core::Expected<size_t, std::string> RegistryFile::WriteAt(uint64_t, const uint8_t*, size_t) {
