@@ -357,10 +357,11 @@ core::Expected<std::shared_ptr<LsmtFile>, std::string> LsmtFile::Open(
         const core::Expected<std::vector<SegmentMapping>, std::string> m =
             CreateMappingsFromSparse(rw_data_file.get(), kHdr);
         if (!m.ok()) return core::make_unexpected(m.error());
+        // Tags left at zero. `ComboIndex` adds the lower count to every
+        // upper mapping as it is constructed, so setting the tag here would
+        // apply the offset twice and point at a layer past the end.
         for (size_t i = 0; i < m.value().size(); ++i) {
-            SegmentMapping entry = m.value()[i];
-            entry.tag = static_cast<uint8_t>(f->rw_tag_);
-            mutable_index.Insert(entry);
+            mutable_index.Insert(m.value()[i]);
         }
     } else if (rw_index_file) {
         const core::Expected<uint64_t, std::string> isz = rw_index_file->Size();
@@ -391,9 +392,10 @@ core::Expected<std::shared_ptr<LsmtFile>, std::string> LsmtFile::Open(
             // file is an append-only journal, and the last record for a block
             // is the current one.
             for (size_t i = 0; i < loaded.size(); ++i) {
-                SegmentMapping entry = loaded[i];
-                entry.tag = static_cast<uint8_t>(f->rw_tag_);
-                mutable_index.Insert(entry);
+                // The loader already reset every tag to zero, and that is
+                // what has to go in: `ComboIndex` offsets them by the lower
+                // count on construction.
+                mutable_index.Insert(loaded[i]);
             }
         }
     } else {
@@ -1118,6 +1120,264 @@ core::Expected<core::Unit, std::string> LsmtFile::DiscardRange(uint64_t offset, 
 
 core::Expected<core::Unit, std::string> LsmtFile::Discard(uint64_t offset, uint64_t len) {
     return DiscardRange(offset, len);
+}
+
+
+// ---------------------------------------------------------------------------
+// resize and introspection
+// ---------------------------------------------------------------------------
+
+core::Expected<core::Unit, std::string> LsmtFile::UpdateVsize(uint64_t vsize) {
+    // The running digest covers the header, and the header is about to
+    // change. Rust drops the tracker and rebuilds it by re-reading the file
+    // -- but only when it was still in sync with the file end; a tracker that
+    // had already fallen behind has nothing to rebuild from.
+    const uint64_t size_before = rw_data_append_offset_;
+    const bool rebuild = has_append_digest_ && append_digest_.Offset() == size_before &&
+                         size_before >= kHdr;
+    has_append_digest_ = false;
+
+    virtual_size_ = vsize;
+    const core::Expected<core::Unit, std::string> hu =
+        UpdateHeaderVsize(rw_data_file_.get(), vsize);
+    if (!hu.ok()) return hu;
+
+    if (rebuild) {
+        const core::Expected<AppendDigestTracker, std::string> seeded =
+            AppendDigestTracker::FromHeader(rw_data_file_.get());
+        if (!seeded.ok()) return core::make_unexpected(seeded.error());
+        AppendDigestTracker t = seeded.value();
+
+        std::vector<uint8_t> buffer(128 * 1024, 0);
+        uint64_t at = kHdr;
+        bool ok = true;
+        while (at < size_before && ok) {
+            const uint64_t left = size_before - at;
+            const size_t want = left < static_cast<uint64_t>(buffer.size())
+                                    ? static_cast<size_t>(left)
+                                    : buffer.size();
+            const core::Expected<size_t, std::string> read =
+                rw_data_file_->ReadAtInto(at, &buffer[0], want);
+            if (!read.ok()) return core::make_unexpected(read.error());
+            if (read.value() != want) {
+                std::ostringstream o;
+                o << "short read while rebuilding append digest tracker: expected " << want
+                  << ", got " << read.value();
+                return core::make_unexpected(o.str());
+            }
+            if (!t.Absorb(at, &buffer[0], read.value()).ok()) ok = false;
+            at += static_cast<uint64_t>(read.value());
+        }
+        // Reinstated only if the file end has not moved underneath the
+        // rebuild. Otherwise the rebuilt digest describes a prefix, and
+        // publishing it would report a digest for bytes that are no longer
+        // the whole layer.
+        if (ok && rw_data_append_offset_ == t.Offset()) {
+            append_digest_ = t;
+            has_append_digest_ = true;
+        }
+    }
+
+    if (file_type_ == kLsmtFileSparseWritable) {
+        // Resized to match, because for sparse the file length *is* the
+        // address space. The cursor follows, since it names the physical end.
+        const core::Expected<core::Unit, std::string> t =
+            rw_data_file_->Truncate(vsize + kHdr);
+        if (!t.ok()) return core::make_unexpected(t.error());
+        rw_data_append_offset_ = vsize + kHdr;
+    }
+
+    if (rw_index_file_) {
+        // The index file carries the same virtual size, so a reopen that only
+        // looks at the index does not disagree with the data file.
+        const core::Expected<core::Unit, std::string> iu =
+            UpdateHeaderVsize(rw_index_file_.get(), vsize);
+        if (!iu.ok()) return iu;
+    }
+    return core::Unit();
+}
+
+core::Expected<core::Unit, std::string> LsmtFile::Truncate(uint64_t size) {
+    return UpdateVsize(size);
+}
+
+core::Expected<core::Unit, std::string> LsmtFile::Sync() {
+    const core::Expected<core::Unit, std::string> f = FlushGroupCommit();
+    if (!f.ok()) return f;
+    // The index file first. A data block whose mapping has not reached disk
+    // reads as a hole on reopen, which is recoverable; a mapping pointing at
+    // data that has not reached disk reads as whatever was there, which is
+    // not.
+    if (rw_index_file_) {
+        const core::Expected<core::Unit, std::string> i = rw_index_file_->Sync();
+        if (!i.ok()) return i;
+    }
+    return rw_data_file_->Sync();
+}
+
+core::Expected<DataStat, std::string> LsmtFile::Stat() const {
+    const core::Expected<uint64_t, std::string> fsz = rw_data_file_->Size();
+    if (!fsz.ok()) return core::make_unexpected(fsz.error());
+    // Saturating, because a file smaller than its own header is not something
+    // to compute a negative size from.
+    const uint64_t total = fsz.value() > kHdr ? fsz.value() - kHdr : 0;
+
+    const uint64_t blocks = (virtual_size_ + kAlign - 1) / kAlign;
+    std::vector<SegmentMapping> mappings;
+    index_->Lookup(Segment(0, static_cast<uint32_t>(blocks)), &mappings);
+
+    uint64_t valid_blocks = 0;
+    for (size_t i = 0; i < mappings.size(); ++i) {
+        if (!mappings[i].zeroed) valid_blocks += mappings[i].Length();
+    }
+
+    DataStat st;
+    // `total` is the physical bytes this layer occupies, which for an
+    // append-only upper exceeds the valid bytes: overwritten blocks are still
+    // on disk, just unreferenced. The gap between the two is what a compact
+    // would reclaim.
+    st.total_data_size = total;
+    st.valid_data_size = valid_blocks * kAlign;
+    return st;
+}
+
+core::Expected<size_t, std::string> LsmtFile::SeekDataSegments(
+    uint64_t begin, uint64_t end, std::vector<Segment>* segs) const {
+    if (segs == 0) return core::make_unexpected(std::string("seek_data: null output"));
+    if (end <= begin) return static_cast<size_t>(0);
+
+    const uint64_t begin_blk = begin / kAlign;
+    const uint64_t end_blk = (end + kAlign - 1) / kAlign;
+    if (end_blk <= begin_blk) return static_cast<size_t>(0);
+
+    std::vector<SegmentMapping> mappings;
+    index_->Lookup(Segment(begin_blk, static_cast<uint32_t>(end_blk - begin_blk)), &mappings);
+    for (size_t i = 0; i < mappings.size(); ++i) {
+        if (mappings[i].zeroed) continue;
+        segs->push_back(Segment(mappings[i].Offset(), mappings[i].Length()));
+    }
+    return segs->size();
+}
+
+// ---------------------------------------------------------------------------
+// seal
+// ---------------------------------------------------------------------------
+
+void LsmtFile::AbsorbSealBytes(uint64_t offset, const uint8_t* data, size_t len) {
+    if (!has_append_digest_) return;
+    if (!append_digest_.Absorb(offset, data, len).ok()) has_append_digest_ = false;
+}
+
+core::Expected<core::Optional<LayerDescriptor>, std::string> LsmtFile::CloseSeal() {
+    // Flipped first and checked atomically in Rust via `swap`. Sealing twice
+    // would append a second index and trailer after the first, leaving a file
+    // whose trailer points at an index that is no longer last.
+    if (sealed_) {
+        return core::make_unexpected(std::string("File has already been sealed."));
+    }
+    sealed_ = true;
+
+    const core::Expected<core::Unit, std::string> fl = FlushGroupCommit();
+    if (!fl.ok()) return core::make_unexpected(fl.error());
+
+    const uint64_t blocks = (virtual_size_ + kAlign - 1) / kAlign;
+    std::vector<SegmentMapping> compact_index;
+    // Only this layer's mappings. The sealed file is a single layer, so a
+    // mapping inherited from a lower would point into a file this one does
+    // not contain.
+    index_->Upper().Lookup(Segment(0, static_cast<uint32_t>(blocks)), &compact_index);
+
+    for (size_t i = 0; i < compact_index.size(); ++i) {
+        compact_index[i].tag = 0;
+        if (compact_index[i].zeroed) {
+            // A retained physical range is meaningless once sealed: the
+            // sealed layer has no writer left to reuse it, and keeping the
+            // offset would describe space the compacted file does not have.
+            compact_index[i].moffset = kNoPhysicalOffset;
+        }
+    }
+
+    const core::Expected<uint64_t, std::string> fsz = rw_data_file_->Size();
+    if (!fsz.ok()) return core::make_unexpected(fsz.error());
+    // At the current data EOF. For sparse that is exactly header + virtual
+    // size, so index bytes cannot land on top of virtual data.
+    const uint64_t index_offset = fsz.value();
+
+    std::vector<uint8_t> index_bytes(compact_index.size() * kMappingSize, 0);
+    for (size_t i = 0; i < compact_index.size(); ++i) {
+        EncodeMapping(DiskSegmentMapping::FromMemory(compact_index[i]),
+                      &index_bytes[i * kMappingSize]);
+    }
+
+    const size_t remainder = index_bytes.size() % static_cast<size_t>(kAlign);
+    if (remainder != 0) {
+        // Padded with 0xFF, not zeros: a zero-filled tail would decode as a
+        // valid mapping of block zero, and the reader counts records rather
+        // than scanning for a terminator.
+        index_bytes.resize(index_bytes.size() + (static_cast<size_t>(kAlign) - remainder), 0xFF);
+    }
+
+    if (!index_bytes.empty()) {
+        const core::Expected<size_t, std::string> w =
+            rw_data_file_->WriteAt(index_offset, &index_bytes[0], index_bytes.size());
+        if (!w.ok()) return core::make_unexpected(w.error());
+        AbsorbSealBytes(index_offset, &index_bytes[0], index_bytes.size());
+    }
+
+    uint64_t trailer_offset = index_offset + static_cast<uint64_t>(index_bytes.size());
+    if (trailer_offset % 4096 != 0) {
+        // The trailer has to start on a 4096 boundary, because a reader finds
+        // it by subtracting that block size from the file length.
+        const uint64_t pad_len = 4096 - (trailer_offset % 4096);
+        std::vector<uint8_t> pad(static_cast<size_t>(pad_len), 0);
+        const core::Expected<size_t, std::string> w =
+            rw_data_file_->WriteAt(trailer_offset, &pad[0], pad.size());
+        if (!w.ok()) return core::make_unexpected(w.error());
+        AbsorbSealBytes(trailer_offset, &pad[0], pad.size());
+        trailer_offset += pad_len;
+    }
+
+    // Built from the existing header rather than from scratch, so the uuid,
+    // parent uuid and user tag carry into the trailer.
+    const core::Expected<ByteBuffer, std::string> raw =
+        rw_data_file_->ReadAt(0, static_cast<size_t>(kHdr));
+    if (!raw.ok()) return core::make_unexpected(raw.error());
+    if (raw.value().size() < HeaderTrailer::kOnDiskSize) {
+        return core::make_unexpected(
+            std::string("failed to read rw data header when sealing"));
+    }
+    HeaderTrailer trailer;
+    if (!HeaderTrailer::Deserialize(&raw.value()[0], raw.value().size(), &trailer)) {
+        return core::make_unexpected(std::string("invalid rw data header"));
+    }
+    trailer.virtual_size = virtual_size_;
+    trailer.index_offset = index_offset;
+    trailer.index_size = compact_index.size();
+    trailer.SetSealed();
+    trailer.SetDataFile();
+    trailer.SetTrailer();
+    // The sparse and hybrid markers describe how a *writable* layer stores
+    // its data. A sealed layer has one shape, so carrying them over would
+    // make a reader take a recovery path that no longer applies.
+    trailer.flags &= ~(1u << 4);
+    trailer.flags &= ~(1u << 5);
+
+    std::vector<uint8_t> trailer_buf(4096, 0);
+    uint8_t enc[HeaderTrailer::kOnDiskSize];
+    trailer.Serialize(enc);
+    std::memcpy(&trailer_buf[0], enc, sizeof(enc));
+
+    const core::Expected<size_t, std::string> tw =
+        rw_data_file_->WriteAt(trailer_offset, &trailer_buf[0], trailer_buf.size());
+    if (!tw.ok()) return core::make_unexpected(tw.error());
+    AbsorbSealBytes(trailer_offset, &trailer_buf[0], trailer_buf.size());
+
+    if (!has_append_digest_) {
+        // Absent, not an error. Only the append-only layout can carry a
+        // digest at all, and even there any out-of-order write abandons it.
+        return core::Optional<LayerDescriptor>();
+    }
+    return core::Optional<LayerDescriptor>(append_digest_.Descriptor());
 }
 
 }  // namespace overlaybd
