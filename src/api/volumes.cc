@@ -2,9 +2,12 @@
 // Rust: src/api/impls/volumes.rs
 #include "agentenv/api/volumes.h"
 
+#include <algorithm>
 #include <set>
+#include <unordered_map>
 #include <sstream>
 
+#include "agentenv/core/identity.h"
 #include "agentenv/core/logging.h"
 
 namespace agentenv {
@@ -213,6 +216,142 @@ ResolveVolumeMounts(volume::VolumeManager* manager,
         }
     }
     return result;
+}
+
+
+// ---------------------------------------------------------------------------
+// fork volume preparation
+// ---------------------------------------------------------------------------
+
+void CleanupForkVolumeChildren(volume::VolumeManager* manager,
+                               const ForkVolumeChildren& children) {
+    if (manager == 0) return;
+    for (ForkVolumeChildren::const_iterator it = children.begin(); it != children.end();
+         ++it) {
+        const std::string& owner = it->first;
+        const std::vector<std::string>& volume_ids = it->second;
+        if (volume_ids.empty()) continue;
+
+        // Released before deleting, not after: `Remove` refuses while any
+        // lease is held, so the other order would leave every clone behind
+        // with no sandbox left to free it.
+        manager->ReplaceOwnerFor(owner, core::Optional<std::string>(), volume_ids);
+        for (std::size_t i = 0; i < volume_ids.size(); ++i) {
+            manager->Remove(volume_ids[i]);
+        }
+    }
+    // Both calls' results are dropped on purpose. This runs while the caller
+    // is already failing, and its error is the one worth reporting -- a
+    // cleanup failure reported instead would hide the cause.
+}
+
+core::Expected<PreparedVolumeForkSpecs, VolumeApiError> PrepareVolumeForkSpecs(
+    volume::VolumeManager* manager, const orchestrator::SandboxMetadata& source,
+    uint32_t count) {
+    if (manager == 0) {
+        return core::make_unexpected(
+            ApiError::Make(500, "volume fork requested without a volume manager"));
+    }
+
+    const std::string source_owner = source.id.ToString();
+
+    // Walked in sorted order. The source's mounts live in an unordered map, so
+    // iterating it directly would make `replace_drive_ids` come out in an
+    // arbitrary order. Nothing downstream depends on that order -- each
+    // replacement names a distinct slot -- but an arbitrary one is not worth
+    // having when a stable one costs a sort.
+    std::vector<std::string> mount_paths;
+    for (std::unordered_map<std::string, std::string>::const_iterator it =
+             source.volume_mounts.begin();
+         it != source.volume_mounts.end(); ++it) {
+        mount_paths.push_back(it->first);
+    }
+    std::sort(mount_paths.begin(), mount_paths.end());
+
+    // Resolved once, before any child is created. Each child needs the same
+    // facts (mode and size), and re-reading per child would let a concurrent
+    // change make two children disagree about the same volume.
+    std::map<std::string, volume::VolumeRecord> source_volumes;
+    for (std::size_t i = 0; i < mount_paths.size(); ++i) {
+        const std::string& reference = source.volume_mounts.find(mount_paths[i])->second;
+        if (source_volumes.find(reference) != source_volumes.end()) continue;
+        const volume::VolumeResult<volume::VolumeRecord> record = manager->Get(reference);
+        if (!record.ok()) {
+            return core::make_unexpected(VolumeErrorResponse(record.error()));
+        }
+        source_volumes[reference] = record.value();
+    }
+
+    PreparedVolumeForkSpecs prepared;
+    for (uint32_t c = 0; c < count; ++c) {
+        const core::SandboxId child_id = core::SandboxId::Fresh();
+        const std::string owner = child_id.ToString();
+        // Present even when it stays empty, so a child that clones nothing is
+        // still accounted for by the cleanup walk.
+        prepared.children[owner];
+
+        std::map<std::string, std::string> volume_mounts;
+        std::map<std::string, std::string> child_mounts;
+        std::vector<std::pair<std::string, std::string> > replace_drive_ids;
+
+        for (std::size_t i = 0; i < mount_paths.size(); ++i) {
+            const std::string& mount_path = mount_paths[i];
+            const volume::VolumeRecord& volume =
+                source_volumes[source.volume_mounts.find(mount_path)->second];
+
+            if (volume.mode == volume::VolumeMode::Exclusive) {
+                // Cloned. An exclusive volume has exactly one writer, so the
+                // parent cannot keep writing it while a child does too.
+                const std::string child_name =
+                    std::string("volume-fork-") + core::Uuid::GenV7().ToSimpleString();
+                const volume::VolumeResult<volume::VolumeRecord> child =
+                    manager->CreateChildForOwner(volume.id, child_name,
+                                                 volume::VolumeMode::Exclusive,
+                                                 volume.size_mb, source_owner, owner);
+                if (!child.ok()) {
+                    // Everything created so far, for this child and every
+                    // earlier one, is undone before returning.
+                    CleanupForkVolumeChildren(manager, prepared.children);
+                    return core::make_unexpected(VolumeErrorResponse(child.error()));
+                }
+                prepared.children[owner].push_back(child.value().id);
+                child_mounts[mount_path] = child.value().id;
+                // The child resumes from the parent's capture, whose config
+                // still names the parent's volume in this slot. Without the
+                // substitution the child would mount the parent's image.
+                replace_drive_ids.push_back(std::make_pair(volume.id, child.value().id));
+                volume_mounts[mount_path] = child.value().id;
+            } else {
+                // Shared. A read-only volume has no writer, so there is
+                // nothing for parent and child to race on -- and cloning it
+                // would copy data that cannot change.
+                volume_mounts[mount_path] = volume.id;
+                child_mounts[mount_path] = volume.id;
+            }
+        }
+
+        // Reserves each mount for the child and builds its drives. A failure
+        // here releases its own reservations, but the clones above are this
+        // function's to undo.
+        const core::Expected<ResolvedVolumeMounts, VolumeApiError> resolved =
+            ResolveVolumeMounts(manager, child_mounts, owner);
+        if (!resolved.ok()) {
+            CleanupForkVolumeChildren(manager, prepared.children);
+            return core::make_unexpected(resolved.error());
+        }
+
+        orchestrator::SandboxForkChildSpec spec;
+        spec.sandbox_id = child_id;
+        for (std::map<std::string, std::string>::const_iterator it = volume_mounts.begin();
+             it != volume_mounts.end(); ++it) {
+            spec.volume_mounts[it->first] = it->second;
+        }
+        spec.extra_drives = resolved.value().drives;
+        spec.replace_drive_ids = replace_drive_ids;
+        prepared.specs.push_back(spec);
+    }
+
+    return prepared;
 }
 
 }  // namespace api

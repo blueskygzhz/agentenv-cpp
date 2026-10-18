@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Rust: src/api/impls/*.rs
 #include "agentenv/api/impls.h"
+#include <unordered_map>
+
+#include "agentenv/api/volumes.h"
 
 namespace agentenv {
 namespace api {
@@ -147,14 +150,58 @@ ApiImpl::ForkSandbox(const std::string& sandbox_id, const ForkSandboxReq& req) {
             ApiError::Make(400, "count must be between 1 and 100"));
     }
 
-    // Deviation, and a refusal rather than a silent downgrade. Rust clones each
-    // exclusive volume for every child so the parent keeps sole ownership of
-    // its own. Without a `VolumeManager` here there is nothing to clone with,
-    // and forking anyway would hand the child the parent's volume ids -- two
-    // live VMs writing one image. See the header.
-    if (!source.value()->volume_mounts.empty()) {
+    const bool has_volumes = !source.value()->volume_mounts.empty();
+
+    // Refused rather than forked without them. Each of the source's exclusive
+    // volumes has to be cloned per child, and with no manager there is nothing
+    // to clone with -- proceeding would hand parent and child the same volume
+    // id, which is two live VMs writing one image.
+    if (has_volumes && !volumes_) {
         return core::make_unexpected(ApiError::Make(
-            501, "forking a sandbox with volume mounts is not available in this build"));
+            501, "forking a sandbox with volume mounts requires a volume manager"));
+    }
+
+    ForkVolumeChildren child_volume_ids;
+    std::vector<orchestrator::SandboxForkChildSpec> child_specs;
+
+    if (has_volumes) {
+        // The children resume from the parent's capture, so the parent's
+        // volume state has to be on disk before that capture is taken --
+        // otherwise a child reads a volume mid-write.
+        const orchestrator::OrchestratorResult<core::Unit> snapshotted =
+            svc_->SnapshotVolumeMounts(id.value());
+        if (!snapshotted.ok()) {
+            return core::make_unexpected(ToApiError(snapshotted.error()));
+        }
+
+        // The clones below are made from the parent's *committed* layers, so a
+        // node whose local backing is stale has to catch up first. Skipping
+        // this would clone from a backing that no longer matches the record.
+        std::vector<std::string> source_volume_ids;
+        for (std::unordered_map<std::string, std::string>::const_iterator it =
+                 source.value()->volume_mounts.begin();
+             it != source.value()->volume_mounts.end(); ++it) {
+            source_volume_ids.push_back(it->second);
+        }
+        const core::Expected<core::Unit, volume::VolumeError> recovered =
+            volumes_->RecoverBackings(sandbox_id, source_volume_ids);
+        if (!recovered.ok()) {
+            return core::make_unexpected(ApiError::Make(
+                500, std::string("failed to recover local volume backing before fork: ") +
+                         recovered.error().ToString()));
+        }
+
+        const core::Expected<PreparedVolumeForkSpecs, VolumeApiError> prepared =
+            PrepareVolumeForkSpecs(volumes_.get(), *source.value(), count);
+        if (!prepared.ok()) return core::make_unexpected(prepared.error());
+        child_specs = prepared.value().specs;
+        child_volume_ids = prepared.value().children;
+    } else {
+        for (uint32_t i = 0; i < count; ++i) {
+            orchestrator::SandboxForkChildSpec spec;
+            spec.sandbox_id = core::SandboxId::Fresh();
+            child_specs.push_back(spec);
+        }
     }
 
     // Seconds on the wire, milliseconds internally. An absent timeout inherits
@@ -166,8 +213,11 @@ ApiImpl::ForkSandbox(const std::string& sandbox_id, const ForkSandboxReq& req) {
 
     const orchestrator::OrchestratorResult<
         std::vector<orchestrator::SandboxForkOutcome> > outcomes =
-        svc_->ForkSandbox(id.value(), count, timeout);
+        svc_->ForkSandboxWithSpecs(id.value(), child_specs, timeout);
     if (!outcomes.ok()) {
+        // The fork never ran, so every clone made for it is orphaned: no
+        // sandbox exists to hold the lease or ever release it.
+        CleanupForkVolumeChildren(volumes_.get(), child_volume_ids);
         // A failure of the fork itself, not of a child.
         //
         // `InvalidSandboxState` is overridden to 409 here. The generic mapping
@@ -183,6 +233,20 @@ ApiImpl::ForkSandbox(const std::string& sandbox_id, const ForkSandboxReq& req) {
                          " state"));
         }
         return core::make_unexpected(ToApiError(outcomes.error()));
+    }
+
+    // Only the children that failed have their clones removed. A successful
+    // child owns its clone now and will release it when it is deleted, so
+    // tidying those up too would pull the volume out from under a running
+    // sandbox.
+    if (!child_volume_ids.empty()) {
+        ForkVolumeChildren failed = child_volume_ids;
+        for (std::size_t i = 0; i < outcomes.value().size(); ++i) {
+            if (outcomes.value()[i].ok()) {
+                failed.erase(outcomes.value()[i].value().id.ToString());
+            }
+        }
+        CleanupForkVolumeChildren(volumes_.get(), failed);
     }
 
     ForkSandboxResp resp;

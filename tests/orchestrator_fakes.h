@@ -32,6 +32,9 @@ struct BackendScript {
     bool fail_freeze_recoverable = false;
     /// `ThawVolumes` fails, which escalates a recoverable capture error.
     bool fail_thaw = false;
+    /// `SnapshotVolumes` declines, which must abort a volume-aware fork before
+    /// any clone is made.
+    bool fail_snapshot_volumes = false;
 
     // fork branches
     bool fail_fork_terminal   = false;
@@ -67,6 +70,7 @@ struct BackendScript {
     int thaw_calls     = 0;
     int fork_calls     = 0;
     int snapshot_calls = 0;
+    int snapshot_volumes_calls = 0;
 
     /// Rust `runtime_info().rootfs_virtual_size`.
     core::Optional<uint64_t> rootfs_virtual_size;
@@ -120,6 +124,14 @@ class FakeSandbox : public sandbox::SandboxBackend {
             sandbox::SandboxCaptureError::Recoverable("fake: snapshot unsupported"));
     }
     sandbox::SandboxCaptureResult<core::Unit> SnapshotVolumes() override {
+        // Counted so a test can assert the volume flush happened *before* the
+        // fork capture. A child resumes the parent's volumes, so one caught
+        // mid-write would come up with a torn filesystem.
+        ++script_->snapshot_volumes_calls;
+        if (script_->fail_snapshot_volumes) {
+            return core::make_unexpected(
+                sandbox::SandboxCaptureError::Recoverable("fake: snapshot volumes declined"));
+        }
         return core::Unit();
     }
     sandbox::SandboxCaptureResult<core::Unit> FreezeAndSnapshotVolumes() override {

@@ -63,6 +63,17 @@ std::string Uuid::ToString() const {
     return std::string(buf);
 }
 
+std::string Uuid::ToSimpleString() const {
+    char buf[33];
+    static const char* kHex = "0123456789abcdef";
+    for (int i = 0; i < 16; ++i) {
+        buf[i * 2]     = kHex[bytes_[i] >> 4];
+        buf[i * 2 + 1] = kHex[bytes_[i] & 0xf];
+    }
+    buf[32] = 0;
+    return std::string(buf);
+}
+
 // UUID v7 per RFC 9562 §5.7. Non-cryptographic randomness suffices for our IDs.
 Uuid Uuid::GenV7() {
     using namespace std::chrono;

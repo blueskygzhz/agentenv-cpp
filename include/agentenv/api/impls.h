@@ -9,6 +9,7 @@
 #include "agentenv/api/dto.h"
 #include "agentenv/core/expected.h"
 #include "agentenv/orchestrator/service.h"
+#include "agentenv/volume.h"
 
 namespace agentenv {
 namespace api {
@@ -35,6 +36,17 @@ class ApiImpl {
     explicit ApiImpl(std::shared_ptr<orchestrator::Orchestrator> svc)
         : svc_(std::move(svc)) {}
 
+    /// With a volume manager, which the fork handler needs to give each child
+    /// its own clone of the source's exclusive volumes.
+    ///
+    /// Separate from the one-argument form rather than defaulted so a caller
+    /// that has a manager cannot forget to pass it: the handler's behaviour
+    /// differs, and silently getting the volume-less form would refuse forks
+    /// the node is perfectly able to serve.
+    ApiImpl(std::shared_ptr<orchestrator::Orchestrator> svc,
+            std::shared_ptr<volume::VolumeManager> volumes)
+        : svc_(std::move(svc)), volumes_(std::move(volumes)) {}
+
     // Sandbox handlers (Rust: src/api/impls/sandbox.rs).
     core::Expected<CreateSandboxResp, ApiError>
         CreateSandbox(const CreateSandboxReq& req);
@@ -60,12 +72,11 @@ class ApiImpl {
     /// three booted. Only a failure of the *fork itself* -- a missing or
     /// non-running source -- comes back as an `ApiError`.
     ///
-    /// Deviation: Rust additionally forks the source's volumes, giving each
-    /// child its own writable clone (`prepare_volume_fork_specs`). That needs a
-    /// `VolumeManager`, which this handler bundle does not hold, so a source
-    /// with volume mounts is refused rather than forked without them -- sharing
-    /// one exclusive volume between parent and child would let two VMs write
-    /// the same image.
+    /// A source holding volume mounts has each of its **exclusive** volumes
+    /// cloned per child, and its read-only ones shared. Without a
+    /// `VolumeManager` such a source is refused rather than forked without its
+    /// volumes: handing one exclusive volume to parent and child would put two
+    /// live VMs on one image.
     core::Expected<ForkSandboxResp, ApiError>
         ForkSandbox(const std::string& sandbox_id, const ForkSandboxReq& req);
 
@@ -84,6 +95,9 @@ class ApiImpl {
     core::Expected<core::SandboxId, ApiError> ParseId(const std::string& text) const;
 
     std::shared_ptr<orchestrator::Orchestrator> svc_;
+    /// Null when this bundle was built without one. Only the fork handler
+    /// needs it, and only for a source that actually has volume mounts.
+    std::shared_ptr<volume::VolumeManager> volumes_;
 };
 
 }  // namespace api

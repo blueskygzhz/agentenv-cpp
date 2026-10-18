@@ -25,6 +25,8 @@
 #include "agentenv/core/json.h"
 #include "agentenv/api/dto.h"
 #include "agentenv/core/optional.h"
+#include "agentenv/orchestrator/store.h"
+#include "agentenv/orchestrator/types.h"
 #include "agentenv/sandbox/extra_drive.h"
 #include "agentenv/volume.h"
 
@@ -78,6 +80,54 @@ core::Expected<ResolvedVolumeMounts, VolumeApiError>
     ResolveVolumeMounts(volume::VolumeManager* manager,
                         const std::map<std::string, std::string>& mounts,
                         const std::string& owner);
+
+/// Volumes created for one fork child, keyed by the child's sandbox id.
+///
+/// Carried out of `PrepareVolumeForkSpecs` so the caller can undo exactly the
+/// children that did not come up. Only *created* volumes are listed: a
+/// read-only volume is shared, not cloned, and deleting it on cleanup would
+/// destroy data the parent is still using.
+typedef std::map<std::string, std::vector<std::string> > ForkVolumeChildren;
+
+/// Rust `cleanup_fork_volume_children`.
+///
+/// Releases each child's lease and then deletes the volume. Both steps, in
+/// that order: a delete refuses while a lease is held, so skipping the release
+/// would leave the clone behind forever with no sandbox to free it.
+///
+/// Every error is swallowed deliberately. This runs on a path that is already
+/// failing, and the caller has a more useful error to report than whatever
+/// went wrong while tidying up.
+void CleanupForkVolumeChildren(volume::VolumeManager* manager,
+                               const ForkVolumeChildren& children);
+
+/// What `PrepareVolumeForkSpecs` produces.
+struct PreparedVolumeForkSpecs {
+    /// One spec per requested child, in order.
+    std::vector<orchestrator::SandboxForkChildSpec> specs;
+    /// The clones made for each child, for cleanup when a child fails.
+    ForkVolumeChildren children;
+};
+
+/// Rust `prepare_volume_fork_specs`.
+///
+/// Gives every fork child its own copy of each **exclusive** volume the source
+/// holds, and shares each read-only one. That split is the whole point: an
+/// exclusive volume has a single writer by definition, so handing the same one
+/// to parent and child would put two live VMs on one image. A read-only volume
+/// has no writer at all, so sharing is free.
+///
+/// Each clone is also registered as a drive replacement, because the child
+/// resumes from the parent's capture: the captured config still names the
+/// parent's volume in that slot, and without the substitution the child would
+/// mount it.
+///
+/// On failure every volume created so far is cleaned up before returning, so a
+/// partial failure leaves nothing leased to a sandbox that never launched.
+core::Expected<PreparedVolumeForkSpecs, VolumeApiError>
+    PrepareVolumeForkSpecs(volume::VolumeManager* manager,
+                           const orchestrator::SandboxMetadata& source,
+                           uint32_t count);
 
 }  // namespace api
 }  // namespace agentenv

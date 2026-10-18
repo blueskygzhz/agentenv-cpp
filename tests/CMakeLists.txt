@@ -110,6 +110,8 @@ agentenv_add_test(test_api_auth           test_api_auth.cc            agentenv-a
 agentenv_add_test(test_api_admin          test_api_admin.cc           agentenv-api)
 # Rust: src/api/impls/sandbox.rs :: sandboxes_sandbox_id_fork_post
 agentenv_add_test(test_api_sandbox_fork   test_api_sandbox_fork.cc   agentenv-api agentenv-orchestrator)
+# Rust: src/api/impls/sandbox.rs :: prepare_volume_fork_specs
+agentenv_add_test(test_api_volume_fork    test_api_volume_fork.cc    agentenv-api agentenv-volume)
 # Rust: src/api/impls/volumes.rs
 agentenv_add_test(test_api_volumes        test_api_volumes.cc         agentenv-api agentenv-volume)
 # Rust: src/api/impls/template_helpers.rs

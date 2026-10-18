@@ -30,6 +30,14 @@ class Uuid {
     /// Format as canonical dashed hex.
     std::string ToString() const;
 
+    /// Rust `Uuid::simple()` — 32 hex digits, no hyphens.
+    ///
+    /// Needed where the value has to pass a character-class check that rejects
+    /// hyphens, or is embedded in an identifier that already uses them as
+    /// separators -- a volume name like `volume-fork-<uuid>` reads as one
+    /// token this way instead of six.
+    std::string ToSimpleString() const;
+
     /// Generate a fresh UUID v7 seeded by the current clock + a rand stream.
     static Uuid GenV7();
 

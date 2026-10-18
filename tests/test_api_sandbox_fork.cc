@@ -6,7 +6,13 @@
 #include <string>
 
 #include "agentenv/api/impls.h"
+#include "agentenv/api/volumes.h"
+#include "agentenv/core/fs.h"
+// Both fake headers. `orchestrator_fakes.h` comes first so its `Fixture` wins
+// the short name and the volume one stays `VolumeFixture`; see the note at the
+// bottom of `volume_fakes.h`.
 #include "orchestrator_fakes.h"
+#include "volume_fakes.h"
 
 using namespace agentenv;
 using namespace agentenv::api;
@@ -338,6 +344,214 @@ MT_TEST(fork_response_is_a_bare_array) {
     const std::string json = resp.ToJson().ToString();
     MT_EXPECT_TRUE(!json.empty());
     MT_EXPECT_EQ(json[0], '[');
+}
+
+
+// ============================================================
+// volume-aware forks
+// ============================================================
+
+MT_TEST(a_source_with_volumes_is_refused_without_a_manager) {
+    Fixture f;
+    f.script.succeed_fork = true;
+    SandboxMetadata source = RegisterRunning(f);
+    source.volume_mounts["/data"] = "vol-a";
+    MT_EXPECT_TRUE(f.store->Update(source).ok());
+
+    ForkSandboxReq req;
+    // The one-argument form, i.e. a bundle with no volume manager.
+    ApiImpl impl(f.orch);
+    const core::Expected<ForkSandboxResp, ApiError> r =
+        impl.ForkSandbox(source.id.ToString(), req);
+
+    // Refused, not forked without the volumes. Each exclusive volume has to
+    // be cloned per child; with nothing to clone with, proceeding would give
+    // parent and child the same volume id -- two live VMs on one image. 501
+    // says the build cannot do it, which is distinct from a bad request.
+    MT_EXPECT_TRUE(!r.ok());
+    if (!r.ok()) {
+        MT_EXPECT_EQ(r.error().code, 501);
+        MT_EXPECT_TRUE(r.error().message.find("volume manager") != std::string::npos);
+    }
+    // The backend was never asked to fork, so the source was never paused.
+    MT_EXPECT_EQ(f.script.fork_calls, 0);
+}
+
+MT_TEST(a_source_with_volumes_forks_each_child_onto_its_own_clone) {
+    Fixture f;
+    agentenv::testing::VolumeFixture vf;
+    f.script.succeed_fork = true;
+
+    const agentenv::volume::VolumeRecord parent = vf.PublishedVolume();
+    SandboxMetadata source = RegisterRunning(f);
+    source.volume_mounts["/data"] = parent.id;
+    MT_EXPECT_TRUE(f.store->Update(source).ok());
+
+    ForkSandboxReq req;
+    req.count = core::Optional<uint32_t>(2);
+    ApiImpl impl(f.orch, vf.manager);
+    const core::Expected<ForkSandboxResp, ApiError> r =
+        impl.ForkSandbox(source.id.ToString(), req);
+    MT_EXPECT_TRUE(r.ok());
+    if (!r.ok()) return;
+    MT_EXPECT_EQ(static_cast<int>(r.value().results.size()), 2);
+
+    std::vector<std::string> mounted;
+    for (std::size_t i = 0; i < r.value().results.size(); ++i) {
+        MT_EXPECT_TRUE(r.value().results[i].sandbox.has_value());
+        if (!r.value().results[i].sandbox.has_value()) continue;
+        const core::Expected<core::SandboxId, std::string> child_id =
+            core::SandboxId::Parse(r.value().results[i].sandbox->sandbox_id);
+        MT_EXPECT_TRUE(child_id.ok());
+        if (!child_id.ok()) continue;
+        const core::Expected<core::Optional<SandboxMetadata>,
+                             orchestrator::StoreError> stored =
+            f.store->Get(child_id.value());
+        MT_EXPECT_TRUE(stored.ok() && stored.value());
+        if (!stored.ok() || !stored.value()) continue;
+        // The child's record names its clone, not the parent's volume.
+        const std::string id = stored.value()->volume_mounts.find("/data")->second;
+        MT_EXPECT_TRUE(id != parent.id);
+        mounted.push_back(id);
+    }
+    MT_EXPECT_EQ(static_cast<int>(mounted.size()), 2);
+    if (mounted.size() == 2) MT_EXPECT_TRUE(mounted[0] != mounted[1]);
+
+    // The source's volume state was flushed before the capture. Without that
+    // a child resumes a volume caught mid-write.
+    MT_EXPECT_TRUE(f.script.snapshot_volumes_calls > 0);
+}
+
+MT_TEST(a_reserved_volume_whose_local_backing_vanished_fails_the_fork) {
+    Fixture f;
+    agentenv::testing::VolumeFixture vf;
+    f.script.succeed_fork = true;
+
+    const agentenv::volume::VolumeRecord parent = vf.PublishedVolume();
+    SandboxMetadata source = RegisterRunning(f);
+    source.volume_mounts["/data"] = parent.id;
+    MT_EXPECT_TRUE(f.store->Update(source).ok());
+
+    const std::string owner = source.id.ToString();
+    MT_EXPECT_TRUE(vf.manager->Reserve(parent.id, owner).ok());
+
+    // The post-restart shape, built in two steps because each covers a
+    // different half of the check:
+    //
+    //  * `Reopen` drops the node-local cache, so the record no longer carries
+    //    a known local path. Without this, `Get` refills it and the recovery
+    //    has nothing to do.
+    //  * The backing file itself is removed, so the recovery cannot simply
+    //    re-derive the path either. This is the case the recovery exists for:
+    //    a volume the catalog says is leased here, whose data is gone.
+    //
+    // Only the second half is observable through anything *other* than the
+    // recovery: `ResolveVolumeMounts` also refills the cache via
+    // `MaterializeBacking`, so a test that asserted only on the path being
+    // restored could not tell the two apart.
+    vf.Reopen();
+    const std::string backing = agentenv::core::fs::Join(
+        vf.manager->DataDir(parent.id), "image.json");
+    MT_EXPECT_TRUE(agentenv::core::fs::Exists(backing));
+    MT_EXPECT_TRUE(agentenv::core::fs::RemoveFile(backing).ok());
+
+    ForkSandboxReq req;
+    ApiImpl impl(f.orch, vf.manager);
+    const core::Expected<ForkSandboxResp, ApiError> r =
+        impl.ForkSandbox(source.id.ToString(), req);
+
+    // Refused. Cloning from a backing this node does not have would produce a
+    // child on an image that was never written, and the guest would find an
+    // empty filesystem where its parent's data should be.
+    MT_EXPECT_TRUE(!r.ok());
+    if (!r.ok()) MT_EXPECT_EQ(r.error().code, 500);
+
+    // And the volume is marked Failed, so no later mount picks it up as if it
+    // were usable.
+    const agentenv::volume::VolumeResult<agentenv::volume::VolumeRecord> after =
+        vf.manager->Get(parent.id);
+    MT_EXPECT_TRUE(after.ok());
+    if (after.ok()) {
+        MT_EXPECT_TRUE(after.value().status == agentenv::volume::VolumeStatus::Failed);
+    }
+
+    // No clone was made: the recovery runs before any create.
+    const agentenv::volume::VolumeResult<agentenv::volume::VolumePage> page =
+        vf.manager->ListPage(core::Optional<std::string>(), 100);
+    if (page.ok()) {
+        int clones = 0;
+        for (std::size_t i = 0; i < page.value().records.size(); ++i) {
+            if (page.value().records[i].name.find("volume-fork-") == 0) ++clones;
+        }
+        MT_EXPECT_EQ(clones, 0);
+    }
+}
+
+MT_TEST(a_fork_that_fails_outright_removes_the_clones_it_made) {
+    Fixture f;
+    agentenv::testing::VolumeFixture vf;
+    // The backend refuses, so the fork fails as a whole and no child exists to
+    // own the clones that were already created for it.
+    f.script.succeed_fork = false;
+
+    const agentenv::volume::VolumeRecord parent = vf.PublishedVolume();
+    SandboxMetadata source = RegisterRunning(f);
+    source.volume_mounts["/data"] = parent.id;
+    MT_EXPECT_TRUE(f.store->Update(source).ok());
+
+    ForkSandboxReq req;
+    req.count = core::Optional<uint32_t>(2);
+    ApiImpl impl(f.orch, vf.manager);
+    const core::Expected<ForkSandboxResp, ApiError> r =
+        impl.ForkSandbox(source.id.ToString(), req);
+    MT_EXPECT_TRUE(!r.ok());
+
+    // Nothing left behind. A clone with no sandbox would hold a lease nothing
+    // ever releases, and keep its parent's layers pinned indefinitely.
+    const agentenv::volume::VolumeResult<agentenv::volume::VolumePage> page =
+        vf.manager->ListPage(core::Optional<std::string>(), 100);
+    MT_EXPECT_TRUE(page.ok());
+    if (!page.ok()) return;
+    int clones = 0;
+    for (std::size_t i = 0; i < page.value().records.size(); ++i) {
+        if (page.value().records[i].name.find("volume-fork-") == 0) ++clones;
+    }
+    MT_EXPECT_EQ(clones, 0);
+}
+
+MT_TEST(a_successful_child_keeps_its_clone_while_a_failed_sibling_loses_its) {
+    Fixture f;
+    agentenv::testing::VolumeFixture vf;
+    f.script.succeed_fork = true;
+    // One child boots, the other does not.
+    f.script.fork_child_outcomes.push_back(true);
+    f.script.fork_child_outcomes.push_back(false);
+
+    const agentenv::volume::VolumeRecord parent = vf.PublishedVolume();
+    SandboxMetadata source = RegisterRunning(f);
+    source.volume_mounts["/data"] = parent.id;
+    MT_EXPECT_TRUE(f.store->Update(source).ok());
+
+    ForkSandboxReq req;
+    req.count = core::Optional<uint32_t>(2);
+    ApiImpl impl(f.orch, vf.manager);
+    const core::Expected<ForkSandboxResp, ApiError> r =
+        impl.ForkSandbox(source.id.ToString(), req);
+    MT_EXPECT_TRUE(r.ok());
+    if (!r.ok()) return;
+
+    // Exactly one clone survives: the one belonging to the child that is now
+    // running. Removing that one too would pull the volume out from under a
+    // live sandbox; keeping the other would leak it.
+    const agentenv::volume::VolumeResult<agentenv::volume::VolumePage> page =
+        vf.manager->ListPage(core::Optional<std::string>(), 100);
+    MT_EXPECT_TRUE(page.ok());
+    if (!page.ok()) return;
+    int clones = 0;
+    for (std::size_t i = 0; i < page.value().records.size(); ++i) {
+        if (page.value().records[i].name.find("volume-fork-") == 0) ++clones;
+    }
+    MT_EXPECT_EQ(clones, 1);
 }
 
 MT_MAIN

@@ -108,7 +108,24 @@ class FakeVolumeRepository : public repo::SnapshotRepository {
         return page;
     }
 
+    /// Creates made so far, and an optional cutoff.
+    ///
+    /// The cutoff exists because a fork creates one clone per child, and the
+    /// behaviour worth testing is a failure *partway through* -- the clones
+    /// already made have to be cleaned up. The clone names carry a fresh uuid,
+    /// so a name collision cannot be staged in advance; counting the calls is
+    /// the only way in from outside.
+    int create_volume_calls = 0;
+    /// Refuse once this many creates have succeeded. Negative never refuses.
+    int fail_create_volume_after = -1;
+
     repo::RepositoryResult<Unit> CreateVolume(const VolumeRecord& record) {
+        if (fail_create_volume_after >= 0 &&
+            create_volume_calls >= fail_create_volume_after) {
+            ++create_volume_calls;
+            return agentenv::core::make_unexpected(
+                repo::RepositoryError::InvalidRequest("injected create failure"));
+        }
         for (std::map<std::string, VolumeRecord>::const_iterator it = records_.begin();
              it != records_.end(); ++it) {
             if (it->second.name == record.name) {
@@ -116,6 +133,7 @@ class FakeVolumeRepository : public repo::SnapshotRepository {
                     repo::RepositoryError::AliasConflict(record.name, it->second.id, record.id));
             }
         }
+        ++create_volume_calls;
         records_[record.id] = Persisted(record);
         return Unit();
     }
@@ -289,12 +307,16 @@ class FakeVolumeRepository : public repo::SnapshotRepository {
     std::map<std::string, std::string> blobs_;
 };
 
-struct Fixture {
+/// Named `VolumeFixture` rather than `Fixture` because `orchestrator_fakes.h`
+/// declares a `Fixture` in this same namespace, and a test that needs both a
+/// real `VolumeManager` and an orchestrator has to include both headers. The
+/// short alias below keeps the existing volume tests reading as they did.
+struct VolumeFixture {
     std::string root;
     std::shared_ptr<FakeVolumeRepository> repository;
     std::shared_ptr<VolumeManager> manager;
 
-    Fixture() {
+    VolumeFixture() {
         const agentenv::core::Expected<std::string, std::string> temp =
             agentenv::core::fs::CreateTempDir("agentenv-volume-");
         MT_EXPECT_TRUE(temp.ok());
@@ -302,7 +324,7 @@ struct Fixture {
         repository.reset(new FakeVolumeRepository(agentenv::core::fs::Join(root, "store")));
         Reopen();
     }
-    ~Fixture() { agentenv::core::fs::RemoveDirAll(root); }
+    ~VolumeFixture() { agentenv::core::fs::RemoveDirAll(root); }
 
     /// Rebuilds the manager while keeping the durable catalog, which is how the
     /// upstream tests simulate a cold node (`manager_at` called twice).
@@ -359,6 +381,14 @@ struct Fixture {
         MT_EXPECT_TRUE(obd::SaveImageConfig(path, config).ok());
     }
 };
+
+/// The short name the existing volume tests use. Defined only when the
+/// orchestrator fakes are not also in play, since both headers would otherwise
+/// declare it -- a test needing a real `VolumeManager` *and* an orchestrator
+/// includes both and names `VolumeFixture` explicitly.
+#ifndef AGENTENV_TESTS_ORCHESTRATOR_FAKES_H_
+typedef VolumeFixture Fixture;
+#endif
 
 }  // namespace testing
 }  // namespace agentenv
