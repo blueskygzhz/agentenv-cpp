@@ -2,6 +2,8 @@
 // Rust: storage/overlaybd/src/backend/oss.rs
 #include "agentenv/storage/overlaybd/oss.h"
 
+#include "agentenv/core/credentials.h"
+
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -219,51 +221,56 @@ std::string ParsedOssUrl::ObjectUrl() const {
 // OssBackend
 // ---------------------------------------------------------------------------
 
+namespace {
+
+/// Rust `normalized_credential`: trimmed, blank treated as absent.
+///
+/// A field of spaces is a config that was never filled in, not a credential
+/// whose value is whitespace -- and sending it would produce a 403 whose
+/// cause is invisible in the config file.
+core::Optional<std::string> NonEmpty(const std::string& value) {
+    const std::string trimmed = Trim(value);
+    if (trimmed.empty()) return core::Optional<std::string>();
+    return core::Optional<std::string>(trimmed);
+}
+
+}  // namespace
+
 core::Expected<std::shared_ptr<OssBackend>, std::string> OssBackend::New(
     const OssConfig& config) {
     const core::Expected<core::Optional<AddressingStyle>, std::string> style =
         ParseAddressingStyle(config.default_addressing_style);
     if (!style.ok()) return core::make_unexpected(style.error());
 
-    // Rust `normalized_credential`: trimmed, and blank counts as absent. A
-    // field of spaces is a config that forgot to fill it in, not a credential
-    // whose value is whitespace.
-    const std::string access_key_id = Trim(config.access_key_id);
-    const std::string secret_access_key = Trim(config.secret_access_key);
-    const std::string security_token = Trim(config.security_token);
-    const std::string credential_process = Trim(config.credential_process);
+    // Delegated rather than re-derived. `core::credentials::FromFields` is the
+    // port of Rust's `credential_source_from_fields`, and the same rules also
+    // serve the remote-image paths; duplicating them here would let the two
+    // copies drift, and the failure mode would be a config accepted by one
+    // and rejected by the other.
+    core::credentials::CredentialFields fields;
+    fields.access_key_id = NonEmpty(config.access_key_id);
+    fields.secret_access_key = NonEmpty(config.secret_access_key);
+    fields.security_token = NonEmpty(config.security_token);
+    fields.credential_process = NonEmpty(config.credential_process);
 
-    // Rust `credential_source_from_fields`, in the same order. Each of these
-    // is a config that cannot mean one thing, so it is refused at
-    // construction rather than producing a 403 on the first read.
-    if (!credential_process.empty()) {
-        if (!access_key_id.empty() || !secret_access_key.empty() ||
-            !security_token.empty()) {
-            return core::make_unexpected(
-                std::string("oss credential_process cannot be combined with access_key_id, "
-                            "secret_access_key, or security_token"));
-        }
-        // Not run here. Rust shells out to it to obtain keys; doing that from
-        // this layer would make a read spawn a process, so a config relying
-        // on it is refused rather than silently degrading to anonymous.
+    core::credentials::CredentialSourceOptions options;
+    options.scope = "oss";
+    // Public buckets must work with no credentials at all.
+    options.allow_anonymous = true;
+    options.required_access_key_id_label = "oss access_key_id";
+    options.required_secret_access_key_label = "oss secret_access_key";
+
+    const core::Expected<core::credentials::CredentialSource, std::string> source =
+        core::credentials::FromFields(fields, options);
+    if (!source.ok()) return core::make_unexpected(source.error());
+
+    // Rust runs it; this layer refuses instead of spawning a process from a
+    // read path, and refusing is deliberate -- silently degrading to
+    // anonymous would fail later as a confusing 403.
+    if (source.value().kind == core::credentials::CredentialSource::Kind::Process) {
         return core::make_unexpected(
             std::string("ossConfig.credentialProcess is not supported by this "
                         "implementation; supply accessKeyId/secretAccessKey"));
-    }
-
-    if (access_key_id.empty() && secret_access_key.empty()) {
-        // A token alone cannot be signed with: it is an addition to a key
-        // pair, not a replacement for one.
-        if (!security_token.empty()) {
-            return core::make_unexpected(
-                std::string("oss security_token requires access_key_id and "
-                            "secret_access_key"));
-        }
-        // Anonymous is allowed for OSS (`allow_anonymous: true`): a public
-        // bucket needs no credentials.
-    } else if (access_key_id.empty() || secret_access_key.empty()) {
-        return core::make_unexpected(
-            std::string("oss access_key_id and secret_access_key must be set together"));
     }
 
     std::shared_ptr<OssBackend> backend(new OssBackend());
@@ -278,9 +285,17 @@ core::Expected<std::shared_ptr<OssBackend>, std::string> OssBackend::New(
         backend->config_.retry_count = kOssDefaultRetryCount;
     }
     backend->addressing_override_ = style.value();
-    backend->credentials_.access_key_id = access_key_id;
-    backend->credentials_.secret_access_key = secret_access_key;
-    backend->credentials_.security_token = security_token;
+    if (source.value().kind == core::credentials::CredentialSource::Kind::Static) {
+        backend->credentials_.access_key_id = source.value().credential.access_key_id;
+        backend->credentials_.secret_access_key = source.value().credential.secret_access_key;
+        // `Optional` -> empty string: an absent token must not be sent, and
+        // the signer skips an empty one.
+        if (source.value().credential.security_token.has_value()) {
+            backend->credentials_.security_token = *source.value().credential.security_token;
+        }
+    }
+    // Anonymous leaves both key fields empty, which `IsAnonymous` reports and
+    // the signer treats as "send no Authorization header".
     return backend;
 }
 
@@ -290,60 +305,97 @@ core::Expected<ParsedOssUrl, std::string> OssBackend::ParseUrl(
                                addressing_override_);
 }
 
+void OssBackend::SignRequest(const S3Credentials& credentials,
+                                 const ParsedOssUrl& location, const std::string& method,
+                                 const uint8_t* body, size_t body_len,
+                                 http::Request* request) const {
+    S3SigningContext ctx;
+    ctx.method = method;
+    ctx.canonical_uri = location.CanonicalUri();
+    ctx.host = location.Host();
+    ctx.region = location.region;
+    ctx.service = "s3";
+    // Signed afresh every attempt: the signature covers a timestamp the
+    // server only accepts inside a window, so a retry after a stall must not
+    // reuse the old one -- and it is the only thing that changes when a
+    // static credential is retried after a 403.
+    ctx.amz_date = S3AmzDateNow();
+    ctx.payload_sha256_hex =
+        body_len > 0 ? HexSha256(body, body_len) : std::string(kS3EmptyPayloadSha256);
+    S3SignRequest(credentials, ctx, request);
+}
+
 core::Expected<http::Response, std::string> OssBackend::Send(
     const ParsedOssUrl& location, const std::string& method, bool has_range,
     uint64_t range_begin, uint64_t range_end, const uint8_t* body, size_t body_len,
     http::BodySink* sink) {
-    const uint32_t attempts = config_.retry_count + 1;
+    // Two passes at most: the operation, then the same operation again after a
+    // permission-denied answer. Rust nests them the same way -- `op(...)` in
+    // `run_with_refresh` is an opendal call that has already exhausted its own
+    // retries, so the credential retry is *added on top* rather than taken out
+    // of the transport budget. A single loop with a shared counter would cost
+    // one transport attempt instead, which matters when a 5xx blip and an
+    // expired credential both occur.
+    const uint32_t passes = 1 + 1;
     std::string last_error;
 
-    for (uint32_t attempt = 0; attempt < attempts; ++attempt) {
-        http::Request request;
-        request.method = method;
-        request.url = location.ObjectUrl();
-        request.has_range = has_range;
-        request.range_begin = range_begin;
-        request.range_end = range_end;
-        request.timeout_secs = static_cast<long>(config_.timeout_secs);
-        if (body != 0 && body_len > 0) {
-            request.body.assign(body, body + body_len);
-        }
-        // Only meaningful for a 2xx; `Perform` routes an error body to
-        // `Response.body` regardless, so the status check above still sees
-        // the message.
-        request.body_sink = sink;
+    for (uint32_t pass = 0; pass < passes; ++pass) {
+        const uint32_t attempts = config_.retry_count + 1;
 
-        S3SigningContext ctx;
-        ctx.method = method;
-        ctx.canonical_uri = location.CanonicalUri();
-        ctx.host = location.Host();
-        ctx.region = location.region;
-        ctx.service = "s3";
-        // Re-signed per attempt: the signature covers a timestamp the server
-        // only accepts within a window, so a retry after a long stall must
-        // not reuse the old one.
-        ctx.amz_date = S3AmzDateNow();
-        ctx.payload_sha256_hex =
-            body_len > 0 ? HexSha256(body, body_len) : std::string(kS3EmptyPayloadSha256);
+        for (uint32_t attempt = 0; attempt < attempts; ++attempt) {
+            http::Request request;
+            request.method = method;
+            request.url = location.ObjectUrl();
+            request.has_range = has_range;
+            request.range_begin = range_begin;
+            request.range_end = range_end;
+            request.timeout_secs = static_cast<long>(config_.timeout_secs);
+            if (body != 0 && body_len > 0) {
+                request.body.assign(body, body + body_len);
+            }
+            // Only meaningful for a 2xx; `Perform` routes an error body to
+            // `Response.body` regardless, so the status checks below still see
+            // the message.
+            request.body_sink = sink;
 
-        S3SignRequest(credentials_, ctx, &request);
+            SignRequest(credentials_, location, method, body, body_len, &request);
 
-        const core::Expected<http::Response, std::string> response = http::Perform(request);
-        if (!response.ok()) {
-            // Transport failure: worth retrying, the request never landed.
-            last_error = response.error();
-            continue;
+            const core::Expected<http::Response, std::string> response =
+                http::Perform(request);
+            if (!response.ok()) {
+                // Transport failure: worth retrying, the request never landed.
+                last_error = response.error();
+                continue;
+            }
+
+            // Only permission denied triggers the second pass. Rust's comment
+            // says as much -- other authentication errors are terminal until
+            // the contract is deliberately broadened.
+            //
+            // With static credentials the rebuilt operator carries the same
+            // pair, so this is a retry rather than a re-authentication: what
+            // changes is the signing timestamp, which is what a clock-skew or
+            // just-rotated-token rejection needs.
+            //
+            // The key check matches Rust's `credentials.is_some()`: an
+            // anonymous request has no credential to rebuild, so repeating its
+            // 403 would only cost a request.
+            if (response.value().status == 403 && pass + 1 < passes &&
+                !credentials_.access_key_id.empty()) {
+                break;
+            }
+
+            // 5xx is the server asking to be retried. A 4xx is its final
+            // answer and is returned as-is, because the caller distinguishes
+            // 404 from 403 from 416 and repeating it would only stall.
+            if (response.value().status >= 500 && attempt + 1 < attempts) {
+                std::ostringstream o;
+                o << "oss " << method << " returned status " << response.value().status;
+                last_error = o.str();
+                continue;
+            }
+            return response.value();
         }
-        // 5xx is the server asking to be retried. A 4xx is its final answer
-        // and is returned as-is, because the caller distinguishes 404 from
-        // 403 from 416 and repeating it would only stall.
-        if (response.value().status >= 500 && attempt + 1 < attempts) {
-            std::ostringstream o;
-            o << "oss " << method << " returned status " << response.value().status;
-            last_error = o.str();
-            continue;
-        }
-        return response.value();
     }
 
     return core::make_unexpected(last_error.empty()

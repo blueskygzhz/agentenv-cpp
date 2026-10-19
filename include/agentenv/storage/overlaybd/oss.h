@@ -152,6 +152,12 @@ class OssBackend {
     /// timestamp that the server only accepts within a window.
     /// `sink` null accumulates the body into the response; non-null streams
     /// it there instead, so a large ranged read is not held whole.
+    /// Sign one request. Separated from `Send` because a 403 retry re-signs
+    /// the same request: only the timestamp changes.
+    void SignRequest(const S3Credentials& credentials, const ParsedOssUrl& location,
+                     const std::string& method, const uint8_t* body, size_t body_len,
+                     http::Request* request) const;
+
     core::Expected<http::Response, std::string> Send(const ParsedOssUrl& location,
                                                         const std::string& method,
                                                         bool has_range, uint64_t range_begin,
