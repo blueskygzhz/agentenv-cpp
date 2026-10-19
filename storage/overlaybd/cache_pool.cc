@@ -493,6 +493,92 @@ core::Expected<core::Unit, std::string> FileCacheBackend::EvictGlobal() {
     return core::Unit();
 }
 
+bool FileCacheBackend::ContainsSrcName(const std::string& src_name) const {
+    return GetCacheEntry(TransformStoreKey(src_name)) != 0;
+}
+
+bool FileCacheBackend::CachedSizeBySrcName(const std::string& src_name,
+                                              uint64_t* out) const {
+    const std::shared_ptr<CacheEntry> entry = GetCacheEntry(TransformStoreKey(src_name));
+    if (!entry) return false;
+    if (out) *out = entry->SourceSize();
+    return true;
+}
+
+core::Expected<core::Unit, std::string> FileCacheBackend::RenameSrcName(
+    const std::string& old_src, const std::string& new_src) {
+    const std::string old_id = TransformStoreKey(old_src);
+    const std::string new_id = TransformStoreKey(new_src);
+    // Not an error: the caller asked for a state that already holds.
+    if (old_id == new_id) return core::Unit();
+
+    // Whatever occupies the destination is dropped first. Rust calls
+    // `force_recycle` here; the entry about to move in owns that directory,
+    // so a survivor would be silently overwritten by the rename below.
+    EvictEntry(new_id, true);
+
+    const std::shared_ptr<CacheEntry> old_entry = GetCacheEntry(old_id);
+    if (!old_entry) {
+        return core::make_unexpected("cache entry not found for key " + old_src);
+    }
+    // Refused rather than deferred. Live handles hold a mapping over the data
+    // file at the old path; moving it out from under them would leave them
+    // writing into a directory that no longer names the entry.
+    if (old_entry->OpenCount() > 0) {
+        return core::make_unexpected(std::string("cache entry is busy (open_count > 0)"));
+    }
+
+    const uint64_t source_size = old_entry->SourceSize();
+    const CacheEntryPaths new_paths = CacheEntryPaths::New(options_.cache_dir, new_id);
+    const std::string old_dir = old_entry->Paths().dir;
+
+    struct stat st;
+    if (::stat(old_dir.c_str(), &st) == 0) {
+        // Cleared first: `rename` onto a non-empty directory fails, and the
+        // eviction above only removed the entry from the map.
+        RemoveTree(new_paths.dir);
+        const std::string::size_type slash = new_paths.dir.rfind('/');
+        if (slash != std::string::npos && slash > 0) {
+            MakeDirs(new_paths.dir.substr(0, slash));
+        }
+        if (::rename(old_dir.c_str(), new_paths.dir.c_str()) != 0) {
+            std::ostringstream o;
+            o << "rename cache dir " << old_dir << " -> " << new_paths.dir << " failed: "
+              << ::strerror(errno);
+            return core::make_unexpected(o.str());
+        }
+    } else if (!MakeDirs(new_paths.dir)) {
+        // The old entry had no directory on disk -- it held nothing cached --
+        // so the destination is simply created empty.
+        return core::make_unexpected("create cache dir " + new_paths.dir + " failed");
+    }
+
+    // The accounting is undone before the old entry goes: its bytes are about
+    // to be re-counted under the new entry, and leaving both would
+    // double-count them against the budget.
+    current_bytes_ -= old_entry->TotalCachedBytes();
+    entries_.erase(old_id);
+
+    CacheEntryOptions entry_options;
+    entry_options.block_size = options_.block_size;
+    const core::Expected<std::shared_ptr<CacheEntry>, std::string> created =
+        CacheEntry::Create(new_id, new_src, source_size, entry_options, new_paths);
+    if (!created.ok()) return core::make_unexpected(created.error());
+
+    created.value()->AdoptFrom(*old_entry);
+    current_bytes_ += created.value()->TotalCachedBytes();
+
+    // Persisted now rather than left to the periodic checkpoint: the bitmap
+    // only exists under the new id in memory, and a crash before the next
+    // checkpoint would lose every cached block the rename just preserved.
+    const core::Expected<core::Unit, std::string> checkpointed =
+        created.value()->Checkpoint();
+    if (!checkpointed.ok()) return core::make_unexpected(checkpointed.error());
+
+    entries_[new_id] = created.value();
+    return core::Unit();
+}
+
 void FileCacheBackend::CheckpointDirtyEntries() {
     for (std::map<std::string, std::shared_ptr<CacheEntry> >::iterator it = entries_.begin();
          it != entries_.end(); ++it) {
@@ -865,10 +951,21 @@ core::Expected<std::shared_ptr<CachedFile>, std::string> FileCacheBackend::OpenF
     uint32_t open_flags) {
     const std::string cache_id = TransformStoreKey(src_name);
 
-    uint64_t size = source_size;
+    // Three sources of truth, in Rust's order: the existing entry, then an
+    // explicit size, then the source itself.
+    //
+    // The existing entry comes first because probing the source is not free
+    // -- for a remote backend it is a request, and `LazySourceFile` would
+    // have to open it. Rust is explicit that this ordering exists to keep
+    // lazy opens lazy on a cache hit: the entry's mapping is already set up,
+    // so nothing needs the source's size.
+    uint64_t size = 0;
+    if (!CachedSizeBySrcName(src_name, &size)) {
+        size = source_size;
+    }
     if (size == 0) {
-        // The entry's mapping is sized once at creation and cannot grow, so
-        // the size has to be known before the entry exists.
+        // Only now. The entry's mapping is sized once at creation and cannot
+        // grow, so the size has to be known before the entry can be created.
         if (!source) {
             return core::make_unexpected(
                 std::string("open cached file requires a source or an explicit size"));

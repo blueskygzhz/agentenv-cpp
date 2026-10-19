@@ -150,6 +150,20 @@ SysResult<core::Unit>::type FSetXattr(int fd, const std::string& name,
                                        const uint8_t* value, size_t len, int flags);
 SysResult<core::Unit>::type FRemoveXattr(int fd, const std::string& name);
 
+/// Rust `getxattr` / `listxattr` / `setxattr` / `removexattr` — the
+/// path-addressed variants.
+///
+/// Kept alongside the descriptor-based ones rather than emulated by opening
+/// the path: a caller may hold no permission to open the file while still
+/// being allowed to read its attributes, and opening would also follow a
+/// symlink that these do not.
+SysResult<std::vector<uint8_t> >::type GetXattr(const std::string& path,
+                                                  const std::string& name);
+SysResult<std::vector<std::string> >::type ListXattr(const std::string& path);
+SysResult<core::Unit>::type SetXattr(const std::string& path, const std::string& name,
+                                       const uint8_t* value, size_t len, int flags);
+SysResult<core::Unit>::type RemoveXattr(const std::string& path, const std::string& name);
+
 /// Rust `parse_nul_list` — split the NUL-separated name list from `flistxattr`.
 ///
 /// Exposed for testing; see the implementation for why an invalid name is an

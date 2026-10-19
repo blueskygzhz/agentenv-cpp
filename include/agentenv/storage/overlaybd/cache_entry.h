@@ -228,6 +228,20 @@ class CacheEntry {
     uint64_t LastAccess() const { return last_access_nanos_; }
     void StatsSnapshot(uint64_t* hits, uint64_t* misses, uint64_t* refills) const;
 
+    /// Rust `rename_store_key`'s transfer block — take over another entry's
+    /// bitmap and counters.
+    ///
+    /// A move, not a copy: `other`'s bitmap is emptied, matching Rust's
+    /// `std::mem::take`. The caller has already renamed the directory on
+    /// disk, so leaving both entries claiming the same blocks would mean two
+    /// owners of one data file.
+    ///
+    /// Only valid while `other` is closed. Rust checks `open_count == 0`
+    /// before reaching here and notes that block reservation state is
+    /// therefore irrelevant -- no refill can be in flight to land in the
+    /// entry being abandoned.
+    void AdoptFrom(CacheEntry& other);
+
     /// Open-file reference count, maintained by the pool.
     size_t OpenCount() const { return open_count_; }
     void IncOpenCount() { ++open_count_; }

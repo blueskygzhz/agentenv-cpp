@@ -417,6 +417,25 @@ uint64_t CacheEntry::TotalCachedBytes() const {
     return full_blocks_bytes + last_block_bytes;
 }
 
+void CacheEntry::AdoptFrom(CacheEntry& other) {
+    // Moved, so only one entry claims the blocks. The directory has already
+    // been renamed underneath us; two entries pointing at it would each
+    // believe they own the data file.
+    index_ = other.index_;
+    other.index_.Clear();
+
+    // Carried over verbatim rather than restarted. These drive LRU order and
+    // the hit-rate report, and a rename is not a new file -- resetting them
+    // would make a renamed entry look cold and get evicted first.
+    hits_ = other.hits_;
+    misses_ = other.misses_;
+    refills_ = other.refills_;
+    last_access_nanos_ = other.last_access_nanos_;
+
+    // The bitmap just changed and has not been persisted under the new id.
+    dirty_ = true;
+}
+
 core::Expected<core::Unit, std::string> CacheEntry::Checkpoint() {
     CacheMetaDisk meta;
     meta.header.source_size = source_size_;

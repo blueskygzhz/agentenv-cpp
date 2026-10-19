@@ -363,6 +363,21 @@ struct ListProbe {
     }
 };
 
+struct PathGetProbe {
+    const char* path;
+    const char* name;
+    ssize_t operator()(uint8_t* dst, size_t len) const {
+        return ::getxattr(path, name, dst, len);
+    }
+};
+
+struct PathListProbe {
+    const char* path;
+    ssize_t operator()(uint8_t* dst, size_t len) const {
+        return ::listxattr(path, reinterpret_cast<char*>(dst), len);
+    }
+};
+
 /// Rejects an interior NUL before it reaches the syscall, which would
 /// otherwise silently address the truncated name.
 bool NameIsClean(const std::string& name) {
@@ -411,6 +426,51 @@ core::Expected<core::Unit, SysError> FRemoveXattr(int fd, const std::string& nam
     return core::make_unexpected(SysError::Last());
 }
 
+
+core::Expected<std::vector<uint8_t>, SysError> GetXattr(const std::string& path,
+                                                          const std::string& name) {
+    if (!NameIsClean(name) || !NameIsClean(path)) {
+        return core::make_unexpected(SysError::FromErrno(EINVAL));
+    }
+    PathGetProbe p;
+    p.path = path.c_str();
+    p.name = name.c_str();
+    return ReadSizedImpl(p);
+}
+
+core::Expected<std::vector<std::string>, SysError> ListXattr(const std::string& path) {
+    if (!NameIsClean(path)) {
+        return core::make_unexpected(SysError::FromErrno(EINVAL));
+    }
+    PathListProbe p;
+    p.path = path.c_str();
+    const core::Expected<std::vector<uint8_t>, SysError> raw = ReadSizedImpl(p);
+    if (!raw.ok()) return core::make_unexpected(raw.error());
+    if (raw.value().empty()) return std::vector<std::string>();
+    return ParseNulList(&raw.value()[0], raw.value().size());
+}
+
+core::Expected<core::Unit, SysError> SetXattr(const std::string& path,
+                                                const std::string& name,
+                                                const uint8_t* value, size_t len,
+                                                int flags) {
+    if (!NameIsClean(name) || !NameIsClean(path)) {
+        return core::make_unexpected(SysError::FromErrno(EINVAL));
+    }
+    // A null value with a zero length is a legitimate way to set an empty
+    // attribute, so it is passed through rather than rejected.
+    if (::setxattr(path.c_str(), name.c_str(), value, len, flags) == 0) return core::Unit();
+    return core::make_unexpected(SysError::Last());
+}
+
+core::Expected<core::Unit, SysError> RemoveXattr(const std::string& path,
+                                                   const std::string& name) {
+    if (!NameIsClean(name) || !NameIsClean(path)) {
+        return core::make_unexpected(SysError::FromErrno(EINVAL));
+    }
+    if (::removexattr(path.c_str(), name.c_str()) == 0) return core::Unit();
+    return core::make_unexpected(SysError::Last());
+}
 
 namespace {
 

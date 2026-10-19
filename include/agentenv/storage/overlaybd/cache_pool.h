@@ -236,6 +236,36 @@ class FileCacheBackend {
     core::Expected<core::Unit, std::string> EvictSrcName(const std::string& src_name);
     core::Expected<core::Unit, std::string> EvictGlobal();
 
+    /// Rust `contains_src_name` — whether an entry exists for this source.
+    ///
+    /// Presence of the *entry*, not of any particular block: an entry with an
+    /// empty bitmap still counts, because it names a source the cache knows
+    /// about.
+    bool ContainsSrcName(const std::string& src_name) const;
+
+    /// Rust `cached_size_by_src_name` — the recorded source size.
+    ///
+    /// The size the entry was created with, not how much is cached. That is
+    /// what a cache-only open needs: the entry's mapping is sized once and
+    /// cannot grow, so reopening it has to re-assert the same value.
+    ///
+    /// Reports absence rather than zero, mirroring Rust's `Option<u64>`: a
+    /// missing entry and a zero-sized one are different situations, and the
+    /// latter cannot occur because creation refuses it.
+    bool CachedSizeBySrcName(const std::string& src_name, uint64_t* out) const;
+
+    /// Rust `rename_src_name` — move an entry to a new source name.
+    ///
+    /// The cached blocks move with it: the directory is renamed on disk and
+    /// the bitmap and counters are adopted by the new entry, so a rename does
+    /// not throw away a warm cache.
+    ///
+    /// Refused while the entry is open. Its data file is mapped by live
+    /// handles, and renaming underneath them would leave those handles
+    /// writing into a path that no longer names the entry.
+    core::Expected<core::Unit, std::string> RenameSrcName(const std::string& old_src,
+                                                             const std::string& new_src);
+
     /// Rust `checkpoint_dirty_entries` — persist entries whose bitmap moved.
     ///
     /// Rust runs this from a periodic worker; here it is the caller's to
