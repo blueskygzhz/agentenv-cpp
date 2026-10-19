@@ -17,6 +17,14 @@ namespace agentenv {
 namespace storage {
 namespace overlaybd {
 
+/// Rust `DEFAULT_TIMEOUT` / `DEFAULT_RETRY_COUNT`.
+///
+/// Substituted when the config says zero. Rust treats zero as "unset" rather
+/// than literal, and it has to: a zero timeout means "no limit" to the
+/// transport, and zero attempts would make every transient failure fatal.
+const uint64_t kOssDefaultTimeoutSecs = 30;
+const uint32_t kOssDefaultRetryCount = 3;
+
 /// Rust `AddressingStyle`.
 enum AddressingStyle {
     /// `https://<bucket>.<endpoint-host>/<key>`.
@@ -142,11 +150,14 @@ class OssBackend {
     /// final answer, and repeating it would turn a wrong key into a long
     /// stall. Each attempt is re-signed, because the signature covers a
     /// timestamp that the server only accepts within a window.
+    /// `sink` null accumulates the body into the response; non-null streams
+    /// it there instead, so a large ranged read is not held whole.
     core::Expected<http::Response, std::string> Send(const ParsedOssUrl& location,
                                                         const std::string& method,
                                                         bool has_range, uint64_t range_begin,
                                                         uint64_t range_end,
-                                                        const uint8_t* body, size_t body_len);
+                                                        const uint8_t* body, size_t body_len,
+                                                        http::BodySink* sink);
 
     OssConfig config_;
     S3Credentials credentials_;

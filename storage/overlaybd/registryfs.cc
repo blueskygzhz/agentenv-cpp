@@ -1069,7 +1069,8 @@ core::Expected<RegistryFs::UrlInfo, std::string> RegistryFs::GetOrCreateUrlInfo(
 core::Expected<http::Response, std::string> RegistryFs::FetchRange(const std::string& url,
                                                                       uint64_t offset,
                                                                       size_t count,
-                                                                      long timeout_secs) {
+                                                                      long timeout_secs,
+                                                                      http::BodySink* sink) {
     const core::Expected<UrlInfo, std::string> info = GetOrCreateUrlInfo(url);
     if (!info.ok()) return core::make_unexpected(info.error());
 
@@ -1102,6 +1103,9 @@ core::Expected<http::Response, std::string> RegistryFs::FetchRange(const std::st
     if (!options_.user_agent.empty()) request.headers["User-Agent"] = options_.user_agent;
     if (!auth_header.empty()) request.headers["Authorization"] = auth_header;
     ApplyClientCert(&request);
+    // Streamed into the caller's buffer when one was given, so a large range
+    // does not cost a second copy of itself.
+    request.body_sink = sink;
 
     const core::Expected<http::Response, std::string> response = http::Perform(request);
     if (!response.ok()) {
@@ -1135,7 +1139,7 @@ core::Expected<ByteBuffer, std::string> RegistryFs::ReadRange(const std::string&
         if (!remaining.ok()) return core::make_unexpected(remaining.error());
 
         const core::Expected<http::Response, std::string> response =
-            FetchRange(url, offset, count, remaining.value());
+            FetchRange(url, offset, count, remaining.value(), 0);
         if (response.ok()) {
             // Returned as received. Rust hands back `resp.bytes()` whole and
             // does not slice a 200 that ignored the range: a registry that
@@ -1162,22 +1166,25 @@ core::Expected<size_t, std::string> RegistryFs::ReadRangeInto(const std::string&
         const core::Expected<long, std::string> remaining = RemainingTimeoutSecs(deadline_ms);
         if (!remaining.ok()) return core::make_unexpected(remaining.error());
 
+        // Written chunk by chunk straight into `dst`, as Rust's
+        // `while let Some(chunk) = resp.chunk()` loop does. The body is never
+        // held whole, so a multi-megabyte range costs one chunk rather than
+        // twice the window.
+        http::BufferSink sink(dst, len);
         const core::Expected<http::Response, std::string> response =
-            FetchRange(url, offset, len, remaining.value());
+            FetchRange(url, offset, len, remaining.value(), &sink);
+
         if (response.ok()) {
-            const ByteBuffer& body = response.value().body;
-            // Refused, not truncated. Rust bails with "range response larger
-            // than requested" while streaming, because more bytes than asked
-            // for means the server ignored the range -- so the surplus is not
-            // the tail of the window, it is a different region, and keeping
-            // the first `len` bytes would hand back the wrong data.
-            if (body.size() > len) {
+            // Rust bails with this exact condition while streaming: a surplus
+            // means the server ignored the range, so what arrived is not the
+            // window that was asked for. The sink already stopped the
+            // transfer, so nothing beyond `len` was even downloaded.
+            if (sink.overflow()) {
                 std::ostringstream o;
                 o << "range response larger than requested for " << url << " at " << offset;
                 return core::make_unexpected(o.str());
             }
-            if (!body.empty()) std::memcpy(dst, &body[0], body.size());
-            return body.size();
+            return sink.filled();
         }
         last_error = response.error();
         if (attempt != options_.retry_count) SleepRetryBackoff();
@@ -1209,7 +1216,7 @@ core::Expected<uint64_t, std::string> RegistryFs::GetLength(const std::string& u
         // A one-byte range: the size arrives in `Content-Range` without
         // transferring the blob.
         const core::Expected<http::Response, std::string> response =
-            FetchRange(url, 0, 1, remaining.value());
+            FetchRange(url, 0, 1, remaining.value(), 0);
         if (!response.ok()) {
             last_error = response.error();
             if (attempt == options_.retry_count) break;

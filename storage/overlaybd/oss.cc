@@ -225,22 +225,62 @@ core::Expected<std::shared_ptr<OssBackend>, std::string> OssBackend::New(
         ParseAddressingStyle(config.default_addressing_style);
     if (!style.ok()) return core::make_unexpected(style.error());
 
-    std::shared_ptr<OssBackend> backend(new OssBackend());
-    backend->config_ = config;
-    backend->addressing_override_ = style.value();
-    backend->credentials_.access_key_id = config.access_key_id;
-    backend->credentials_.secret_access_key = config.secret_access_key;
-    backend->credentials_.security_token = config.security_token;
+    // Rust `normalized_credential`: trimmed, and blank counts as absent. A
+    // field of spaces is a config that forgot to fill it in, not a credential
+    // whose value is whitespace.
+    const std::string access_key_id = Trim(config.access_key_id);
+    const std::string secret_access_key = Trim(config.secret_access_key);
+    const std::string security_token = Trim(config.security_token);
+    const std::string credential_process = Trim(config.credential_process);
 
-    // `credential_process` is not run here. Rust shells out to it to obtain
-    // keys; doing that from this layer would make a read spawn a process,
-    // so a config relying on it is refused rather than silently falling back
-    // to anonymous access, which would fail later as a confusing 403.
-    if (!Trim(config.credential_process).empty()) {
+    // Rust `credential_source_from_fields`, in the same order. Each of these
+    // is a config that cannot mean one thing, so it is refused at
+    // construction rather than producing a 403 on the first read.
+    if (!credential_process.empty()) {
+        if (!access_key_id.empty() || !secret_access_key.empty() ||
+            !security_token.empty()) {
+            return core::make_unexpected(
+                std::string("oss credential_process cannot be combined with access_key_id, "
+                            "secret_access_key, or security_token"));
+        }
+        // Not run here. Rust shells out to it to obtain keys; doing that from
+        // this layer would make a read spawn a process, so a config relying
+        // on it is refused rather than silently degrading to anonymous.
         return core::make_unexpected(
             std::string("ossConfig.credentialProcess is not supported by this "
                         "implementation; supply accessKeyId/secretAccessKey"));
     }
+
+    if (access_key_id.empty() && secret_access_key.empty()) {
+        // A token alone cannot be signed with: it is an addition to a key
+        // pair, not a replacement for one.
+        if (!security_token.empty()) {
+            return core::make_unexpected(
+                std::string("oss security_token requires access_key_id and "
+                            "secret_access_key"));
+        }
+        // Anonymous is allowed for OSS (`allow_anonymous: true`): a public
+        // bucket needs no credentials.
+    } else if (access_key_id.empty() || secret_access_key.empty()) {
+        return core::make_unexpected(
+            std::string("oss access_key_id and secret_access_key must be set together"));
+    }
+
+    std::shared_ptr<OssBackend> backend(new OssBackend());
+    backend->config_ = config;
+    // Rust falls back when either is zero. Zero is "unset", not a literal
+    // instruction: libcurl reads a zero timeout as "no limit", and zero
+    // attempts would make every transient failure fatal.
+    if (backend->config_.timeout_secs == 0) {
+        backend->config_.timeout_secs = kOssDefaultTimeoutSecs;
+    }
+    if (backend->config_.retry_count == 0) {
+        backend->config_.retry_count = kOssDefaultRetryCount;
+    }
+    backend->addressing_override_ = style.value();
+    backend->credentials_.access_key_id = access_key_id;
+    backend->credentials_.secret_access_key = secret_access_key;
+    backend->credentials_.security_token = security_token;
     return backend;
 }
 
@@ -252,7 +292,8 @@ core::Expected<ParsedOssUrl, std::string> OssBackend::ParseUrl(
 
 core::Expected<http::Response, std::string> OssBackend::Send(
     const ParsedOssUrl& location, const std::string& method, bool has_range,
-    uint64_t range_begin, uint64_t range_end, const uint8_t* body, size_t body_len) {
+    uint64_t range_begin, uint64_t range_end, const uint8_t* body, size_t body_len,
+    http::BodySink* sink) {
     const uint32_t attempts = config_.retry_count + 1;
     std::string last_error;
 
@@ -267,6 +308,10 @@ core::Expected<http::Response, std::string> OssBackend::Send(
         if (body != 0 && body_len > 0) {
             request.body.assign(body, body + body_len);
         }
+        // Only meaningful for a 2xx; `Perform` routes an error body to
+        // `Response.body` regardless, so the status check above still sees
+        // the message.
+        request.body_sink = sink;
 
         S3SigningContext ctx;
         ctx.method = method;
@@ -329,7 +374,7 @@ core::Expected<core::Optional<uint64_t>, std::string> OssBackend::ObjectSize(
     if (!location.ok()) return core::make_unexpected(location.error());
 
     const core::Expected<http::Response, std::string> response =
-        Send(location.value(), "HEAD", false, 0, 0, 0, 0);
+        Send(location.value(), "HEAD", false, 0, 0, 0, 0, 0);
     if (!response.ok()) return core::make_unexpected(response.error());
 
     // Absent, not an error: callers probe for an object they may still need
@@ -356,7 +401,7 @@ core::Expected<core::Unit, std::string> OssBackend::UploadBytes(const std::strin
     if (!location.ok()) return core::make_unexpected(location.error());
 
     const core::Expected<http::Response, std::string> response =
-        Send(location.value(), "PUT", false, 0, 0, data, len);
+        Send(location.value(), "PUT", false, 0, 0, data, len, 0);
     if (!response.ok()) return core::make_unexpected(response.error());
     if (!response.value().IsSuccess()) {
         std::ostringstream o;
@@ -375,7 +420,7 @@ core::Expected<uint64_t, std::string> OssFile::Size() {
     if (size_known_) return size_;
 
     const core::Expected<http::Response, std::string> response =
-        backend_->Send(location_, "HEAD", false, 0, 0, 0, 0);
+        backend_->Send(location_, "HEAD", false, 0, 0, 0, 0, 0);
     if (!response.ok()) return core::make_unexpected(response.error());
     if (!response.value().IsSuccess()) {
         std::ostringstream o;
@@ -411,7 +456,7 @@ core::Expected<ByteBuffer, std::string> OssFile::ReadAt(uint64_t offset, size_t 
     const uint64_t end = offset + want - 1;
 
     const core::Expected<http::Response, std::string> response =
-        backend_->Send(location_, "GET", true, offset, end, 0, 0);
+        backend_->Send(location_, "GET", true, offset, end, 0, 0, 0);
     if (!response.ok()) return core::make_unexpected(response.error());
     if (!response.value().IsSuccess()) {
         std::ostringstream o;
@@ -420,26 +465,47 @@ core::Expected<ByteBuffer, std::string> OssFile::ReadAt(uint64_t offset, size_t 
         return core::make_unexpected(o.str());
     }
 
-    out = response.value().body;
-    // A server that ignores `Range` answers 200 with the whole object; the
-    // requested window is taken out of it rather than returning everything.
-    if (response.value().status == 200 && out.size() > want) {
-        ByteBuffer sliced(out.begin() + static_cast<size_t>(offset),
-                          out.begin() + static_cast<size_t>(offset + want));
-        return sliced;
-    }
-    if (out.size() > want) out.resize(static_cast<size_t>(want));
-    return out;
+    // Returned as received. Rust hands back `data.to_bytes()` and does not
+    // re-window a 200 that ignored the range: such a server is
+    // non-conforming, and silently slicing its answer here would differ from
+    // the Rust reader against the same store.
+    return response.value().body;
 }
 
 core::Expected<size_t, std::string> OssFile::ReadAtInto(uint64_t offset, uint8_t* dst,
                                                            size_t len) {
     if (len == 0) return static_cast<size_t>(0);
-    const core::Expected<ByteBuffer, std::string> data = ReadAt(offset, len);
-    if (!data.ok()) return core::make_unexpected(data.error());
-    const size_t n = data.value().size() < len ? data.value().size() : len;
-    if (n > 0) std::memcpy(dst, &data.value()[0], n);
-    return n;
+
+    const core::Expected<uint64_t, std::string> size = Size();
+    if (!size.ok()) return core::make_unexpected(size.error());
+    if (offset >= size.value()) return static_cast<size_t>(0);
+
+    // Clamped to the object, as Rust's `min(offset + len, size)` does.
+    const uint64_t remain = size.value() - offset;
+    const size_t want = static_cast<size_t>(remain < len ? remain : len);
+    const uint64_t end = offset + static_cast<uint64_t>(want) - 1;
+
+    // Streamed into the caller's buffer rather than built up first: a
+    // multi-megabyte range otherwise costs two copies of itself.
+    http::BufferSink sink(dst, want);
+    const core::Expected<http::Response, std::string> response =
+        backend_->Send(location_, "GET", true, offset, end, 0, 0, &sink);
+    if (!response.ok()) return core::make_unexpected(response.error());
+    if (!response.value().IsSuccess()) {
+        std::ostringstream o;
+        o << "read range " << offset << ".." << (end + 1) << " from oss object '"
+          << location_.key << "' returned status " << response.value().status;
+        return core::make_unexpected(o.str());
+    }
+    // A surplus means the store ignored the range, so what arrived is not the
+    // window asked for; the sink already cut the transfer off.
+    if (sink.overflow()) {
+        std::ostringstream o;
+        o << "range response larger than requested for oss object '" << location_.key
+          << "' at " << offset;
+        return core::make_unexpected(o.str());
+    }
+    return sink.filled();
 }
 
 core::Expected<size_t, std::string> OssFile::WriteAt(uint64_t, const uint8_t*, size_t) {

@@ -277,17 +277,20 @@ class RegistryFs {
 
     /// One ranged GET against the resolved URL, with the accelerator applied
     /// when configured.
+    /// `sink` null accumulates the body into the response; non-null streams
+    /// it there instead.
     core::Expected<http::Response, std::string> FetchRange(const std::string& url,
                                                               uint64_t offset, size_t count,
-                                                              long timeout_secs);
+                                                              long timeout_secs,
+                                                              http::BodySink* sink);
 
     core::Expected<ByteBuffer, std::string> ReadRange(const std::string& url, uint64_t offset,
                                                          size_t count);
-    /// Rust `read_range_into` — fill a caller-owned buffer.
+    /// Rust `read_range_into` — stream into a caller-owned buffer.
     ///
-    /// Separate from `ReadRange` because Rust streams this one chunk by chunk
-    /// into `dst` and refuses an over-long response outright, instead of
-    /// materialising a buffer it would then have to copy.
+    /// Separate from `ReadRange` because Rust consumes `resp.chunk()` into
+    /// `dst` rather than materialising the body first, and refuses an
+    /// over-long response outright instead of truncating it.
     core::Expected<size_t, std::string> ReadRangeInto(const std::string& url, uint64_t offset,
                                                          uint8_t* dst, size_t len);
     core::Expected<uint64_t, std::string> GetLength(const std::string& url);

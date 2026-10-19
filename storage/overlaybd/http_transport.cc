@@ -60,26 +60,77 @@ std::string Trim(const std::string& s) {
 
 #ifdef AGENTENV_WITH_CURL
 
+/// Routes each chunk either to the caller's sink or to `Response.body`.
+///
+/// The decision is per chunk rather than made up front because the status is
+/// not known until the headers are in: an error body has to land in
+/// `Response.body` so the caller can read the message, even when a sink was
+/// supplied for the payload.
+struct BodyTarget {
+    std::vector<uint8_t>* buffer;
+    BodySink* sink;
+    const long* status;
+    /// Set when the sink refused a chunk, so `Perform` can tell an aborted
+    /// transfer apart from a network failure.
+    bool sink_refused;
+};
+
 size_t WriteBody(char* ptr, size_t size, size_t nmemb, void* userdata) {
-    std::vector<uint8_t>* out = static_cast<std::vector<uint8_t>*>(userdata);
+    BodyTarget* target = static_cast<BodyTarget*>(userdata);
     const size_t total = size * nmemb;
-    out->insert(out->end(), reinterpret_cast<uint8_t*>(ptr),
-                reinterpret_cast<uint8_t*>(ptr) + total);
+    const uint8_t* bytes = reinterpret_cast<uint8_t*>(ptr);
+
+    const bool to_sink = target->sink != 0 && *target->status >= 200 && *target->status < 300;
+    if (to_sink) {
+        if (!target->sink->Write(bytes, total)) {
+            target->sink_refused = true;
+            // Returning anything but `total` makes libcurl abort with
+            // CURLE_WRITE_ERROR, which is the documented way to stop a
+            // transfer early -- so an over-long response is cut off instead
+            // of being downloaded in full and then rejected.
+            return 0;
+        }
+        return total;
+    }
+
+    target->buffer->insert(target->buffer->end(), bytes, bytes + total);
     return total;
 }
 
+struct HeaderTarget {
+    HeaderMap* headers;
+    /// Updated as soon as the status line arrives, because the body callback
+    /// has to know whether this is a 2xx before the first chunk -- and
+    /// `CURLINFO_RESPONSE_CODE` is only readable after the transfer.
+    long* status;
+};
+
 size_t WriteHeader(char* ptr, size_t size, size_t nmemb, void* userdata) {
-    HeaderMap* out = static_cast<HeaderMap*>(userdata);
+    HeaderTarget* target = static_cast<HeaderTarget*>(userdata);
     const size_t total = size * nmemb;
     const std::string line(ptr, total);
+
     const std::string::size_type colon = line.find(':');
-    // The status line and the blank terminator have no colon; skipping them
-    // is why this is not an error.
-    if (colon != std::string::npos) {
-        const std::string name = Trim(line.substr(0, colon));
-        const std::string value = Trim(line.substr(colon + 1));
-        if (!name.empty()) (*out)[name] = value;
+    if (colon == std::string::npos) {
+        // No colon: either the status line or the blank terminator. A status
+        // line starts with the version, and a redirect chain produces several
+        // -- the last one wins, which is the status the body belongs to.
+        if (line.compare(0, 5, "HTTP/") == 0) {
+            const std::string::size_type sp = line.find(' ');
+            if (sp != std::string::npos) {
+                *target->status = ::strtol(line.c_str() + sp + 1, 0, 10);
+                // A new response means the previous one's headers do not
+                // apply; keeping them would let a redirect's Content-Length
+                // describe the final body.
+                target->headers->clear();
+            }
+        }
+        return total;
     }
+
+    const std::string name = Trim(line.substr(0, colon));
+    const std::string value = Trim(line.substr(colon + 1));
+    if (!name.empty()) (*target->headers)[name] = value;
     return total;
 }
 
@@ -153,6 +204,20 @@ bool Response::ContentRangeTotal(uint64_t* out) const {
     return true;
 }
 
+bool BufferSink::Write(const uint8_t* data, size_t len) {
+    // Refused, not truncated. More bytes than the window means the server
+    // ignored the range, so the surplus is a different region of the object
+    // rather than the tail of what was asked for -- keeping the first `cap`
+    // bytes would hand back the wrong data.
+    if (filled_ + len > cap_) {
+        overflow_ = true;
+        return false;
+    }
+    if (len > 0) std::memcpy(dst_ + filled_, data, len);
+    filled_ += len;
+    return true;
+}
+
 bool Available() {
 #ifdef AGENTENV_WITH_CURL
     return true;
@@ -204,9 +269,17 @@ core::Expected<Response, std::string> Perform(const Request& request) {
         ::curl_easy_setopt(handle, CURLOPT_SSLKEYTYPE, "PEM");
     }
     ::curl_easy_setopt(handle, CURLOPT_WRITEFUNCTION, WriteBody);
-    ::curl_easy_setopt(handle, CURLOPT_WRITEDATA, &response.body);
+    BodyTarget body_target;
+    body_target.buffer = &response.body;
+    body_target.sink = request.body_sink;
+    body_target.status = &response.status;
+    body_target.sink_refused = false;
+    ::curl_easy_setopt(handle, CURLOPT_WRITEDATA, &body_target);
     ::curl_easy_setopt(handle, CURLOPT_HEADERFUNCTION, WriteHeader);
-    ::curl_easy_setopt(handle, CURLOPT_HEADERDATA, &response.headers);
+    HeaderTarget header_target;
+    header_target.headers = &response.headers;
+    header_target.status = &response.status;
+    ::curl_easy_setopt(handle, CURLOPT_HEADERDATA, &header_target);
 
     if (request.method == "HEAD") {
         ::curl_easy_setopt(handle, CURLOPT_NOBODY, 1L);
@@ -240,11 +313,20 @@ core::Expected<Response, std::string> Perform(const Request& request) {
 
     const CURLcode rc = ::curl_easy_perform(handle);
     if (rc == CURLE_OK) {
+        // Authoritative once the transfer finished; the header callback's
+        // value is only needed mid-flight.
         ::curl_easy_getinfo(handle, CURLINFO_RESPONSE_CODE, &response.status);
     }
+    const bool sink_refused = body_target.sink_refused;
 
     if (headers != 0) ::curl_slist_free_all(headers);
     ::curl_easy_cleanup(handle);
+
+    // Reported as success with its status intact. The abort was this layer's
+    // own decision, so turning it into a transport error would hide the fact
+    // that the server answered -- and the caller already knows why it
+    // refused, from its own sink.
+    if (rc == CURLE_WRITE_ERROR && sink_refused) return response;
 
     if (rc != CURLE_OK) {
         // A transport failure is an error; an HTTP status is not. The callers

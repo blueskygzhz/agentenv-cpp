@@ -34,6 +34,8 @@ typedef std::map<std::string, std::string, CaseInsensitiveLess> HeaderMap;
 struct Response {
     long status;
     HeaderMap headers;
+    /// Empty when the request supplied a `body_sink`: the bytes went there
+    /// instead of being accumulated here.
     std::vector<uint8_t> body;
 
     Response() : status(0) {}
@@ -51,6 +53,45 @@ struct Response {
     /// A ranged response's `Content-Length` is the length of the *range*, so
     /// the full size can only come from the `/total` suffix here.
     bool ContentRangeTotal(uint64_t* out) const;
+};
+
+/// Where a response body goes as it arrives, instead of into `Response.body`.
+///
+/// Rust's readers stream: `read_range_into` consumes `resp.chunk()` in a loop
+/// and writes straight into the caller's buffer, so a 4 MiB range costs one
+/// chunk of memory rather than 4 MiB. Accumulating the whole body first and
+/// copying afterwards would double the peak and differ from Rust on exactly
+/// the reads that matter most.
+class BodySink {
+ public:
+    virtual ~BodySink() {}
+
+    /// One chunk, in order. Return false to abort the transfer — used to
+    /// refuse a response longer than was asked for, rather than discovering
+    /// it after the whole thing arrived.
+    virtual bool Write(const uint8_t* data, size_t len) = 0;
+};
+
+/// A `BodySink` filling a fixed caller-owned buffer.
+///
+/// Refuses a surplus rather than truncating it: more bytes than requested
+/// means the server ignored the range, so the extra is a different region of
+/// the object, not the tail of the window.
+class BufferSink : public BodySink {
+ public:
+    BufferSink(uint8_t* dst, size_t cap) : dst_(dst), cap_(cap), filled_(0), overflow_(false) {}
+
+    bool Write(const uint8_t* data, size_t len);
+
+    size_t filled() const { return filled_; }
+    /// True when the server sent more than `cap`.
+    bool overflow() const { return overflow_; }
+
+ private:
+    uint8_t* dst_;
+    size_t cap_;
+    size_t filled_;
+    bool overflow_;
 };
 
 /// What a request needs beyond its URL.
@@ -84,6 +125,13 @@ struct Request {
     std::string client_cert_file;
     std::string client_key_file;
 
+    /// Where the body goes. Null accumulates it into `Response.body`.
+    ///
+    /// Not owned; it has to outlive the call. Only consulted for a 2xx: an
+    /// error body is small and belongs in `Response.body` where the caller
+    /// can read the message, not in a sink sized for payload.
+    BodySink* body_sink;
+
     Request()
         : method("GET"),
           has_range(false),
@@ -91,7 +139,8 @@ struct Request {
           range_end(0),
           timeout_secs(30),
           connect_timeout_secs(10),
-          follow_redirects(true) {}
+          follow_redirects(true),
+          body_sink(0) {}
 };
 
 /// Perform one request.
