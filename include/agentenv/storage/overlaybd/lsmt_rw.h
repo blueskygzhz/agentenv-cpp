@@ -359,10 +359,39 @@ class LsmtFile : public VirtualFile {
 // Rust: lsmt/file/stack.rs — the open/stack entry points
 // ---------------------------------------------------------------------------
 
-/// Rust `stack.rs :: create_file_rw` — a fresh upper from a layer description.
+/// Rust `types.rs :: LayerInfo` — the description a new upper is created from.
 ///
-/// A thin alias for `CreateWithMetadata`; it exists so callers that already
-/// hold a `LayerInfo`-shaped set of arguments do not have to unpack it.
+/// It exists for its constructor. Rust's `LayerInfo::new` fills `uuid` with a
+/// fresh v4, so every layer created through the normal path has a stable
+/// identity; the expanded `CreateFileRw` below takes the uuid as a plain
+/// argument, which made it possible to pass an empty one and silently produce
+/// a layer with a nil identity. That is not a cosmetic loss: the premerged
+/// index cache keys on layer uuids and refuses to engage when any is nil, and
+/// a parent/child relationship cannot be expressed at all.
+struct LayerInfo {
+    std::shared_ptr<VirtualFile> fdata;
+    /// Absent means the index lives in the data file.
+    std::shared_ptr<VirtualFile> findex;
+    uint64_t virtual_size;
+    std::string parent_uuid;
+    std::string uuid;
+    std::vector<uint8_t> user_tag;
+    RwLayout rw_layout;
+
+    /// Rust `LayerInfo::new` — defaults a fresh v4 uuid, no parent, and the
+    /// log-structured layout.
+    static LayerInfo New(const std::shared_ptr<VirtualFile>& fdata,
+                         const std::shared_ptr<VirtualFile>& findex, uint64_t virtual_size);
+
+ private:
+    LayerInfo() : virtual_size(0), rw_layout(kRwLogStructured) {}
+};
+
+/// Rust `stack.rs :: create_file_rw` — a fresh upper from a layer description.
+core::Expected<std::shared_ptr<LsmtFile>, std::string> CreateFileRw(const LayerInfo& info);
+
+/// The expanded form. Prefer the `LayerInfo` overload: an empty `uuid` here is
+/// stored verbatim, giving the layer a nil identity.
 core::Expected<std::shared_ptr<LsmtFile>, std::string> CreateFileRw(
     std::shared_ptr<VirtualFile> fdata, std::shared_ptr<VirtualFile> findex,
     uint64_t virtual_size, RwLayout layout, const std::string& uuid,

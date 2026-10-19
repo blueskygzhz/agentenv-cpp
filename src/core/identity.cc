@@ -75,6 +75,23 @@ std::string Uuid::ToSimpleString() const {
 }
 
 // UUID v7 per RFC 9562 §5.7. Non-cryptographic randomness suffices for our IDs.
+Uuid Uuid::GenV4() {
+    // Same thread-local stream as GenV7; only the layout differs.
+    thread_local std::mt19937_64 rng{static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count()) ^ 0x9e3779b97f4a7c15ull};
+    const uint64_t hi = rng();
+    const uint64_t lo = rng();
+
+    uint8_t bytes[16] = {};
+    for (int i = 0; i < 8; ++i) bytes[i] = static_cast<uint8_t>((hi >> (8 * (7 - i))) & 0xff);
+    for (int i = 0; i < 8; ++i) bytes[8 + i] = static_cast<uint8_t>((lo >> (8 * (7 - i))) & 0xff);
+    // ver = 4 in the high nibble of bytes[6].
+    bytes[6] = static_cast<uint8_t>(0x40 | (bytes[6] & 0x0f));
+    // var = 10b in the high two bits of bytes[8].
+    bytes[8] = static_cast<uint8_t>(0x80 | (bytes[8] & 0x3f));
+    return Uuid(bytes);
+}
+
 Uuid Uuid::GenV7() {
     using namespace std::chrono;
     // 48-bit unix ms.

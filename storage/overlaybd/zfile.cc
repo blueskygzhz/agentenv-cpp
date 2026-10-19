@@ -177,6 +177,14 @@ uint32_t Crc32c(const uint8_t* data, size_t len) {
     return ~Crc32cRaw(~0u, data, len);
 }
 
+uint32_t Crc32cAppend(uint32_t crc, const uint8_t* data, size_t len) {
+    // Rust: `crc32c_append(crc, data)`. The running state is the complement of
+    // the reported value, which is why the previous result is inverted on the
+    // way in and the new one on the way out -- feeding the reported value
+    // directly would restart the polynomial from the wrong state.
+    return ~Crc32cRaw(~crc, data, len);
+}
+
 uint32_t Crc32cSalt(const uint8_t* data, size_t len) {
     // Rust: `!crc32c_append(!NOI_WELL_KNOWN_PRIME, data)`. The prime seeds the
     // running state directly rather than being hashed as data, matching

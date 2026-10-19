@@ -219,6 +219,13 @@ std::shared_ptr<CacheEntry> FileCacheBackend::GetCacheEntry(
     return found->second;
 }
 
+bool FileCacheBackend::CacheKeyOf(const std::string& cache_id, std::string* out) const {
+    const std::shared_ptr<CacheEntry> entry = GetCacheEntry(cache_id);
+    if (!entry) return false;
+    if (out != 0) *out = entry->Key();
+    return true;
+}
+
 std::string FileCacheBackend::TransformStoreKey(const std::string& src_name) const {
     // A source name is a URL; the cache id has to be one safe path
     // component, so it is hashed rather than escaped.
@@ -1187,6 +1194,276 @@ core::Expected<size_t, std::string> CachedFile::RefillRange(uint64_t offset, siz
         cursor = next;
     }
     return capped;
+}
+
+// ---------------------------------------------------------------------------
+// Rust: cache_store.rs — the background download surface
+// ---------------------------------------------------------------------------
+
+uint64_t CachedFile::BackgroundBlockSize() const { return backend_->options_.block_size; }
+
+core::Expected<core::Unit, std::string> CachedFile::BackgroundSourceSnapshot(
+    std::shared_ptr<VirtualFile>* source, uint64_t* source_size) const {
+    if (!source_) {
+        return core::make_unexpected(
+            std::string("background cache download requires source file"));
+    }
+    if (source != 0) *source = source_;
+    // The recorded size, not a fresh probe: a background download plans
+    // against the size the entry was created with, and the entry's mapping
+    // cannot grow past it anyway.
+    if (source_size != 0) *source_size = source_size_;
+    return core::Unit();
+}
+
+core::Expected<uint64_t, std::string> CachedFile::BackgroundBlockCount(
+    uint64_t source_size) const {
+    const uint64_t block_size = BackgroundBlockSize();
+    if (block_size == 0) {
+        return core::make_unexpected(std::string("cache block size is zero"));
+    }
+    const uint64_t block_count = DivRoundUp(source_size, block_size);
+    // The bitmap indexes blocks with a u32, so a source needing more than
+    // that cannot be tracked at all -- refused here rather than silently
+    // wrapping into another block's bit.
+    if (block_count > static_cast<uint64_t>(0xFFFFFFFFull) + 1) {
+        std::ostringstream o;
+        o << "background cache block count " << block_count << " exceeds bitmap range";
+        return core::make_unexpected(o.str());
+    }
+    return block_count;
+}
+
+core::Expected<std::vector<uint64_t>, std::string> CachedFile::MissingBackgroundBlocks(
+    uint64_t source_size) const {
+    const core::Expected<uint64_t, std::string> block_count =
+        BackgroundBlockCount(source_size);
+    if (!block_count.ok()) return core::make_unexpected(block_count.error());
+
+    const std::shared_ptr<CacheEntry> entry = backend_->GetCacheEntry(cache_id_);
+    if (!entry) {
+        return core::make_unexpected("cache entry evicted: cache_id=" + cache_id_);
+    }
+
+    std::vector<uint64_t> missing;
+    for (uint64_t block_id = 0; block_id < block_count.value(); ++block_id) {
+        if (!entry->HasBlock(block_id)) missing.push_back(block_id);
+    }
+    return missing;
+}
+
+core::Expected<bool, std::string> CachedFile::BackgroundIsComplete(
+    uint64_t source_size) const {
+    const core::Expected<std::vector<uint64_t>, std::string> missing =
+        MissingBackgroundBlocks(source_size);
+    if (!missing.ok()) return core::make_unexpected(missing.error());
+    return missing.value().empty();
+}
+
+core::Expected<std::vector<std::pair<uint64_t, uint32_t> >, std::string>
+CachedFile::ActionableBackgroundChunks(uint64_t source_size,
+                                          uint32_t blocks_per_chunk) const {
+    const uint64_t per_chunk = blocks_per_chunk < 1 ? 1 : blocks_per_chunk;
+    const core::Expected<uint64_t, std::string> block_count =
+        BackgroundBlockCount(source_size);
+    if (!block_count.ok()) return core::make_unexpected(block_count.error());
+
+    const std::shared_ptr<CacheEntry> entry = backend_->GetCacheEntry(cache_id_);
+    if (!entry) {
+        return core::make_unexpected("cache entry evicted: cache_id=" + cache_id_);
+    }
+
+    std::vector<std::pair<uint64_t, uint32_t> > chunks;
+    for (uint64_t start = 0; start < block_count.value(); start += per_chunk) {
+        uint64_t end = start + per_chunk;
+        // The last chunk is short whenever the source is not a chunk
+        // multiple; clamping here is what keeps the read inside the source.
+        if (end > block_count.value()) end = block_count.value();
+
+        bool any_missing = false;
+        for (uint64_t block_id = start; block_id < end; ++block_id) {
+            if (!entry->HasBlock(block_id)) {
+                any_missing = true;
+                break;
+            }
+        }
+        // Complete chunks are skipped, not re-fetched: that is what makes a
+        // resumed download pay only for what it still lacks.
+        if (!any_missing) continue;
+        chunks.push_back(std::make_pair(start, static_cast<uint32_t>(end - start)));
+    }
+    return chunks;
+}
+
+core::Expected<uint64_t, std::string> CachedFile::BackgroundRefillRange(
+    const std::shared_ptr<VirtualFile>& source, uint64_t source_size, uint64_t start_block,
+    uint32_t len_blocks) {
+    if (!source) {
+        return core::make_unexpected(
+            std::string("background cache refill requires source file"));
+    }
+    const uint64_t end_block = start_block + static_cast<uint64_t>(len_blocks);
+    if (end_block < start_block) {
+        return core::make_unexpected(std::string("background cache block range overflow"));
+    }
+    const core::Expected<uint64_t, std::string> block_count =
+        BackgroundBlockCount(source_size);
+    if (!block_count.ok()) return core::make_unexpected(block_count.error());
+    if (end_block > block_count.value()) {
+        return core::make_unexpected(
+            std::string("background cache block range out of bounds"));
+    }
+
+    // Backed off while full rather than evicting to make room. Rust's comment
+    // says why: the caller's retry loop turns this into a bounded ENOSPC wait,
+    // whereas evicting here would have a background download churn the cache
+    // against the foreground reads that put it under pressure.
+    if (backend_->options_.capacity_bytes == 0 || backend_->is_full_) {
+        return core::make_unexpected(std::string("cache is full (ENOSPC)"));
+    }
+
+    const std::shared_ptr<CacheEntry> entry = backend_->GetCacheEntry(cache_id_);
+    if (!entry) {
+        return core::make_unexpected("cache entry evicted: cache_id=" + cache_id_);
+    }
+
+    // Loader election for the whole range *before* any source I/O, then one
+    // read per contiguous run of won blocks. Electing first is what lets the
+    // runs be contiguous: deciding per block would interleave with other
+    // loaders and fragment every read.
+    std::vector<std::vector<uint64_t> > runs;
+    for (uint64_t block_id = start_block; block_id < end_block; ++block_id) {
+        const AcquireRefillResult acquired = entry->AcquireRefill(block_id);
+        if (acquired == kRefillInCache) continue;
+        // Left to whoever holds it. Unlike the foreground path there is no
+        // fallback read to make: a background download that skips a block
+        // simply leaves it to the loader that owns it.
+        if (acquired == kRefillInProgress) continue;
+
+        if (!runs.empty() && runs.back().back() + 1 == block_id) {
+            runs.back().push_back(block_id);
+        } else {
+            runs.push_back(std::vector<uint64_t>(1, block_id));
+        }
+    }
+
+    uint64_t read_bytes = 0;
+    for (size_t r = 0; r < runs.size(); ++r) {
+        const core::Expected<uint64_t, std::string> got =
+            RefillBlockRun(entry.get(), source.get(), source_size, runs[r]);
+        if (!got.ok()) {
+            // The failed run's elections are released so a later attempt can
+            // retry it; runs already written stay published, because their
+            // bytes are in the mapping and the bitmap already says so.
+            for (size_t i = r; i < runs.size(); ++i) {
+                for (size_t b = 0; b < runs[i].size(); ++b) {
+                    entry->FinishRefill(runs[i][b]);
+                }
+            }
+            return core::make_unexpected(got.error());
+        }
+        read_bytes += got.value();
+    }
+    return read_bytes;
+}
+
+core::Expected<uint64_t, std::string> CachedFile::RefillBlockRun(
+    CacheEntry* entry, VirtualFile* source, uint64_t source_size,
+    const std::vector<uint64_t>& run) {
+    if (run.empty()) return static_cast<uint64_t>(0);
+
+    const uint64_t block_size = BackgroundBlockSize();
+    const uint64_t first = run.front();
+    const uint64_t last = run.back();
+    const uint64_t offset = first * block_size;
+    if (offset > source_size) {
+        for (size_t i = 0; i < run.size(); ++i) entry->FinishRefill(run[i]);
+        return static_cast<uint64_t>(0);
+    }
+
+    const uint64_t span = (last - first + 1) * block_size;
+    const uint64_t remain = source_size - offset;
+    const uint64_t read_len = remain < span ? remain : span;
+    if (read_len == 0) {
+        for (size_t i = 0; i < run.size(); ++i) entry->FinishRefill(run[i]);
+        return static_cast<uint64_t>(0);
+    }
+
+    // One source request for the whole run, into scratch. This is the point
+    // of running in the background: a single large read instead of one per
+    // block, which is also why the bytes cannot go straight into the mapping
+    // (they span several blocks' mappings).
+    std::vector<uint8_t> scratch(static_cast<size_t>(read_len), 0);
+    size_t done = 0;
+    while (done < scratch.size()) {
+        const core::Expected<size_t, std::string> n =
+            source->ReadAtInto(offset + done, &scratch[done], scratch.size() - done);
+        if (!n.ok()) {
+            for (size_t i = 0; i < run.size(); ++i) entry->FinishRefill(run[i]);
+            return core::make_unexpected(n.error());
+        }
+        if (n.value() == 0) break;
+        done += n.value();
+    }
+    if (static_cast<uint64_t>(done) != read_len) {
+        for (size_t i = 0; i < run.size(); ++i) entry->FinishRefill(run[i]);
+        std::ostringstream o;
+        o << "short background chunk read at offset " << offset << ": got " << done
+          << ", want " << read_len;
+        return core::make_unexpected(o.str());
+    }
+
+    // The whole run is reserved before any block is published: the copies
+    // below write through the mapping, and an allocation failure at that
+    // point would fault rather than return. Reserving first means a failure
+    // happens here, before the batched accounting below.
+    const core::Expected<RangeAllocation, std::string> allocated =
+        entry->EnsureRangeAllocated(offset, read_len);
+    if (!allocated.ok()) {
+        for (size_t i = 0; i < run.size(); ++i) entry->FinishRefill(run[i]);
+        return core::make_unexpected(allocated.error());
+    }
+
+    uint64_t committed = 0;
+    for (size_t i = 0; i < run.size(); ++i) {
+        const uint64_t block_id = run[i];
+        const uint64_t block_off = block_id * block_size;
+        const uint64_t block_remain =
+            block_off >= source_size ? 0 : source_size - block_off;
+        const size_t want =
+            static_cast<size_t>(block_remain < block_size ? block_remain : block_size);
+        if (want == 0) {
+            entry->FinishRefill(block_id);
+            continue;
+        }
+
+        uint8_t* dst = 0;
+        size_t dst_len = 0;
+        bool available = false;
+        const core::Expected<core::Unit, std::string> mapped =
+            entry->MmapMutForBlock(block_id, source_size, &dst, &dst_len, &available);
+        if (!mapped.ok() || !available) {
+            entry->FinishRefill(block_id);
+            if (!mapped.ok()) return core::make_unexpected(mapped.error());
+            return core::make_unexpected(
+                std::string("background cache block offset beyond source size"));
+        }
+
+        const size_t copy_len = dst_len < want ? dst_len : want;
+        const size_t src_off = static_cast<size_t>(block_off - offset);
+        std::memcpy(dst, &scratch[src_off], copy_len);
+        entry->MarkBlockCached(block_id);
+        entry->RecordRefill();
+        committed += copy_len;
+        // Released right after publication, not at the end of the run: the
+        // block is readable now, and holding the election would block a
+        // foreground reader that wants it.
+        entry->FinishRefill(block_id);
+    }
+
+    // One accounting update per run rather than per block, matching Rust.
+    if (committed > 0) backend_->current_bytes_ += committed;
+    return committed;
 }
 
 core::Expected<uint64_t, std::string> CachedFile::Query(uint64_t offset, size_t count) {

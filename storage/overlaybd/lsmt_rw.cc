@@ -1482,6 +1482,24 @@ core::Expected<std::shared_ptr<LsmtFile>, std::string> CreateFileRw(
                                         parent_uuid, user_tag, user_tag_len);
 }
 
+LayerInfo LayerInfo::New(const std::shared_ptr<VirtualFile>& fdata,
+                         const std::shared_ptr<VirtualFile>& findex, uint64_t virtual_size) {
+    LayerInfo info;
+    info.fdata = fdata;
+    info.findex = findex;
+    info.virtual_size = virtual_size;
+    // v4, as Rust's `Uuid::new_v4()` is -- not v7. A layer uuid is published
+    // inside an image, so it must not carry the creation time that v7 encodes.
+    info.uuid = core::Uuid::GenV4().ToString();
+    return info;
+}
+
+core::Expected<std::shared_ptr<LsmtFile>, std::string> CreateFileRw(const LayerInfo& info) {
+    return CreateFileRw(info.fdata, info.findex, info.virtual_size, info.rw_layout, info.uuid,
+                        info.parent_uuid,
+                        info.user_tag.empty() ? 0 : &info.user_tag[0], info.user_tag.size());
+}
+
 core::Expected<std::shared_ptr<LsmtFile>, std::string> OpenFileRw(
     std::shared_ptr<VirtualFile> fdata, std::shared_ptr<VirtualFile> findex) {
     // No lower index and no lower layers: every mapping this upper holds

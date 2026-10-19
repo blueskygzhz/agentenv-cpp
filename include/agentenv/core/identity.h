@@ -41,6 +41,16 @@ class Uuid {
     /// Generate a fresh UUID v7 seeded by the current clock + a rand stream.
     static Uuid GenV7();
 
+    /// Rust `Uuid::new_v4()` — 122 random bits, no time component.
+    ///
+    /// Kept distinct from `GenV7` rather than being an alias: v7 leaks its
+    /// creation time and sorts by it, which is desirable for a record id and
+    /// undesirable for a layer identity that ends up in an image anyone can
+    /// pull. Rust uses v4 for LSMT layer UUIDs specifically, and the two are
+    /// not interchangeable -- a reader comparing versions would see different
+    /// values in the version nibble.
+    static Uuid GenV4();
+
     /// The all-zero (nil) UUID. Mirrors Rust `Uuid::nil()`.
     static Uuid Nil() { return Uuid(); }
     bool is_nil() const {

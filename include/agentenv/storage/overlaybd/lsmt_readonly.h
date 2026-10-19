@@ -233,6 +233,65 @@ core::Expected<std::vector<ReadOnlyLayerMetadata>, std::string> LoadReadonlyLaye
 /// is newest), so the layer vector is reversed to match. Hand them over in
 /// the wrong order and every read silently resolves to the wrong layer --
 /// no error, just the contents of some other version of the image.
+core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> OpenFilesRo(
+    const std::vector<std::shared_ptr<VirtualFile> >& files);
+
+/// Rust `types.rs :: PremergedIndexCachePolicy`.
+///
+/// Merging the indices of a deep stack is pure computation over data that
+/// never changes, so the result can be cached on disk and reused by the next
+/// open of the same layer set. `read` and `write` are separate so a cache can
+/// be consumed without being grown (and vice versa, for a warming pass).
+struct PremergedIndexCachePolicy {
+    bool read;
+    bool write;
+    /// Budget for the artifact directory. Enforced by deleting the oldest
+    /// artifacts, not by refusing to write: an entry that cannot be cached
+    /// still has to be *usable*.
+    uint64_t max_dir_bytes;
+
+    PremergedIndexCachePolicy() : read(false), write(false), max_dir_bytes(0) {}
+
+    /// Rust `hybrid` — a sixteenth of the block cache budget, clamped.
+    ///
+    /// Derived from the cache size rather than configured separately because
+    /// the two compete for the same disk; a fraction keeps the index cache
+    /// proportionate without another knob to get wrong.
+    static PremergedIndexCachePolicy Hybrid(uint32_t cache_size_gb);
+    /// Rust `disabled` — merge every time.
+    static PremergedIndexCachePolicy Disabled();
+};
+
+/// Rust `MIN_PREMERGED_INDEX_CACHE_BYTES` / `MAX_PREMERGED_INDEX_CACHE_BYTES`.
+const uint64_t kMinPremergedIndexCacheBytes = 64ULL * 1024 * 1024;
+const uint64_t kMaxPremergedIndexCacheBytes = 1024ULL * 1024 * 1024;
+
+/// Rust `PREMERGED_INDEX_EXT` / `_MAGIC` / `_FORMAT_VERSION` /
+/// `_MERGE_VERSION` / `_HEADER_LEN`.
+///
+/// Two versions, not one: `format` covers the artifact's own layout, `merge`
+/// covers the semantics of the merge that produced it. Changing how layers
+/// are merged must invalidate every artifact even though the file layout is
+/// untouched, and a single version could not express that.
+extern const char* const kPremergedIndexExt;
+extern const char kPremergedIndexMagic[8];
+const uint32_t kPremergedIndexFormatVersion = 1;
+const uint32_t kPremergedIndexMergeVersion = 1;
+/// magic(8) + format(4) + merge(4) + header_len(4) + layer_count(4)
+/// + mapping_count(8) + body_len(8) + key_digest(32) + body_checksum(32)
+const size_t kPremergedIndexHeaderLen = 104;
+
+/// Rust `stack.rs :: open_files_ro_with_premerged_cache`.
+///
+/// Falls back to `OpenFilesRo` -- never fails -- whenever the cache cannot
+/// help: both directions disabled, an empty `cache_dir`, or a layer set with
+/// no stable identity. A cache is an optimisation, so every one of its own
+/// failures has to degrade into the uncached path rather than into an error.
+core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string>
+OpenFilesRoWithPremergedCache(const std::vector<std::shared_ptr<VirtualFile> >& files,
+                                 const std::string& cache_dir,
+                                 const PremergedIndexCachePolicy& policy);
+
 /// Rust `stack.rs :: is_lsmt` — 1 when `file` is a sealed LSMT layer, 0
 /// otherwise.
 ///
@@ -252,9 +311,6 @@ int IsLsmt(VirtualFile* file);
 /// Reads through the trailer, so it refuses an unsealed file: the index of an
 /// upper still being appended to has no fixed location to read from.
 core::Expected<std::shared_ptr<ReadOnlyIndex>, std::string> OpenFileIndex(VirtualFile* file);
-
-core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> OpenFilesRo(
-    const std::vector<std::shared_ptr<VirtualFile> >& files);
 
 /// Rust `vfile_io.rs :: read_exact` — fill `dst` completely or fail.
 ///

@@ -2,6 +2,22 @@
 // Rust: storage/overlaybd/src/lsmt/file/readonly.rs (+ helper.rs, vfile_io.rs)
 #include "agentenv/storage/overlaybd/lsmt_readonly.h"
 
+#include <dirent.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <atomic>
+#include <map>
+#include <mutex>
+
+#include "agentenv/core/digest.h"
+#include "agentenv/core/fs.h"
+#include "agentenv/core/logging.h"
+#include "agentenv/storage/overlaybd/cache_pool.h"
+
 #include <cstring>
 #include <sstream>
 
@@ -589,6 +605,767 @@ core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> OpenFilesRo(
     if (!merged.ok()) return core::make_unexpected(merged.error());
 
     return BuildReadonlyStackFromMerged(files, metadata.value(), merged.value());
+}
+
+// ---------------------------------------------------------------------------
+// Premerged index cache
+//
+// Rust: lsmt/file/{types.rs, helper.rs, stack.rs}
+//
+// Merging the indices of a deep stack is deterministic work over immutable
+// inputs, so the answer can be cached on disk and reused by the next open of
+// the same layer set. Every failure here falls back to merging, because the
+// cache is an optimisation and an unusable cache must not make an image
+// unopenable.
+// ---------------------------------------------------------------------------
+
+const char* const kPremergedIndexExt = "pmidx";
+const char kPremergedIndexMagic[8] = {'P', 'M', 'I', 'D', 'X', '0', '0', '1'};
+
+namespace {
+
+/// Rust `premerged_index_cache_limit_bytes`.
+uint64_t PremergedIndexCacheLimitBytes(uint32_t cache_size_gb) {
+    if (cache_size_gb == 0) return kMinPremergedIndexCacheBytes;
+    const uint64_t gib = 1024ULL * 1024 * 1024;
+    uint64_t budget = static_cast<uint64_t>(cache_size_gb) * gib / 16;
+    if (budget < kMinPremergedIndexCacheBytes) budget = kMinPremergedIndexCacheBytes;
+    if (budget > kMaxPremergedIndexCacheBytes) budget = kMaxPremergedIndexCacheBytes;
+    return budget;
+}
+
+void AppendU32Le(std::vector<uint8_t>* out, uint32_t v) {
+    for (int i = 0; i < 4; ++i) out->push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+}
+
+void AppendU64Le(std::vector<uint8_t>* out, uint64_t v) {
+    for (int i = 0; i < 8; ++i) out->push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+}
+
+uint32_t ReadU32LeAt(const uint8_t* b, size_t at) {
+    return static_cast<uint32_t>(b[at]) | (static_cast<uint32_t>(b[at + 1]) << 8) |
+           (static_cast<uint32_t>(b[at + 2]) << 16) | (static_cast<uint32_t>(b[at + 3]) << 24);
+}
+
+uint64_t ReadU64LeAt(const uint8_t* b, size_t at) {
+    uint64_t v = 0;
+    for (int i = 7; i >= 0; --i) v = (v << 8) | static_cast<uint64_t>(b[at + static_cast<size_t>(i)]);
+    return v;
+}
+
+std::string HexLower(const uint8_t* bytes, size_t len) {
+    static const char* digits = "0123456789abcdef";
+    std::string out;
+    out.reserve(len * 2);
+    for (size_t i = 0; i < len; ++i) {
+        out.push_back(digits[(bytes[i] >> 4) & 0x0F]);
+        out.push_back(digits[bytes[i] & 0x0F]);
+    }
+    return out;
+}
+
+std::string JoinPath(const std::string& dir, const std::string& name) {
+    if (dir.empty()) return name;
+    if (dir[dir.size() - 1] == '/') return dir + name;
+    return dir + "/" + name;
+}
+
+/// Rust's `uuid.is_nil()`. An all-zero UUID means the layer never got a stable
+/// identity, so it cannot take part in a cache key.
+bool IsNilUuid(const std::string& uuid) {
+    if (uuid.empty()) return true;
+    for (size_t i = 0; i < uuid.size(); ++i) {
+        const char c = uuid[i];
+        if (c != '0' && c != '-') return false;
+    }
+    return true;
+}
+
+/// Rust `PremergedIndexCacheKey`.
+struct PremergedIndexCacheKey {
+    uint8_t digest[32];
+    std::string digest_hex;
+    size_t layer_count;
+
+    PremergedIndexCacheKey() : layer_count(0) { std::memset(digest, 0, sizeof(digest)); }
+
+    std::string ArtifactPath(const std::string& cache_dir) const {
+        return JoinPath(JoinPath(cache_dir, kPremergedIndexDir),
+                        digest_hex + "." + kPremergedIndexExt);
+    }
+};
+
+/// Rust `PremergedIndexCacheKey::from_metadata`.
+///
+/// False when any layer has a nil UUID: without a stable identity for every
+/// layer the key could collide across different stacks, and a wrong hit would
+/// serve one image's index for another's data.
+bool BuildPremergedKey(const std::vector<ReadOnlyLayerMetadata>& metadata,
+                       PremergedIndexCacheKey* out) {
+    if (metadata.empty()) return false;
+    for (size_t i = 0; i < metadata.size(); ++i) {
+        if (IsNilUuid(metadata[i].uuid)) return false;
+    }
+
+    std::vector<uint8_t> key;
+    const char* domain = "overlaybd-premerged-index-key-v1";
+    key.insert(key.end(), domain, domain + std::strlen(domain));
+    // Both versions go into the key, so bumping either one invalidates every
+    // artifact without needing the directory to be cleared.
+    AppendU32Le(&key, kPremergedIndexFormatVersion);
+    AppendU32Le(&key, kPremergedIndexMergeVersion);
+    AppendU32Le(&key, static_cast<uint32_t>(metadata.size()));
+
+    // Reversed: the merged index tags layers top-to-bottom while this function
+    // receives them bottom-to-top. The key follows the merged order so that it
+    // describes the artifact it will name, not the call that produced it.
+    for (size_t i = metadata.size(); i-- > 0;) {
+        const ReadOnlyLayerMetadata& layer = metadata[i];
+        // The UUID's bytes as stored. Rust hashes `uuid.as_bytes()` (16 raw
+        // bytes) while this holds the textual form; the digest differs from
+        // Rust's for the same stack, which is fine because the artifact is
+        // private to one implementation -- but it does mean the two do not
+        // share a cache directory.
+        key.insert(key.end(), layer.uuid.begin(), layer.uuid.end());
+        AppendU64Le(&key, layer.file_size);
+        AppendU64Le(&key, layer.virtual_size);
+        AppendU64Le(&key, layer.index_offset);
+        AppendU64Le(&key, layer.index_size);
+        key.push_back(layer.header_version);
+        key.push_back(layer.header_sub_version);
+        key.push_back(layer.trailer_version);
+        key.push_back(layer.trailer_sub_version);
+    }
+
+    const core::Digest digest =
+        core::Digest::Sha256(key.empty() ? 0 : &key[0], key.size());
+    std::memcpy(out->digest, digest.bytes(), 32);
+    out->digest_hex = HexLower(out->digest, 32);
+    out->layer_count = metadata.size();
+    return true;
+}
+
+/// Rust `PremergedIndexArtifactHeader`.
+struct PremergedArtifactHeader {
+    uint32_t format_version;
+    uint32_t merge_version;
+    uint32_t layer_count;
+    uint64_t mapping_count;
+    uint64_t body_len;
+    uint8_t key_digest[32];
+    uint8_t body_checksum[32];
+};
+
+/// Rust `build_premerged_artifact_header`.
+std::vector<uint8_t> BuildPremergedArtifactHeader(const PremergedIndexCacheKey& key,
+                                                  uint64_t mapping_count, uint64_t body_len,
+                                                  const uint8_t* body_checksum) {
+    std::vector<uint8_t> header;
+    header.reserve(kPremergedIndexHeaderLen);
+    header.insert(header.end(), kPremergedIndexMagic, kPremergedIndexMagic + 8);
+    AppendU32Le(&header, kPremergedIndexFormatVersion);
+    AppendU32Le(&header, kPremergedIndexMergeVersion);
+    // The header's own length is recorded so a future longer header is
+    // rejected rather than read as a short one with garbage fields.
+    AppendU32Le(&header, static_cast<uint32_t>(kPremergedIndexHeaderLen));
+    AppendU32Le(&header, static_cast<uint32_t>(key.layer_count));
+    AppendU64Le(&header, mapping_count);
+    AppendU64Le(&header, body_len);
+    header.insert(header.end(), key.digest, key.digest + 32);
+    header.insert(header.end(), body_checksum, body_checksum + 32);
+    return header;
+}
+
+/// Rust `parse_premerged_artifact_header`.
+core::Expected<PremergedArtifactHeader, std::string> ParsePremergedArtifactHeader(
+    const std::vector<uint8_t>& bytes) {
+    if (bytes.size() < kPremergedIndexHeaderLen) {
+        return core::make_unexpected(std::string("premerged artifact header is truncated"));
+    }
+    if (std::memcmp(&bytes[0], kPremergedIndexMagic, 8) != 0) {
+        return core::make_unexpected(std::string("premerged artifact magic mismatch"));
+    }
+    const uint8_t* b = &bytes[0];
+    if (ReadU32LeAt(b, 16) != static_cast<uint32_t>(kPremergedIndexHeaderLen)) {
+        return core::make_unexpected(std::string("premerged artifact header length mismatch"));
+    }
+
+    PremergedArtifactHeader header;
+    header.format_version = ReadU32LeAt(b, 8);
+    header.merge_version = ReadU32LeAt(b, 12);
+    header.layer_count = ReadU32LeAt(b, 20);
+    header.mapping_count = ReadU64LeAt(b, 24);
+    header.body_len = ReadU64LeAt(b, 32);
+    std::memcpy(header.key_digest, b + 40, 32);
+    std::memcpy(header.body_checksum, b + 72, 32);
+    return header;
+}
+
+/// Rust `serialize_premerged_mappings`.
+std::vector<uint8_t> SerializePremergedMappings(const std::vector<SegmentMapping>& mappings) {
+    std::vector<uint8_t> body;
+    body.reserve(mappings.size() * 16);
+    for (size_t i = 0; i < mappings.size(); ++i) {
+        const DiskSegmentMapping disk = DiskSegmentMapping::FromMemory(mappings[i]);
+        AppendU64Le(&body, disk.data_low);
+        AppendU64Le(&body, disk.data_high);
+    }
+    return body;
+}
+
+/// Rust `deserialize_premerged_mappings`.
+///
+/// Every invariant the merge path would have established is re-checked here,
+/// because a cached artifact is attacker-adjacent input: it is a file on disk
+/// that a later read trusts as if it had been computed in this process.
+core::Expected<std::vector<SegmentMapping>, std::string> DeserializePremergedMappings(
+    const uint8_t* body, size_t body_len, size_t mapping_count, size_t layer_count) {
+    const size_t stride = 16;
+    if (mapping_count != 0 && mapping_count > body_len / stride) {
+        return core::make_unexpected(std::string("premerged artifact body length overflow"));
+    }
+    if (body_len != mapping_count * stride) {
+        return core::make_unexpected(std::string("premerged artifact body length mismatch"));
+    }
+
+    std::vector<SegmentMapping> mappings;
+    mappings.reserve(mapping_count);
+    bool have_previous_end = false;
+    uint64_t previous_end = 0;
+
+    for (size_t i = 0; i < mapping_count; ++i) {
+        DiskSegmentMapping disk;
+        disk.data_low = ReadU64LeAt(body, i * stride);
+        disk.data_high = ReadU64LeAt(body, i * stride + 8);
+        const SegmentMapping mapping = disk.ToMemory();
+
+        if (mapping.Length() == 0) {
+            return core::make_unexpected(std::string("premerged artifact contains empty mapping"));
+        }
+        // A non-zeroed mapping with no physical offset would resolve to no
+        // bytes at all, which a read cannot represent.
+        if (!mapping.zeroed && !mapping.HasPhysicalRange()) {
+            return core::make_unexpected(std::string("data mapping has no physical offset"));
+        }
+        // The tag indexes straight into the layer vector, so one past the end
+        // would read some other layer -- or past it.
+        if (static_cast<size_t>(mapping.tag) >= layer_count) {
+            return core::make_unexpected(std::string("premerged artifact layer tag out of range"));
+        }
+        if (have_previous_end && mapping.Offset() < previous_end) {
+            // Lookup is a binary search over this list; unsorted or
+            // overlapping input makes it answer with the wrong mapping rather
+            // than fail.
+            return core::make_unexpected(
+                std::string("premerged artifact mappings are not sorted or overlap"));
+        }
+        have_previous_end = true;
+        previous_end = mapping.End();
+        mappings.push_back(mapping);
+    }
+    return mappings;
+}
+
+/// Rust `decode_premerged_index_artifact`.
+core::Expected<std::shared_ptr<ReadOnlyIndex>, std::string> DecodePremergedIndexArtifact(
+    const std::vector<uint8_t>& bytes, const PremergedIndexCacheKey& key) {
+    const core::Expected<PremergedArtifactHeader, std::string> header =
+        ParsePremergedArtifactHeader(bytes);
+    if (!header.ok()) return core::make_unexpected(header.error());
+
+    if (header.value().format_version != kPremergedIndexFormatVersion) {
+        return core::make_unexpected(std::string("premerged artifact format version mismatch"));
+    }
+    if (header.value().merge_version != kPremergedIndexMergeVersion) {
+        return core::make_unexpected(std::string("premerged artifact merge version mismatch"));
+    }
+    if (static_cast<size_t>(header.value().layer_count) != key.layer_count) {
+        return core::make_unexpected(std::string("premerged artifact layer count mismatch"));
+    }
+    // The decisive check: the digest covers every layer's identity and
+    // geometry, so a match means this artifact really describes this stack.
+    // The filename alone would not, since a digest collision in the path is
+    // indistinguishable from a hit.
+    if (std::memcmp(header.value().key_digest, key.digest, 32) != 0) {
+        return core::make_unexpected(std::string("premerged artifact key digest mismatch"));
+    }
+
+    const uint64_t body_len = header.value().body_len;
+    const uint64_t mapping_count = header.value().mapping_count;
+    if (body_len > static_cast<uint64_t>(SIZE_MAX) ||
+        mapping_count > static_cast<uint64_t>(SIZE_MAX)) {
+        return core::make_unexpected(
+            std::string("premerged artifact body length does not fit usize"));
+    }
+    if (mapping_count != 0 && mapping_count > UINT64_MAX / 16) {
+        return core::make_unexpected(std::string("premerged artifact body length overflow"));
+    }
+    if (body_len != mapping_count * 16) {
+        return core::make_unexpected(
+            std::string("premerged artifact mapping count/body length mismatch"));
+    }
+    if (static_cast<uint64_t>(bytes.size()) != kPremergedIndexHeaderLen + body_len) {
+        return core::make_unexpected(std::string("premerged artifact file length mismatch"));
+    }
+
+    const uint8_t* body = &bytes[0] + kPremergedIndexHeaderLen;
+    const core::Digest checksum =
+        core::Digest::Sha256(body_len == 0 ? 0 : body, static_cast<size_t>(body_len));
+    if (std::memcmp(checksum.bytes(), header.value().body_checksum, 32) != 0) {
+        return core::make_unexpected(std::string("premerged artifact body checksum mismatch"));
+    }
+
+    const core::Expected<std::vector<SegmentMapping>, std::string> mappings =
+        DeserializePremergedMappings(body, static_cast<size_t>(body_len),
+                                     static_cast<size_t>(mapping_count), key.layer_count);
+    if (!mappings.ok()) return core::make_unexpected(mappings.error());
+
+    return std::shared_ptr<ReadOnlyIndex>(new ReadOnlyIndex(mappings.value()));
+}
+
+bool ReadWholeFile(const std::string& path, std::vector<uint8_t>* out, bool* not_found) {
+    *not_found = false;
+    FILE* file = ::fopen(path.c_str(), "rb");
+    if (file == 0) {
+        *not_found = (errno == ENOENT);
+        return false;
+    }
+    out->clear();
+    uint8_t buffer[65536];
+    for (;;) {
+        const size_t got = ::fread(buffer, 1, sizeof(buffer), file);
+        if (got > 0) out->insert(out->end(), buffer, buffer + got);
+        if (got < sizeof(buffer)) break;
+    }
+    const bool failed = ::ferror(file) != 0;
+    ::fclose(file);
+    return !failed;
+}
+
+/// Rust `try_read_premerged_index_artifact`.
+///
+/// Null for every failure, with a warning: a corrupt or unreadable artifact is
+/// a cache miss, and treating it as an error would make a bad file in the
+/// cache directory break every open of that image.
+std::shared_ptr<ReadOnlyIndex> TryReadPremergedIndexArtifact(
+    const std::string& cache_dir, const PremergedIndexCacheKey& key) {
+    const std::string path = key.ArtifactPath(cache_dir);
+    std::vector<uint8_t> bytes;
+    bool not_found = false;
+    if (!ReadWholeFile(path, &bytes, &not_found)) {
+        // A missing artifact is the ordinary cold case, so it is silent.
+        if (!not_found) {
+            AGENTENV_WARN("path=" << path << " read premerged index artifact failed");
+        }
+        return std::shared_ptr<ReadOnlyIndex>();
+    }
+    const core::Expected<std::shared_ptr<ReadOnlyIndex>, std::string> decoded =
+        DecodePremergedIndexArtifact(bytes, key);
+    if (!decoded.ok()) {
+        AGENTENV_WARN("err=" << decoded.error() << " path=" << path
+                             << " ignore invalid premerged index artifact");
+        return std::shared_ptr<ReadOnlyIndex>();
+    }
+    return decoded.value();
+}
+
+/// Rust `PREMERGED_INDEX_PRUNE_SCAN_FRACTION`.
+const uint64_t kPremergedIndexPruneScanFraction = 8;
+
+/// Rust `PremergedIndexScanAccount` + `PremergedIndexPruneState`.
+///
+/// Growth accounting rather than a scan per write: listing and stat-ing the
+/// whole directory costs far more than writing one artifact, so a scan is only
+/// elected once accumulated growth could plausibly have breached the budget.
+struct PremergedPruneState {
+    std::mutex mu;
+    uint64_t bytes_since_scan;
+    bool scan_in_progress;
+    bool initial_scan_done;
+
+    PremergedPruneState()
+        : bytes_since_scan(0), scan_in_progress(false), initial_scan_done(false) {}
+
+    uint64_t Threshold(uint64_t max_dir_bytes) const {
+        const uint64_t t = max_dir_bytes / kPremergedIndexPruneScanFraction;
+        return t > 0 ? t : 1;
+    }
+
+    /// Rust `elect_scan`. The first charge on a fresh state always elects, so
+    /// a directory already over budget at process start gets validated rather
+    /// than waiting for a threshold's worth of new writes.
+    bool ElectScan(uint64_t written_bytes, uint64_t max_dir_bytes) {
+        std::lock_guard<std::mutex> lk(mu);
+        bytes_since_scan += written_bytes;
+        if (scan_in_progress) return false;
+        const bool elected =
+            !initial_scan_done || bytes_since_scan >= Threshold(max_dir_bytes);
+        if (elected) {
+            initial_scan_done = true;
+            bytes_since_scan = 0;
+            scan_in_progress = true;
+        }
+        return elected;
+    }
+
+    /// Rust `scan_finished` — true when growth charged *during* the scan has
+    /// already re-crossed the trigger, so the same caller runs another pass
+    /// instead of leaving the directory over budget until the next write.
+    bool ScanFinished(uint64_t max_dir_bytes) {
+        std::lock_guard<std::mutex> lk(mu);
+        scan_in_progress = false;
+        if (bytes_since_scan >= Threshold(max_dir_bytes)) {
+            bytes_since_scan = 0;
+            scan_in_progress = true;
+            return true;
+        }
+        return false;
+    }
+
+    /// Rust `scan_aborted` — concurrent charges are kept, so the next write
+    /// re-elects rather than the failure resetting the accounting.
+    void ScanAborted() {
+        std::lock_guard<std::mutex> lk(mu);
+        scan_in_progress = false;
+    }
+};
+
+std::shared_ptr<PremergedPruneState> PremergedPruneStateFor(const std::string& cache_dir) {
+    static std::mutex states_mu;
+    static std::map<std::string, std::shared_ptr<PremergedPruneState> >* states =
+        new std::map<std::string, std::shared_ptr<PremergedPruneState> >();
+    std::lock_guard<std::mutex> lk(states_mu);
+    std::shared_ptr<PremergedPruneState>& slot = (*states)[cache_dir];
+    if (!slot) slot.reset(new PremergedPruneState());
+    return slot;
+}
+
+/// Rust `premerged_index_locks` + `acquire/release_premerged_index_lock`.
+///
+/// Per-digest, so two different stacks never serialise against each other,
+/// and weakly held so the map does not grow without bound. The lock exists to
+/// stop N concurrent opens of the same image each computing the same merge and
+/// each writing the same artifact.
+struct PremergedLockRegistry {
+    std::mutex mu;
+    std::map<std::string, std::weak_ptr<std::mutex> > locks;
+};
+
+PremergedLockRegistry* PremergedLocks() {
+    static PremergedLockRegistry* registry = new PremergedLockRegistry();
+    return registry;
+}
+
+std::shared_ptr<std::mutex> AcquirePremergedIndexLock(const std::string& key) {
+    PremergedLockRegistry* registry = PremergedLocks();
+    std::lock_guard<std::mutex> lk(registry->mu);
+    // Swept only when the map is large, so the common path stays O(log n)
+    // rather than paying a full scan per open.
+    if (registry->locks.size() > 1024) {
+        for (std::map<std::string, std::weak_ptr<std::mutex> >::iterator it =
+                 registry->locks.begin();
+             it != registry->locks.end();) {
+            if (it->second.expired()) {
+                registry->locks.erase(it++);
+            } else {
+                ++it;
+            }
+        }
+    }
+    const std::map<std::string, std::weak_ptr<std::mutex> >::iterator found =
+        registry->locks.find(key);
+    if (found != registry->locks.end()) {
+        const std::shared_ptr<std::mutex> existing = found->second.lock();
+        if (existing) return existing;
+    }
+    std::shared_ptr<std::mutex> lock(new std::mutex());
+    registry->locks[key] = lock;
+    return lock;
+}
+
+void ReleasePremergedIndexLock(const std::string& key,
+                               const std::shared_ptr<std::mutex>& lock) {
+    PremergedLockRegistry* registry = PremergedLocks();
+    std::lock_guard<std::mutex> lk(registry->mu);
+    const std::map<std::string, std::weak_ptr<std::mutex> >::iterator found =
+        registry->locks.find(key);
+    if (found == registry->locks.end()) return;
+    const std::shared_ptr<std::mutex> current = found->second.lock();
+    if (!current) {
+        // Someone else's entry already died; drop the dead slot.
+        registry->locks.erase(found);
+        return;
+    }
+    // Erased only when this caller holds the last reference *and* the entry is
+    // still this very lock: a newer lock for the same digest must survive.
+    if (current == lock && lock.use_count() <= 2) registry->locks.erase(found);
+}
+
+struct PremergedArtifactEntry {
+    std::string path;
+    uint64_t len;
+    /// Seconds since the epoch. Ordering only, so the resolution is enough.
+    int64_t modified;
+};
+
+bool PremergedEntryOlder(const PremergedArtifactEntry& a, const PremergedArtifactEntry& b) {
+    return a.modified < b.modified;
+}
+
+/// Rust `prune_premerged_index_dir_blocking` — delete oldest artifacts until
+/// the directory fits.
+core::Expected<core::Unit, std::string> PrunePremergedIndexDir(const std::string& dir,
+                                                                  uint64_t max_dir_bytes) {
+    DIR* handle = ::opendir(dir.c_str());
+    if (handle == 0) {
+        return core::make_unexpected("read premerged index cache dir " + dir);
+    }
+
+    std::vector<PremergedArtifactEntry> entries;
+    uint64_t total = 0;
+    const std::string suffix = std::string(".") + kPremergedIndexExt;
+
+    for (;;) {
+        struct dirent* ent = ::readdir(handle);
+        if (ent == 0) break;
+        const std::string name(ent->d_name);
+        // Extension, not prefix: the writer's temporary files live in the same
+        // directory and must not be counted or deleted as artifacts.
+        if (name.size() <= suffix.size()) continue;
+        if (name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+
+        const std::string path = JoinPath(dir, name);
+        struct stat st;
+        if (::stat(path.c_str(), &st) != 0) {
+            // Deleted concurrently with the scan; that only shrinks the
+            // directory, so it is not a failure.
+            if (errno == ENOENT) continue;
+            ::closedir(handle);
+            return core::make_unexpected("stat " + path);
+        }
+        if (!S_ISREG(st.st_mode)) continue;
+
+        PremergedArtifactEntry entry;
+        entry.path = path;
+        entry.len = static_cast<uint64_t>(st.st_size);
+        entry.modified = static_cast<int64_t>(st.st_mtime);
+        total += entry.len;
+        entries.push_back(entry);
+    }
+    ::closedir(handle);
+
+    if (total <= max_dir_bytes) return core::Unit();
+
+    // Oldest first. Modification time, not access time: an artifact is written
+    // once and then only read, so mtime is the age of the layer set it
+    // describes -- and atime is frequently disabled.
+    std::sort(entries.begin(), entries.end(), PremergedEntryOlder);
+    for (size_t i = 0; i < entries.size() && total > max_dir_bytes; ++i) {
+        if (::unlink(entries[i].path.c_str()) == 0) {
+            total -= entries[i].len;
+        } else if (errno == ENOENT) {
+            // Removed by someone else since the scan: those bytes left the
+            // directory too, so they count as freed.
+            total -= entries[i].len;
+        } else {
+            AGENTENV_WARN("path=" << entries[i].path
+                                  << " remove premerged index artifact failed");
+        }
+    }
+    return core::Unit();
+}
+
+/// Rust `prune_premerged_index_cache`.
+void PrunePremergedIndexCache(const std::string& cache_dir, uint64_t written,
+                              uint64_t max_dir_bytes) {
+    const std::shared_ptr<PremergedPruneState> state = PremergedPruneStateFor(cache_dir);
+    if (!state->ElectScan(written, max_dir_bytes)) return;
+
+    const std::string dir = JoinPath(cache_dir, kPremergedIndexDir);
+    for (;;) {
+        const core::Expected<core::Unit, std::string> pruned =
+            PrunePremergedIndexDir(dir, max_dir_bytes);
+        if (!pruned.ok()) {
+            AGENTENV_WARN("err=" << pruned.error() << " path=" << dir
+                                 << " prune premerged index cache dir failed");
+            state->ScanAborted();
+            return;
+        }
+        if (!state->ScanFinished(max_dir_bytes)) return;
+    }
+}
+
+/// Rust `write_premerged_index_artifact` — tmp file plus rename.
+///
+/// Atomic by rename, so a concurrent reader either sees the previous artifact
+/// or the complete new one. A partially written file under the real name would
+/// be read, fail its checksum, and be discarded -- correct but wasteful, and
+/// it would mask the real one.
+core::Expected<uint64_t, std::string> WritePremergedIndexArtifact(
+    const std::string& cache_dir, const PremergedIndexCacheKey& key,
+    const ReadOnlyIndex& index) {
+    const std::string dir = JoinPath(cache_dir, kPremergedIndexDir);
+    const core::Expected<core::Unit, std::string> made = core::fs::CreateDirAll(dir);
+    if (!made.ok()) {
+        return core::make_unexpected("create premerged index cache dir " + dir + ": " +
+                                     made.error());
+    }
+
+    const std::vector<uint8_t> body = SerializePremergedMappings(index.Mappings());
+    const core::Digest checksum =
+        core::Digest::Sha256(body.empty() ? 0 : &body[0], body.size());
+
+    std::vector<uint8_t> artifact = BuildPremergedArtifactHeader(
+        key, static_cast<uint64_t>(index.Mappings().size()),
+        static_cast<uint64_t>(body.size()), checksum.bytes());
+    artifact.insert(artifact.end(), body.begin(), body.end());
+
+    std::ostringstream tmp_name;
+    // The pid and a counter rather than a UUID: the only requirement is that
+    // two concurrent writers of the same digest pick different names.
+    static std::atomic<uint64_t> tmp_counter(0);
+    tmp_name << "." << key.digest_hex << "." << static_cast<long>(::getpid()) << "-"
+             << tmp_counter.fetch_add(1) << ".tmp";
+    const std::string tmp = JoinPath(dir, tmp_name.str());
+    const std::string path = key.ArtifactPath(cache_dir);
+
+    FILE* file = ::fopen(tmp.c_str(), "wb");
+    if (file == 0) return core::make_unexpected("write " + tmp);
+    bool ok = artifact.empty() ||
+              ::fwrite(&artifact[0], 1, artifact.size(), file) == artifact.size();
+    if (ok) ok = ::fflush(file) == 0;
+    ::fclose(file);
+    if (!ok) {
+        ::unlink(tmp.c_str());
+        return core::make_unexpected("write " + tmp);
+    }
+
+    if (::rename(tmp.c_str(), path.c_str()) != 0) {
+        ::unlink(tmp.c_str());
+        return core::make_unexpected("rename premerged index artifact " + tmp + " to " + path);
+    }
+    return static_cast<uint64_t>(artifact.size());
+}
+
+}  // namespace
+
+PremergedIndexCachePolicy PremergedIndexCachePolicy::Hybrid(uint32_t cache_size_gb) {
+    PremergedIndexCachePolicy policy;
+    policy.read = true;
+    policy.write = true;
+    policy.max_dir_bytes = PremergedIndexCacheLimitBytes(cache_size_gb);
+    return policy;
+}
+
+PremergedIndexCachePolicy PremergedIndexCachePolicy::Disabled() {
+    PremergedIndexCachePolicy policy;
+    policy.read = false;
+    policy.write = false;
+    // The floor rather than zero: a disabled policy still carries a sane
+    // budget, so enabling writes later cannot prune the directory to nothing.
+    policy.max_dir_bytes = kMinPremergedIndexCacheBytes;
+    return policy;
+}
+
+core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string>
+OpenFilesRoWithPremergedCache(const std::vector<std::shared_ptr<VirtualFile> >& files,
+                                 const std::string& cache_dir,
+                                 const PremergedIndexCachePolicy& policy) {
+    if (files.empty()) return core::make_unexpected(std::string("empty file list"));
+    if (files.size() > kMaxStackLayers) {
+        std::ostringstream o;
+        o << "too many layers: " << files.size() << " > " << kMaxStackLayers;
+        return core::make_unexpected(o.str());
+    }
+
+    // Nothing to gain either way, or nowhere to put it.
+    if (!policy.read && !policy.write) return OpenFilesRo(files);
+    if (cache_dir.empty()) return OpenFilesRo(files);
+
+    const core::Expected<std::vector<ReadOnlyLayerMetadata>, std::string> metadata =
+        LoadReadonlyLayersMetadata(files);
+    if (!metadata.ok()) return core::make_unexpected(metadata.error());
+
+    PremergedIndexCacheKey key;
+    if (!BuildPremergedKey(metadata.value(), &key)) {
+        // No stable identity for this stack, so nothing may be cached under
+        // any name. Merge and return, exactly as the uncached path would.
+        const core::Expected<std::shared_ptr<ReadOnlyIndex>, std::string> merged =
+            MergeReadonlyIndexes(files, metadata.value());
+        if (!merged.ok()) return core::make_unexpected(merged.error());
+        return BuildReadonlyStackFromMerged(files, metadata.value(), merged.value());
+    }
+
+    // Probed before taking the digest lock: a hit is the common case and must
+    // not queue behind another open's merge.
+    if (policy.read) {
+        const std::shared_ptr<ReadOnlyIndex> hit =
+            TryReadPremergedIndexArtifact(cache_dir, key);
+        if (hit) return BuildReadonlyStackFromMerged(files, metadata.value(), hit);
+    }
+
+    const std::shared_ptr<std::mutex> lock = AcquirePremergedIndexLock(key.digest_hex);
+    {
+        std::unique_lock<std::mutex> guard(*lock);
+
+        // Re-probed under the lock: whoever held it may have just written the
+        // artifact this caller is about to compute. Without this, N concurrent
+        // cold opens would each do the full merge in turn.
+        if (policy.read) {
+            const std::shared_ptr<ReadOnlyIndex> hit =
+                TryReadPremergedIndexArtifact(cache_dir, key);
+            if (hit) {
+                const core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> result =
+                    BuildReadonlyStackFromMerged(files, metadata.value(), hit);
+                guard.unlock();
+                ReleasePremergedIndexLock(key.digest_hex, lock);
+                return result;
+            }
+        }
+
+        const core::Expected<std::shared_ptr<ReadOnlyIndex>, std::string> merged =
+            MergeReadonlyIndexes(files, metadata.value());
+        if (!merged.ok()) {
+            guard.unlock();
+            ReleasePremergedIndexLock(key.digest_hex, lock);
+            return core::make_unexpected(merged.error());
+        }
+
+        if (policy.write) {
+            // Deviation: Rust hands the write and the prune tail to a spawned
+            // task and returns immediately, so an open never waits for its own
+            // cache fill. There is no task runtime here, and a detached thread
+            // would have to keep the index alive past this scope while the
+            // caller may already be reading through it -- so the write runs
+            // inline. The cost is the artifact write (one sequential file) on
+            // the cold path only; correctness is unaffected because a failed
+            // write is ignored either way.
+            const core::Expected<uint64_t, std::string> written =
+                WritePremergedIndexArtifact(cache_dir, key, *merged.value());
+            if (!written.ok()) {
+                AGENTENV_WARN("err=" << written.error() << " digest=" << key.digest_hex
+                                     << " write premerged index artifact failed");
+            }
+
+            const core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> result =
+                BuildReadonlyStackFromMerged(files, metadata.value(), merged.value());
+
+            // The lock goes before the prune, as Rust orders it: a directory
+            // scan must not block the next opener of this same digest.
+            guard.unlock();
+            ReleasePremergedIndexLock(key.digest_hex, lock);
+            if (written.ok()) {
+                PrunePremergedIndexCache(cache_dir, written.value(), policy.max_dir_bytes);
+            }
+            return result;
+        }
+
+        const core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> result =
+            BuildReadonlyStackFromMerged(files, metadata.value(), merged.value());
+        guard.unlock();
+        ReleasePremergedIndexLock(key.digest_hex, lock);
+        return result;
+    }
 }
 
 

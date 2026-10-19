@@ -39,6 +39,14 @@ uint32_t Crc32c(const uint8_t* data, size_t len);
 /// Rust `crc32c_salt` — the same polynomial chained from the salted raw state.
 uint32_t Crc32cSalt(const uint8_t* data, size_t len);
 
+/// Rust `crc32c_append` — continue a CRC-32C from a previous result.
+///
+/// `Crc32cAppend(0, d, n) == Crc32c(d, n)`, and chaining chunk by chunk gives
+/// the same value as one call over the concatenation. Exposed because the
+/// prefetch trace accumulates its checksum record by record while encoding
+/// them, rather than making a second pass over the assembled payload.
+uint32_t Crc32cAppend(uint32_t crc, const uint8_t* data, size_t len);
+
 /// Rust `CompressOptions`.
 struct CompressOptions {
     static const uint8_t kLz4 = 1;

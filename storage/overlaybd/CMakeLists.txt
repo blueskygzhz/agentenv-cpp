@@ -14,6 +14,8 @@ add_library(agentenv-overlaybd STATIC
     # wire formats. Here rather than in agentenv-snapshot because the ublk
     # read path is their other consumer.
     startup_pack.cc
+    startup_pack_task.cc
+    bk_download.cc
     # Rust: src/io/virtual_file.rs — the abstraction the whole stack layers on
     virtual_file.cc
     # Rust: src/sys/{open_flags,page_cache,release_space,xattr}.rs

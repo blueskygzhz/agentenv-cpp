@@ -156,6 +156,49 @@ class CachedFile : public VirtualFile {
     core::Expected<size_t, std::string> WriteAtWithFlags(uint64_t offset, const uint8_t* data,
                                                             size_t len, uint32_t rw_flags);
 
+    // -- background download -----------------------------------------------
+
+    /// Rust `background_block_size` — the cache's own block size.
+    ///
+    /// Distinct from the *download* chunk size: a background fetch covers
+    /// several of these per request for throughput, while foreground reads
+    /// keep this finer granularity so a fault refills only what it touched.
+    uint64_t BackgroundBlockSize() const;
+
+    /// Rust `background_source_snapshot` — the source and its recorded size.
+    ///
+    /// Refused without a source: a background download has nothing to pull
+    /// from, and a cache-only handle must not be queued for one.
+    core::Expected<core::Unit, std::string> BackgroundSourceSnapshot(
+        std::shared_ptr<VirtualFile>* source, uint64_t* source_size) const;
+
+    /// Rust `missing_background_blocks` — block ids not yet cached.
+    core::Expected<std::vector<uint64_t>, std::string> MissingBackgroundBlocks(
+        uint64_t source_size) const;
+
+    /// Rust `background_is_complete`.
+    core::Expected<bool, std::string> BackgroundIsComplete(uint64_t source_size) const;
+
+    /// Rust `actionable_background_chunks` — download chunks with at least
+    /// one missing block, as `(start_block, len_blocks)`.
+    ///
+    /// Chunks that are already complete are skipped rather than re-fetched,
+    /// which is what makes a resumed download cheap.
+    core::Expected<std::vector<std::pair<uint64_t, uint32_t> >, std::string>
+        ActionableBackgroundChunks(uint64_t source_size, uint32_t blocks_per_chunk) const;
+
+    /// Rust `background_refill_range` — fetch a block range from the source.
+    ///
+    /// Returns the bytes read. Elects a loader for every block up front, then
+    /// issues one source read per *contiguous* run of blocks it won, so a
+    /// range already partly cached does not re-fetch what it has.
+    ///
+    /// Refuses with ENOSPC while the cache is full: the caller's retry loop
+    /// turns that into a bounded wait instead of churning eviction.
+    core::Expected<uint64_t, std::string> BackgroundRefillRange(
+        const std::shared_ptr<VirtualFile>& source, uint64_t source_size,
+        uint64_t start_block, uint32_t len_blocks);
+
     // -- VirtualFile -------------------------------------------------------
 
     core::Expected<ByteBuffer, std::string> ReadAt(uint64_t offset, size_t len) override;
@@ -175,6 +218,15 @@ class CachedFile : public VirtualFile {
     /// Rust `tryget_size` — the source size, refreshed from the source when
     /// the request reaches past what is known.
     core::Expected<uint64_t, std::string> TryGetSize(uint64_t offset, size_t count);
+
+    /// Rust `background_block_count` — blocks the bitmap must span.
+    core::Expected<uint64_t, std::string> BackgroundBlockCount(uint64_t source_size) const;
+
+    /// Rust `refill_block_run` — one source read covering a whole run of
+    /// loader-owned blocks, then a publish per block.
+    core::Expected<uint64_t, std::string> RefillBlockRun(CacheEntry* entry, VirtualFile* source,
+                                                            uint64_t source_size,
+                                                            const std::vector<uint64_t>& run);
 
     FileCacheBackend* backend_;
     std::string cache_id_;
@@ -277,6 +329,14 @@ class FileCacheBackend {
 
     /// Rust `is_full` — whether refills are currently refused.
     bool IsFull() const { return is_full_; }
+
+    /// Rust `get_cache_entry(id).map(|e| e.key.clone())` — the source name an
+    /// entry was created with.
+    ///
+    /// Needed because a background download is registered by `cache_id` (what
+    /// a `CachedFile` exposes) but has to be *reopened* by the source name,
+    /// and the digest is one-way.
+    bool CacheKeyOf(const std::string& cache_id, std::string* out) const;
 
     /// Rust `transform_store_key` — the cache id for a source name.
     ///
