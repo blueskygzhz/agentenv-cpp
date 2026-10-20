@@ -127,26 +127,21 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 6. Shutdown plumbing. Installed before the refusal so that the parts
-    //    above are exercised the same way they would be in a working daemon,
-    //    and so a supervisor's SIGTERM is still honoured.
-    const core::Expected<core::Unit, std::string> signals = ud::InstallSignalHandlers();
-    if (!signals.ok()) {
-        AGENTENV_ERROR(signals.error());
-        return 1;
-    }
-    const core::Expected<int, std::string> parent_pidfd = ud::PidfdOpen(parent_pid);
-    if (!parent_pidfd.ok()) {
-        AGENTENV_ERROR("open parent pidfd: " << parent_pidfd.error());
-        return 1;
-    }
-    ::close(parent_pidfd.value());
-
-    // 7. The refusal. Named precisely, because the gap is a specific missing
+    // 6. The refusal. Named precisely, because the gap is a specific missing
     //    piece and not a general "unimplemented": the protocol and client are
     //    ported (`protocol.cc`, `client.cc`), the device control path exists
     //    (`storage/ublk/ctrl.cc`), and what is absent is the server loop plus
     //    the overlaybd ublk target it would drive.
+    //
+    //    This comes before the shutdown plumbing on purpose. Rust opens the
+    //    parent pidfd here and treats a failure as fatal, but it does so to
+    //    hand the descriptor to a running server. With no server, opening one
+    //    and closing it again would be a fatal check on a resource this
+    //    process immediately discards -- and on a host without
+    //    `pidfd_open` (containers often block it) that check would mask the
+    //    message the operator actually needs. `PidfdOpen`,
+    //    `InstallSignalHandlers` and `WaitForShutdown` are implemented and
+    //    waiting in `lifecycle.cc` for the server that will use them.
     //
     //    No "ready" line is printed. Rust prints it on stdout once the socket
     //    is accepting, and a supervisor waits for it -- emitting it here would
@@ -157,5 +152,9 @@ int main(int argc, char** argv) {
         "see storage/ublk/impls.cc). Configuration was parsed and validated, and "
         "the socket at "
         << cli.value().socket_path << " was NOT created.");
+    // `parent_pid` is captured above because that must happen on the main
+    // thread before anything else runs; it is unused only because the server
+    // that would watch it is absent.
+    (void)parent_pid;
     return 1;
 }

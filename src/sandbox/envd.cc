@@ -27,6 +27,12 @@ void sleep_ms(int64_t ms) {
 }
 }  // namespace
 
+// `std::min` takes its arguments by const reference, which odr-uses the
+// constant below. An in-class initialiser alone is only a compile-time value;
+// without this definition the reference has nothing to bind to and the link
+// fails.
+const int64_t EnvdInstance::kHealthProbeTimeoutMs;
+
 EnvdInstance::EnvdInstance(std::string base_path)
     : base_path_(base_path), grpc_address_(base_path) {}
 
