@@ -13,6 +13,7 @@
 #include <sstream>
 
 #include "agentenv/core/digest.h"
+#include "agentenv/storage/overlaybd/bk_download.h"
 #include "agentenv/storage/overlaybd/sys.h"
 
 namespace agentenv {
@@ -20,6 +21,19 @@ namespace storage {
 namespace overlaybd {
 
 const char* const kPremergedIndexDir = "premerged-index";
+
+// Rust seeds the background-download caps from `DownloadConfig::default()`:
+// `CacheConfig` does not carry the download config, so a caller that holds
+// the global one (image_service) overrides them after construction.
+FileCacheBackendOptions::FileCacheBackendOptions()
+    : cache_dir(kCacheDefaultDir),
+      capacity_bytes(kCacheDefaultCapacityBytes),
+      block_size(kCacheDefaultBlockSize),
+      open_evict_idle_secs(600),
+      bk_download_max_inflight_blocks(DownloadConfig().max_inflight_blocks),
+      bk_download_max_concurrent_files(DownloadConfig().max_concurrent_files),
+      bk_download_block_size(DownloadConfig().block_size),
+      bk_download_hedge_timeout_ms(kBkDefaultHedgeTimeoutMs) {}
 
 namespace {
 
@@ -194,6 +208,15 @@ FileCacheBackend::WithOptions(const FileCacheBackendOptions& options) {
     }
 
     backend->PublishPressure();
+
+    // Rust creates the scheduler inside the constructor and keeps it in
+    // `_bk_scheduler_owner`. Created after the restart scan so a task
+    // submitted immediately cannot race the entry table being populated.
+    backend->bk_scheduler_ = BkDownloadScheduler::New(
+        normalized.bk_download_max_inflight_blocks,
+        normalized.bk_download_max_concurrent_files,
+        normalized.bk_download_block_size,
+        normalized.bk_download_hedge_timeout_ms);
     return backend;
 }
 
@@ -219,9 +242,30 @@ FileCacheBackend::WithOptionsAndTransFunc(const FileCacheBackendOptions& options
 }
 
 FileCacheBackend::~FileCacheBackend() {
+    // Before anything else, and unlike Rust, which only calls the
+    // non-blocking `stop()` here.
+    //
+    // The difference is forced by how a task reaches the backend: Rust's
+    // `BkDownloadTask` holds `backend: FileCacheBackend`, a clone that keeps
+    // the shared cache state alive on its own, so a worker outliving this
+    // value is harmless. The C++ `BkDownloadTask` holds a raw
+    // `FileCacheBackend*`, so a worker still inside a task after this
+    // destructor returns would dereference freed memory. `Shutdown` waits
+    // for the in-flight count to reach zero and clears the registry, which
+    // is what makes that impossible.
+    ShutdownBkDownloads();
+
     // Entries whose bitmap moved are persisted on the way out: the data is
     // already on disk, and losing the bitmap would discard it.
     CheckpointDirtyEntries();
+}
+
+void FileCacheBackend::ShutdownBkDownloads() {
+    if (bk_scheduler_) bk_scheduler_->Shutdown();
+}
+
+bool FileCacheBackend::BkDownloadRegistered(const std::string& cache_id) const {
+    return bk_scheduler_ && bk_scheduler_->IsRegistered(cache_id);
 }
 
 std::shared_ptr<CacheEntry> FileCacheBackend::GetCacheEntry(
@@ -1067,7 +1111,14 @@ CachedFile::~CachedFile() {
     const std::shared_ptr<CacheEntry> entry = backend_->GetCacheEntry(cache_id_);
     // Decremented so the entry becomes evictable again. A missing entry is
     // not an error: it may have been evicted while this handle was open.
-    if (entry) entry->DecOpenCount();
+    if (entry) {
+        entry->DecOpenCount();
+        // Rust `remove_open_file` touches as well. Closing is a use: without
+        // this the entry re-enters the LRU carrying its last *read* timestamp,
+        // so a file held open across a quiet period is evicted ahead of
+        // genuinely colder ones.
+        entry->Touch();
+    }
 }
 
 core::Expected<uint64_t, std::string> CachedFile::TryGetSize(uint64_t offset, size_t count) {

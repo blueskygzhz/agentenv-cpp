@@ -56,11 +56,28 @@ struct FileCacheBackendOptions {
     /// survives and refills on demand. Zero disables open-entry eviction.
     uint64_t open_evict_idle_secs;
 
-    FileCacheBackendOptions()
-        : cache_dir(kCacheDefaultDir),
-          capacity_bytes(kCacheDefaultCapacityBytes),
-          block_size(kCacheDefaultBlockSize),
-          open_evict_idle_secs(600) {}
+    /// Node-level cap on concurrently downloading chunks, enforced by this
+    /// backend's download scheduler. Bounds total scratch memory to
+    /// `bk_download_max_inflight_blocks * bk_download_block_size`. A
+    /// per-image `maxInflightBlocks` override never resizes it.
+    std::size_t bk_download_max_inflight_blocks;
+    /// Node-level cap on concurrently running background-download layer
+    /// tasks.
+    std::size_t bk_download_max_concurrent_files;
+    /// The largest chunk size the scheduler accepts from any task, so the
+    /// scratch budget above holds regardless of per-image overrides.
+    uint32_t bk_download_block_size;
+    /// Per-block read timeout for background downloads, in milliseconds: a
+    /// slow read is dropped and reissued rather than holding a block slot
+    /// forever. Rust carries a `Duration`; milliseconds here because that is
+    /// what `BkDownloadScheduler::New` takes.
+    uint64_t bk_download_hedge_timeout_ms;
+
+    /// Defined out-of-line: the hedge-timeout default lives with the
+    /// scheduler in `bk_download.h`, which includes *this* header, so naming
+    /// the constant here would close the include cycle. Duplicating its value
+    /// would be worse -- two defaults that can drift apart silently.
+    FileCacheBackendOptions();
 
     /// Rust `from_cache_config`.
     static core::Expected<FileCacheBackendOptions, std::string> FromCacheConfig(
@@ -119,12 +136,28 @@ struct CachePoolStat {
 };
 
 class FileCacheBackend;
+/// Defined in `bk_download.h`, which includes this header. The backend owns
+/// one through a `shared_ptr`, and that needs no definition here.
+class BkDownloadScheduler;
 
 /// Rust `CachedFile` — a handle onto one cached file.
 ///
 /// Reads are served from the cache and refill from `source` on a miss. The
 /// source is replaceable (`SetSource`) so a layer being downloaded can be
 /// read from the registry meanwhile and from the local copy afterwards.
+///
+/// Lifetime, and a deliberate divergence from Rust: the owning
+/// `FileCacheBackend` **must outlive every `CachedFile` it handed out**.
+/// `~CachedFile` dereferences `backend_` to release the entry's open count.
+/// Rust's `CachedFile` instead holds `backend: FileCacheBackend`, a clone
+/// sharing the backend's `Arc` state, and so keeps it alive itself. That is
+/// not reproducible here: Rust separates the outer handle from the `Arc`
+/// state, whereas this `FileCacheBackend` is one object owned by a
+/// `shared_ptr`. Holding a strong reference would close the cycle
+/// backend -> bk_scheduler_ -> BkDownloadTask -> CachedFile -> backend and
+/// `~FileCacheBackend` would never run -- taking the background-download
+/// drain down with it. The raw pointer plus this constraint is the price of
+/// not having that cycle.
 class CachedFile : public VirtualFile {
  public:
     ~CachedFile();
@@ -287,6 +320,39 @@ class FileCacheBackend {
         const std::string& src_name, std::shared_ptr<VirtualFile> source,
         uint64_t source_size, uint32_t open_flags);
 
+    // -- background download ----------------------------------------------
+    //
+    // The scheduler belongs to the backend, as in Rust: a `BkDownloadTask`
+    // reaches back into the backend to publish the blocks it fetched, so the
+    // backend has to outlive it.
+    //
+    // Rust needs a `Weak` plus an `_bk_scheduler_owner: Option<Arc<..>>` to
+    // pin shutdown to one clone, because its `FileCacheBackend` is a value
+    // type that gets cloned. This one is always held through a `shared_ptr`
+    // handed out by the factories, so there is a single object and a plain
+    // owning pointer says the same thing with no clone bookkeeping.
+    //
+    // The three *submit* entry points are free functions in `bk_download.h`
+    // (`SubmitBkDownloadBatch` and friends) rather than members here. Rust
+    // has them on the backend, but their signatures name `BkDownloadRequest`
+    // and `StartupPackHandle`, which live in a header that includes this one
+    // -- declaring them here would close the include cycle. The semantics,
+    // including the closed-scheduler report, are unchanged.
+
+    /// Rust's `_bk_scheduler_owner` / `bk_scheduler`, collapsed into one
+    /// owning handle. Incomplete type by design: naming the scheduler's
+    /// definition here is what would create the cycle.
+    std::shared_ptr<BkDownloadScheduler> BkScheduler() const { return bk_scheduler_; }
+
+    /// Rust `shutdown_bk_downloads` — stop cache-owned background downloads
+    /// and wait for in-flight I/O to drain. Idempotent.
+    void ShutdownBkDownloads();
+
+    /// Whether a cache id is registered with the scheduler. Rust marks the
+    /// equivalent `#[cfg(test)]`; kept here because deregistration is a
+    /// property worth asserting rather than reviewing.
+    bool BkDownloadRegistered(const std::string& cache_id) const;
+
     /// Rust `stats`.
     CacheStats Stats() const;
 
@@ -388,6 +454,12 @@ class FileCacheBackend {
     FileCacheBackend& operator=(const FileCacheBackend&);
 
     std::shared_ptr<CacheEntry> GetCacheEntry(const std::string& cache_id) const;
+
+    /// The scheduler this backend owns. Declared last among the handles on
+    /// purpose is *not* enough to make teardown safe -- `~FileCacheBackend`
+    /// drains it explicitly before touching anything else, because a worker
+    /// still running a task holds a raw `FileCacheBackend*`.
+    std::shared_ptr<BkDownloadScheduler> bk_scheduler_;
 
     /// Rust `query_refill_range_for` — the block-aligned hole covering the
     /// gaps of a request, with fully cached edges trimmed off.

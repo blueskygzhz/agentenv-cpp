@@ -50,6 +50,7 @@ agentenv_add_test(test_overlaybd_lsmt_readonly test_overlaybd_lsmt_readonly.cc a
 # Rust: storage/overlaybd/src/lsmt/file/readwrite.rs
 agentenv_add_test(test_overlaybd_lsmt_rw test_overlaybd_lsmt_rw.cc agentenv-overlaybd)
 agentenv_add_test(test_overlaybd_lsmt_compact test_overlaybd_lsmt_compact.cc agentenv-overlaybd)
+agentenv_add_test(test_overlaybd_bk_download test_overlaybd_bk_download.cc agentenv-overlaybd)
 agentenv_add_test(test_deps                test_deps.cc                agentenv-rootmod)
 agentenv_add_test(test_overlaybd_p2p       test_overlaybd_p2p.cc       agentenv-overlaybd-p2p)
 agentenv_add_test(test_mpsc_queue          test_mpsc_queue.cc          agentenv-core)

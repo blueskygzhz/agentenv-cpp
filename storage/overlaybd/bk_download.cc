@@ -1141,6 +1141,43 @@ StartupPackHandle::~StartupPackHandle() {
     }
 }
 
+// ==== backend-facing submission ==========================================
+
+core::Expected<core::Unit, std::string> SubmitBkDownloadBatch(
+    FileCacheBackend* backend, const std::vector<BkDownloadRequest>& requests) {
+    if (backend == 0) {
+        return core::make_unexpected(std::string("background download submit without backend"));
+    }
+    const std::shared_ptr<BkDownloadScheduler> scheduler = backend->BkScheduler();
+    // Rust reports `BkDownloadSubmitError::Closed` when the `Weak` no longer
+    // upgrades; a backend without a scheduler is the same condition, and the
+    // caller distinguishes it by this message.
+    if (!scheduler) return core::make_unexpected(std::string(kBkSubmitClosedMessage));
+    return scheduler->Submit(backend, requests);
+}
+
+core::Expected<core::Unit, std::string> SubmitBkDownload(
+    FileCacheBackend* backend, std::shared_ptr<CachedFile> file,
+    const DownloadConfig& config, const core::Optional<std::string>& device_key) {
+    BkDownloadRequest request;
+    request.file = file;
+    request.config = config;
+    request.device_key = device_key;
+    std::vector<BkDownloadRequest> one;
+    one.push_back(request);
+    return SubmitBkDownloadBatch(backend, one);
+}
+
+core::Expected<StartupPackHandle, std::string> SubmitStartupPack(
+    FileCacheBackend* backend, const StartupPackSubmission& submission) {
+    if (backend == 0) {
+        return core::make_unexpected(std::string("startup pack submit without backend"));
+    }
+    const std::shared_ptr<BkDownloadScheduler> scheduler = backend->BkScheduler();
+    if (!scheduler) return core::make_unexpected(std::string(kBkSubmitClosedMessage));
+    return scheduler->SubmitStartupPack(submission);
+}
+
 }  // namespace overlaybd
 }  // namespace storage
 }  // namespace agentenv

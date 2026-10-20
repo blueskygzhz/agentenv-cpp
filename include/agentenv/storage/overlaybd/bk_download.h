@@ -424,6 +424,37 @@ class BkDownloadScheduler : public std::enable_shared_from_this<BkDownloadSchedu
     std::atomic<bool> chunk_clamp_warned_;
 };
 
+// ==== backend-facing submission ==========================================
+//
+// Rust has these three as methods on `FileCacheBackend`. They are free
+// functions here purely because their signatures name types declared in this
+// header, which includes `cache_pool.h` -- putting them on the class would
+// close the include cycle. `backend` is the receiver Rust's `&self` is, and
+// the behaviour is the same, including resolving the scheduler through the
+// backend rather than taking one as an argument.
+
+/// Rust `FileCacheBackend::submit_bk_download_batch`.
+///
+/// Submission never fails for lack of capacity: tasks wait in the registry
+/// until a file slot frees. A shut-down scheduler *is* reported, which is the
+/// case `image_service` downgrades to a warning so a warm-up that is optional
+/// by design cannot fail an image open.
+core::Expected<core::Unit, std::string> SubmitBkDownloadBatch(
+    FileCacheBackend* backend, const std::vector<BkDownloadRequest>& requests);
+
+/// Rust `FileCacheBackend::submit_bk_download` — the one-request form.
+core::Expected<core::Unit, std::string> SubmitBkDownload(
+    FileCacheBackend* backend, std::shared_ptr<CachedFile> file,
+    const DownloadConfig& config, const core::Optional<std::string>& device_key);
+
+/// Rust `FileCacheBackend::submit_startup_pack`.
+///
+/// A concurrent submission of the same immutable pack identity shares one
+/// task; the returned handle is a holder, and the last release of a live task
+/// cancels it.
+core::Expected<StartupPackHandle, std::string> SubmitStartupPack(
+    FileCacheBackend* backend, const StartupPackSubmission& submission);
+
 }  // namespace overlaybd
 }  // namespace storage
 }  // namespace agentenv
