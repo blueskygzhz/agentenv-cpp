@@ -450,13 +450,22 @@ core::Expected<core::Unit, std::string> LsmtReadOnlyFile::Flatten(
 
 core::Expected<core::Unit, std::string> LsmtReadOnlyFile::CommitPreservingMetadata(
     const CommitArgs& args) {
+    if (!args.writer) {
+        return core::make_unexpected(std::string("commit requires a destination writer"));
+    }
+    VirtualFileCompactSink sink(args.writer);
+    return CommitPreservingMetadataTo(&sink);
+}
+
+core::Expected<core::Unit, std::string> LsmtReadOnlyFile::CommitPreservingMetadataTo(
+    lsmt::CompactSink* sink) {
+    if (sink == 0) {
+        return core::make_unexpected(std::string("commit requires a destination writer"));
+    }
     if (layers_.size() != 1) {
         return core::make_unexpected(
             std::string("commit_preserving_metadata requires a sealed single-file overlaybd"
                         " layer; stacked read-only layers are not supported"));
-    }
-    if (!args.writer) {
-        return core::make_unexpected(std::string("commit requires a destination writer"));
     }
     if (!layers_[0]) {
         return core::make_unexpected(std::string("commit source layer is not open"));
@@ -475,7 +484,6 @@ core::Expected<core::Unit, std::string> LsmtReadOnlyFile::CommitPreservingMetada
     // The identity is taken from the source, overriding whatever the caller
     // put in `args`: repacking a layer must not re-identify it, or the layer
     // below stops recognising it as its child.
-    CommitArgs stamped = args;
     const core::Optional<std::string> uuid =
         ParseUuidField(trailer.value().uuid, sizeof(trailer.value().uuid));
     const core::Optional<std::string> parent_uuid =
@@ -485,9 +493,10 @@ core::Expected<core::Unit, std::string> LsmtReadOnlyFile::CommitPreservingMetada
     // An absent field clears the corresponding arg rather than leaving the
     // caller's value in place: Rust assigns the `Option` straight across, so
     // a source with no parent produces an output with no parent.
-    stamped.uuid = uuid.has_value() ? *uuid : std::string();
-    stamped.parent_uuid = parent_uuid.has_value() ? *parent_uuid : std::string();
-    stamped.user_tag = user_tag.has_value() ? *user_tag : std::vector<uint8_t>();
+    lsmt::CompactCommitArgs identity;
+    identity.uuid = uuid.has_value() ? *uuid : std::string();
+    identity.parent_uuid = parent_uuid.has_value() ? *parent_uuid : std::string();
+    identity.user_tag = user_tag.has_value() ? *user_tag : std::vector<uint8_t>();
 
     const uint64_t blocks = (virtual_size_ + kAlign - 1) / kAlign;
     if (blocks > static_cast<uint64_t>(~static_cast<uint32_t>(0))) {
@@ -496,15 +505,9 @@ core::Expected<core::Unit, std::string> LsmtReadOnlyFile::CommitPreservingMetada
     std::vector<SegmentMapping> mappings;
     index_->Lookup(Segment(0, static_cast<uint32_t>(blocks)), &mappings);
 
-    lsmt::CompactCommitArgs identity;
-    identity.uuid = stamped.uuid;
-    identity.parent_uuid = stamped.parent_uuid;
-    identity.user_tag = stamped.user_tag;
-
     LayerStackCompactSource source(layers_);
-    VirtualFileCompactSink sink(stamped.writer);
     std::string err;
-    if (!lsmt::CompactTo(&sink, &source, mappings, virtual_size_, identity, &err)) {
+    if (!lsmt::CompactTo(sink, &source, mappings, virtual_size_, identity, &err)) {
         return core::make_unexpected(std::string("commit_preserving_metadata: ") + err);
     }
     return core::Unit();

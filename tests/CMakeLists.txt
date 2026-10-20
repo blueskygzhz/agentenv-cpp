@@ -51,6 +51,18 @@ agentenv_add_test(test_overlaybd_lsmt_readonly test_overlaybd_lsmt_readonly.cc a
 agentenv_add_test(test_overlaybd_lsmt_rw test_overlaybd_lsmt_rw.cc agentenv-overlaybd)
 agentenv_add_test(test_overlaybd_lsmt_compact test_overlaybd_lsmt_compact.cc agentenv-overlaybd)
 agentenv_add_test(test_overlaybd_bk_download test_overlaybd_bk_download.cc agentenv-overlaybd)
+# Rust: the write path of src/backend/cache/full_file_cache/cache_store.rs.
+agentenv_add_test(test_overlaybd_cache_write test_overlaybd_cache_write.cc agentenv-overlaybd)
+# Rust: the open path and eviction tiers of
+# src/backend/cache/full_file_cache/cache_pool.rs.
+agentenv_add_test(test_overlaybd_cache_open test_overlaybd_cache_open.cc agentenv-overlaybd)
+# Rust: the ZFile read metrics of src/metrics.rs and the pread sampler of
+# src/compression/zfile.rs.
+agentenv_add_test(test_overlaybd_zfile_metrics test_overlaybd_zfile_metrics.cc agentenv-overlaybd)
+# Rust: src/dense_export.rs
+agentenv_add_test(test_overlaybd_dense_export test_overlaybd_dense_export.cc agentenv-overlaybd)
+# Rust: src/tools/oci.rs
+agentenv_add_test(test_overlaybd_tools_oci test_overlaybd_tools_oci.cc agentenv-overlaybd)
 agentenv_add_test(test_overlaybd_image_file test_overlaybd_image_file.cc agentenv-overlaybd)
 agentenv_add_test(test_deps                test_deps.cc                agentenv-rootmod)
 agentenv_add_test(test_overlaybd_p2p       test_overlaybd_p2p.cc       agentenv-overlaybd-p2p)

@@ -19,6 +19,14 @@ const char kRemoteReadDuration[] = "agentenv_overlaybd_remote_read_duration_seco
 const char kRemoteReadBytes[] = "agentenv_overlaybd_remote_read_bytes_total";
 const char kRemoteMetadataDuration[] = "agentenv_overlaybd_remote_metadata_duration_seconds";
 
+const char kZFileOutputBytes[] = "agentenv_overlaybd_zfile_output_bytes_total";
+const char kZFileEncodedBytes[] = "agentenv_overlaybd_zfile_encoded_bytes_total";
+const char kZFileBlocks[] = "agentenv_overlaybd_zfile_blocks_total";
+const char kZFileReadBatches[] = "agentenv_overlaybd_zfile_read_batches_total";
+const char kZFileRetries[] = "agentenv_overlaybd_zfile_retries_total";
+const char kZFilePreadDuration[] = "agentenv_overlaybd_zfile_pread_duration_seconds";
+const char kZFileDecompressDuration[] = "agentenv_overlaybd_zfile_decompress_duration_seconds";
+
 /// The `metrics!` macro takes name + label pairs; the C++ facade is
 /// label-free, so labels are folded into the series name in the standard
 /// Prometheus `name{k="v",..}` text form. Same convention as
@@ -197,6 +205,171 @@ void RecordRemoteMetadata(const RemoteSource& source, const std::string& error,
     labels.push_back(std::make_pair("registry", source.RegistryLabel()));
     labels.push_back(std::make_pair("status", std::string(RemoteReadStatusLabel(status))));
     observability::HistogramObserve(WithLabels(kRemoteMetadataDuration, labels), elapsed_seconds);
+}
+
+// ---------------------------------------------------------------------------
+// ZFile read metrics
+// ---------------------------------------------------------------------------
+
+const char* ZFileCodecLabel(ZFileCodec codec) {
+    return codec == kZFileZstd ? "zstd" : "lz4";
+}
+
+const char* ZFileReadStatusLabel(ZFileReadStatus status) {
+    return status == kZFileReadError ? "error" : "ok";
+}
+
+bool SampleZFilePread() {
+    // Thread-local, as in Rust: a shared counter would be a contended atomic
+    // on the hot read path, and an unbiased sample does not need a global
+    // sequence. `static` inside the function so no two translation units can
+    // disagree about the counter.
+    static __thread uint64_t seen = 0;
+    ++seen;
+    return (seen % kZFilePreadSampleInterval) == 0;
+}
+
+namespace {
+
+/// Every ZFile series name, built once.
+///
+/// This is the C++ stand-in for Rust's `OnceLock<Counter>` slots, and it is
+/// there for the same reason Rust bothers: the comment on `zcounter!` states
+/// that key construction happens once per reader, after which a logical
+/// `pread` pays only an atomic increment. Formatting the name on each call
+/// would put several string allocations into the zfile read loop -- a loop
+/// whose whole design (merged batch reads, decode straight into the caller's
+/// buffer) exists to avoid exactly that kind of per-read cost.
+///
+/// Every name is fully determined by the codec plus a fixed label, so the
+/// whole set is small and enumerable. Function-local statics, so it costs
+/// nothing until the first zfile read; C++11 makes their initialisation
+/// thread-safe.
+struct ZFileSeries {
+    // Indexed by codec: [lz4, zstd].
+    std::string output_bytes[2];
+    std::string encoded_bytes[2];
+    std::string blocks[2];
+    std::string read_batches[2];
+    std::string retries_checksum[2];
+    std::string retries_decompress[2];
+    // Indexed [codec][status], status being [ok, error].
+    std::string pread_duration[2][2];
+    std::string decompress_duration[2];
+
+    ZFileSeries() {
+        const ZFileCodec codecs[2] = {kZFileLz4, kZFileZstd};
+        const ZFileReadStatus statuses[2] = {kZFileReadOk, kZFileReadError};
+        for (int c = 0; c < 2; ++c) {
+            std::vector<std::pair<const char*, std::string> > base;
+            base.push_back(std::make_pair("codec", std::string(ZFileCodecLabel(codecs[c]))));
+
+            output_bytes[c] = WithLabels(kZFileOutputBytes, base);
+            encoded_bytes[c] = WithLabels(kZFileEncodedBytes, base);
+            blocks[c] = WithLabels(kZFileBlocks, base);
+            read_batches[c] = WithLabels(kZFileReadBatches, base);
+            decompress_duration[c] = WithLabels(kZFileDecompressDuration, base);
+
+            std::vector<std::pair<const char*, std::string> > crc(base);
+            crc.push_back(std::make_pair("reason", std::string("checksum")));
+            retries_checksum[c] = WithLabels(kZFileRetries, crc);
+
+            std::vector<std::pair<const char*, std::string> > dec(base);
+            dec.push_back(std::make_pair("reason", std::string("decompress")));
+            retries_decompress[c] = WithLabels(kZFileRetries, dec);
+
+            for (int st = 0; st < 2; ++st) {
+                std::vector<std::pair<const char*, std::string> > with_status(base);
+                with_status.push_back(
+                    std::make_pair("status", std::string(ZFileReadStatusLabel(statuses[st]))));
+                pread_duration[c][st] = WithLabels(kZFilePreadDuration, with_status);
+            }
+        }
+    }
+};
+
+const ZFileSeries& Series() {
+    static const ZFileSeries table;
+    return table;
+}
+
+int CodecIndex(ZFileCodec codec) { return codec == kZFileZstd ? 1 : 0; }
+int StatusIndex(ZFileReadStatus status) { return status == kZFileReadError ? 1 : 0; }
+
+}  // namespace
+
+void RecordZFileRead(ZFileCodec codec, const ZFileReadStats& stats) {
+    const ZFileSeries& s = Series();
+    const int c = CodecIndex(codec);
+
+    // Each guarded by non-zero, as Rust's `if stats.x > 0` arranges:
+    // registering a series with a zero increment publishes a metric that
+    // carries nothing and cannot be told apart from a genuine zero.
+    if (stats.output_bytes > 0) {
+        observability::CounterIncr(s.output_bytes[c], static_cast<int64_t>(stats.output_bytes));
+    }
+    if (stats.encoded_bytes > 0) {
+        observability::CounterIncr(s.encoded_bytes[c], static_cast<int64_t>(stats.encoded_bytes));
+    }
+    if (stats.blocks > 0) {
+        observability::CounterIncr(s.blocks[c], static_cast<int64_t>(stats.blocks));
+    }
+    if (stats.read_batches > 0) {
+        observability::CounterIncr(s.read_batches[c], static_cast<int64_t>(stats.read_batches));
+    }
+
+    // The two retry counters are one series split by `reason`, exactly as
+    // Rust spells it -- telling checksum corruption from decode corruption
+    // needs them side by side.
+    if (stats.checksum_retries > 0) {
+        observability::CounterIncr(s.retries_checksum[c],
+                                   static_cast<int64_t>(stats.checksum_retries));
+    }
+    if (stats.decompress_retries > 0) {
+        observability::CounterIncr(s.retries_decompress[c],
+                                   static_cast<int64_t>(stats.decompress_retries));
+    }
+}
+
+void RecordZFileReadDurations(ZFileCodec codec, ZFileReadStatus status, double pread_seconds,
+                              double decompress_seconds) {
+    const ZFileSeries& s = Series();
+    const int c = CodecIndex(codec);
+    observability::HistogramObserve(s.pread_duration[c][StatusIndex(status)], pread_seconds);
+    // No `status` on this one, matching Rust: the decode time of a failed
+    // pread is still decode time, and splitting it would halve each bucket's
+    // sample count for a question nobody asks.
+    observability::HistogramObserve(s.decompress_duration[c], decompress_seconds);
+}
+
+std::string ZFileSeriesNameForTest(ZFileSeriesId id, ZFileCodec codec) {
+    const ZFileSeries& s = Series();
+    // Deliberately through the same `CodecIndex` the recorders use, so a
+    // wrong index is observable here rather than only in whatever the
+    // recorder happened to publish.
+    const int c = CodecIndex(codec);
+    switch (id) {
+        case kZFileSeriesOutputBytes:
+            return s.output_bytes[c];
+        case kZFileSeriesEncodedBytes:
+            return s.encoded_bytes[c];
+        case kZFileSeriesBlocks:
+            return s.blocks[c];
+        case kZFileSeriesReadBatches:
+            return s.read_batches[c];
+        case kZFileSeriesRetriesChecksum:
+            return s.retries_checksum[c];
+        case kZFileSeriesRetriesDecompress:
+            return s.retries_decompress[c];
+        case kZFileSeriesDecompressDuration:
+            return s.decompress_duration[c];
+    }
+    return std::string();
+}
+
+std::string ZFilePreadDurationNameForTest(ZFileCodec codec, ZFileReadStatus status) {
+    const ZFileSeries& s = Series();
+    return s.pread_duration[CodecIndex(codec)][StatusIndex(status)];
 }
 
 }  // namespace metrics

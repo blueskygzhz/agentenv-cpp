@@ -2,6 +2,8 @@
 // Rust: storage/overlaybd/src/compression/zfile.rs
 #include "agentenv/storage/overlaybd/zfile.h"
 
+#include <time.h>
+
 #include <cstring>
 #include <sstream>
 
@@ -35,6 +37,17 @@ uint64_t ReadU64Le(const uint8_t* b, size_t off) {
     uint64_t v = 0;
     for (size_t i = 0; i < 8; ++i) v |= static_cast<uint64_t>(b[off + i]) << (8 * i);
     return v;
+}
+
+/// Monotonic seconds, for the metric wrappers only.
+///
+/// Seconds as a double rather than the milliseconds `oss.cc` uses: a single
+/// block decode is routinely under a millisecond, and integer milliseconds
+/// would report most of this histogram as zero.
+double MonotonicSecondsForMetrics() {
+    struct timespec ts;
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
 }
 
 void WriteU32Le(uint8_t* b, size_t off, uint32_t v) {
@@ -625,8 +638,41 @@ core::Expected<size_t, std::string> ZFileRO::PlanCoalescedBatch(size_t begin_idx
     return next;
 }
 
+metrics::ZFileCodec ZFileRO::CodecLabel() const {
+    // Only the two Rust names exist as labels. Anything else was already
+    // refused at open (`zfile_open_ro` rejects an unknown algo rather than
+    // defaulting), so this cannot mislabel a file that is actually readable.
+    return ht_.opt.algo == CompressOptions::kZstd ? metrics::kZFileZstd : metrics::kZFileLz4;
+}
+
 core::Expected<size_t, std::string> ZFileRO::Pread(uint8_t* buf, size_t len,
                                                      uint64_t offset) const {
+    // Rust `pread_generic`: the observation wrapper. The counters are
+    // recorded exactly once per logical pread, on success and on every error
+    // exit alike -- a pread that failed halfway still did the reads it did,
+    // and dropping them would make the byte totals disagree with the backing
+    // store under exactly the conditions worth investigating.
+    const bool sampled = metrics::SampleZFilePread();
+    metrics::ZFileReadStats stats;
+    double decompress_seconds = 0.0;
+
+    const double started = sampled ? MonotonicSecondsForMetrics() : 0.0;
+    const core::Expected<size_t, std::string> result =
+        PreadObserved(buf, len, offset, sampled, &stats, &decompress_seconds);
+    metrics::RecordZFileRead(CodecLabel(), stats);
+
+    if (sampled) {
+        metrics::RecordZFileReadDurations(
+            CodecLabel(), result.ok() ? metrics::kZFileReadOk : metrics::kZFileReadError,
+            MonotonicSecondsForMetrics() - started, decompress_seconds);
+    }
+    return result;
+}
+
+core::Expected<size_t, std::string> ZFileRO::PreadObserved(uint8_t* buf, size_t len,
+                                                             uint64_t offset, bool sampled,
+                                                             metrics::ZFileReadStats* stats,
+                                                             double* decompress_seconds) const {
     const size_t block_size = static_cast<size_t>(ht_.opt.block_size);
     if (block_size == 0) {
         return core::make_unexpected(std::string("invalid block_size"));
@@ -649,6 +695,11 @@ core::Expected<size_t, std::string> ZFileRO::Pread(uint8_t* buf, size_t len,
     const size_t begin_idx = static_cast<size_t>(offset / block_size);
     const uint64_t end = offset + clamped - 1;
     const size_t end_idx = static_cast<size_t>(end / block_size) + 1;
+
+    // The request's span, counted once. Retries deliberately do not
+    // re-increment it, so `blocks` stays a measure of how much was asked for
+    // rather than of how much work it took.
+    stats->blocks += static_cast<uint64_t>(end_idx - begin_idx);
 
     size_t written = 0;
     std::vector<uint8_t> compressed;
@@ -681,6 +732,11 @@ core::Expected<size_t, std::string> ZFileRO::Pread(uint8_t* buf, size_t len,
         // it, so a run of small blocks costs one backing IO rather than N.
         compressed.assign(batch_len, 0);
         if (batch_len > 0) {
+            // Counted before the read, not after: a failed read still
+            // submitted the bytes, and only counting successes would hide
+            // exactly the traffic worth looking at.
+            ++stats->read_batches;
+            stats->encoded_bytes += batch_len64;
             const core::Expected<core::Unit, std::string> got =
                 ReadExactAt(file_.get(), &compressed[0], batch_len, batch_begin.value());
             if (!got.ok()) return core::make_unexpected(got.error());
@@ -738,6 +794,12 @@ core::Expected<size_t, std::string> ZFileRO::Pread(uint8_t* buf, size_t len,
                     if (got != expected) {
                         if (retry > 0) {
                             --retry;
+                            ++stats->checksum_retries;
+                            // A retry is another exact read of the same
+                            // block, so it is both a batch and more encoded
+                            // bytes on the wire.
+                            ++stats->read_batches;
+                            stats->encoded_bytes += encoded_len64;
                             const core::Expected<core::Unit, std::string> ev =
                                 file_->EvictRange(block_begin.value(), encoded_len64);
                             if (!ev.ok()) return core::make_unexpected(ev.error());
@@ -761,6 +823,12 @@ core::Expected<size_t, std::string> ZFileRO::Pread(uint8_t* buf, size_t len,
 
                 std::string decomp_err;
                 bool decomp_ok = false;
+                // Clock read only when sampled: an unsampled pread must not
+                // pay two `clock_gettime` calls per block. Accumulated across
+                // every block *and every retry decode* of this one pread, so
+                // the histogram observes a per-pread sum, never a per-block
+                // value.
+                const double decomp_started = sampled ? MonotonicSecondsForMetrics() : 0.0;
                 if (cp_begin == 0 && cp_len == block_size) {
                     // A whole block decodes straight into the caller's
                     // buffer, with no intermediate copy.
@@ -795,10 +863,17 @@ core::Expected<size_t, std::string> ZFileRO::Pread(uint8_t* buf, size_t len,
                     }
                 }
 
+                if (sampled) {
+                    *decompress_seconds += MonotonicSecondsForMetrics() - decomp_started;
+                }
+
                 if (decomp_ok) break;
 
                 if (retry > 0) {
                     --retry;
+                    ++stats->decompress_retries;
+                    ++stats->read_batches;
+                    stats->encoded_bytes += encoded_len64;
                     const core::Expected<core::Unit, std::string> ev =
                         file_->EvictRange(block_begin.value(), encoded_len64);
                     if (!ev.ok()) return core::make_unexpected(ev.error());
@@ -818,6 +893,10 @@ core::Expected<size_t, std::string> ZFileRO::Pread(uint8_t* buf, size_t len,
         batch_begin_idx = batch_end_idx;
     }
 
+    // Only on the success path, as Rust arranges: a pread that failed
+    // returned nothing to the caller, and counting the bytes it had staged
+    // would overstate what the layer actually served.
+    stats->output_bytes += static_cast<uint64_t>(written);
     return written;
 }
 

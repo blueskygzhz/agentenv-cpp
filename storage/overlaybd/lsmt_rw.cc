@@ -925,7 +925,8 @@ core::Expected<size_t, std::string> LsmtFile::WriteInternalGeneric(const Writer&
 
                 if (f.kind == WriteFragment::kInPlace) {
                     const core::Expected<size_t, std::string> w =
-                        writer.WriteInto(rw_data_file_.get(), f.phys_offset, chunk + f.data_offset, f.len);
+                        writer.WriteInto(rw_data_file_.get(), f.phys_offset,
+                                         chunk + f.data_offset, f.len);
                     if (!w.ok()) return core::make_unexpected(w.error());
                     // No mapping published: one already points here, and it
                     // is unchanged.

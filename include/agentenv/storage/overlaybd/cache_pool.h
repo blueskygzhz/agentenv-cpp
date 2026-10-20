@@ -277,6 +277,18 @@ class CachedFile : public VirtualFile {
     /// the request reaches past what is known.
     core::Expected<uint64_t, std::string> TryGetSize(uint64_t offset, size_t count);
 
+    /// Rust `cache_refill_with_data_generic` — `RefillFromSlice` over a reader
+    /// strategy, because the merge step below reads the *source*.
+    template <typename Reader>
+    core::Expected<size_t, std::string> RefillFromSliceGeneric(const Reader& reader,
+                                                                 uint64_t offset,
+                                                                 const uint8_t* data, size_t len);
+
+    /// The two halves of the write precondition, shared by the plain and ctx
+    /// write paths so neither can drift into accepting what the other refuses.
+    core::Expected<core::Unit, std::string> CheckWriteRange(uint64_t offset, size_t len);
+    core::Expected<size_t, std::string> ClampWriteLength(uint64_t offset, size_t len);
+
     /// Rust `background_block_count` — blocks the bitmap must span.
     core::Expected<uint64_t, std::string> BackgroundBlockCount(uint64_t source_size) const;
 

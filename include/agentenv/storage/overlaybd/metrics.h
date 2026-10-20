@@ -90,6 +90,98 @@ void RecordRemoteRead(const RemoteSource& source, RemoteReadOperation operation,
 void RecordRemoteMetadata(const RemoteSource& source, const std::string& error,
                           double elapsed_seconds);
 
+// ---------------------------------------------------------------------------
+// Rust: the ZFile read metrics of metrics.rs
+// ---------------------------------------------------------------------------
+
+/// Rust `ZFileCodec` — the `codec` label.
+enum ZFileCodec { kZFileLz4, kZFileZstd };
+const char* ZFileCodecLabel(ZFileCodec codec);
+
+/// Rust `ZFileReadStatus` — the complete `status` label set of the pread
+/// duration histogram.
+enum ZFileReadStatus { kZFileReadOk, kZFileReadError };
+const char* ZFileReadStatusLabel(ZFileReadStatus status);
+
+/// Rust `ZFileReadStats` — exact counters accumulated across one logical
+/// `pread`.
+///
+/// A plain aggregate on purpose: the read loop increments these as stack
+/// integers and the metric backend is touched once, after the loop. Reporting
+/// per block would put a map lookup and a string build inside the hot path.
+struct ZFileReadStats {
+    /// Bytes returned to the caller; set only on success.
+    uint64_t output_bytes;
+    /// Encoded bytes submitted to exact reads, retry re-reads included.
+    uint64_t encoded_bytes;
+    /// Logical blocks touched by the initial request. Retries do not
+    /// re-increment this, so `blocks` stays a measure of the request's span
+    /// rather than of the work done.
+    uint64_t blocks;
+    /// Initial merged-range reads plus single-block retry reads. A zfile-level
+    /// read count, **not** a syscall or HTTP attempt count: one merged read
+    /// may be filled by several backing calls.
+    uint64_t read_batches;
+    /// Block re-reads after a CRC32C mismatch.
+    uint64_t checksum_retries;
+    /// Block re-reads after a decompress failure.
+    uint64_t decompress_retries;
+
+    ZFileReadStats()
+        : output_bytes(0), encoded_bytes(0), blocks(0), read_batches(0), checksum_retries(0),
+          decompress_retries(0) {}
+};
+
+/// Rust `ZFileReadMetrics::record` — the exact counters of one logical pread.
+///
+/// Called once per pread, on success and on every error exit alike. A counter
+/// is emitted only when its value is non-zero, matching Rust: a zero
+/// increment would register the series without carrying information.
+void RecordZFileRead(ZFileCodec codec, const ZFileReadStats& stats);
+
+/// Rust `ZFileReadMetrics::record_durations` — the sampled duration
+/// histograms of one logical pread.
+///
+/// Called only for preads the sampler selected, so the exported `_count` of
+/// both histograms is a **sample count, not an operation count**.
+/// `decompress_seconds` is the *sum* of every per-block decode inside this one
+/// pread, retry decodes included -- never a per-block observation.
+void RecordZFileReadDurations(ZFileCodec codec, ZFileReadStatus status, double pread_seconds,
+                              double decompress_seconds);
+
+/// Rust `ZFILE_PREAD_SAMPLE_INTERVAL`.
+const uint64_t kZFilePreadSampleInterval = 1024;
+
+/// Rust `sample_zfile_pread` — true for one pread in
+/// `kZFilePreadSampleInterval` on each thread.
+///
+/// Per-thread rather than global: a shared counter would be a contended
+/// atomic on the hot read path, and the sample only has to be unbiased, not
+/// globally sequenced.
+bool SampleZFilePread();
+
+/// The ZFile series the recorder emits.
+enum ZFileSeriesId {
+    kZFileSeriesOutputBytes,
+    kZFileSeriesEncodedBytes,
+    kZFileSeriesBlocks,
+    kZFileSeriesReadBatches,
+    kZFileSeriesRetriesChecksum,
+    kZFileSeriesRetriesDecompress,
+    kZFileSeriesDecompressDuration
+};
+
+/// Test seam onto the composed series names.
+///
+/// The metric facade is write-only -- `observability::CounterIncr` takes a
+/// name and returns nothing -- so reading the composed name back is the only
+/// way to check two things that are otherwise invisible: that the series
+/// table is indexed the right way round, and that the label text is what Rust
+/// exports. Both are silent failures otherwise, because a wrong name does not
+/// error, it just publishes a series nobody is looking at.
+std::string ZFileSeriesNameForTest(ZFileSeriesId id, ZFileCodec codec);
+std::string ZFilePreadDurationNameForTest(ZFileCodec codec, ZFileReadStatus status);
+
 }  // namespace metrics
 }  // namespace overlaybd
 }  // namespace storage

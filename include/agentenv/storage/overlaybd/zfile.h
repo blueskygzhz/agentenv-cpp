@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "agentenv/core/expected.h"
+#include "agentenv/storage/overlaybd/metrics.h"
 #include "agentenv/storage/overlaybd/virtual_file.h"
 
 namespace agentenv {
@@ -244,6 +245,22 @@ class ZFileRO : public VirtualFile {
     /// The *decompressed* size, not the size of the backing file.
     core::Expected<uint64_t, std::string> Size() override;
 
+    /// Test seam onto `PreadObserved`.
+    ///
+    /// Rust keeps its `pread_observed` private and still tests it, because
+    /// its tests live in the same module. They cannot here, and the
+    /// alternative -- asserting counters through a metrics recorder -- would
+    /// test the recorder's label formatting instead of the read loop's
+    /// accounting. Named `ForTest` following `FileCacheForTest`.
+    core::Expected<size_t, std::string> PreadObservedForTest(
+        uint8_t* buf, size_t len, uint64_t offset, bool sampled,
+        metrics::ZFileReadStats* stats, double* decompress_seconds) const {
+        return PreadObserved(buf, len, offset, sampled, stats, decompress_seconds);
+    }
+
+    /// The `codec` label this file reports.
+    metrics::ZFileCodec CodecLabelForTest() const { return CodecLabel(); }
+
  private:
     friend core::Expected<std::shared_ptr<ZFileRO>, std::string> ZFileOpenRo(
         std::shared_ptr<VirtualFile>, bool);
@@ -256,6 +273,23 @@ class ZFileRO : public VirtualFile {
     /// one backing read.
     core::Expected<size_t, std::string> PlanCoalescedBatch(size_t begin_idx,
                                                               size_t end_idx) const;
+
+    /// Rust `pread_observed` — the read itself, reporting what it did.
+    ///
+    /// Split from `Pread` exactly as Rust splits it, and for the same reason:
+    /// the loop fills `stats` in stack integers and touches no metric
+    /// backend, so the hot path costs nothing, and a test can drive the
+    /// success, retry and error flows and assert the aggregate without
+    /// installing a recorder. `decompress_seconds` is only accumulated when
+    /// `sampled` is set -- an unsampled pread must not pay for a clock read
+    /// per block.
+    core::Expected<size_t, std::string> PreadObserved(uint8_t* buf, size_t len, uint64_t offset,
+                                                         bool sampled,
+                                                         metrics::ZFileReadStats* stats,
+                                                         double* decompress_seconds) const;
+
+    /// The `codec` label for this file, from the trailer's compression type.
+    metrics::ZFileCodec CodecLabel() const;
 
     std::shared_ptr<VirtualFile> file_;
     HeaderTrailer ht_;

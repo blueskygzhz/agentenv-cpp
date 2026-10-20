@@ -15,6 +15,7 @@
 #include "agentenv/core/digest.h"
 #include "agentenv/storage/overlaybd/bk_download.h"
 #include "agentenv/storage/overlaybd/sys.h"
+#include "internal.h"
 
 namespace agentenv {
 namespace storage {
@@ -813,8 +814,9 @@ bool FileCacheBackend::QueryRefillRange(const CacheEntry& entry, uint64_t offset
 // Refill
 // ---------------------------------------------------------------------------
 
-core::Expected<core::Unit, std::string> FileCacheBackend::DoRefillBlock(
-    CacheEntry* entry, const std::string& cache_id, VirtualFile* source,
+template <typename Reader>
+core::Expected<core::Unit, std::string> FileCacheBackend::DoRefillBlockGeneric(
+    const Reader& reader, CacheEntry* entry, const std::string& cache_id, VirtualFile* source,
     uint64_t source_size, uint64_t block_id) {
     const uint64_t block_size = options_.block_size;
     uint64_t offset = block_id * block_size;
@@ -854,7 +856,7 @@ core::Expected<core::Unit, std::string> FileCacheBackend::DoRefillBlock(
     size_t done = 0;
     while (done < buf_len) {
         const core::Expected<size_t, std::string> n =
-            source->ReadAtInto(offset + done, buf + done, buf_len - done);
+            reader.ReadInto(source, offset + done, buf + done, buf_len - done);
         if (!n.ok()) return core::make_unexpected(n.error());
         if (n.value() == 0) break;
         done += n.value();
@@ -876,9 +878,10 @@ core::Expected<core::Unit, std::string> FileCacheBackend::DoRefillBlock(
     return core::Unit();
 }
 
-core::Expected<core::Unit, std::string> FileCacheBackend::RefillExactRange(
-    const std::string& cache_id, VirtualFile* source, uint64_t source_size,
-    uint64_t refill_off, uint64_t refill_size) {
+template <typename Reader>
+core::Expected<core::Unit, std::string> FileCacheBackend::RefillExactRangeGeneric(
+    const Reader& reader, const std::string& cache_id, VirtualFile* source,
+    uint64_t source_size, uint64_t refill_off, uint64_t refill_size) {
     if (refill_size == 0) return core::Unit();
 
     const std::shared_ptr<CacheEntry> entry = GetCacheEntry(cache_id);
@@ -901,8 +904,8 @@ core::Expected<core::Unit, std::string> FileCacheBackend::RefillExactRange(
             if (acquired == kRefillInProgress) break;
 
             ++active_refills_;
-            const core::Expected<core::Unit, std::string> filled =
-                DoRefillBlock(entry.get(), cache_id, source, source_size, block_id);
+            const core::Expected<core::Unit, std::string> filled = DoRefillBlockGeneric(
+                reader, entry.get(), cache_id, source, source_size, block_id);
             --active_refills_;
             entry->FinishRefill(block_id);
 
@@ -927,9 +930,10 @@ core::Expected<core::Unit, std::string> FileCacheBackend::RefillExactRange(
 // Read
 // ---------------------------------------------------------------------------
 
-core::Expected<ByteBuffer, std::string> FileCacheBackend::DoPread(
-    const std::string& cache_id, VirtualFile* source, uint64_t source_size,
-    uint32_t open_flags, uint32_t rw_flags, uint64_t offset, size_t len) {
+template <typename Reader>
+core::Expected<ByteBuffer, std::string> FileCacheBackend::DoPreadGeneric(
+    const Reader& reader, const std::string& cache_id, VirtualFile* source,
+    uint64_t source_size, uint32_t open_flags, uint32_t rw_flags, uint64_t offset, size_t len) {
     ByteBuffer out;
     if (len == 0 || offset >= source_size) return out;
 
@@ -957,7 +961,8 @@ core::Expected<ByteBuffer, std::string> FileCacheBackend::DoPread(
                 entry->RecordMiss();
                 // Failure is ignored: the read below still serves the request
                 // from the source, so a refill problem must not fail it.
-                RefillExactRange(cache_id, source, source_size, hole_off, hole_len);
+                RefillExactRangeGeneric(reader, cache_id, source, source_size, hole_off,
+                                        hole_len);
             }
         }
     }
@@ -1006,8 +1011,8 @@ core::Expected<ByteBuffer, std::string> FileCacheBackend::DoPread(
             }
             size_t done = 0;
             while (done < copy_len) {
-                const core::Expected<size_t, std::string> n = source->ReadAtInto(
-                    block_base + from + done, &out[written + done], copy_len - done);
+                const core::Expected<size_t, std::string> n = reader.ReadInto(
+                    source, block_base + from + done, &out[written + done], copy_len - done);
                 if (!n.ok()) return core::make_unexpected(n.error());
                 if (n.value() == 0) break;
                 done += n.value();
@@ -1025,6 +1030,30 @@ core::Expected<ByteBuffer, std::string> FileCacheBackend::DoPread(
 
     out.resize(written);
     return out;
+}
+
+// The plain entry points. Each is the generic body instantiated with the
+// direct reader, so there is exactly one copy of the logic.
+
+core::Expected<core::Unit, std::string> FileCacheBackend::DoRefillBlock(
+    CacheEntry* entry, const std::string& cache_id, VirtualFile* source, uint64_t source_size,
+    uint64_t block_id) {
+    return DoRefillBlockGeneric(DirectLayerRead(), entry, cache_id, source, source_size,
+                                block_id);
+}
+
+core::Expected<core::Unit, std::string> FileCacheBackend::RefillExactRange(
+    const std::string& cache_id, VirtualFile* source, uint64_t source_size, uint64_t refill_off,
+    uint64_t refill_size) {
+    return RefillExactRangeGeneric(DirectLayerRead(), cache_id, source, source_size, refill_off,
+                                   refill_size);
+}
+
+core::Expected<ByteBuffer, std::string> FileCacheBackend::DoPread(
+    const std::string& cache_id, VirtualFile* source, uint64_t source_size, uint32_t open_flags,
+    uint32_t rw_flags, uint64_t offset, size_t len) {
+    return DoPreadGeneric(DirectLayerRead(), cache_id, source, source_size, open_flags, rw_flags,
+                          offset, len);
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,6 +1122,12 @@ core::Expected<std::shared_ptr<CachedFile>, std::string> FileCacheBackend::OpenF
     }
 
     entry->IncOpenCount();
+    // Rust touches the entry here too, and it is not cosmetic. The second
+    // eviction tier reclaims the blocks of entries that are *currently open*
+    // but idle, choosing by last access -- so an entry reopened without this
+    // still carries the age it had before and is the first thing thrown away,
+    // before the handle that just opened it has read a byte.
+    entry->Touch();
 
     std::shared_ptr<CachedFile> file(new CachedFile());
     file->backend_ = this;
@@ -1151,6 +1186,46 @@ core::Expected<ByteBuffer, std::string> CachedFile::ReadAt(uint64_t offset, size
     return ReadAtWithFlags(offset, len, 0);
 }
 
+// The ctx variants. This is the layer the context exists for: on a miss the
+// backend reads the source, and that read is the one a ublk queue thread
+// wants on its own ring.
+
+core::Expected<ByteBuffer, std::string> CachedFile::ReadAtWithCtx(const IoCtx& ctx,
+                                                                     uint64_t offset,
+                                                                     size_t len) {
+    const core::Expected<uint64_t, std::string> size = TryGetSize(offset, len);
+    if (!size.ok()) return core::make_unexpected(size.error());
+    return backend_->DoPreadGeneric(CtxLayerRead(ctx), cache_id_, source_.get(), size.value(),
+                                    open_flags_, 0, offset, len);
+}
+
+core::Expected<size_t, std::string> CachedFile::ReadAtIntoWithCtx(const IoCtx& ctx,
+                                                                     uint64_t offset,
+                                                                     uint8_t* dst, size_t len) {
+    if (len == 0) return static_cast<size_t>(0);
+    if (dst == 0) {
+        return core::make_unexpected(std::string("cached read_at_into: null destination"));
+    }
+    const core::Expected<ByteBuffer, std::string> data = ReadAtWithCtx(ctx, offset, len);
+    if (!data.ok()) return core::make_unexpected(data.error());
+    const size_t n = data.value().size() < len ? data.value().size() : len;
+    if (n > 0) std::memcpy(dst, &data.value()[0], n);
+    return n;
+}
+
+core::Expected<size_t, std::string> CachedFile::WriteAtWithCtx(const IoCtx& ctx, uint64_t offset,
+                                                                  const uint8_t* data,
+                                                                  size_t len) {
+    const core::Expected<core::Unit, std::string> checked = CheckWriteRange(offset, len);
+    if (!checked.ok()) return core::make_unexpected(checked.error());
+
+    const core::Expected<size_t, std::string> write_len = ClampWriteLength(offset, len);
+    if (!write_len.ok()) return core::make_unexpected(write_len.error());
+    if (write_len.value() == 0) return static_cast<size_t>(0);
+
+    return RefillFromSliceGeneric(CtxLayerRead(ctx), offset, data, write_len.value());
+}
+
 core::Expected<size_t, std::string> CachedFile::ReadAtInto(uint64_t offset, uint8_t* dst,
                                                               size_t len) {
     if (len == 0) return static_cast<size_t>(0);
@@ -1161,27 +1236,35 @@ core::Expected<size_t, std::string> CachedFile::ReadAtInto(uint64_t offset, uint
     return n;
 }
 
-core::Expected<size_t, std::string> CachedFile::WriteAtWithFlags(uint64_t offset,
-                                                                    const uint8_t* data,
-                                                                    size_t len, uint32_t) {
+core::Expected<core::Unit, std::string> CachedFile::CheckWriteRange(uint64_t offset,
+                                                                      size_t len) {
+    if (len == 0) return core::Unit();
+    if (offset + static_cast<uint64_t>(len) < offset) {
+        return core::make_unexpected(std::string("write range overflow"));
+    }
+    // Page alignment, not block alignment: a write that starts mid-page could
+    // not be merged into a block without reading a partial page back, and the
+    // callers above all work in pages. Anything coarser is handled by the
+    // read-modify-write in `RefillFromSliceGeneric`.
+    if ((offset % kCachePageSize) != 0) {
+        std::ostringstream o;
+        o << "offset " << offset << " is not aligned to " << kCachePageSize;
+        return core::make_unexpected(o.str());
+    }
+    return core::Unit();
+}
+
+core::Expected<size_t, std::string> CachedFile::ClampWriteLength(uint64_t offset, size_t len) {
     if (len == 0) return static_cast<size_t>(0);
 
     const core::Expected<uint64_t, std::string> size = TryGetSize(offset, len);
     if (!size.ok()) return core::make_unexpected(size.error());
     const uint64_t source_size = size.value();
 
-    const uint64_t write_end = offset + static_cast<uint64_t>(len);
-    if (write_end < offset) return core::make_unexpected(std::string("write range overflow"));
-
-    // Blocks are the unit of both the bitmap and the mapping, so a write that
-    // does not start on a page boundary could not be recorded as whole blocks.
-    if ((offset % kCachePageSize) != 0) {
-        std::ostringstream o;
-        o << "offset " << offset << " is not aligned to " << kCachePageSize;
-        return core::make_unexpected(o.str());
-    }
     if (offset >= source_size) return static_cast<size_t>(0);
+
     // The final write may be short, since the source itself ends mid-page.
+    const uint64_t write_end = offset + static_cast<uint64_t>(len);
     if ((static_cast<uint64_t>(len) % kCachePageSize) != 0 && write_end < source_size) {
         std::ostringstream o;
         o << "size " << len << " is not aligned to " << kCachePageSize;
@@ -1189,10 +1272,20 @@ core::Expected<size_t, std::string> CachedFile::WriteAtWithFlags(uint64_t offset
     }
 
     const uint64_t remain = source_size - offset;
-    const size_t write_len = static_cast<size_t>(remain < len ? remain : len);
-    if (write_len == 0) return static_cast<size_t>(0);
+    return static_cast<size_t>(remain < len ? remain : len);
+}
 
-    return RefillFromSlice(offset, data, write_len);
+core::Expected<size_t, std::string> CachedFile::WriteAtWithFlags(uint64_t offset,
+                                                                    const uint8_t* data,
+                                                                    size_t len, uint32_t) {
+    const core::Expected<core::Unit, std::string> checked = CheckWriteRange(offset, len);
+    if (!checked.ok()) return core::make_unexpected(checked.error());
+
+    const core::Expected<size_t, std::string> write_len = ClampWriteLength(offset, len);
+    if (!write_len.ok()) return core::make_unexpected(write_len.error());
+    if (write_len.value() == 0) return static_cast<size_t>(0);
+
+    return RefillFromSlice(offset, data, write_len.value());
 }
 
 core::Expected<size_t, std::string> CachedFile::WriteAt(uint64_t offset, const uint8_t* data,
@@ -1202,45 +1295,129 @@ core::Expected<size_t, std::string> CachedFile::WriteAt(uint64_t offset, const u
 
 core::Expected<uint64_t, std::string> CachedFile::Size() { return source_size_; }
 
-core::Expected<size_t, std::string> CachedFile::RefillFromSlice(uint64_t offset,
-                                                                   const uint8_t* data,
-                                                                   size_t len) {
+template <typename Reader>
+core::Expected<size_t, std::string> CachedFile::RefillFromSliceGeneric(const Reader& reader,
+                                                                        uint64_t offset,
+                                                                        const uint8_t* data,
+                                                                        size_t len) {
+    if (len == 0) return static_cast<size_t>(0);
+    if (data == 0) {
+        return core::make_unexpected(std::string("refill_from_slice: null data"));
+    }
+
+    const uint64_t write_end = offset + static_cast<uint64_t>(len);
+    if (write_end < offset) {
+        return core::make_unexpected(std::string("refill range overflow"));
+    }
+
     const std::shared_ptr<CacheEntry> entry = backend_->GetCacheEntry(cache_id_);
     if (!entry) {
         return core::make_unexpected("cache entry evicted: cache_id=" + cache_id_);
     }
 
     const uint64_t block_size = backend_->options_.block_size;
-    // Only whole blocks are published: a partial block recorded as present
-    // would serve its unwritten remainder as cached data.
-    if ((offset % block_size) != 0) return static_cast<size_t>(0);
+    const uint64_t start_block = offset / block_size;
+    const uint64_t end_block = (write_end - 1) / block_size;
 
-    size_t written = 0;
-    uint64_t block_id = offset / block_size;
-    while (written < len) {
-        const size_t chunk = static_cast<size_t>(
-            (len - written) < block_size ? (len - written) : block_size);
-        const uint64_t block_off = block_id * block_size;
-        const uint64_t remain =
-            entry->SourceSize() > block_off ? entry->SourceSize() - block_off : 0;
-        const size_t expect = static_cast<size_t>(remain < block_size ? remain : block_size);
-        // A trailing partial chunk is only publishable when it is the
-        // source's own short last block.
-        if (chunk < block_size && chunk != expect) break;
-        if (expect == 0) break;
-
-        const core::Expected<core::Unit, std::string> ok =
-            entry->WriteBlock(block_id, data + written, chunk);
-        if (!ok.ok()) return core::make_unexpected(ok.error());
-        entry->RecordRefill();
-        backend_->AddCurrentBytes(static_cast<uint64_t>(chunk));
-
-        written += chunk;
-        ++block_id;
+    // Rust widens the entry here when the write reaches past the known size.
+    // `SetSourceSize` refuses any actual change -- the mapping length and
+    // every bitmap index derive from the original size -- so the call is only
+    // made when it is a no-op, and a genuine growth is reported rather than
+    // silently writing outside the mapping.
+    const uint64_t new_size =
+        entry->SourceSize() > write_end ? entry->SourceSize() : write_end;
+    if (new_size > entry->SourceSize()) {
+        const core::Expected<core::Unit, std::string> grown = entry->SetSourceSize(new_size);
+        if (!grown.ok()) return core::make_unexpected(grown.error());
     }
 
+    std::vector<uint8_t> block(static_cast<size_t>(block_size), 0);
+
+    for (uint64_t block_id = start_block; block_id <= end_block; ++block_id) {
+        const uint64_t block_start = block_id * block_size;
+        const uint64_t in_start = offset > block_start ? offset : block_start;
+        const uint64_t block_limit = block_start + block_size;
+        const uint64_t in_end = write_end < block_limit ? write_end : block_limit;
+        if (in_start >= in_end) continue;
+
+        // Read-modify-write. The block is the unit of both the bitmap and the
+        // mapping, so a block can only be published whole: publishing it with
+        // the untouched remainder left at zero would serve those zeros as
+        // data, and refusing the write instead would silently lose it. The
+        // remainder therefore has to be recovered -- from the cached copy if
+        // there is one, otherwise from the source.
+        std::memset(&block[0], 0, block.size());
+        const uint8_t* existing = 0;
+        size_t existing_len = 0;
+        bool found = false;
+        const core::Expected<core::Unit, std::string> got =
+            entry->ReadBlock(block_id, &existing, &existing_len, &found);
+        if (got.ok() && found) {
+            const size_t n = existing_len < block.size() ? existing_len : block.size();
+            if (n > 0) std::memcpy(&block[0], existing, n);
+        } else if (source_ && block_start < entry->SourceSize()) {
+            const uint64_t remain = entry->SourceSize() - block_start;
+            const size_t want =
+                static_cast<size_t>(remain < block_size ? remain : block_size);
+            size_t done = 0;
+            while (done < want) {
+                const core::Expected<size_t, std::string> n = reader.ReadInto(
+                    source_.get(), block_start + done, &block[done], want - done);
+                if (!n.ok()) return core::make_unexpected(n.error());
+                if (n.value() == 0) break;
+                done += n.value();
+            }
+            if (done != want) {
+                std::ostringstream o;
+                o << "short source read while merging block " << block_id << ": got " << done
+                  << ", want " << want;
+                return core::make_unexpected(o.str());
+            }
+        }
+
+        const size_t src_begin = static_cast<size_t>(in_start - offset);
+        const size_t src_end = static_cast<size_t>(in_end - offset);
+        const size_t dst_begin = static_cast<size_t>(in_start - block_start);
+        if (src_end > len || dst_begin + (src_end - src_begin) > block.size()) {
+            return core::make_unexpected(std::string("invalid refill segment boundaries"));
+        }
+        std::memcpy(&block[dst_begin], data + src_begin, src_end - src_begin);
+
+        // The published length stops at the source's end, so the last block of
+        // a short file is not padded out with zeros that reads would serve.
+        const uint64_t tail = new_size > block_start ? new_size - block_start : 0;
+        size_t valid = static_cast<size_t>(tail < block_size ? tail : block_size);
+        if (valid > block.size()) valid = block.size();
+        if (valid == 0) continue;
+
+        // Checked per block rather than once up front, matching Rust: an
+        // eviction running beside this loop can flip `is_full_` partway.
+        if (backend_->options_.capacity_bytes == 0 || backend_->is_full_) {
+            return core::make_unexpected(std::string("cache is full (ENOSPC)"));
+        }
+
+        // Asked before publishing: `WriteBlock` sets the bitmap, after which
+        // every block looks cached and a rewrite would be counted as new
+        // bytes. The counter drives the eviction watermark, so inflating it
+        // walks the cache toward a permanent "full" verdict.
+        const bool was_cached = entry->HasBlock(block_id);
+        const core::Expected<core::Unit, std::string> put =
+            entry->WriteBlock(block_id, &block[0], valid);
+        if (!put.ok()) return core::make_unexpected(put.error());
+        if (!was_cached) backend_->AddCurrentBytes(static_cast<uint64_t>(valid));
+    }
+
+    // Once per call, not once per block: this is a refill event, and Rust
+    // counts it that way.
+    entry->RecordRefill();
     backend_->EvictionInner();
-    return written;
+    return len;
+}
+
+core::Expected<size_t, std::string> CachedFile::RefillFromSlice(uint64_t offset,
+                                                                   const uint8_t* data,
+                                                                   size_t len) {
+    return RefillFromSliceGeneric(DirectLayerRead(), offset, data, len);
 }
 
 core::Expected<size_t, std::string> CachedFile::RefillRange(uint64_t offset, size_t count) {

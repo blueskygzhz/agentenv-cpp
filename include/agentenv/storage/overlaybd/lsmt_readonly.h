@@ -219,6 +219,19 @@ class LsmtReadOnlyFile : public VirtualFile {
     /// source has no trailer to read one from.
     core::Expected<core::Unit, std::string> CommitPreservingMetadata(const CommitArgs& args);
 
+    /// The same operation against an arbitrary sink.
+    ///
+    /// `CommitArgs::writer` is a `VirtualFile`, which is the wrong shape for a
+    /// consumer that is not a file -- the dense-export digest, for instance,
+    /// only hashes the stream. Rust has no such split because its
+    /// `CommitArgs.writer` is already the `CompactWriter` trait; this overload
+    /// is where that trait object enters, and the `CommitArgs` form is a thin
+    /// wrapper over it.
+    ///
+    /// The identity is still taken from the source trailer, not from the
+    /// caller. Nothing else differs.
+    core::Expected<core::Unit, std::string> CommitPreservingMetadataTo(lsmt::CompactSink* sink);
+
     // -- VirtualFile -------------------------------------------------------
 
     core::Expected<ByteBuffer, std::string> ReadAt(uint64_t offset, size_t len) override;
