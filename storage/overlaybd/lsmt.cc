@@ -2,6 +2,10 @@
 // Rust: storage/overlaybd/src/lsmt/{index,format}.rs — faithful C++11 port.
 #include "agentenv/storage/overlaybd/lsmt.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cstdio>
 #include <utility>
 
@@ -541,6 +545,58 @@ void FillUserTagField(uint8_t* dst, size_t cap, const std::vector<uint8_t>& tag)
     for (size_t i = 0; i < n; ++i) dst[i] = tag[i];
 }
 
+// Rust `VirtualFileWriter` over a freshly created local file: the sink the
+// path-taking `CompactTo` overloads bind to.
+//
+// Positioned `pwrite` rather than `fseek`+`fwrite`: `std::fseek` takes a
+// `long`, which silently truncates the offset once a compacted layer passes
+// 2 GiB on any platform where `long` is 32-bit. The offsets here are
+// genuinely file-sized (data is packed after the header, then the index, then
+// the trailer), so the 64-bit `off_t` form is the correct one.
+class FdCompactSink : public CompactSink {
+ public:
+    FdCompactSink() : fd_(-1) {}
+    ~FdCompactSink() { Close(); }
+
+    bool Create(const std::string& path) {
+        Close();
+        fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+        return fd_ >= 0;
+    }
+
+    void Close() {
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+    bool WriteAt(uint64_t off, const uint8_t* data, uint64_t len) {
+        if (fd_ < 0) return false;
+        uint64_t done = 0;
+        while (done < len) {
+            const ssize_t n = ::pwrite(fd_, data + done, static_cast<size_t>(len - done),
+                                       static_cast<off_t>(off + done));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return false;
+            }
+            // A zero-byte write with nothing left to signal it is not going
+            // to make progress on a retry; treat it as the failure it is
+            // rather than spinning.
+            if (n == 0) return false;
+            done += static_cast<uint64_t>(n);
+        }
+        return true;
+    }
+
+ private:
+    FdCompactSink(const FdCompactSink&);
+    FdCompactSink& operator=(const FdCompactSink&);
+
+    int fd_;
+};
+
 }  // namespace
 
 bool CompactTo(const std::string& path, CompactSource* source,
@@ -552,14 +608,23 @@ bool CompactTo(const std::string& path, CompactSource* source,
 bool CompactTo(const std::string& path, CompactSource* source,
         const std::vector<SegmentMapping>& mappings,
          uint64_t virtual_size, const CompactCommitArgs& args, std::string* err) {
+    FdCompactSink sink;
+    if (!sink.Create(path)) {
+        if (err) *err = "cannot create " + path;
+        return false;
+    }
+    return CompactTo(&sink, source, mappings, virtual_size, args, err);
+}
+
+bool CompactTo(CompactSink* sink, CompactSource* source,
+        const std::vector<SegmentMapping>& mappings,
+         uint64_t virtual_size, const CompactCommitArgs& args, std::string* err) {
     auto set_err = [&](const std::string& m) { if (err) *err = m; };
     if (source == nullptr) { set_err("null CompactSource"); return false; }
+    if (sink == nullptr) { set_err("null CompactSink"); return false; }
 
     const uint64_t HEADER_SIZE = kLsmtHeaderSize;   // 4096
     const uint64_t ALIGNMENT   = kLsmtAlignment;    // 512
-
-    std::FILE* f = std::fopen(path.c_str(), "wb+");
-    if (!f) { set_err("cannot create " + path); return false; }
 
     // --- header block @ 0 ---
     HeaderTrailer header = HeaderTrailer::New();
@@ -586,8 +651,8 @@ bool CompactTo(const std::string& path, CompactSource* source,
         header.Serialize(hb);
   for (size_t i = 0; i < sizeof(hb); ++i) header_buf[i] = hb[i];
     }
-    if (std::fwrite(&header_buf[0], 1, header_buf.size(), f) != header_buf.size()) {
-        std::fclose(f); set_err("write header failed"); return false;
+    if (!sink->WriteAt(0, &header_buf[0], header_buf.size())) {
+        set_err("write header failed"); return false;
     }
 
     // --- Phase 1+2: pack non-zeroed data sequentially after the header ---
@@ -607,14 +672,11 @@ bool CompactTo(const std::string& path, CompactSource* source,
         const uint64_t src_byte_off = m.moffset * ALIGNMENT;
         std::vector<uint8_t> data(static_cast<size_t>(nbytes), 0);
 if (nbytes > 0 && !source->ReadAt(m.tag, src_byte_off, &data[0], nbytes)) {
- std::fclose(f); set_err("CompactSource read failed"); return false;
+ set_err("CompactSource read failed"); return false;
         }
         const uint64_t dest_byte_off = dest_moffset * ALIGNMENT;
-        if (std::fseek(f, static_cast<long>(dest_byte_off), SEEK_SET) != 0) {
-      std::fclose(f); set_err("seek data failed"); return false;
-        }
-        if (nbytes > 0 && std::fwrite(&data[0], 1, data.size(), f) != data.size()) {
-            std::fclose(f); set_err("write data failed"); return false;
+        if (nbytes > 0 && !sink->WriteAt(dest_byte_off, &data[0], data.size())) {
+            set_err("write data failed"); return false;
         }
         SegmentMapping out = m;
  out.moffset = dest_moffset;
@@ -649,12 +711,9 @@ if (nbytes > 0 && !source->ReadAt(m.tag, src_byte_off, &data[0], nbytes)) {
    index_bytes.insert(index_bytes.end(), rec, rec + 16);
     }
 
-    if (std::fseek(f, static_cast<long>(index_offset), SEEK_SET) != 0) {
-      std::fclose(f); set_err("seek index failed"); return false;
-    }
  if (!index_bytes.empty() &&
-        std::fwrite(&index_bytes[0], 1, index_bytes.size(), f) != index_bytes.size()) {
-        std::fclose(f); set_err("write index failed"); return false;
+        !sink->WriteAt(index_offset, &index_bytes[0], index_bytes.size())) {
+        set_err("write index failed"); return false;
     }
 
   const uint64_t index_size = compact_index.size() + padding_count;
@@ -662,8 +721,9 @@ if (nbytes > 0 && !source->ReadAt(m.tag, src_byte_off, &data[0], nbytes)) {
     if (trailer_offset % 4096 != 0) {
         uint64_t pad_len = 4096 - (trailer_offset % 4096);
   std::vector<uint8_t> pad(static_cast<size_t>(pad_len), 0);
-        std::fseek(f, static_cast<long>(trailer_offset), SEEK_SET);
-        std::fwrite(&pad[0], 1, pad.size(), f);
+        if (!sink->WriteAt(trailer_offset, &pad[0], pad.size())) {
+            set_err("write index padding failed"); return false;
+        }
         trailer_offset += pad_len;
     }
 
@@ -678,14 +738,10 @@ uint8_t tb[HeaderTrailer::kOnDiskSize];
         trailer.Serialize(tb);
    for (size_t i = 0; i < sizeof(tb); ++i) trailer_buf[i] = tb[i];
     }
-    if (std::fseek(f, static_cast<long>(trailer_offset), SEEK_SET) != 0) {
-        std::fclose(f); set_err("seek trailer failed"); return false;
-    }
-    if (std::fwrite(&trailer_buf[0], 1, trailer_buf.size(), f) != trailer_buf.size()) {
-     std::fclose(f); set_err("write trailer failed"); return false;
+    if (!sink->WriteAt(trailer_offset, &trailer_buf[0], trailer_buf.size())) {
+     set_err("write trailer failed"); return false;
     }
 
-    std::fclose(f);
     return true;
 }
 

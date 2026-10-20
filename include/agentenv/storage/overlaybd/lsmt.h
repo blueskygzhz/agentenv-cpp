@@ -338,6 +338,24 @@ class CompactSource {
           uint8_t* dst, uint64_t len) = 0;
 };
 
+/// Rust `storage_util::CompactWriter` — the positioned sink `compact_to`
+/// writes its output through.
+///
+/// Declared here rather than taking a `VirtualFile` directly to keep this
+/// header free of the io layer, which mirrors the Rust split: `compact_to`
+/// takes a `CompactWriter`, and `VirtualFileWriter` is the adapter that binds
+/// one to a file. The `VirtualFile` adapter lives in `lsmt_rw.cc`.
+///
+/// Every offset and length `CompactTo` hands this sink is 512B-aligned (the
+/// header is 4096, data blocks are whole ALIGNMENT units, and the index array
+/// is padded to 4096), so an implementation backed by O_DIRECT is usable.
+class CompactSink {
+ public:
+    virtual ~CompactSink() {}
+    /// Rust `write_all_at`: a partial write is a failure, not a retry point.
+    virtual bool WriteAt(uint64_t off, const uint8_t* data, uint64_t len) = 0;
+};
+
 /// Rust: lsmt/file/helper.rs :: compact_to (single-threaded, no zero-detection
 /// path — i.e. COMPACT_ZERO_DETECTION_ENABLED == false).
 /// Packs non-zeroed mappings sequentially after the 4096B header, records zeroed
@@ -346,9 +364,10 @@ class CompactSource {
 /// Rust `types.rs :: CommitArgs` — the identity a compacted layer is stamped
 /// with.
 ///
-/// Only the fields that reach the header are here. Rust's `writer` and
-/// `concurrency` are absent by construction: this port writes the output
-/// itself and does so sequentially, which is the `concurrency = 1` default.
+/// Only the fields that reach the header are here. Rust's `writer` is passed
+/// alongside as a `CompactSink` rather than being a member, and `concurrency`
+/// is absent by construction: this port copies data blocks sequentially,
+/// which is the `concurrency = 1` default.
 struct CompactCommitArgs {
     /// Empty means the nil uuid is written, *not* that the field is left
     /// blank -- see `CompactTo`.
@@ -382,6 +401,22 @@ bool CompactTo(const std::string& path,
            CompactSource* source,
                const std::vector<SegmentMapping>& mappings,
    uint64_t virtual_size,
+         std::string* err);
+
+/// As above, writing through a caller-supplied sink instead of creating a
+/// file. This is the primitive the path-taking overloads delegate to, and it
+/// is what matches Rust: `compact_to` only ever writes through
+/// `args.writer`, so a caller that already holds an open destination (the
+/// staging file of an OSS export, an arbitrary `VirtualFile` handed to
+/// `flatten`) does not have to round-trip through a path.
+///
+/// The sink is not synced or closed here; its owner decides when the bytes
+/// have to be durable, exactly as in Rust.
+bool CompactTo(CompactSink* sink,
+           CompactSource* source,
+               const std::vector<SegmentMapping>& mappings,
+   uint64_t virtual_size,
+         const CompactCommitArgs& args,
          std::string* err);
 
 // ==== LinearizedBptree / IndexLBPT template definitions ====================

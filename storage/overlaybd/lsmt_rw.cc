@@ -8,6 +8,7 @@
 #include "agentenv/core/identity.h"
 #include "agentenv/storage/overlaybd/local_file.h"
 #include "agentenv/storage/overlaybd/sys.h"
+#include "internal.h"
 
 namespace agentenv {
 namespace storage {
@@ -1616,36 +1617,98 @@ core::Expected<std::shared_ptr<LsmtFile>, std::string> StackFiles(
     return stacked;
 }
 
-
 namespace {
 
-/// A `CompactSource` over a stack's layer vector, selecting by tag.
+/// The tail every compact-style export shares: bind the stack as the source,
+/// the caller's file as the sink, and stamp the layer identity.
 ///
-/// The tag is the index into the same vector `OpenFilesRo` built, so this is
-/// the one place that invariant is cashed in. An out-of-range tag is a corrupt
-/// index and is refused rather than clamped: clamping would silently read
-/// another layer's bytes into the merged output.
-class LayerStackCompactSource : public lsmt::CompactSource {
- public:
-    explicit LayerStackCompactSource(const std::vector<std::shared_ptr<VirtualFile> >& layers)
-        : layers_(layers) {}
-
-    bool ReadAt(uint8_t tag, uint64_t src_byte_off, uint8_t* dst, uint64_t len) {
-        if (static_cast<size_t>(tag) >= layers_.size()) return false;
-        VirtualFile* file = layers_[tag].get();
-        if (file == 0) return false;
-        const core::Expected<size_t, std::string> got =
-            file->ReadAtInto(src_byte_off, dst, static_cast<size_t>(len));
-        // A short read is a failure, not a partial success: the compacted
-        // output would otherwise carry whatever was already in the buffer.
-        return got.ok() && got.value() == static_cast<size_t>(len);
+/// `CommitArgs` is split here because the identity half is all that reaches
+/// the on-disk header, which is what `lsmt::CompactCommitArgs` carries; the
+/// writer half becomes the sink.
+core::Expected<core::Unit, std::string> CompactMappingsInto(
+        const std::vector<std::shared_ptr<VirtualFile> >& layers,
+        const std::vector<SegmentMapping>& mappings, uint64_t virtual_size,
+        const CommitArgs& args, const char* operation) {
+    if (!args.writer) {
+        return core::make_unexpected(std::string(operation) + " requires a destination writer");
     }
+    lsmt::CompactCommitArgs identity;
+    identity.uuid = args.uuid;
+    identity.parent_uuid = args.parent_uuid;
+    identity.user_tag = args.user_tag;
 
- private:
-    const std::vector<std::shared_ptr<VirtualFile> >& layers_;
-};
+    LayerStackCompactSource source(layers);
+    VirtualFileCompactSink sink(args.writer);
+    std::string err;
+    if (!lsmt::CompactTo(&sink, &source, mappings, virtual_size, identity, &err)) {
+        return core::make_unexpected(std::string(operation) + ": " + err);
+    }
+    return core::Unit();
+}
 
 }  // namespace
+
+core::Expected<SealedReopen, std::string> LsmtFile::CloseSealAndReopen() {
+    const core::Expected<core::Optional<LayerDescriptor>, std::string> descriptor = CloseSeal();
+    if (!descriptor.ok()) return core::make_unexpected(descriptor.error());
+
+    // Reopened from the handle, not the path: the seal wrote the index and
+    // trailer through this handle, and opening the path again would hand the
+    // caller a second, independent view of the same bytes.
+    const core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> reopened =
+        LsmtReadOnlyFile::Open(rw_data_file_);
+    if (!reopened.ok()) return core::make_unexpected(reopened.error());
+
+    const core::Expected<core::Unit, std::string> tuned =
+        reopened.value()->SetMaxIoSize(max_io_size_);
+    if (!tuned.ok()) return core::make_unexpected(tuned.error());
+
+    SealedReopen out;
+    out.file = reopened.value();
+    out.descriptor = descriptor.value();
+    return out;
+}
+
+core::Expected<core::Unit, std::string> LsmtFile::Flatten(std::shared_ptr<VirtualFile> dest) {
+    return FlattenWithArgs(CommitArgs(dest));
+}
+
+core::Expected<core::Unit, std::string> LsmtFile::FlattenWithArgs(const CommitArgs& args) {
+    // The whole virtual size, not the mapped ranges only: flattening has to
+    // resolve shadowing, and the combined index's lookup is what decides
+    // which layer owns a block.
+    const uint64_t blocks = (virtual_size_ + kAlign - 1) / kAlign;
+    if (blocks > static_cast<uint64_t>(~static_cast<uint32_t>(0))) {
+        return core::make_unexpected(std::string("flatten: virtual size too large to query"));
+    }
+    std::vector<SegmentMapping> mappings;
+    index_->Lookup(Segment(0, static_cast<uint32_t>(blocks)), &mappings);
+    return CompactMappingsInto(layers_, mappings, virtual_size_, args, "flatten");
+}
+
+core::Expected<core::Unit, std::string> LsmtFile::ExportUpperAsSealed(const CommitArgs& args) {
+    // Buffered mappings first: an exported layer that omitted them would read
+    // as holes exactly where the caller had written data.
+    const core::Expected<core::Unit, std::string> flushed = FlushGroupCommit();
+    if (!flushed.ok()) return core::make_unexpected(flushed.error());
+
+    // Only this layer's own mappings, which is what makes the output a
+    // snapshot of the upper rather than of the image.
+    const std::vector<SegmentMapping> rw_mappings = index_->Upper().Dump();
+
+    CommitArgs stamped = args;
+    // Overrides whatever the caller passed, as Rust does: the parent of an
+    // exported upper is a property of the stack it was taken from, not a
+    // choice. `Uuids()` reads `[newest_lower, ..., oldest_lower, upper]`, so
+    // index 0 is the upper's immediate parent; a single-layer file has none.
+    if (uuids_.size() >= 2) {
+        stamped.parent_uuid = uuids_[0];
+    } else {
+        stamped.parent_uuid.clear();
+    }
+    return CompactMappingsInto(layers_, rw_mappings, virtual_size_, stamped,
+                               "export upper as sealed");
+}
 
 core::Expected<core::Unit, std::string> MergeFilesRo(
     const std::vector<std::shared_ptr<VirtualFile> >& src_files,

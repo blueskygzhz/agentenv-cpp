@@ -73,6 +73,41 @@ struct LayerDescriptor {
     LayerDescriptor() : size(0) {}
 };
 
+/// Rust `types.rs :: CommitArgs` — where a compacted layer goes plus the
+/// identity it is stamped with.
+///
+/// `writer` is a `VirtualFile` rather than Rust's `Arc<dyn CompactWriter>`:
+/// both ported callers reach this through `CommitArgs::new`, which wraps a
+/// file in `VirtualFileWriter`. The general trait is still available one
+/// level down as `lsmt::CompactSink`, so a non-file writer can be passed to
+/// `lsmt::CompactTo` directly; nothing in the ported surface needs it.
+///
+/// Rust's `concurrency` field is absent: this port copies data blocks
+/// sequentially, which is Rust's default of 1.
+struct CommitArgs {
+    std::shared_ptr<VirtualFile> writer;
+    /// Empty means the nil uuid is written out as text, not that the field is
+    /// left zeroed -- see `lsmt::CompactTo`.
+    std::string uuid;
+    /// Empty leaves the field zeroed, which reads back as "no parent".
+    std::string parent_uuid;
+    std::vector<uint8_t> user_tag;
+
+    CommitArgs() {}
+    /// Rust `CommitArgs::new`.
+    explicit CommitArgs(std::shared_ptr<VirtualFile> as_file) : writer(as_file) {}
+};
+
+/// Rust's `(LSMTReadOnlyFile, Option<LayerDescriptor>)` tuple return from
+/// `close_seal_and_reopen`, named because C++11 has no structured binding to
+/// unpack a pair readably at the call site.
+struct SealedReopen {
+    std::shared_ptr<LsmtReadOnlyFile> file;
+    /// Absent is normal: only the append-only layout with an unbroken digest
+    /// can report one.
+    core::Optional<LayerDescriptor> descriptor;
+};
+
 /// Rust `types.rs :: AppendDigestTracker`.
 ///
 /// Hashes the upper's bytes as they are appended, so sealing can report the
@@ -286,6 +321,42 @@ class LsmtFile : public VirtualFile {
     /// the append-only layout with an unbroken digest. Absent is normal, not
     /// an error.
     core::Expected<core::Optional<LayerDescriptor>, std::string> CloseSeal();
+
+    /// Rust `close_seal_and_reopen` — seal this upper, then hand back a
+    /// read-only view of the layer it just became.
+    ///
+    /// The reopened file is built from this upper's own data handle, not from
+    /// its path: sealing wrote the index and trailer through that handle, and
+    /// reopening the path would be a second handle onto the same bytes.
+    ///
+    /// The max io size carries over, because a caller that tuned this upper
+    /// stacked the result expecting the same chunking.
+    core::Expected<SealedReopen, std::string> CloseSealAndReopen();
+
+    /// Rust `flatten` — write the whole image, as resolved through this
+    /// stack, into `dest` as one self-contained sealed layer.
+    core::Expected<core::Unit, std::string> Flatten(std::shared_ptr<VirtualFile> dest);
+
+    /// Rust `flatten_with_args` — `Flatten` with a caller-chosen destination
+    /// and layer identity.
+    core::Expected<core::Unit, std::string> FlattenWithArgs(const CommitArgs& args);
+
+    /// Rust `export_upper_as_sealed` — copy *only this upper's* mappings into
+    /// `args.writer` as a standalone sealed layer.
+    ///
+    /// Unlike `CloseSeal` and `CloseSealAndReopen`, **this file stays
+    /// writable**: nothing is sealed in place, the upper is only read from.
+    /// That is what makes it usable as a snapshot of a running image.
+    ///
+    /// The output's parent is set to `Uuids()[0]`, the topmost lower — after
+    /// `OpenFilesRo` + `StackFiles` the uuid vector reads
+    /// `[newest_lower, ..., oldest_lower, upper]`, so index 0 is the upper's
+    /// immediate parent in the chain. A single-layer file has no parent and
+    /// the field is left zeroed.
+    ///
+    /// Any mapping buffered by group commit is flushed first; an exported
+    /// layer that omitted them would read as holes where data was written.
+    core::Expected<core::Unit, std::string> ExportUpperAsSealed(const CommitArgs& args);
 
     /// Rust `plan_hybrid_write`. Exposed for testing: the fragment split is
     /// the whole of the hybrid write decision, and it is pure.

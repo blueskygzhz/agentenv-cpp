@@ -17,6 +17,7 @@
 #include "agentenv/core/fs.h"
 #include "agentenv/core/logging.h"
 #include "agentenv/storage/overlaybd/cache_pool.h"
+#include "internal.h"
 
 #include <cstring>
 #include <sstream>
@@ -398,6 +399,33 @@ DataStat LsmtReadOnlyFile::Stat() const {
     s.total_data_size = valid_blocks * kAlign;
     s.valid_data_size = s.total_data_size;
     return s;
+}
+
+core::Expected<core::Unit, std::string> LsmtReadOnlyFile::Flatten(
+    std::shared_ptr<VirtualFile> dest) {
+    if (!dest) {
+        return core::make_unexpected(std::string("flatten requires a destination writer"));
+    }
+    // The whole virtual size, not the mapped ranges only: flattening has to
+    // resolve shadowing, and the merged index's lookup is what decides which
+    // layer owns a block.
+    const uint64_t blocks = (virtual_size_ + kAlign - 1) / kAlign;
+    if (blocks > static_cast<uint64_t>(~static_cast<uint32_t>(0))) {
+        return core::make_unexpected(std::string("flatten: virtual size too large to query"));
+    }
+    std::vector<SegmentMapping> mappings;
+    index_->Lookup(Segment(0, static_cast<uint32_t>(blocks)), &mappings);
+
+    // Rust `CommitArgs::from_writer`: no identity is supplied, so the output
+    // carries the nil uuid and no parent.
+    LayerStackCompactSource source(layers_);
+    VirtualFileCompactSink sink(dest);
+    std::string err;
+    if (!lsmt::CompactTo(&sink, &source, mappings, virtual_size_,
+                         lsmt::CompactCommitArgs(), &err)) {
+        return core::make_unexpected(std::string("flatten: ") + err);
+    }
+    return core::Unit();
 }
 
 core::Expected<size_t, std::string> LsmtReadOnlyFile::SeekDataSegments(

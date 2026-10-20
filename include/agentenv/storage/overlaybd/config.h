@@ -102,6 +102,10 @@ core::Expected<UpperMode, std::string> UpperModeParse(const std::string& raw);
 
 /// Rust struct `ImageConfig` — the per-image `image.json` that overlaybd reads.
 ///
+/// Declared ahead of `ImageConfig` so `EffectiveDownload` can name it; the
+/// definition follows below.
+struct GlobalConfig;
+
 /// Distinct from `OverlaybdConfig` above: this one describes an image's layer
 /// stack, while `OverlaybdConfig` describes one attached device. All fields are
 /// `#[serde(default, rename_all = "camelCase")]` upstream, so the JSON keys are
@@ -119,6 +123,14 @@ struct ImageConfig {
     DownloadConfig download_override;
     bool acceleration_layer = false;
     std::string record_trace_path;
+
+    /// Rust `effective_download` — the per-image override when present,
+    /// otherwise the node's policy.
+    ///
+    /// Returns a reference into one of the two arguments, so the result must
+    /// not outlive either; the ported callers copy it immediately, as Rust's
+    /// `.clone()` does at the `ImageFile::open` call site.
+    const DownloadConfig& EffectiveDownload(const GlobalConfig& global_config) const;
 
     bool operator==(const ImageConfig& other) const;
     bool operator!=(const ImageConfig& other) const { return !(*this == other); }

@@ -162,6 +162,18 @@ class LsmtReadOnlyFile : public VirtualFile {
     core::Expected<size_t, std::string> SeekDataSegments(uint64_t begin, uint64_t end,
                                                            std::vector<Segment>* segs) const;
 
+    /// Rust `flatten` — write the whole image, as resolved through these
+    /// layers, into `dest` as one self-contained sealed layer.
+    ///
+    /// The query spans the entire virtual size rather than the mapped ranges
+    /// only, because flattening has to resolve shadowing: a block present in
+    /// two layers must come out as the newer one's, which is the decision the
+    /// merged index's lookup already makes.
+    ///
+    /// `dest` is written but neither synced nor closed; its owner decides
+    /// when the bytes have to be durable.
+    core::Expected<core::Unit, std::string> Flatten(std::shared_ptr<VirtualFile> dest);
+
     // -- VirtualFile -------------------------------------------------------
 
     core::Expected<ByteBuffer, std::string> ReadAt(uint64_t offset, size_t len) override;

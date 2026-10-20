@@ -227,6 +227,13 @@ core::Expected<UpperMode, std::string> UpperModeParse(const std::string& raw) {
     return core::make_unexpected(std::string("unsupported upper mode \"") + raw + "\"");
 }
 
+const DownloadConfig& ImageConfig::EffectiveDownload(const GlobalConfig& global_config) const {
+    // Rust `download_override.as_ref().unwrap_or(&global_config.download)`:
+    // presence is what selects, not whether the override differs from the
+    // default, so an image that spells out the default values still overrides.
+    return has_download_override ? download_override : global_config.download;
+}
+
 bool ImageConfig::operator==(const ImageConfig& other) const {
     if (repo_blob_url != other.repo_blob_url || result_file != other.result_file ||
         has_download_override != other.has_download_override ||
