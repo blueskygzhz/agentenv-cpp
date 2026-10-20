@@ -467,6 +467,20 @@ core::Expected<std::shared_ptr<LsmtFile>, std::string> OpenFileRw(
 core::Expected<std::shared_ptr<LsmtReadOnlyFile>, std::string> OpenFileRo(
     std::shared_ptr<VirtualFile> file);
 
+/// Rust `helper.rs :: validate_rw_header_pair_paths` — structural check on an
+/// unsealed RW layer pair, by path.
+///
+/// For external tools that mutate an OverlayBD upper in place and want a
+/// cheap check before the image is reopened. Reads only the two header blocks
+/// and the file sizes, so it costs two opens and two stats.
+///
+/// `index_path` must be absent for `kRwSparse` and present otherwise, which
+/// is checked rather than assumed: a sparse layer carrying an index file, or
+/// a log-structured one missing it, is a layout the reader cannot interpret.
+core::Expected<core::Unit, std::string> ValidateRwHeaderPairPaths(
+    const std::string& data_path, const core::Optional<std::string>& index_path,
+    uint64_t expected_virtual_size, RwLayout expected_layout);
+
 /// Rust `stack.rs :: verify_layer_order` — check that each layer names the one
 /// below it as its parent.
 ///
