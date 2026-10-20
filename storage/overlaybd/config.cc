@@ -86,6 +86,8 @@ core::Expected<LayerConfig, std::string> ParseLayerConfig(const core::Json& obje
     return layer;
 }
 
+}  // namespace
+
 core::Expected<UpperConfig, std::string> ParseUpperConfig(const core::Json& object) {
     UpperConfig upper;
     if (object.kind() == core::Json::Kind::Null) return upper;
@@ -112,8 +114,6 @@ core::Expected<UpperConfig, std::string> ParseUpperConfig(const core::Json& obje
     if (!step.ok()) return core::make_unexpected(step.take_error());
     return upper;
 }
-
-}  // namespace
 
 core::Expected<bool, std::string> ValidateUpperConfig(const UpperConfig& upper) {
     const bool has_upper_data = !upper.data.empty();

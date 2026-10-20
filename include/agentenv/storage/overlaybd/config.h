@@ -60,6 +60,16 @@ struct UpperConfig {
 /// Rust `validate_upper_config`.
 core::Expected<bool, std::string> ValidateUpperConfig(const UpperConfig& upper);
 
+/// Parses just the `upper` sub-object, matching serde's
+/// `from_value::<UpperConfig>`.
+///
+/// Public because an `image.json` is sometimes inspected for its upper alone,
+/// without loading the whole config: the ublk daemon has to decide whether a
+/// source image already carries a writable upper before it knows whether the
+/// rest of the config is even loadable. A `Null` value parses to the default,
+/// which is how an absent `upper` key reads.
+core::Expected<UpperConfig, std::string> ParseUpperConfig(const core::Json& object);
+
 /// Rust struct `DownloadConfig` — background prefetch policy, written into the
 /// generated overlaybd global configs and (as `download`) into a tools image.
 ///

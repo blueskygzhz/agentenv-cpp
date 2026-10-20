@@ -105,9 +105,10 @@ struct PoolConfigOverrides {
 
 /// Rust `ResizeToolSpec`, as main.rs builds it.
 ///
-/// Declared here rather than in a runtime header because `runtime.rs` is not
-/// ported: this is the one part of it main.rs needs, and inventing the rest
-/// would be a shape with nothing behind it.
+/// Rust declares it in `protocol.rs`; it stays here because the ported
+/// protocol never names it — no request carries a resize tool — and putting it
+/// there would make every protocol consumer include a type it does not use.
+/// `runtime.h` is the consumer, and includes this header for it.
 struct ResizeToolSpec {
     std::string binary;
     core::Optional<std::string> lib_dir;

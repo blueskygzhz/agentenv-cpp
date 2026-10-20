@@ -109,6 +109,8 @@ agentenv_add_test(test_ublk_dev            test_ublk_dev.cc            agentenv-
 agentenv_add_test(test_ublk_queue_worker   test_ublk_queue_worker.cc   agentenv-ublk)
 # Rust: storage/ublk-daemon/src/main.rs — flag > env > TOML, per field
 agentenv_add_test(test_ublk_daemon_config  test_ublk_daemon_config.cc  agentenv-ublk-daemon-config)
+# Rust: storage/ublk-daemon/src/runtime.rs — claim, upper, resize, rollback
+agentenv_add_test(test_ublk_daemon_runtime test_ublk_daemon_runtime.cc agentenv-ublk-daemon-runtime)
 agentenv_add_test(test_lsmt                test_lsmt.cc                agentenv-overlaybd)
 agentenv_add_test(test_lsmt_bptree         test_lsmt_bptree.cc         agentenv-overlaybd)
 agentenv_add_test(test_scheduler           test_scheduler.cc           agentenv-scheduler-internal)

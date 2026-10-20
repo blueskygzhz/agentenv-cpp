@@ -26,10 +26,24 @@ target_link_libraries(agentenv-ublk-daemon-config PUBLIC
     agentenv-warm-pool
 )
 
+# `runtime.rs` — materializing a private overlaybd runtime directory. A library
+# of its own because it is the half of the daemon that is testable without a
+# ublk device: it only touches the filesystem, overlaybd, and one child process.
+add_library(agentenv-ublk-daemon-runtime STATIC
+    runtime.cc
+)
+target_include_directories(agentenv-ublk-daemon-runtime PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(agentenv-ublk-daemon-runtime PUBLIC
+    agentenv-core
+    agentenv-overlaybd
+    agentenv-ublk-daemon-config
+)
+
 add_executable(agentenv-ublk-daemon main.cc)
 target_link_libraries(agentenv-ublk-daemon PRIVATE
     agentenv-core
     agentenv-ublk
     agentenv-ublk-daemon-protocol
     agentenv-ublk-daemon-config
+    agentenv-ublk-daemon-runtime
 )
