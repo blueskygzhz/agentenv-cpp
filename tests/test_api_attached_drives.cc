@@ -14,22 +14,35 @@ namespace {
 
 /// Resolves every reference to a fixed config path, so the tests exercise the
 /// validation logic rather than image resolution.
+///
+/// `Resolve` takes the raw reference string, matching Rust's
+/// `resolver.resolve(&drive.image)`. There is no parse step: this port used to
+/// have one, which meant these tests asserted on a decomposition Rust never
+/// performs.
 class FakeResolver : public image::ImageResolver {
  public:
     int         calls = 0;
-    bool        fail  = false;
+    /// When set, the next `Resolve` fails with this error. Typed as
+    /// `ImageError` rather than a bool plus a string so a test can choose the
+    /// *class* of failure, which is what decides 400 versus 500.
+    core::Optional<image::ImageError> failure;
     std::string last_reference;
 
-    core::Expected<image::ResolvedBlockImage, std::string>
-        Resolve(const image::ImageReference& ref) override {
+    core::Expected<image::ResolvedBlockImage, image::ImageError> Resolve(
+        const std::string& image_ref) override {
         ++calls;
-        last_reference = ref.ToString();
-        if (fail) return core::make_unexpected(std::string("registry unreachable"));
+        last_reference = image_ref;
+        if (failure.has_value()) return core::make_unexpected(*failure);
         image::ResolvedBlockImage resolved;
-        resolved.reference             = ref;
+        resolved.image_ref             = image_ref;
         resolved.overlaybd_config_path = "/var/lib/agentenv/images/app/image.json";
         return resolved;
     }
+
+    const std::string& DefaultImage() const override { return default_image_; }
+
+ private:
+    std::string default_image_ = "docker.io/library/alpine:3.20";
 };
 
 AttachedDriveRequest Request(const std::string& drive_id, const std::string& image) {
@@ -162,8 +175,10 @@ MT_TEST(attached_drives_trims_drive_id_and_image) {
     auto resolved = ResolveAttachedDrives(drives, &resolver);
     MT_EXPECT_TRUE(resolved.ok());
     MT_EXPECT_EQ(resolved.value()[0].drive.drive_id, std::string("data"));
-    // The trimmed image is what reaches the resolver.
-    MT_EXPECT_TRUE(resolver.last_reference.find("alpine") != std::string::npos);
+    // The trimmed image is what reaches the resolver, verbatim: the resolver
+    // takes the reference string and does its own expansion, so anything
+    // rewritten here would be rewritten twice.
+    MT_EXPECT_EQ(resolver.last_reference, std::string("alpine"));
 }
 
 MT_TEST(attached_drives_rejects_empty_source_image) {
@@ -226,14 +241,48 @@ MT_TEST(attached_drives_applies_virtual_size) {
 
 MT_TEST(attached_drives_reports_resolver_failure_as_server_error) {
     FakeResolver resolver;
-    resolver.fail = true;
+    resolver.failure =
+        core::Optional<image::ImageError>(image::OtherError("registry unreachable"));
     std::vector<AttachedDriveRequest> drives;
     drives.push_back(Request("data", "alpine"));
 
     auto resolved = ResolveAttachedDrives(drives, &resolver);
     MT_EXPECT_TRUE(!resolved.ok());
     MT_EXPECT_EQ(resolved.error().status, 500);
+    // The drive id is in the message: with several drives, "resolution failed"
+    // alone does not say which one.
     MT_EXPECT_TRUE(resolved.error().message.find("data") != std::string::npos);
+}
+
+MT_TEST(attached_drives_reports_bad_reference_as_client_error) {
+    // The counterpart to the test above, and the reason the resolver reports
+    // `ImageError` instead of a string: a mistyped reference and an
+    // unreachable registry are both "resolution failed", but only one of them
+    // is worth retrying. Reporting the first as 500 tells the client to retry
+    // something that can never succeed.
+    FakeResolver resolver;
+    resolver.failure = core::Optional<image::ImageError>(
+        image::InvalidReference("image reference has an empty tag: alpine:"));
+    std::vector<AttachedDriveRequest> drives;
+    drives.push_back(Request("data", "alpine:"));
+
+    auto resolved = ResolveAttachedDrives(drives, &resolver);
+    MT_EXPECT_TRUE(!resolved.ok());
+    MT_EXPECT_EQ(resolved.error().status, 400);
+}
+
+MT_TEST(attached_drives_reports_unsupported_image_as_client_error) {
+    // Also 4xx: the image exists, but its layer format is the publisher's or
+    // the caller's choice, not a server fault.
+    FakeResolver resolver;
+    resolver.failure = core::Optional<image::ImageError>(
+        image::UnsupportedImage("image is an overlaybd turbo-OCI image"));
+    std::vector<AttachedDriveRequest> drives;
+    drives.push_back(Request("data", "alpine"));
+
+    auto resolved = ResolveAttachedDrives(drives, &resolver);
+    MT_EXPECT_TRUE(!resolved.ok());
+    MT_EXPECT_EQ(resolved.error().status, 400);
 }
 
 MT_TEST(attached_drives_empty_request_needs_no_resolver) {

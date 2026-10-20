@@ -86,6 +86,8 @@ agentenv_add_test(test_orchestrator_types  test_orchestrator_types.cc  agentenv-
 agentenv_add_test(test_store               test_store.cc               agentenv-orchestrator)
 agentenv_add_test(test_image_reference     test_image_reference.cc     agentenv-image)
 agentenv_add_test(test_image_oci  test_image_oci.cc   agentenv-image)
+# Rust: src/image/local_layer.rs
+agentenv_add_test(test_image_local_layer   test_image_local_layer.cc   agentenv-image)
 agentenv_add_test(test_image_commit_index  test_image_commit_index.cc  agentenv-image)
 agentenv_add_test(test_image_cache     test_image_cache.cc    agentenv-image)
 # Rust: the `ImageCacheMetadataStore` tests in src/image/cache/graph.rs.
