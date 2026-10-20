@@ -1,7 +1,10 @@
 add_library(agentenv-image STATIC
-    image.cc
+    # Rust: src/image/mod.rs — the 4xx/5xx classification every API below
+    # returns. Listed first because everything else depends on it.
+    error.cc
     reference.cc
     metadata.cc
+    local_layer.cc
     layers.cc
     oci_image.cc
     commit_index.cc
@@ -18,7 +21,7 @@ target_link_libraries(agentenv-image PUBLIC
     agentenv-core
     # The cache metadata graph is persisted in a local KV store, keys P2P
     # artifacts by digest, and parses overlaybd image configs to find the
-    # `file=` lowers it must pin.
+    # `file=` lowers it must pin. `local_layer.cc` also builds a `LayerConfig`.
     agentenv-local-store
     agentenv-p2p
     agentenv-overlaybd

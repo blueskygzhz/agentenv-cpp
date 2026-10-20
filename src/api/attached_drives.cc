@@ -5,7 +5,7 @@
 #include <set>
 #include <sstream>
 
-#include "agentenv/image/reference.h"
+#include "agentenv/image/layers.h"
 
 namespace agentenv {
 namespace api {
@@ -156,24 +156,24 @@ ResolveAttachedDrives(const std::vector<AttachedDriveRequest>& drives,
     for (std::size_t i = 0; i < pending.size(); ++i) {
         const PendingAttachedDrive& drive = pending[i];
 
-        core::Expected<image::ImageReference, std::string> reference =
-            image::ParseReference(drive.image);
-        if (!reference.ok()) {
-            std::ostringstream os;
-            os << "resolve attached drive '" << drive.drive_id << "' image '" << drive.image
-               << "': " << reference.error();
-            return core::make_unexpected(AttachedDriveError::BadRequest(os.str()));
-        }
-
-        core::Expected<image::ResolvedBlockImage, std::string> image_result =
-            image_resolver->Resolve(reference.value());
+        // The raw reference goes straight to the resolver. Rust calls
+        // `resolver.resolve(&drive.image)` with no parse step, and the parse
+        // this port used to perform decomposed the string with rules Rust does
+        // not have -- notably keeping both tag and digest, which can resolve to
+        // a different image than the digest pins.
+        core::Expected<image::ResolvedBlockImage, image::ImageError> image_result =
+            image_resolver->Resolve(drive.image);
         if (!image_result.ok()) {
-            // Rust picks 400 vs 500 from `err.is_user_error()`; the C++
-            // resolver reports a flat string, so a resolution failure is
-            // surfaced as a server error rather than blaming the request.
             std::ostringstream os;
             os << "resolve attached drive '" << drive.drive_id << "' image '" << drive.image
-               << "': " << image_result.error();
+               << "': " << image_result.error().ToString();
+            // Rust picks 400 vs 500 from `err.is_user_error()`, and now so does
+            // this: a mistyped tag is the caller's problem, a registry outage
+            // is ours. Reporting both as 500 told clients to retry a request
+            // that can never succeed.
+            if (image_result.error().IsUserError()) {
+                return core::make_unexpected(AttachedDriveError::BadRequest(os.str()));
+            }
             return core::make_unexpected(AttachedDriveError::Internal(os.str()));
         }
 
