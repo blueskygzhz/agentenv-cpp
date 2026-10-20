@@ -13,9 +13,23 @@ target_link_libraries(agentenv-ublk-daemon-protocol PUBLIC
     agentenv-overlaybd
 )
 
+# `main.rs`'s config resolution and process lifecycle, split from the binary so
+# the precedence rules (flag > env > TOML, per field) are testable without
+# spawning a daemon.
+add_library(agentenv-ublk-daemon-config STATIC
+    config.cc
+    lifecycle.cc
+)
+target_include_directories(agentenv-ublk-daemon-config PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(agentenv-ublk-daemon-config PUBLIC
+    agentenv-core
+    agentenv-warm-pool
+)
+
 add_executable(agentenv-ublk-daemon main.cc)
 target_link_libraries(agentenv-ublk-daemon PRIVATE
     agentenv-core
     agentenv-ublk
     agentenv-ublk-daemon-protocol
+    agentenv-ublk-daemon-config
 )
