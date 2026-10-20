@@ -135,6 +135,37 @@ core::Expected<ImageConfig, std::string> ParseImageConfig(const std::string& tex
 /// Reads and parses the file at `path`.
 core::Expected<ImageConfig, std::string> LoadImageConfig(const std::string& path);
 
+/// Rust `lexically_normalize_path` — collapse `.` and `..` without touching
+/// the filesystem.
+///
+/// Purely textual on purpose: the paths being resolved may not exist yet (an
+/// upper's data file is created later), so `realpath` would fail on exactly
+/// the inputs that need normalizing. It therefore does not resolve symlinks,
+/// which means `a/symlink/..` normalizes to `a` rather than to the link's
+/// parent.
+std::string LexicallyNormalizePath(const std::string& path);
+
+/// Rust `resolve_image_config_local_paths` — rebase every local path field
+/// against the directory holding the config.
+///
+/// An `image.json` names its upper and local lowers relatively, and the daemon
+/// does not run with that directory as its cwd; without this every relative
+/// path would resolve against wherever the daemon happens to be. URLs are left
+/// alone -- a value containing `://` is not a path.
+void ResolveImageConfigLocalPaths(const std::string& image_config_path, ImageConfig* cfg);
+
+/// Rust `validate_image_config`.
+///
+/// Separate from parsing because a config that round-trips is not necessarily
+/// openable: these are the cross-field rules (a partial upper, a remote lower
+/// with no `repoBlobUrl`, more lowers than tags exist for).
+core::Expected<core::Unit, std::string> ValidateImageConfig(const ImageConfig& cfg);
+
+/// Rust `validate_download_chunk_knobs` — the knobs a per-image override may
+/// set. Exported because `ValidateImageConfig` applies it to the override.
+core::Expected<core::Unit, std::string> ValidateDownloadChunkKnobs(const DownloadConfig& cfg,
+                                                                     const std::string& field);
+
 /// Writes `config` to `path`, creating parent directories as needed.
 core::Expected<bool, std::string> SaveImageConfig(const std::string& path,
                                                   const ImageConfig& config);

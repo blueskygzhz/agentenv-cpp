@@ -291,6 +291,20 @@ core::Expected<Response, std::string> Perform(const Request& request) {
                            static_cast<curl_off_t>(request.body.size()));
     } else if (request.method != "GET") {
         ::curl_easy_setopt(handle, CURLOPT_CUSTOMREQUEST, request.method.c_str());
+        // A body on a non-PUT method. Previously only PUT could carry one, so
+        // a POST's body was silently dropped -- which SigV4 turns into a 403
+        // rather than a visible truncation, because the signature covers a
+        // payload hash the server then computes over an empty body.
+        //
+        // POSTFIELDS rather than the upload machinery: it keeps
+        // `CUSTOMREQUEST` as the method (CURLOPT_POST would force "POST" and
+        // override a DELETE), and it sets Content-Length from the size given.
+        if (!request.body.empty()) {
+            ::curl_easy_setopt(handle, CURLOPT_POSTFIELDS,
+                               reinterpret_cast<const char*>(&request.body[0]));
+            ::curl_easy_setopt(handle, CURLOPT_POSTFIELDSIZE_LARGE,
+                               static_cast<curl_off_t>(request.body.size()));
+        }
     }
 
     if (request.has_range) {

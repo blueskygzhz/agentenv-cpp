@@ -205,6 +205,19 @@ FileCacheBackend::FromCacheConfig(const CacheConfig& cfg) {
     return WithOptions(opt.value());
 }
 
+core::Expected<std::shared_ptr<FileCacheBackend>, std::string>
+FileCacheBackend::WithOptionsAndTransFunc(const FileCacheBackendOptions& options,
+                                             const CacheFnTransFunc& trans_func) {
+    const core::Expected<std::shared_ptr<FileCacheBackend>, std::string> backend =
+        WithOptions(options);
+    if (!backend.ok()) return backend;
+    // Installed after construction but before the backend is handed out, so
+    // the restart scan above has already keyed existing entries by their
+    // on-disk directory names -- which is what the transform produces too.
+    backend.value()->trans_func_ = trans_func;
+    return backend;
+}
+
 FileCacheBackend::~FileCacheBackend() {
     // Entries whose bitmap moved are persisted on the way out: the data is
     // already on disk, and losing the bitmap would discard it.
@@ -227,6 +240,27 @@ bool FileCacheBackend::CacheKeyOf(const std::string& cache_id, std::string* out)
 }
 
 std::string FileCacheBackend::TransformStoreKey(const std::string& src_name) const {
+    if (trans_func_) {
+        std::string key = trans_func_(src_name);
+        // Leading separators stripped: the key is joined onto the cache dir,
+        // and an absolute one would place the entry outside it -- where the
+        // restart scan and eviction accounting, which both walk the cache
+        // dir, would never see it again. Rust joins the transform's result
+        // directly and its own transform returns `/<basename>`, so there the
+        // entry lands at the filesystem root.
+        std::string::size_type begin = 0;
+        while (begin < key.size() && key[begin] == '/') ++begin;
+        if (begin > 0) key = key.substr(begin);
+        if (!key.empty() && key.find('/') == std::string::npos && key != "." &&
+            key != ".." && key != kPremergedIndexDir) {
+            return key;
+        }
+        // Anything else falls through to hashing: a multi-component key would
+        // nest entries, `.`/`..` would resolve to the cache dir or its
+        // parent, and the premerged-index name is already taken by the index
+        // cache that lives beside the entries.
+    }
+
     // A source name is a URL; the cache id has to be one safe path
     // component, so it is hashed rather than escaped.
     core::Sha256Stream h;

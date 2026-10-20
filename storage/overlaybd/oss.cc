@@ -2,6 +2,9 @@
 // Rust: storage/overlaybd/src/backend/oss.rs
 #include "agentenv/storage/overlaybd/oss.h"
 
+#include <atomic>
+#include <stdio.h>
+
 #include "agentenv/core/credentials.h"
 
 #include <cstdlib>
@@ -308,10 +311,16 @@ core::Expected<ParsedOssUrl, std::string> OssBackend::ParseUrl(
 void OssBackend::SignRequest(const S3Credentials& credentials,
                                  const ParsedOssUrl& location, const std::string& method,
                                  const uint8_t* body, size_t body_len,
+                                 const std::string& canonical_query,
                                  http::Request* request) const {
     S3SigningContext ctx;
     ctx.method = method;
     ctx.canonical_uri = location.CanonicalUri();
+    // Part of the signature, not decoration: SigV4 hashes the canonical query
+    // string, so a `?partNumber=..&uploadId=..` that is sent but not signed is
+    // rejected. It must already be sorted and percent-encoded by the caller,
+    // which is why the multipart helpers below build it in one place.
+    ctx.canonical_query = canonical_query;
     ctx.host = location.Host();
     ctx.region = location.region;
     ctx.service = "s3";
@@ -329,6 +338,14 @@ core::Expected<http::Response, std::string> OssBackend::Send(
     const ParsedOssUrl& location, const std::string& method, bool has_range,
     uint64_t range_begin, uint64_t range_end, const uint8_t* body, size_t body_len,
     http::BodySink* sink) {
+    return SendWithQuery(location, method, has_range, range_begin, range_end, body, body_len,
+                         sink, std::string());
+}
+
+core::Expected<http::Response, std::string> OssBackend::SendWithQuery(
+    const ParsedOssUrl& location, const std::string& method, bool has_range,
+    uint64_t range_begin, uint64_t range_end, const uint8_t* body, size_t body_len,
+    http::BodySink* sink, const std::string& canonical_query) {
     // Two passes at most: the operation, then the same operation again after a
     // permission-denied answer. Rust nests them the same way -- `op(...)` in
     // `run_with_refresh` is an opendal call that has already exhausted its own
@@ -346,6 +363,7 @@ core::Expected<http::Response, std::string> OssBackend::Send(
             http::Request request;
             request.method = method;
             request.url = location.ObjectUrl();
+            if (!canonical_query.empty()) request.url += "?" + canonical_query;
             request.has_range = has_range;
             request.range_begin = range_begin;
             request.range_end = range_end;
@@ -358,7 +376,8 @@ core::Expected<http::Response, std::string> OssBackend::Send(
             // the message.
             request.body_sink = sink;
 
-            SignRequest(credentials_, location, method, body, body_len, &request);
+            SignRequest(credentials_, location, method, body, body_len, canonical_query,
+                        &request);
 
             const core::Expected<http::Response, std::string> response =
                 http::Perform(request);
@@ -462,6 +481,315 @@ core::Expected<core::Unit, std::string> OssBackend::UploadBytes(const std::strin
         return core::make_unexpected(o.str());
     }
     return core::Unit();
+}
+
+
+// ---------------------------------------------------------------------------
+// Multipart upload
+//
+// Rust reaches this through opendal's `writer_with(key).chunk(n).concurrent(n)`,
+// which performs an S3 multipart upload underneath. There is no opendal here,
+// so the three calls are issued directly.
+//
+// Multipart rather than a single PUT for two reasons: a sealed upper layer can
+// be larger than the 5 GiB single-PUT ceiling, and a single PUT would need the
+// whole object resident in memory because the transport takes a pointer and a
+// length.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Rust `UPLOAD_READ_SIZE`-style staging buffer: how much is read from the
+/// source file per `fread`.
+const size_t kOssUploadReadSize = 1024 * 1024;
+
+/// S3 requires at least 5 MiB for every part except the last, and allows at
+/// most 10000 parts.
+const size_t kOssMinPartSize = 5 * 1024 * 1024;
+const uint32_t kOssMaxParts = 10000;
+
+/// XML text escaping for the complete-upload body.
+///
+/// Only the five predefined entities. An ETag is server-supplied and normally
+/// hex in quotes, but it is echoed back verbatim, so it is escaped rather than
+/// trusted to be inert.
+std::string XmlEscape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        switch (in[i]) {
+            case '&': out += "&amp;"; break;
+            case '<': out += "&lt;"; break;
+            case '>': out += "&gt;"; break;
+            case '"': out += "&quot;"; break;
+            case '\'': out += "&apos;"; break;
+            default: out.push_back(in[i]);
+        }
+    }
+    return out;
+}
+
+/// The text between the first `<tag>` and its `</tag>`.
+///
+/// A deliberate non-parser: the three responses involved have a fixed,
+/// flat shape, and pulling one element out of each is all that is needed. A
+/// real XML parser would be a dependency and a much larger attack surface for
+/// no gain -- but it does mean a namespaced or attributed tag is not matched,
+/// which is why a miss is reported as an error rather than ignored.
+bool XmlFirstElement(const std::string& xml, const std::string& tag, std::string* out) {
+    const std::string open = "<" + tag + ">";
+    const std::string close = "</" + tag + ">";
+    const std::string::size_type begin = xml.find(open);
+    if (begin == std::string::npos) return false;
+    const std::string::size_type from = begin + open.size();
+    const std::string::size_type end = xml.find(close, from);
+    if (end == std::string::npos) return false;
+    *out = xml.substr(from, end - from);
+    return true;
+}
+
+std::string BodyToString(const std::vector<uint8_t>& body) {
+    if (body.empty()) return std::string();
+    return std::string(reinterpret_cast<const char*>(&body[0]), body.size());
+}
+
+/// Percent-encode one query *value* per RFC 3986 unreserved set.
+///
+/// SigV4 hashes the canonical query string, so the encoding used here has to
+/// be byte-identical to what is sent -- which is why the value is encoded once
+/// and the same string is used for both.
+std::string EncodeQueryComponent(const std::string& in) {
+    static const char* kHex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(in[i]);
+        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+                                c == '~';
+        if (unreserved) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[(c >> 4) & 0x0F]);
+            out.push_back(kHex[c & 0x0F]);
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+core::Expected<core::Unit, std::string> OssBackend::UploadPath(const std::string& url,
+                                                                  const std::string& path,
+                                                                  size_t part_size,
+                                                                  size_t concurrency,
+                                                                  std::atomic<uint64_t>* progress) {
+    // Reset first, as Rust does, so the counter always describes the attempt
+    // now underway rather than carrying the previous one's total.
+    if (progress != 0) progress->store(0);
+
+    const core::Expected<ParsedOssUrl, std::string> location = ParseUrl(url);
+    if (!location.ok()) return core::make_unexpected(location.error());
+
+    // Raised, not rejected: `part_size` is a tuning hint, and a value below
+    // the protocol floor would make every part but the last invalid.
+    if (part_size < kOssMinPartSize) part_size = kOssMinPartSize;
+
+    FILE* file = ::fopen(path.c_str(), "rb");
+    if (file == 0) {
+        return core::make_unexpected("open oss upload source file " + path);
+    }
+    // Deviation: Rust passes `concurrency` to opendal, which uploads that many
+    // parts at once. Parts are uploaded sequentially here. The resulting
+    // object is identical -- part order is given by the part number, not by
+    // completion order -- so this costs throughput on a large upload and
+    // nothing else. Overlapping them would need a thread per part plus its
+    // own staging buffer, which is a separate piece of work.
+    (void)concurrency;
+
+    const core::Expected<std::string, std::string> upload_id =
+        CreateMultipartUpload(location.value());
+    if (!upload_id.ok()) {
+        ::fclose(file);
+        return core::make_unexpected(upload_id.error());
+    }
+
+    std::vector<std::string> etags;
+    std::vector<uint8_t> part;
+    part.reserve(part_size);
+    std::vector<uint8_t> chunk(kOssUploadReadSize);
+    bool read_failed = false;
+    std::string failure;
+
+    for (;;) {
+        // Filled to exactly `part_size` before sending, because only the final
+        // part may be shorter.
+        while (part.size() < part_size) {
+            const size_t want = part_size - part.size() < chunk.size()
+                                    ? part_size - part.size()
+                                    : chunk.size();
+            const size_t got = ::fread(&chunk[0], 1, want, file);
+            if (got > 0) part.insert(part.end(), chunk.begin(), chunk.begin() + (long)got);
+            if (got < want) {
+                if (::ferror(file) != 0) read_failed = true;
+                break;
+            }
+        }
+        if (read_failed) {
+            failure = "read oss upload source file " + path;
+            break;
+        }
+        if (part.empty()) break;
+
+        if (etags.size() + 1 > kOssMaxParts) {
+            std::ostringstream o;
+            o << "oss upload needs more than " << kOssMaxParts << " parts; raise part_size";
+            failure = o.str();
+            break;
+        }
+
+        const core::Expected<std::string, std::string> etag = UploadPart(
+            location.value(), upload_id.value(), static_cast<uint32_t>(etags.size() + 1),
+            part.empty() ? 0 : &part[0], part.size());
+        if (!etag.ok()) {
+            failure = etag.error();
+            break;
+        }
+        etags.push_back(etag.value());
+        // After the part is acknowledged, unlike Rust's "handed off to the
+        // writer": there is no writer queue here, so acknowledged is the only
+        // point that exists.
+        if (progress != 0) progress->fetch_add(static_cast<uint64_t>(part.size()));
+
+        const bool last = part.size() < part_size;
+        part.clear();
+        if (last) break;
+    }
+    ::fclose(file);
+
+    if (!failure.empty()) {
+        // Abandoned explicitly. An incomplete multipart upload is invisible as
+        // an object but still billed for its parts, so leaving it would charge
+        // for storage nobody can read.
+        AbortMultipartUpload(location.value(), upload_id.value());
+        return core::make_unexpected("upload oss object '" + url + "' from " + path + ": " +
+                                     failure);
+    }
+
+    // Zero-length source: there is no valid empty multipart upload, so the
+    // object is written with a plain PUT instead.
+    if (etags.empty()) {
+        AbortMultipartUpload(location.value(), upload_id.value());
+        return UploadBytes(url, 0, 0);
+    }
+
+    const core::Expected<core::Unit, std::string> completed =
+        CompleteMultipartUpload(location.value(), upload_id.value(), etags);
+    if (!completed.ok()) {
+        AbortMultipartUpload(location.value(), upload_id.value());
+        return core::make_unexpected("upload oss object '" + url + "' from " + path + ": " +
+                                     completed.error());
+    }
+    return core::Unit();
+}
+
+core::Expected<std::string, std::string> OssBackend::CreateMultipartUpload(
+    const ParsedOssUrl& location) {
+    // `uploads` is a valueless sub-resource; SigV4 still expects the `=`.
+    const core::Expected<http::Response, std::string> response =
+        SendWithQuery(location, "POST", false, 0, 0, 0, 0, 0, "uploads=");
+    if (!response.ok()) return core::make_unexpected(response.error());
+    if (!response.value().IsSuccess()) {
+        std::ostringstream o;
+        o << "oss create multipart upload '" << location.key << "' returned status "
+          << response.value().status;
+        return core::make_unexpected(o.str());
+    }
+
+    std::string upload_id;
+    if (!XmlFirstElement(BodyToString(response.value().body), "UploadId", &upload_id) ||
+        upload_id.empty()) {
+        return core::make_unexpected(
+            std::string("oss create multipart upload response has no UploadId"));
+    }
+    return upload_id;
+}
+
+core::Expected<std::string, std::string> OssBackend::UploadPart(const ParsedOssUrl& location,
+                                                                   const std::string& upload_id,
+                                                                   uint32_t part_number,
+                                                                   const uint8_t* body,
+                                                                   size_t body_len) {
+    // Sorted by key, as the canonical query string requires: `partNumber`
+    // before `uploadId`.
+    std::ostringstream query;
+    query << "partNumber=" << part_number << "&uploadId=" << EncodeQueryComponent(upload_id);
+
+    const core::Expected<http::Response, std::string> response =
+        SendWithQuery(location, "PUT", false, 0, 0, body, body_len, 0, query.str());
+    if (!response.ok()) return core::make_unexpected(response.error());
+    if (!response.value().IsSuccess()) {
+        std::ostringstream o;
+        o << "oss upload part " << part_number << " of '" << location.key
+          << "' returned status " << response.value().status;
+        return core::make_unexpected(o.str());
+    }
+
+    const http::HeaderMap::const_iterator etag = response.value().headers.find("ETag");
+    if (etag == response.value().headers.end() || etag->second.empty()) {
+        // The completion request has to name every part's ETag, so a part
+        // whose ETag is missing cannot be completed -- failing here keeps the
+        // upload abortable instead of producing a rejected completion.
+        std::ostringstream o;
+        o << "oss upload part " << part_number << " of '" << location.key
+          << "' returned no ETag";
+        return core::make_unexpected(o.str());
+    }
+    return etag->second;
+}
+
+core::Expected<core::Unit, std::string> OssBackend::CompleteMultipartUpload(
+    const ParsedOssUrl& location, const std::string& upload_id,
+    const std::vector<std::string>& etags) {
+    std::ostringstream xml;
+    xml << "<CompleteMultipartUpload>";
+    for (size_t i = 0; i < etags.size(); ++i) {
+        xml << "<Part><PartNumber>" << (i + 1) << "</PartNumber><ETag>"
+            << XmlEscape(etags[i]) << "</ETag></Part>";
+    }
+    xml << "</CompleteMultipartUpload>";
+    const std::string body = xml.str();
+
+    const core::Expected<http::Response, std::string> response = SendWithQuery(
+        location, "POST", false, 0, 0, reinterpret_cast<const uint8_t*>(body.data()),
+        body.size(), 0, "uploadId=" + EncodeQueryComponent(upload_id));
+    if (!response.ok()) return core::make_unexpected(response.error());
+    if (!response.value().IsSuccess()) {
+        std::ostringstream o;
+        o << "oss complete multipart upload '" << location.key << "' returned status "
+          << response.value().status;
+        return core::make_unexpected(o.str());
+    }
+
+    // A 200 is not enough: S3 streams the completion and may report a failure
+    // inside the body after the headers are already sent. Treating the status
+    // alone as success would report an object that does not exist.
+    const std::string text = BodyToString(response.value().body);
+    std::string code;
+    if (XmlFirstElement(text, "Error", &code) || XmlFirstElement(text, "Code", &code)) {
+        return core::make_unexpected("oss complete multipart upload '" + location.key +
+                                     "' failed after 200: " + code);
+    }
+    return core::Unit();
+}
+
+void OssBackend::AbortMultipartUpload(const ParsedOssUrl& location,
+                                      const std::string& upload_id) {
+    // Best-effort: the caller is already failing, and a failed abort only
+    // leaves the parts for the bucket's own lifecycle rule to clean up.
+    SendWithQuery(location, "DELETE", false, 0, 0, 0, 0, 0,
+                  "uploadId=" + EncodeQueryComponent(upload_id));
 }
 
 // ---------------------------------------------------------------------------

@@ -5,6 +5,7 @@
 #define AGENTENV_STORAGE_OVERLAYBD_CACHE_POOL_H_
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -39,6 +40,10 @@ const uint32_t kRwV2CacheOnly = 0x00000004;
 
 /// Rust `PREMERGED_INDEX_DIR` — shares the cache root but is not an entry.
 extern const char* const kPremergedIndexDir;
+
+/// Rust `CacheFnTransFunc` — maps a source name to the cache id to store it
+/// under. Returning an empty string means "no opinion".
+typedef std::function<std::string(const std::string&)> CacheFnTransFunc;
 
 /// Rust `FileCacheBackendOptions`.
 struct FileCacheBackendOptions {
@@ -254,6 +259,21 @@ class FileCacheBackend {
     static core::Expected<std::shared_ptr<FileCacheBackend>, std::string> FromCacheConfig(
         const CacheConfig& cfg);
 
+    /// Rust `with_options_and_trans_func`.
+    ///
+    /// `trans_func` maps a source name to the cache id it is stored under.
+    /// The point is that one blob reachable through several URLs must share a
+    /// single entry: the image service installs a transform that keeps only
+    /// the basename (the blob digest), so switching the P2P accelerator
+    /// address -- which rewrites every layer URL -- does not invalidate the
+    /// whole cache.
+    ///
+    /// A transform returning an empty string is treated as "no opinion" and
+    /// the default keying applies.
+    static core::Expected<std::shared_ptr<FileCacheBackend>, std::string>
+    WithOptionsAndTransFunc(const FileCacheBackendOptions& options,
+                               const CacheFnTransFunc& trans_func);
+
     ~FileCacheBackend();
 
     const FileCacheBackendOptions& Options() const { return options_; }
@@ -340,8 +360,23 @@ class FileCacheBackend {
 
     /// Rust `transform_store_key` — the cache id for a source name.
     ///
-    /// A sha256 of the name rather than the name itself: it has to be a
-    /// single safe path component, and a source name is a URL.
+    /// The installed transform wins when it returns a non-empty value;
+    /// otherwise the name is hashed.
+    ///
+    /// Two deviations from Rust here, both deliberate:
+    ///
+    ///  * Rust falls back to the source name *verbatim*. The id becomes a
+    ///    path component under the cache dir, so a URL would produce
+    ///    `cache_dir/https:/host/v2/...` -- a deep tree with `:` in it, and
+    ///    a top-level `https:` entry that the restart scan would then try to
+    ///    load as a cache entry. Hashing keeps it one safe component.
+    ///
+    ///  * The transform's result has leading separators stripped. Rust joins
+    ///    it onto the cache dir, and its transform returns `/<basename>`;
+    ///    joining an absolute path in Rust *replaces* the base, so the entry
+    ///    would be created at the filesystem root instead of inside the
+    ///    cache. That escape also hides the entry from the restart scan and
+    ///    from eviction accounting, which both walk the cache dir.
     std::string TransformStoreKey(const std::string& src_name) const;
 
  private:
@@ -397,6 +432,14 @@ class FileCacheBackend {
     uint64_t EvictOpenEntryBlocks(const std::string& cache_id, bool user_initiated);
 
     FileCacheBackendOptions options_;
+
+    /// Rust `fn_trans_func`. Empty means the default keying applies.
+    ///
+    /// Set once at construction rather than behind a lock: Rust guards it with
+    /// an `RwLock` but never writes it after `with_options_and_trans_func`,
+    /// and a key transform that could change at runtime would orphan every
+    /// entry stored under the previous one.
+    CacheFnTransFunc trans_func_;
     uint64_t capacity_watermark_;
     std::map<std::string, std::shared_ptr<CacheEntry> > entries_;
     uint64_t current_bytes_;

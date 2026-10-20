@@ -3,6 +3,7 @@
 #ifndef AGENTENV_STORAGE_OVERLAYBD_OSS_H_
 #define AGENTENV_STORAGE_OVERLAYBD_OSS_H_
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -135,6 +136,21 @@ class OssBackend {
     core::Expected<core::Unit, std::string> UploadBytes(const std::string& url,
                                                            const uint8_t* data, size_t len);
 
+    /// Rust `upload_path` — upload a local file as one object.
+    ///
+    /// Multipart, because a sealed upper layer can exceed the 5 GiB
+    /// single-PUT ceiling and because a single PUT would need the whole object
+    /// in memory. The object appears whole or not at all: an abandoned upload
+    /// is aborted rather than left to be billed as orphaned parts.
+    ///
+    /// `part_size` is raised to the 5 MiB protocol floor when smaller.
+    /// `progress`, when given, is reset to zero and then advanced by each
+    /// acknowledged part.
+    core::Expected<core::Unit, std::string> UploadPath(const std::string& url,
+                                                          const std::string& path,
+                                                          size_t part_size, size_t concurrency,
+                                                          std::atomic<uint64_t>* progress);
+
  private:
     friend class OssFile;
 
@@ -156,7 +172,7 @@ class OssBackend {
     /// the same request: only the timestamp changes.
     void SignRequest(const S3Credentials& credentials, const ParsedOssUrl& location,
                      const std::string& method, const uint8_t* body, size_t body_len,
-                     http::Request* request) const;
+                     const std::string& canonical_query, http::Request* request) const;
 
     core::Expected<http::Response, std::string> Send(const ParsedOssUrl& location,
                                                         const std::string& method,
@@ -164,6 +180,34 @@ class OssBackend {
                                                         uint64_t range_end,
                                                         const uint8_t* body, size_t body_len,
                                                         http::BodySink* sink);
+
+    /// `Send` with a signed query string, for the multipart sub-resources
+    /// (`?uploads`, `?partNumber&uploadId`, `?uploadId`).
+    ///
+    /// `canonical_query` must already be sorted and percent-encoded: SigV4
+    /// hashes it verbatim, so building it here rather than in each caller is
+    /// what keeps the sent URL and the signed string identical.
+    /// The three multipart calls. Split out so `UploadPath` reads as the
+    /// protocol sequence it is, and so each one's response validation lives
+    /// next to the request that needs it.
+    core::Expected<std::string, std::string> CreateMultipartUpload(
+        const ParsedOssUrl& location);
+    core::Expected<std::string, std::string> UploadPart(const ParsedOssUrl& location,
+                                                           const std::string& upload_id,
+                                                           uint32_t part_number,
+                                                           const uint8_t* body,
+                                                           size_t body_len);
+    core::Expected<core::Unit, std::string> CompleteMultipartUpload(
+        const ParsedOssUrl& location, const std::string& upload_id,
+        const std::vector<std::string>& etags);
+    /// Best-effort; failures are swallowed because the caller is already
+    /// returning an error.
+    void AbortMultipartUpload(const ParsedOssUrl& location, const std::string& upload_id);
+
+    core::Expected<http::Response, std::string> SendWithQuery(
+        const ParsedOssUrl& location, const std::string& method, bool has_range,
+        uint64_t range_begin, uint64_t range_end, const uint8_t* body, size_t body_len,
+        http::BodySink* sink, const std::string& canonical_query);
 
     OssConfig config_;
     S3Credentials credentials_;

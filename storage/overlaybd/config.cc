@@ -369,6 +369,162 @@ core::Expected<ImageConfig, std::string> LoadImageConfig(const std::string& path
     return ParseImageConfig(text.value());
 }
 
+
+// ---------------------------------------------------------------------------
+// Image config path resolution and validation
+// Rust: config.rs :: {lexically_normalize_path, resolve_image_config_local_paths,
+//                     validate_image_config}
+// ---------------------------------------------------------------------------
+
+std::string LexicallyNormalizePath(const std::string& path) {
+    if (path.empty()) return path;
+    const bool absolute = path[0] == '/';
+
+    std::vector<std::string> parts;
+    std::string::size_type i = 0;
+    while (i < path.size()) {
+        std::string::size_type slash = path.find('/', i);
+        if (slash == std::string::npos) slash = path.size();
+        const std::string part = path.substr(i, slash - i);
+        if (part == ".") {
+            // Dropped, matching Rust's `Component::CurDir => {}`.
+        } else if (part == "..") {
+            // Rust's `normalized.pop()`: popping an empty buffer is a no-op,
+            // so a relative path cannot climb above its own start and an
+            // absolute one cannot climb above the root.
+            if (!parts.empty()) parts.pop_back();
+        } else if (!part.empty()) {
+            parts.push_back(part);
+        }
+        i = slash == path.size() ? slash : slash + 1;
+    }
+
+    std::string out;
+    if (absolute) out.push_back('/');
+    for (size_t k = 0; k < parts.size(); ++k) {
+        if (k > 0) out.push_back('/');
+        out += parts[k];
+    }
+    // A path that normalizes away entirely. Rust's `PathBuf` would be empty
+    // here too, so the field is left empty rather than becoming ".".
+    return out;
+}
+
+namespace {
+
+/// Rust `resolve_path_field`.
+void ResolvePathField(const std::string& base_dir, std::string* value) {
+    if (value->empty()) return;
+    // Not a path. A URL's `//` would otherwise be mangled by normalization,
+    // and rebasing it against a directory is meaningless.
+    if (value->find("://") != std::string::npos) return;
+
+    std::string resolved;
+    if ((*value)[0] == '/') {
+        // Already absolute: normalized but not rebased.
+        resolved = *value;
+    } else if (base_dir.empty()) {
+        resolved = *value;
+    } else if (base_dir[base_dir.size() - 1] == '/') {
+        resolved = base_dir + *value;
+    } else {
+        resolved = base_dir + "/" + *value;
+    }
+    *value = LexicallyNormalizePath(resolved);
+}
+
+}  // namespace
+
+void ResolveImageConfigLocalPaths(const std::string& image_config_path, ImageConfig* cfg) {
+    if (cfg == 0) return;
+
+    // Rust's `parent().unwrap_or(Path::new("."))`: a bare filename has no
+    // parent, and its siblings live in the current directory.
+    const core::Optional<std::string> parent = core::fs::Parent(image_config_path);
+    const std::string base_dir =
+        parent.has_value() && !parent->empty() ? *parent : std::string(".");
+
+    for (size_t i = 0; i < cfg->lowers.size(); ++i) {
+        LayerConfig& layer = cfg->lowers[i];
+        ResolvePathField(base_dir, &layer.gzip_index);
+        ResolvePathField(base_dir, &layer.file);
+        ResolvePathField(base_dir, &layer.target_file);
+        ResolvePathField(base_dir, &layer.dir);
+    }
+
+    ResolvePathField(base_dir, &cfg->upper.index);
+    ResolvePathField(base_dir, &cfg->upper.data);
+    ResolvePathField(base_dir, &cfg->upper.target);
+    ResolvePathField(base_dir, &cfg->upper.gzip_index);
+    ResolvePathField(base_dir, &cfg->result_file);
+    ResolvePathField(base_dir, &cfg->record_trace_path);
+}
+
+namespace {
+/// Forward declaration. The definition sits further down, inside the
+/// anonymous namespace that holds the rest of the parser helpers, next to
+/// `ValidateDownloadSchedulerCaps` -- the other half of the same rule set.
+core::Expected<core::Unit, std::string> ValidateDownloadChunkKnobsImpl(
+    const DownloadConfig& cfg, const char* field);
+}  // namespace
+
+// Exported so `ValidateImageConfig` and `ValidateGlobalConfig` apply the
+// same per-layer rules to an image override and to the global config.
+core::Expected<core::Unit, std::string> ValidateDownloadChunkKnobs(const DownloadConfig& cfg,
+                                                                     const std::string& field) {
+    return ValidateDownloadChunkKnobsImpl(cfg, field.c_str());
+}
+
+core::Expected<core::Unit, std::string> ValidateImageConfig(const ImageConfig& cfg) {
+    if (cfg.has_download_override) {
+        // Only the chunk knobs. The scheduler caps are fixed when the backend
+        // is created, so validating them here would reject a value that is
+        // then ignored anyway.
+        const core::Expected<core::Unit, std::string> knobs =
+            ValidateDownloadChunkKnobs(cfg.download_override, "download override concurrency");
+        if (!knobs.ok()) return knobs;
+    }
+
+    if (cfg.lowers.size() > kMaxLayerCnt) {
+        std::ostringstream o;
+        o << "too many lowers: " << cfg.lowers.size() << ", max " << kMaxLayerCnt;
+        return core::make_unexpected(o.str());
+    }
+
+    const core::Expected<bool, std::string> writable = ValidateUpperConfig(cfg.upper);
+    if (!writable.ok()) return core::make_unexpected(writable.error());
+
+    if (cfg.lowers.empty() && !writable.value()) {
+        // Nothing to read and nothing to write: there is no device to build.
+        return core::make_unexpected(
+            std::string("image config has no lowers and no writable upper"));
+    }
+
+    for (size_t i = 0; i < cfg.lowers.size(); ++i) {
+        const LayerConfig& layer = cfg.lowers[i];
+        if (layer.file.empty() && layer.digest.empty() && layer.dir.empty()) {
+            return core::make_unexpected(
+                std::string("each lower must provide at least one of file/dir/digest"));
+        }
+        // A lower with a digest but no local file is fetched from the
+        // registry, which needs a base URL to fetch it from.
+        const bool is_remote = layer.file.empty() && !layer.digest.empty();
+        if (is_remote && layer.EffectiveRepoBlobUrl(cfg.repo_blob_url).empty()) {
+            return core::make_unexpected(
+                std::string("repoBlobUrl is required for remote lower layers"));
+        }
+    }
+
+    // Recording a trace rewrites the upper as it runs, and an acceleration
+    // layer is itself a recorded trace being replayed; enabling both would
+    // have the replay recording over its own input.
+    if (cfg.acceleration_layer && !cfg.record_trace_path.empty()) {
+        return core::make_unexpected(
+            std::string("accelerationLayer and recordTracePath cannot be enabled together"));
+    }
+    return core::Unit();
+}
+
 core::Expected<bool, std::string> SaveImageConfig(const std::string& path,
                                                   const ImageConfig& config) {
     const core::Optional<std::string> parent = core::fs::Parent(path);
@@ -565,8 +721,10 @@ core::Expected<CertConfig, std::string> ParseCertConfig(const core::Json& o) {
 }
 
 /// Rust `validate_download_chunk_knobs` — the per-layer knobs.
-core::Expected<core::Unit, std::string> ValidateDownloadChunkKnobs(const DownloadConfig& cfg,
-                                                                      const char* field) {
+///
+/// File-local; `ValidateDownloadChunkKnobs` below is the exported wrapper.
+core::Expected<core::Unit, std::string> ValidateDownloadChunkKnobsImpl(
+    const DownloadConfig& cfg, const char* field) {
     const uint64_t kMaxBlockSize = 64ULL * 1024ULL * 1024ULL;
     const std::size_t kMaxConcurrency = 16;
     const uint64_t kMaxLayerScratchBytes = 256ULL * 1024ULL * 1024ULL;
