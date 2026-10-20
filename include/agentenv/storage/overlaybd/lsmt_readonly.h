@@ -54,6 +54,37 @@ enum LsmtFileType {
     kLsmtFileHybridWritable = 3
 };
 
+/// Rust `types.rs :: CommitArgs` — where a compacted layer goes plus the
+/// identity it is stamped with.
+///
+/// `writer` is a `VirtualFile` rather than Rust's `Arc<dyn CompactWriter>`:
+/// both ported callers reach this through `CommitArgs::new`, which wraps a
+/// file in `VirtualFileWriter`. The general trait is still available one
+/// level down as `lsmt::CompactSink`, so a non-file writer can be passed to
+/// `lsmt::CompactTo` directly; nothing in the ported surface needs it.
+///
+/// Rust's `concurrency` field is absent: this port copies data blocks
+/// sequentially, which is Rust's default of 1.
+///
+/// Declared here rather than in `lsmt_rw.h` because both the read-only and
+/// the read-write file commit through it, exactly as Rust puts it in
+/// `types.rs` for the same reason. `lsmt_rw.h` includes this header, so the
+/// other placement would make `LsmtReadOnlyFile::CommitPreservingMetadata`
+/// unable to name its own argument type.
+struct CommitArgs {
+    std::shared_ptr<VirtualFile> writer;
+    /// Empty means the nil uuid is written out as text, not that the field is
+    /// left zeroed -- see `lsmt::CompactTo`.
+    std::string uuid;
+    /// Empty leaves the field zeroed, which reads back as "no parent".
+    std::string parent_uuid;
+    std::vector<uint8_t> user_tag;
+
+    CommitArgs() {}
+    /// Rust `CommitArgs::new`.
+    explicit CommitArgs(std::shared_ptr<VirtualFile> as_file) : writer(as_file) {}
+};
+
 /// Rust `types.rs :: DataStat`.
 struct DataStat {
     uint64_t total_data_size;
@@ -173,6 +204,20 @@ class LsmtReadOnlyFile : public VirtualFile {
     /// `dest` is written but neither synced nor closed; its owner decides
     /// when the bytes have to be durable.
     core::Expected<core::Unit, std::string> Flatten(std::shared_ptr<VirtualFile> dest);
+
+    /// Rust `commit_preserving_metadata` — rewrite a sealed layer into
+    /// `args.writer`, carrying its stamped identity across.
+    ///
+    /// The identity comes from the *source trailer*, not from `args`: uuid,
+    /// parent uuid and user tag are overwritten on the copy that is passed
+    /// down. That is the whole point of the operation -- repacking a layer
+    /// must not re-identify it, or the layer below would stop recognising it
+    /// as its child and `VerifyLayerOrder` would reject the stack.
+    ///
+    /// Requires exactly one layer, and requires it sealed. A stacked
+    /// read-only file has no single identity to preserve, and an unsealed
+    /// source has no trailer to read one from.
+    core::Expected<core::Unit, std::string> CommitPreservingMetadata(const CommitArgs& args);
 
     // -- VirtualFile -------------------------------------------------------
 

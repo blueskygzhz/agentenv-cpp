@@ -37,6 +37,20 @@ bool Exists(const std::string& path) {
     return !path.empty() && Stat(path, &st);
 }
 
+Expected<bool, std::string> TryExists(const std::string& path) {
+    // Rust `Path::new("").try_exists()` reports `Ok(false)`: the empty path
+    // names nothing, and that is an answer rather than a failure.
+    if (path.empty()) return false;
+
+    struct stat st;
+    if (::stat(path.c_str(), &st) == 0) return true;
+    // Only these two mean "it is not there". Everything else -- EACCES on a
+    // parent directory, ELOOP, EIO -- means the question could not be
+    // answered, which is what separates this from `Exists`.
+    if (errno == ENOENT || errno == ENOTDIR) return false;
+    return make_unexpected(Errno("stat", path, errno));
+}
+
 bool IsDir(const std::string& path) {
     struct stat st;
     return !path.empty() && Stat(path, &st) && S_ISDIR(st.st_mode);

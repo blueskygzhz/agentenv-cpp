@@ -73,31 +73,6 @@ struct LayerDescriptor {
     LayerDescriptor() : size(0) {}
 };
 
-/// Rust `types.rs :: CommitArgs` — where a compacted layer goes plus the
-/// identity it is stamped with.
-///
-/// `writer` is a `VirtualFile` rather than Rust's `Arc<dyn CompactWriter>`:
-/// both ported callers reach this through `CommitArgs::new`, which wraps a
-/// file in `VirtualFileWriter`. The general trait is still available one
-/// level down as `lsmt::CompactSink`, so a non-file writer can be passed to
-/// `lsmt::CompactTo` directly; nothing in the ported surface needs it.
-///
-/// Rust's `concurrency` field is absent: this port copies data blocks
-/// sequentially, which is Rust's default of 1.
-struct CommitArgs {
-    std::shared_ptr<VirtualFile> writer;
-    /// Empty means the nil uuid is written out as text, not that the field is
-    /// left zeroed -- see `lsmt::CompactTo`.
-    std::string uuid;
-    /// Empty leaves the field zeroed, which reads back as "no parent".
-    std::string parent_uuid;
-    std::vector<uint8_t> user_tag;
-
-    CommitArgs() {}
-    /// Rust `CommitArgs::new`.
-    explicit CommitArgs(std::shared_ptr<VirtualFile> as_file) : writer(as_file) {}
-};
-
 /// Rust's `(LSMTReadOnlyFile, Option<LayerDescriptor>)` tuple return from
 /// `close_seal_and_reopen`, named because C++11 has no structured binding to
 /// unpack a pair readably at the call site.
@@ -357,6 +332,19 @@ class LsmtFile : public VirtualFile {
     /// Any mapping buffered by group commit is flushed first; an exported
     /// layer that omitted them would read as holes where data was written.
     core::Expected<core::Unit, std::string> ExportUpperAsSealed(const CommitArgs& args);
+
+    /// Rust `commit_with_args` — write this file out as one sealed layer with
+    /// a caller-chosen identity.
+    ///
+    /// Refuses a stacked file. `Flatten` is the operation for that case: it
+    /// resolves shadowing across the whole stack, whereas a commit is defined
+    /// as "write *this* layer's own content", and the two cannot be the same
+    /// call. Rust's message, `"not supported: commit stacked files"`, is kept
+    /// verbatim because callers match on it.
+    ///
+    /// Group-committed mappings are flushed first, for the same reason
+    /// `ExportUpperAsSealed` does it.
+    core::Expected<core::Unit, std::string> CommitWithArgs(const CommitArgs& args);
 
     /// Rust `plan_hybrid_write`. Exposed for testing: the fragment split is
     /// the whole of the hybrid write decision, and it is pure.

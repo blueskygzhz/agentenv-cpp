@@ -22,6 +22,8 @@ add_library(agentenv-overlaybd STATIC
     sys.cc
     # Rust: src/image/helper.rs — config path rewriting + runtime upper setup
     image_helper.cc
+    image_service.cc
+    image_file.cc
     # Rust: src/backend/tar.rs — tar detection (the TarFile wrapper is not ported)
     tar.cc
     # Rust: src/backend/local.rs — the first concrete VirtualFile

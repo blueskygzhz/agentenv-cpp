@@ -22,6 +22,17 @@ namespace fs {
 
 /// Rust `Path::exists`.
 bool Exists(const std::string& path);
+
+/// Rust `tokio::fs::try_exists` / `std::fs::exists` — three-valued existence.
+///
+/// Distinct from `Exists` on purpose. `Exists` collapses "cannot tell" into
+/// "no", which is right where absence and inaccessibility call for the same
+/// action. It is wrong where the two must diverge: a layer whose file cannot
+/// be stat'ed because of a permission error is not a layer that is absent,
+/// and treating it as absent sends the caller down a fallback path with a
+/// misleading reason. Rust's callers propagate that error, so a port that
+/// means to match them needs this.
+Expected<bool, std::string> TryExists(const std::string& path);
 /// Rust `Path::is_dir`.
 bool IsDir(const std::string& path);
 /// Rust `Path::is_file`.

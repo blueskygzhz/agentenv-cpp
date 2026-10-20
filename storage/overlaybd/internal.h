@@ -12,6 +12,8 @@
 #include <vector>
 
 #include "agentenv/core/expected.h"
+#include "agentenv/core/identity.h"
+#include "agentenv/core/optional.h"
 #include "agentenv/storage/overlaybd/lsmt.h"
 #include "agentenv/storage/overlaybd/virtual_file.h"
 
@@ -78,6 +80,33 @@ class VirtualFileCompactSink : public lsmt::CompactSink {
  private:
     std::shared_ptr<VirtualFile> file_;
 };
+
+/// Rust `helper.rs :: parse_uuid_field` — read a NUL-padded uuid slot.
+///
+/// Reports absence for an empty or unparseable field, which is what lets a
+/// commit distinguish "this layer names no parent" from "this layer names a
+/// parent whose stamp is corrupt". Returns the canonical spelling rather than
+/// the raw bytes, matching Rust's parse-then-`to_string` round trip.
+inline core::Optional<std::string> ParseUuidField(const uint8_t* field, size_t len) {
+    size_t end = 0;
+    while (end < len && field[end] != 0) ++end;
+    if (end == 0) return core::Optional<std::string>();
+    const std::string text(reinterpret_cast<const char*>(field), end);
+    core::Uuid parsed;
+    if (!core::Uuid::Parse(text, &parsed)) return core::Optional<std::string>();
+    return core::Optional<std::string>(parsed.ToString());
+}
+
+/// Rust `helper.rs :: parse_user_tag_field` — read a NUL-padded opaque tag.
+///
+/// Unlike the uuid slot the bytes are not interpreted, so only emptiness is
+/// an absence here.
+inline core::Optional<std::vector<uint8_t> > ParseUserTagField(const uint8_t* field, size_t len) {
+    size_t end = 0;
+    while (end < len && field[end] != 0) ++end;
+    if (end == 0) return core::Optional<std::vector<uint8_t> >();
+    return core::Optional<std::vector<uint8_t> >(std::vector<uint8_t>(field, field + end));
+}
 
 }  // namespace overlaybd
 }  // namespace storage

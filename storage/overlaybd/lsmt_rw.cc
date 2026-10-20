@@ -1710,6 +1710,30 @@ core::Expected<core::Unit, std::string> LsmtFile::ExportUpperAsSealed(const Comm
                                "export upper as sealed");
 }
 
+core::Expected<core::Unit, std::string> LsmtFile::CommitWithArgs(const CommitArgs& args) {
+    // A stacked file has no single layer to commit; `Flatten` is the
+    // operation that resolves across a stack. Rust's wording is kept because
+    // it is what callers match on.
+    if (layers_.size() > 1) {
+        return core::make_unexpected(std::string("not supported: commit stacked files"));
+    }
+
+    const core::Expected<core::Unit, std::string> flushed = FlushGroupCommit();
+    if (!flushed.ok()) return core::make_unexpected(flushed.error());
+
+    // The full virtual size, as Rust queries it. With at most one layer the
+    // lookup has nothing to shadow, so this and the upper's own dump agree --
+    // but the query is what Rust writes, and a later change to allow a single
+    // lower would need this form to stay correct.
+    const uint64_t blocks = (virtual_size_ + kAlign - 1) / kAlign;
+    if (blocks > static_cast<uint64_t>(~static_cast<uint32_t>(0))) {
+        return core::make_unexpected(std::string("commit: virtual size too large to query"));
+    }
+    std::vector<SegmentMapping> mappings;
+    index_->Lookup(Segment(0, static_cast<uint32_t>(blocks)), &mappings);
+    return CompactMappingsInto(layers_, mappings, virtual_size_, args, "commit");
+}
+
 core::Expected<core::Unit, std::string> MergeFilesRo(
     const std::vector<std::shared_ptr<VirtualFile> >& src_files,
     const std::string& output_path, const lsmt::CompactCommitArgs& args) {

@@ -51,6 +51,7 @@ agentenv_add_test(test_overlaybd_lsmt_readonly test_overlaybd_lsmt_readonly.cc a
 agentenv_add_test(test_overlaybd_lsmt_rw test_overlaybd_lsmt_rw.cc agentenv-overlaybd)
 agentenv_add_test(test_overlaybd_lsmt_compact test_overlaybd_lsmt_compact.cc agentenv-overlaybd)
 agentenv_add_test(test_overlaybd_bk_download test_overlaybd_bk_download.cc agentenv-overlaybd)
+agentenv_add_test(test_overlaybd_image_file test_overlaybd_image_file.cc agentenv-overlaybd)
 agentenv_add_test(test_deps                test_deps.cc                agentenv-rootmod)
 agentenv_add_test(test_overlaybd_p2p       test_overlaybd_p2p.cc       agentenv-overlaybd-p2p)
 agentenv_add_test(test_mpsc_queue          test_mpsc_queue.cc          agentenv-core)
@@ -122,6 +123,7 @@ agentenv_add_test(test_api_template_helpers test_api_template_helpers.cc agenten
 agentenv_add_test(test_api_sandbox_params  test_api_sandbox_params.cc  agentenv-api agentenv-sandbox)
 # Rust: hyper / hyper-util legacy Client (HTTP over AF_UNIX + TCP)
 agentenv_add_test(test_core_http           test_core_http.cc           agentenv-core agentenv-sandbox Threads::Threads)
+agentenv_add_test(test_core_rwlock         test_core_rwlock.cc         agentenv-core Threads::Threads)
 # Rust: src/sandbox/firecracker/{process_vm_reader,pool,startup_pack,config}.rs
 agentenv_add_test(test_firecracker_lifecycle test_firecracker_lifecycle.cc agentenv-sandbox)
 # Rust: src/sandbox/firecracker/overlaybd_snapshot.rs (dirty-page mapping)
