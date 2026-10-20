@@ -356,6 +356,18 @@ class LsmtFile : public VirtualFile {
     core::Expected<ByteBuffer, std::string> ReadAt(uint64_t offset, size_t len) override;
     core::Expected<size_t, std::string> ReadAtInto(uint64_t offset, uint8_t* dst,
                                                     size_t len) override;
+    /// Rust `read_at_with_ctx` / `read_at_into_with_ctx` / `write_at_with_ctx`.
+    ///
+    /// Same resolvers as the plain methods, over a ctx-aware read (or write)
+    /// primitive. See `lsmt_readonly.h` for why the strategy is a template
+    /// parameter instead of a duplicated body.
+    core::Expected<ByteBuffer, std::string> ReadAtWithCtx(const IoCtx& ctx, uint64_t offset,
+                                                            size_t len) override;
+    core::Expected<size_t, std::string> ReadAtIntoWithCtx(const IoCtx& ctx, uint64_t offset,
+                                                            uint8_t* dst, size_t len) override;
+    core::Expected<size_t, std::string> WriteAtWithCtx(const IoCtx& ctx, uint64_t offset,
+                                                         const uint8_t* data,
+                                                         size_t len) override;
     core::Expected<size_t, std::string> WriteAt(uint64_t offset, const uint8_t* data,
                                                  size_t len) override;
     core::Expected<uint64_t, std::string> Size() override;
@@ -378,6 +390,18 @@ class LsmtFile : public VirtualFile {
     core::Expected<core::Unit, std::string> AppendIndexBytes(const uint8_t* bytes, size_t len);
     core::Expected<core::Unit, std::string> AppendIndexMapping(const DiskSegmentMapping& m);
 
+    /// Rust `read_internal_into_generic` / `read_mappings_into_generic`,
+    /// generic in the reader strategy. Defined in the .cc next to their
+    /// instantiations.
+    template <typename Reader>
+    core::Expected<size_t, std::string> ReadInternalIntoGeneric(const Reader& reader,
+                                                                  uint64_t offset,
+                                                                  uint8_t* dst, size_t len);
+    template <typename Reader>
+    core::Expected<core::Unit, std::string> ReadMappingsIntoGeneric(
+        const Reader& reader, const std::vector<SegmentMapping>& mappings, uint64_t begin_blk,
+        uint64_t count_blk, size_t step, size_t buf_pos, uint8_t* buf);
+
     core::Expected<size_t, std::string> ReadInternalInto(uint64_t offset, uint8_t* dst,
                                                            size_t len);
     core::Expected<core::Unit, std::string> ReadMappingsInto(
@@ -385,6 +409,9 @@ class LsmtFile : public VirtualFile {
         size_t step, size_t buf_pos, uint8_t* buf);
     core::Expected<size_t, std::string> WriteInternal(uint64_t offset, const uint8_t* data,
                                                         size_t len);
+    template <typename Writer>
+    core::Expected<size_t, std::string> WriteInternalGeneric(const Writer& writer, uint64_t offset,
+                                                               const uint8_t* data, size_t len);
     core::Expected<core::Unit, std::string> DiscardHybridRange(uint64_t offset, uint64_t len);
 
     void AbsorbSealBytes(uint64_t offset, const uint8_t* data, size_t len);

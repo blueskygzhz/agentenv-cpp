@@ -94,9 +94,14 @@ class OssFile : public VirtualFile {
     /// Always refused — Rust directs writes to `UploadBytes` instead.
     core::Expected<size_t, std::string> WriteAt(uint64_t offset, const uint8_t* data,
                                                   size_t len) override;
+    /// Rust `size` / `read_at` — thin measuring wrappers over the
+    /// matching `*Inner`, which hold the actual request logic.
     core::Expected<uint64_t, std::string> Size() override;
 
  private:
+    core::Expected<uint64_t, std::string> SizeInner();
+    core::Expected<ByteBuffer, std::string> ReadAtInner(uint64_t offset, size_t len);
+
     friend class OssBackend;
 
     OssFile() : backend_(0), size_known_(false), size_(0) {}

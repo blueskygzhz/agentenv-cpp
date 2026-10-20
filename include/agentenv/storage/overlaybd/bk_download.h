@@ -64,6 +64,15 @@ extern const char kBkSubmitClosedCategory[];
 /// text instead. The category set is identical, but a message that does not
 /// mention its cause lands in the generic bucket where Rust would have
 /// recognised the type.
+///
+/// The match is also locale-dependent, which has been measured rather than
+/// assumed: these strings carry `strerror`, and under `LANG=zh_CN.UTF-8`
+/// `strerror(ENOENT)` is "没有那个文件或目录", so an English-only probe never
+/// fires. That is tolerable **here and only here** because the result is a
+/// log label and nothing branches on it — a mislabelled failure is still
+/// logged, retried and reported identically. Where such a test would decide
+/// control flow it must not be used; `image_file.cc` had exactly that bug and
+/// now probes the path instead (see `LocalLayerIsMissing`).
 const char* DownloadErrorCategory(const std::string& error);
 
 /// Rust `background_download_delay` — `delay` plus up to `delay_extra`

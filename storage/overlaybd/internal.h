@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -107,6 +108,86 @@ inline core::Optional<std::vector<uint8_t> > ParseUserTagField(const uint8_t* fi
     if (end == 0) return core::Optional<std::vector<uint8_t> >();
     return core::Optional<std::vector<uint8_t> >(std::vector<uint8_t>(field, field + end));
 }
+
+/// Rust `vfile_io.rs :: DirectRead` — the plain per-layer read primitive.
+///
+/// Both LSMT resolvers (`LsmtReadOnlyFile` and `LsmtFile`) are templates over
+/// this shape rather than plain functions, so that the ctx variant runs the
+/// *same* hole-and-mapping arithmetic. A second copy written to add a context
+/// parameter is exactly where the two paths would drift, and the drift would
+/// surface as a hole read out of the wrong layer.
+struct DirectLayerRead {
+    core::Expected<size_t, std::string> ReadInto(VirtualFile* file, uint64_t offset,
+                                                   uint8_t* dst, size_t len) const {
+        return file->ReadAtInto(offset, dst, len);
+    }
+};
+
+/// Rust `vfile_io.rs :: CtxRead` — the same primitive, submitted on `ctx`.
+///
+/// Holds the context by pointer: `IoCtx` is a lightweight handle to a ring
+/// owned by the caller's thread, and copying it per read would be a copy of
+/// something this code must not own anyway.
+struct CtxLayerRead {
+    explicit CtxLayerRead(const IoCtx& ctx) : ctx(&ctx) {}
+
+    core::Expected<size_t, std::string> ReadInto(VirtualFile* file, uint64_t offset,
+                                                   uint8_t* dst, size_t len) const {
+        return file->ReadAtIntoWithCtx(*ctx, offset, dst, len);
+    }
+
+    const IoCtx* ctx;
+};
+
+/// Rust `read_exact`, generic in the reader strategy.
+///
+/// One implementation for both strategies: they differ only in `ReadInto`, so
+/// a per-strategy body here would be a second place to drift.
+template <typename Reader>
+inline core::Expected<core::Unit, std::string> ReadExactWith(const Reader& reader,
+                                                              VirtualFile* file, uint64_t offset,
+                                                              uint8_t* dst, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+        const core::Expected<size_t, std::string> n =
+            reader.ReadInto(file, offset + done, dst + done, len - done);
+        if (!n.ok()) return core::make_unexpected(n.error());
+        if (n.value() == 0) {
+            // A short read is a success at the `VirtualFile` boundary but a
+            // failure here: the index said these bytes are data, so handing
+            // back the zeros already in the buffer would silently substitute
+            // a hole for whatever the layer was supposed to hold.
+            std::ostringstream o;
+            o << "unexpected EOF: still need " << (len - done) << " byte(s)";
+            return core::make_unexpected(o.str());
+        }
+        done += n.value();
+    }
+    return core::Unit();
+}
+
+/// Rust `vfile_io.rs :: DirectWrite` / `CtxWrite` — the write counterpart.
+///
+/// The same reasoning as the read pair: `LsmtFile::WriteInternal` is a long
+/// piece of hybrid/sparse placement logic, and a second copy written to add
+/// `ctx` is where the two would diverge.
+struct DirectLayerWrite {
+    core::Expected<size_t, std::string> WriteInto(VirtualFile* file, uint64_t offset,
+                                                    const uint8_t* data, size_t len) const {
+        return file->WriteAt(offset, data, len);
+    }
+};
+
+struct CtxLayerWrite {
+    explicit CtxLayerWrite(const IoCtx& ctx) : ctx(&ctx) {}
+
+    core::Expected<size_t, std::string> WriteInto(VirtualFile* file, uint64_t offset,
+                                                    const uint8_t* data, size_t len) const {
+        return file->WriteAtWithCtx(*ctx, offset, data, len);
+    }
+
+    const IoCtx* ctx;
+};
 
 }  // namespace overlaybd
 }  // namespace storage

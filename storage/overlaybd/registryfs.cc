@@ -2,6 +2,8 @@
 // Rust: storage/overlaybd/src/backend/registryfs_v2.rs (read path)
 #include "agentenv/storage/overlaybd/registryfs.h"
 
+#include "agentenv/storage/overlaybd/metrics.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1124,9 +1126,9 @@ core::Expected<http::Response, std::string> RegistryFs::FetchRange(const std::st
     return response.value();
 }
 
-core::Expected<ByteBuffer, std::string> RegistryFs::ReadRange(const std::string& url,
-                                                                 uint64_t offset,
-                                                                 size_t count) {
+core::Expected<ByteBuffer, std::string> RegistryFs::ReadRangeInner(const std::string& url,
+                                                                      uint64_t offset,
+                                                                      size_t count) {
     // One deadline for the whole retry loop, not per attempt. Rust takes
     // `remaining_timeout(deadline)` before each try, so `timeout` bounds the
     // entire read -- otherwise N retries could take N * timeout, and a caller
@@ -1156,9 +1158,10 @@ core::Expected<ByteBuffer, std::string> RegistryFs::ReadRange(const std::string&
                                      : last_error);
 }
 
-core::Expected<size_t, std::string> RegistryFs::ReadRangeInto(const std::string& url,
-                                                                 uint64_t offset, uint8_t* dst,
-                                                                 size_t len) {
+core::Expected<size_t, std::string> RegistryFs::ReadRangeIntoInner(const std::string& url,
+                                                                       uint64_t offset,
+                                                                       uint8_t* dst,
+                                                                       size_t len) {
     const uint64_t deadline_ms = NowMs() + options_.timeout_secs * 1000ULL;
 
     std::string last_error;
@@ -1194,7 +1197,7 @@ core::Expected<size_t, std::string> RegistryFs::ReadRangeInto(const std::string&
                                      : last_error);
 }
 
-core::Expected<uint64_t, std::string> RegistryFs::GetLength(const std::string& url) {
+core::Expected<uint64_t, std::string> RegistryFs::GetLengthInner(const std::string& url) {
     {
         std::lock_guard<std::mutex> lk(cache_mu_);
         const std::map<std::string, CachedSize>::const_iterator found = sizes_.find(url);
@@ -1323,6 +1326,53 @@ core::Expected<uint64_t, std::string> RegistryFile::Size() {
     size_ = size.value();
     size_known_ = true;
     return size_;
+}
+
+core::Expected<uint64_t, std::string> RegistryFs::GetLength(const std::string& url) {
+    const metrics::RemoteSource source =
+        metrics::RemoteSource::Registry(accelerate_address_, url);
+    const uint64_t start = NowMs();
+    const core::Expected<uint64_t, std::string> result = GetLengthInner(url);
+    metrics::RecordRemoteMetadata(source, result.ok() ? std::string() : result.error(),
+                                  static_cast<double>(NowMs() - start) / 1000.0);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Metric wrappers
+// ---------------------------------------------------------------------------
+//
+// Rust splits each of these into an outer function that measures and an
+// `_inner` that does the work; the split is kept because it is what guarantees
+// every return path is timed, including the early ones.
+
+core::Expected<ByteBuffer, std::string> RegistryFs::ReadRange(const std::string& url,
+                                                                 uint64_t offset,
+                                                                 size_t count) {
+    const metrics::RemoteSource source =
+        metrics::RemoteSource::Registry(accelerate_address_, url);
+    const uint64_t start = NowMs();
+    const core::Expected<ByteBuffer, std::string> result = ReadRangeInner(url, offset, count);
+    metrics::RecordRemoteRead(
+        source, metrics::kReadRange, result.ok() ? std::string() : result.error(),
+        result.ok() ? static_cast<uint64_t>(result.value().size()) : 0,
+        static_cast<double>(NowMs() - start) / 1000.0);
+    return result;
+}
+
+core::Expected<size_t, std::string> RegistryFs::ReadRangeInto(const std::string& url,
+                                                                 uint64_t offset, uint8_t* dst,
+                                                                 size_t len) {
+    const metrics::RemoteSource source =
+        metrics::RemoteSource::Registry(accelerate_address_, url);
+    const uint64_t start = NowMs();
+    const core::Expected<size_t, std::string> result =
+        ReadRangeIntoInner(url, offset, dst, len);
+    metrics::RecordRemoteRead(
+        source, metrics::kReadRangeInto, result.ok() ? std::string() : result.error(),
+        result.ok() ? static_cast<uint64_t>(result.value()) : 0,
+        static_cast<double>(NowMs() - start) / 1000.0);
+    return result;
 }
 
 core::Expected<ByteBuffer, std::string> RegistryFile::ReadAt(uint64_t offset, size_t len) {

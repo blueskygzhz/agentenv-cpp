@@ -21,6 +21,7 @@ add_library(agentenv-overlaybd STATIC
     # Rust: src/sys/{open_flags,page_cache,release_space,xattr}.rs
     sys.cc
     # Rust: src/image/helper.rs — config path rewriting + runtime upper setup
+    metrics.cc
     image_helper.cc
     image_service.cc
     image_file.cc
@@ -46,7 +47,10 @@ add_library(agentenv-overlaybd STATIC
     registryfs.cc
 )
 target_include_directories(agentenv-overlaybd PUBLIC ${CMAKE_SOURCE_DIR}/include)
-target_link_libraries(agentenv-overlaybd PUBLIC agentenv-core agentenv-storage-util)
+# `agentenv-observability` is the metrics facade, matching Rust: this crate's
+# Cargo.toml depends on `metrics`, and `src/metrics.rs` records through it.
+target_link_libraries(agentenv-overlaybd PUBLIC agentenv-core agentenv-storage-util
+                                                agentenv-observability)
 if(AGENTENV_WITH_ZSTD)
     target_link_libraries(agentenv-overlaybd PUBLIC ${ZSTD_LIB} ${LZ4_LIB})
 endif()

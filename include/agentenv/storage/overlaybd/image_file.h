@@ -174,6 +174,48 @@ class ImageFile : public VirtualFile {
     core::Expected<core::Optional<uint64_t>, std::string> SeekData(uint64_t offset) override;
     core::Expected<core::Optional<uint64_t>, std::string> SeekHole(uint64_t offset) override;
 
+    /// Rust `read_at_with_ctx` / `read_at_into_with_ctx`.
+    ///
+    /// Overridden to **forward** the context rather than accept the
+    /// `VirtualFile` default. This class always wraps something (a lower stack
+    /// or an upper), so the default would cut every read below it back to
+    /// synchronous I/O -- the failure `virtual_file.h` warns about, applied at
+    /// the one layer that sits above the whole image.
+    ///
+    /// The `FgReadGuard` is here for the same reason as in `ReadAt`: ublk
+    /// queue threads enter through these, and a foreground read that skipped
+    /// the count would let the background-download gate admit work beside it.
+    core::Expected<ByteBuffer, std::string> ReadAtWithCtx(const IoCtx& ctx, uint64_t offset,
+                                                             size_t len) override;
+    core::Expected<size_t, std::string> ReadAtIntoWithCtx(const IoCtx& ctx, uint64_t offset,
+                                                             uint8_t* dst, size_t len) override;
+
+    /// Rust `write_at_with_ctx`.
+    ///
+    /// Forwards the context and refreshes the size, but takes **no**
+    /// `FgReadGuard` -- matching Rust, where the write path is the one that
+    /// does not hold it. The refresh still happens inside the guard, as in
+    /// `WriteAt`, so a restack cannot swap the base underneath it.
+    ///
+    /// Rust's `write_bytes_at_with_ctx` has no counterpart here: it takes
+    /// `Bytes` (an owned, refcounted buffer) while this port writes through
+    /// `const uint8_t*`, so there is nothing left for a `_bytes` variant to
+    /// express.
+    core::Expected<size_t, std::string> WriteAtWithCtx(const IoCtx& ctx, uint64_t offset,
+                                                          const uint8_t* data,
+                                                          size_t len) override;
+
+    /// Rust `evict_range` / `evict_all` — forwarded to the live base.
+    ///
+    /// The `VirtualFile` default is a no-op success, which is right for a file
+    /// that caches nothing but wrong here: this class always wraps a stack
+    /// that does cache, and accepting the default would answer "evicted"
+    /// without asking anything below to evict. Nothing reports the miss --
+    /// the hint is advisory, so the caller just keeps a warm cache it meant to
+    /// drop.
+    core::Expected<core::Unit, std::string> EvictRange(uint64_t offset, uint64_t len) override;
+    core::Expected<core::Unit, std::string> EvictAll() override;
+
  private:
     /// Takes the service by value because the field below must be a live
     /// handle from the moment the image exists.
@@ -229,6 +271,22 @@ class ImageFile : public VirtualFile {
     /// No cycle: the service never holds an `ImageFile`.
     ImageService image_service_;
 };
+
+/// Rust `image/snapshot.rs :: export_upper_as_snapshot_layer` — seal the
+/// image's writable upper into a fresh file at `output_layer_path`.
+///
+/// **A read-only image succeeds without doing anything.** That is Rust's
+/// behaviour, not an oversight: the caller is snapshotting whatever the image
+/// has accumulated, and an image with no upper has accumulated nothing. The
+/// output file is therefore not created either, so a caller that needs to
+/// distinguish the two cases must check `IsReadOnly()` itself.
+///
+/// `image_service` is accepted and unused, mirroring Rust's `_image_service`:
+/// the export goes through the image's own handles, and the parameter is kept
+/// so the call site does not have to change if it ever needs the service.
+core::Expected<core::Unit, std::string> ExportUpperAsSnapshotLayer(
+    const ImageService& image_service, ImageFile* image,
+    const std::string& output_layer_path);
 
 }  // namespace overlaybd
 }  // namespace storage

@@ -274,14 +274,18 @@ core::Expected<std::shared_ptr<FileCacheBackend>, std::string> ImageService::Bui
     return FileCacheBackend::WithOptionsAndTransFunc(normalized, &BasenameCacheTransform);
 }
 
-core::Expected<RemoteRuntime, std::string> ImageService::BuildRemoteRuntime() {
+core::Expected<RemoteRuntime, std::string> ImageService::BuildRemoteRuntime(
+    const std::string& accelerate_address) {
     RemoteRuntime runtime;
 
     const core::Expected<std::shared_ptr<RegistryFs>, std::string> registryfs =
         RegistryFs::FromGlobalConfig(inner_->global_config);
     if (!registryfs.ok()) return core::make_unexpected(registryfs.error());
     runtime.underlay_registryfs = registryfs.value();
-    runtime.underlay_registryfs->SetAccelerateAddress(CurrentAccelerateAddress());
+    // Passed in rather than read here: this runs under the runtime lock, and
+    // taking the mode lock inside it would invert the order
+    // `EnableAcceleration` uses (mode, then runtime) and deadlock.
+    runtime.underlay_registryfs->SetAccelerateAddress(accelerate_address);
 
     if (inner_->global_config.oss_config.enable) {
         const core::Expected<std::shared_ptr<OssBackend>, std::string> oss =
@@ -299,10 +303,22 @@ core::Expected<RemoteRuntime, std::string> ImageService::BuildRemoteRuntime() {
 }
 
 core::Expected<RemoteRuntime*, std::string> ImageService::GetRemoteRuntime() {
+    // Read before the runtime lock is taken. `EnableAcceleration` locks mode
+    // and then runtime; doing the reverse here would be an ABBA deadlock
+    // between an image open and an accelerator probe, both of which run
+    // concurrently on the open path.
+    //
+    // Racing with a concurrent `EnableAcceleration` is harmless: that call
+    // retargets an already-built runtime under the runtime lock, so whichever
+    // of the two lands second decides the address, and the registry client is
+    // never left unset.
+    const std::string accelerate_address = CurrentAccelerateAddress();
+
     std::lock_guard<std::mutex> guard(inner_->remote_runtime_mutex);
     if (inner_->remote_runtime) return inner_->remote_runtime.get();
 
-    const core::Expected<RemoteRuntime, std::string> built = BuildRemoteRuntime();
+    const core::Expected<RemoteRuntime, std::string> built =
+        BuildRemoteRuntime(accelerate_address);
     // A failed init is not cached, matching Rust's `get_or_try_init`: the
     // next caller retries rather than inheriting a permanent failure.
     if (!built.ok()) return core::make_unexpected(built.error());
@@ -363,12 +379,23 @@ ImageService::OpenBackendSourceWithSize(const std::string& url,
         return std::shared_ptr<VirtualFile>(opened.value());
     }
 
-    // A zero hint is what the registry backend reads as "probe the size", so
-    // the absent case needs no separate call as it does in Rust.
+    // Rust picks between two different calls here, and they are not
+    // interchangeable:
+    //   * with a hint, `open_with_size_hint` builds a lazy handle;
+    //   * without one, `open()` runs `file.size().await?` before returning,
+    //     so the probe happens *now* and its failure fails the open.
+    // A zero hint only selects the lazy form, so the eager probe has to be
+    // issued explicitly. Without it a bad URL, a missing blob or an auth
+    // failure would surface much later, from inside the layer's index load,
+    // as an unrelated-looking read error.
     const core::Expected<std::shared_ptr<RegistryFile>, std::string> opened =
         runtime.value()->underlay_registryfs->OpenFile(
             url, source_size.has_value() ? *source_size : 0);
     if (!opened.ok()) return core::make_unexpected(opened.error());
+    if (!source_size.has_value()) {
+        const core::Expected<uint64_t, std::string> probed = opened.value()->Size();
+        if (!probed.ok()) return core::make_unexpected(probed.error());
+    }
     return std::shared_ptr<VirtualFile>(opened.value());
     // No `RuntimeDispatchFile` wrapper: there is no runtime to pin I/O to.
     // See the class comment.

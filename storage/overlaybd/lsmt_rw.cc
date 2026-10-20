@@ -678,9 +678,10 @@ core::Expected<core::Unit, std::string> LsmtFile::FlushGroupCommit() {
 // so: a block is mapped, zeroed, or absent, and the only difference is that
 // the combined index may resolve a block to the upper.
 
-core::Expected<core::Unit, std::string> LsmtFile::ReadMappingsInto(
-    const std::vector<SegmentMapping>& mappings, uint64_t begin_blk, uint64_t count_blk,
-    size_t step, size_t buf_pos, uint8_t* buf) {
+template <typename Reader>
+core::Expected<core::Unit, std::string> LsmtFile::ReadMappingsIntoGeneric(
+    const Reader& reader, const std::vector<SegmentMapping>& mappings, uint64_t begin_blk,
+    uint64_t count_blk, size_t step, size_t buf_pos, uint8_t* buf) {
     uint64_t current_blk = begin_blk;
     const uint64_t end_blk = begin_blk + count_blk;
 
@@ -717,7 +718,8 @@ core::Expected<core::Unit, std::string> LsmtFile::ReadMappingsInto(
                 return core::make_unexpected(o.str());
             }
             const core::Expected<core::Unit, std::string> r =
-                ReadExact(layers_[layer_idx].get(), m.moffset * kAlign, buf + local, copy_len);
+                ReadExactWith(reader, layers_[layer_idx].get(), m.moffset * kAlign, buf + local,
+                              copy_len);
             if (!r.ok()) return core::make_unexpected(r.error());
         }
         current_blk = m.End();
@@ -730,8 +732,11 @@ core::Expected<core::Unit, std::string> LsmtFile::ReadMappingsInto(
     return core::Unit();
 }
 
-core::Expected<size_t, std::string> LsmtFile::ReadInternalInto(uint64_t offset, uint8_t* dst,
-                                                                 size_t len) {
+template <typename Reader>
+core::Expected<size_t, std::string> LsmtFile::ReadInternalIntoGeneric(const Reader& reader,
+                                                                       uint64_t offset,
+                                                                       uint8_t* dst,
+                                                                       size_t len) {
     const core::Expected<core::Unit, std::string> al = CheckAlignment(offset, len);
     if (!al.ok()) return core::make_unexpected(al.error());
 
@@ -753,7 +758,7 @@ core::Expected<size_t, std::string> LsmtFile::ReadInternalInto(uint64_t offset, 
         index_->Lookup(Segment(begin_blk, static_cast<uint32_t>(count_blk)), &mappings);
 
         const core::Expected<core::Unit, std::string> r =
-            ReadMappingsInto(mappings, begin_blk, count_blk, step, buf_pos, dst);
+            ReadMappingsIntoGeneric(reader, mappings, begin_blk, count_blk, step, buf_pos, dst);
         if (!r.ok()) return core::make_unexpected(r.error());
 
         remaining -= step;
@@ -761,6 +766,18 @@ core::Expected<size_t, std::string> LsmtFile::ReadInternalInto(uint64_t offset, 
         buf_pos += step;
     }
     return read_len;
+}
+
+core::Expected<core::Unit, std::string> LsmtFile::ReadMappingsInto(
+    const std::vector<SegmentMapping>& mappings, uint64_t begin_blk, uint64_t count_blk,
+    size_t step, size_t buf_pos, uint8_t* buf) {
+    return ReadMappingsIntoGeneric(DirectLayerRead(), mappings, begin_blk, count_blk, step,
+                                   buf_pos, buf);
+}
+
+core::Expected<size_t, std::string> LsmtFile::ReadInternalInto(uint64_t offset, uint8_t* dst,
+                                                                 size_t len) {
+    return ReadInternalIntoGeneric(DirectLayerRead(), offset, dst, len);
 }
 
 core::Expected<ByteBuffer, std::string> LsmtFile::ReadAt(uint64_t offset, size_t len) {
@@ -874,9 +891,11 @@ core::Expected<std::vector<WriteFragment>, std::string> LsmtFile::PlanHybridWrit
 // write
 // ---------------------------------------------------------------------------
 
-core::Expected<size_t, std::string> LsmtFile::WriteInternal(uint64_t offset,
-                                                              const uint8_t* data,
-                                                              size_t len) {
+template <typename Writer>
+core::Expected<size_t, std::string> LsmtFile::WriteInternalGeneric(const Writer& writer,
+                                                                    uint64_t offset,
+                                                                    const uint8_t* data,
+                                                                    size_t len) {
     if (sealed_) return core::make_unexpected(std::string("File is sealed."));
     if (len == 0) return static_cast<size_t>(0);
     if (data == 0) return core::make_unexpected(std::string("lsmt rw write: null data"));
@@ -906,7 +925,7 @@ core::Expected<size_t, std::string> LsmtFile::WriteInternal(uint64_t offset,
 
                 if (f.kind == WriteFragment::kInPlace) {
                     const core::Expected<size_t, std::string> w =
-                        rw_data_file_->WriteAt(f.phys_offset, chunk + f.data_offset, f.len);
+                        writer.WriteInto(rw_data_file_.get(), f.phys_offset, chunk + f.data_offset, f.len);
                     if (!w.ok()) return core::make_unexpected(w.error());
                     // No mapping published: one already points here, and it
                     // is unchanged.
@@ -928,7 +947,7 @@ core::Expected<size_t, std::string> LsmtFile::WriteInternal(uint64_t offset,
                 }
 
                 const core::Expected<size_t, std::string> w =
-                    rw_data_file_->WriteAt(phys, chunk + f.data_offset, f.len);
+                    writer.WriteInto(rw_data_file_.get(), phys, chunk + f.data_offset, f.len);
                 if (!w.ok()) return core::make_unexpected(w.error());
 
                 if (f.kind == WriteFragment::kAppend) {
@@ -975,14 +994,14 @@ core::Expected<size_t, std::string> LsmtFile::WriteInternal(uint64_t offset,
             // block now belongs to the layer.
             phys_offset = kHdr + current_offset;
             const core::Expected<size_t, std::string> w =
-                rw_data_file_->WriteAt(phys_offset, chunk, chunk_len);
+                writer.WriteInto(rw_data_file_.get(), phys_offset, chunk, chunk_len);
             if (!w.ok()) return core::make_unexpected(w.error());
         } else {
             const core::Expected<uint64_t, std::string> at = DataAppendOffset();
             if (!at.ok()) return core::make_unexpected(at.error());
             phys_offset = at.value();
             const core::Expected<size_t, std::string> w =
-                rw_data_file_->WriteAt(phys_offset, chunk, chunk_len);
+                writer.WriteInto(rw_data_file_.get(), phys_offset, chunk, chunk_len);
             if (!w.ok()) return core::make_unexpected(w.error());
             const core::Expected<core::Unit, std::string> adv =
                 AdvanceDataAppendOffset(phys_offset, chunk_len);
@@ -1018,9 +1037,45 @@ core::Expected<size_t, std::string> LsmtFile::WriteInternal(uint64_t offset,
     return done;
 }
 
+core::Expected<size_t, std::string> LsmtFile::WriteInternal(uint64_t offset,
+                                                              const uint8_t* data, size_t len) {
+    return WriteInternalGeneric(DirectLayerWrite(), offset, data, len);
+}
+
 core::Expected<size_t, std::string> LsmtFile::WriteAt(uint64_t offset, const uint8_t* data,
                                                         size_t len) {
     return WriteInternal(offset, data, len);
+}
+
+core::Expected<size_t, std::string> LsmtFile::WriteAtWithCtx(const IoCtx& ctx, uint64_t offset,
+                                                               const uint8_t* data,
+                                                               size_t len) {
+    return WriteInternalGeneric(CtxLayerWrite(ctx), offset, data, len);
+}
+
+core::Expected<ByteBuffer, std::string> LsmtFile::ReadAtWithCtx(const IoCtx& ctx,
+                                                                  uint64_t offset,
+                                                                  size_t len) {
+    if (len == 0 || offset >= virtual_size_) return ByteBuffer();
+    const uint64_t room = virtual_size_ - offset;
+    const size_t read_len = room < static_cast<uint64_t>(len) ? static_cast<size_t>(room) : len;
+    ByteBuffer buf(read_len, 0);
+    const core::Expected<size_t, std::string> n =
+        ReadInternalIntoGeneric(CtxLayerRead(ctx), offset, &buf[0], read_len);
+    if (!n.ok()) return core::make_unexpected(n.error());
+    buf.resize(n.value());
+    return buf;
+}
+
+core::Expected<size_t, std::string> LsmtFile::ReadAtIntoWithCtx(const IoCtx& ctx,
+                                                                  uint64_t offset,
+                                                                  uint8_t* dst,
+                                                                  size_t len) {
+    if (len == 0) return static_cast<size_t>(0);
+    if (dst == 0) {
+        return core::make_unexpected(std::string("lsmt rw read_at_into: null destination"));
+    }
+    return ReadInternalIntoGeneric(CtxLayerRead(ctx), offset, dst, len);
 }
 
 // ---------------------------------------------------------------------------
@@ -1732,6 +1787,158 @@ core::Expected<core::Unit, std::string> LsmtFile::CommitWithArgs(const CommitArg
     std::vector<SegmentMapping> mappings;
     index_->Lookup(Segment(0, static_cast<uint32_t>(blocks)), &mappings);
     return CompactMappingsInto(layers_, mappings, virtual_size_, args, "commit");
+}
+
+namespace {
+
+/// Rust's nested `read_header` inside `validate_rw_header_pair_paths`.
+core::Expected<core::Unit, std::string> ReadUnsealedRwHeader(
+    const std::string& path, uint64_t expected_virtual_size, HeaderTrailer* header_out,
+    uint64_t* size_out) {
+    const core::Expected<std::shared_ptr<LocalFile>, std::string> file = LocalFile::OpenRo(path);
+    if (!file.ok()) return core::make_unexpected("open RW layer " + path + ": " + file.error());
+
+    const core::Expected<uint64_t, std::string> size = file.value()->Size();
+    if (!size.ok()) return core::make_unexpected("stat RW layer " + path + ": " + size.error());
+    if (size.value() < HeaderTrailer::kSpace) {
+        return core::make_unexpected("RW layer is shorter than its header block: " + path);
+    }
+
+    HeaderTrailer header;
+    const core::Expected<size_t, std::string> read = file.value()->ReadAtInto(
+        0, reinterpret_cast<uint8_t*>(&header), sizeof(header));
+    if (!read.ok() || read.value() != sizeof(header)) {
+        return core::make_unexpected("read RW header " + path);
+    }
+    if (!header.VerifyMagic()) {
+        return core::make_unexpected("invalid RW header magic: " + path);
+    }
+    // Both halves matter: a trailer here would mean the file is sealed, and a
+    // sealed layer is not an upper a tool may mutate.
+    if (!header.IsHeader() || header.IsSealed()) {
+        return core::make_unexpected("expected unsealed RW header: " + path);
+    }
+    if (header.virtual_size != expected_virtual_size) {
+        char buf[160];
+        std::snprintf(buf, sizeof(buf),
+                      "RW virtual size mismatch in %s: expected %llu, got %llu", path.c_str(),
+                      static_cast<unsigned long long>(expected_virtual_size),
+                      static_cast<unsigned long long>(header.virtual_size));
+        return core::make_unexpected(std::string(buf));
+    }
+
+    *header_out = header;
+    *size_out = size.value();
+    return core::Unit();
+}
+
+const char* RwLayoutName(RwLayout layout) {
+    switch (layout) {
+        case kRwLogStructured: return "LogStructured";
+        case kRwSparse: return "Sparse";
+        case kRwHybridLogStructured: return "HybridLogStructured";
+    }
+    return "<unknown>";
+}
+
+}  // namespace
+
+core::Expected<core::Unit, std::string> ValidateRwHeaderPairPaths(
+    const std::string& data_path, const core::Optional<std::string>& index_path,
+    uint64_t expected_virtual_size, RwLayout expected_layout) {
+    HeaderTrailer data_header;
+    uint64_t data_size = 0;
+    const core::Expected<core::Unit, std::string> data_ok =
+        ReadUnsealedRwHeader(data_path, expected_virtual_size, &data_header, &data_size);
+    if (!data_ok.ok()) return data_ok;
+
+    if (!data_header.IsDataFile()) {
+        return core::make_unexpected("RW data header has index-file type: " + data_path);
+    }
+
+    // The two flags are independent bits, so "both set" is representable and
+    // has no meaning; refused rather than resolved to either one.
+    RwLayout actual_layout;
+    if (data_header.IsSparseRw() && data_header.IsHybridRw()) {
+        return core::make_unexpected(
+            std::string("RW data header has both sparse and hybrid flags"));
+    } else if (data_header.IsSparseRw()) {
+        actual_layout = kRwSparse;
+    } else if (data_header.IsHybridRw()) {
+        actual_layout = kRwHybridLogStructured;
+    } else {
+        actual_layout = kRwLogStructured;
+    }
+    if (actual_layout != expected_layout) {
+        return core::make_unexpected(std::string("RW layout mismatch: expected ") +
+                                     RwLayoutName(expected_layout) + ", got " +
+                                     RwLayoutName(actual_layout));
+    }
+
+    if (expected_layout == kRwSparse) {
+        if (index_path.has_value()) {
+            return core::make_unexpected(
+                std::string("sparse RW layer must not have an index file"));
+        }
+        // A sparse upper is pre-sized to the whole virtual disk, so its length
+        // is fully determined; anything else means it was truncated or grown.
+        const uint64_t want = HeaderTrailer::kSpace + expected_virtual_size;
+        if (data_size != want) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf),
+                          "sparse RW data size mismatch: expected %llu, got %llu",
+                          static_cast<unsigned long long>(want),
+                          static_cast<unsigned long long>(data_size));
+            return core::make_unexpected(std::string(buf));
+        }
+        return core::Unit();
+    }
+
+    if (!index_path.has_value()) {
+        return core::make_unexpected(
+            std::string("log-structured RW layer requires an index file"));
+    }
+
+    HeaderTrailer index_header;
+    uint64_t index_size = 0;
+    const core::Expected<core::Unit, std::string> index_ok =
+        ReadUnsealedRwHeader(*index_path, expected_virtual_size, &index_header, &index_size);
+    if (!index_ok.ok()) return index_ok;
+
+    if (index_header.IsDataFile()) {
+        return core::make_unexpected("RW index header has data-file type: " + *index_path);
+    }
+    // Compared as raw bytes, which is what Rust's `data_header.uuid ==
+    // index_header.uuid` does: the pair must carry the same stamp, and an
+    // unparseable stamp shared by both is still a match.
+    if (std::memcmp(data_header.uuid, index_header.uuid, sizeof(data_header.uuid)) != 0) {
+        return core::make_unexpected(std::string("RW data/index UUID mismatch"));
+    }
+    if (index_header.index_offset != HeaderTrailer::kSpace) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf),
+                      "RW index header has invalid unsealed index offset: %llu",
+                      static_cast<unsigned long long>(index_header.index_offset));
+        return core::make_unexpected(std::string(buf));
+    }
+    if (index_header.IsHybridRw() != data_header.IsHybridRw()) {
+        return core::make_unexpected(std::string("RW data/index hybrid flag mismatch"));
+    }
+    if (data_size % kAlign != 0) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "RW data file size is not %llu-byte aligned: %llu",
+                      static_cast<unsigned long long>(kAlign),
+                      static_cast<unsigned long long>(data_size));
+        return core::make_unexpected(std::string(buf));
+    }
+    if (index_size < HeaderTrailer::kSpace ||
+        (index_size - HeaderTrailer::kSpace) % sizeof(lsmt::DiskSegmentMapping) != 0) {
+        char buf[128];
+        std::snprintf(buf, sizeof(buf), "RW index mapping area is misaligned: %llu",
+                      static_cast<unsigned long long>(index_size));
+        return core::make_unexpected(std::string(buf));
+    }
+    return core::Unit();
 }
 
 core::Expected<core::Unit, std::string> MergeFilesRo(

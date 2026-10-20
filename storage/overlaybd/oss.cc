@@ -2,6 +2,8 @@
 // Rust: storage/overlaybd/src/backend/oss.rs
 #include "agentenv/storage/overlaybd/oss.h"
 
+#include "agentenv/storage/overlaybd/metrics.h"
+
 #include <atomic>
 #include <stdio.h>
 
@@ -796,7 +798,7 @@ void OssBackend::AbortMultipartUpload(const ParsedOssUrl& location,
 // OssFile
 // ---------------------------------------------------------------------------
 
-core::Expected<uint64_t, std::string> OssFile::Size() {
+core::Expected<uint64_t, std::string> OssFile::SizeInner() {
     if (size_known_) return size_;
 
     const core::Expected<http::Response, std::string> response =
@@ -820,7 +822,8 @@ core::Expected<uint64_t, std::string> OssFile::Size() {
     return size_;
 }
 
-core::Expected<ByteBuffer, std::string> OssFile::ReadAt(uint64_t offset, size_t len) {
+core::Expected<ByteBuffer, std::string> OssFile::ReadAtInner(uint64_t offset,
+                                                                size_t len) {
     ByteBuffer out;
     if (len == 0) return out;
 
@@ -850,6 +853,51 @@ core::Expected<ByteBuffer, std::string> OssFile::ReadAt(uint64_t offset, size_t 
     // non-conforming, and silently slicing its answer here would differ from
     // the Rust reader against the same store.
     return response.value().body;
+}
+
+namespace {
+
+/// Monotonic milliseconds, for the metric wrappers only.
+uint64_t NowMsForMetrics() {
+    struct timespec ts;
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<uint64_t>(ts.tv_sec) * 1000ULL +
+           static_cast<uint64_t>(ts.tv_nsec) / 1000000ULL;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Metric wrappers
+// ---------------------------------------------------------------------------
+//
+// Rust measures around the operator call and keeps the work in a separate
+// body; the split is kept so that every exit of the multi-return inner
+// function is timed.
+
+core::Expected<uint64_t, std::string> OssFile::Size() {
+    // The cached answer is returned without a metric, as Rust does: its
+    // `size()` checks `size_cache` before `Instant::now()`, so a cache hit is
+    // not a remote operation and must not appear as one.
+    if (size_known_) return size_;
+
+    const uint64_t start = NowMsForMetrics();
+    const core::Expected<uint64_t, std::string> result = SizeInner();
+    metrics::RecordRemoteMetadata(metrics::RemoteSource::Oss(),
+                                  result.ok() ? std::string() : result.error(),
+                                  static_cast<double>(NowMsForMetrics() - start) / 1000.0);
+    return result;
+}
+
+core::Expected<ByteBuffer, std::string> OssFile::ReadAt(uint64_t offset, size_t len) {
+    const uint64_t start = NowMsForMetrics();
+    const core::Expected<ByteBuffer, std::string> result = ReadAtInner(offset, len);
+    metrics::RecordRemoteRead(
+        metrics::RemoteSource::Oss(), metrics::kReadRange,
+        result.ok() ? std::string() : result.error(),
+        result.ok() ? static_cast<uint64_t>(result.value().size()) : 0,
+        static_cast<double>(NowMsForMetrics() - start) / 1000.0);
+    return result;
 }
 
 core::Expected<size_t, std::string> OssFile::ReadAtInto(uint64_t offset, uint8_t* dst,

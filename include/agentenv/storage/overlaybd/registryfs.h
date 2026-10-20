@@ -284,6 +284,12 @@ class RegistryFs {
                                                               long timeout_secs,
                                                               http::BodySink* sink);
 
+    /// Rust `read_range` / `read_range_into` / `get_length` — each is a thin
+    /// measuring wrapper over the matching `*Inner`.
+    ///
+    /// The split is Rust's and is kept for the same reason: it puts the
+    /// metric on the single exit of the wrapper, so no early return inside
+    /// the retry loop can escape untimed.
     core::Expected<ByteBuffer, std::string> ReadRange(const std::string& url, uint64_t offset,
                                                          size_t count);
     /// Rust `read_range_into` — stream into a caller-owned buffer.
@@ -293,6 +299,13 @@ class RegistryFs {
     /// over-long response outright instead of truncating it.
     core::Expected<size_t, std::string> ReadRangeInto(const std::string& url, uint64_t offset,
                                                          uint8_t* dst, size_t len);
+
+    core::Expected<ByteBuffer, std::string> ReadRangeInner(const std::string& url,
+                                                              uint64_t offset, size_t count);
+    core::Expected<size_t, std::string> ReadRangeIntoInner(const std::string& url,
+                                                              uint64_t offset, uint8_t* dst,
+                                                              size_t len);
+    core::Expected<uint64_t, std::string> GetLengthInner(const std::string& url);
     core::Expected<uint64_t, std::string> GetLength(const std::string& url);
 
     void InvalidateUrlInfo(const std::string& url) {

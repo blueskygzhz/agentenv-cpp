@@ -246,6 +246,26 @@ class CachedFile : public VirtualFile {
                                                   size_t len) override;
     core::Expected<uint64_t, std::string> Size() override;
 
+    /// Rust `read_at_with_ctx` / `read_at_into_with_ctx` / `write_at_with_ctx`.
+    ///
+    /// This is the layer the whole context exists for: on a miss the backend
+    /// reads the *source*, and that read is what a ublk queue thread wants on
+    /// its own ring. Everything above here only forwards.
+    ///
+    /// Note what this does and does not buy today: the leaf `LocalFile`
+    /// deliberately does not override the ctx variants (see `local_file.h`),
+    /// so a local source still lands on a synchronous `pread`. A remote
+    /// source is unaffected either way. The forwarding is still required --
+    /// without it the context is lost here and could never reach a leaf that
+    /// grows the ability to use it.
+    core::Expected<ByteBuffer, std::string> ReadAtWithCtx(const IoCtx& ctx, uint64_t offset,
+                                                            size_t len) override;
+    core::Expected<size_t, std::string> ReadAtIntoWithCtx(const IoCtx& ctx, uint64_t offset,
+                                                            uint8_t* dst, size_t len) override;
+    core::Expected<size_t, std::string> WriteAtWithCtx(const IoCtx& ctx, uint64_t offset,
+                                                         const uint8_t* data,
+                                                         size_t len) override;
+
  private:
     friend class FileCacheBackend;
 
@@ -482,6 +502,30 @@ class FileCacheBackend {
                                                        uint64_t source_size, uint32_t open_flags,
                                                        uint32_t rw_flags, uint64_t offset,
                                                        size_t len);
+
+    /// Rust `do_preadv2_generic` / `refill_range_generic` /
+    /// `cache_refill_with_data_generic` — the same three bodies, generic in the
+    /// reader strategy so the ctx path reads its source through the caller's
+    /// ring instead of a synchronous `pread`.
+    ///
+    /// Declared here and defined in the .cc, where the two instantiations are
+    /// named explicitly. Templates keep the strategy out of the installed
+    /// header, which is also why `internal.h` does not have to be public.
+    template <typename Reader>
+    core::Expected<ByteBuffer, std::string> DoPreadGeneric(const Reader& reader,
+                                                             const std::string& cache_id,
+                                                             VirtualFile* source,
+                                                             uint64_t source_size,
+                                                             uint32_t open_flags, uint32_t rw_flags,
+                                                             uint64_t offset, size_t len);
+    template <typename Reader>
+    core::Expected<core::Unit, std::string> RefillExactRangeGeneric(
+        const Reader& reader, const std::string& cache_id, VirtualFile* source,
+        uint64_t source_size, uint64_t refill_off, uint64_t refill_size);
+    template <typename Reader>
+    core::Expected<core::Unit, std::string> DoRefillBlockGeneric(
+        const Reader& reader, CacheEntry* entry, const std::string& cache_id, VirtualFile* source,
+        uint64_t source_size, uint64_t block_id);
 
     /// Byte accounting, paired with republishing the pressure flag: the two
     /// must move together or a refill admitted between them would see a stale

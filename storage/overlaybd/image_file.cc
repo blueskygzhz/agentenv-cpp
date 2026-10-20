@@ -76,18 +76,23 @@ std::string TrimTrailingSlashes(const std::string& s) {
     return s.substr(0, end);
 }
 
-/// Rust `is_not_found` — whether the failure was a missing file.
+/// Rust `is_not_found`, re-expressed as a probe of the path rather than a
+/// match on the error text.
 ///
-/// Deviation: Rust walks the error chain and downcasts to `io::Error` to test
-/// `ErrorKind::NotFound`. Errors here are strings, so this matches on their
-/// text, the same trade-off `DownloadErrorCategory` records in
-/// `bk_download.h`. The consequence is narrow and worth naming: this decides
-/// only whether to *fall back* to the P2P-uuid path, so a miss costs the
-/// fallback, not correctness.
-bool IsNotFound(const std::string& error) {
-    return error.find("No such file or directory") != std::string::npos ||
-           error.find("not found") != std::string::npos ||
-           error.find("ENOENT") != std::string::npos;
+/// Rust tests the error *kind* — it walks the chain for an `io::Error` whose
+/// kind is `NotFound`. There is no kind to test here, and matching
+/// `strerror`'s text does not work: this process runs under
+/// `LANG=zh_CN.UTF-8` in at least one deployment, where `strerror(ENOENT)` is
+/// "没有那个文件或目录". An English-only match would silently never fire, and
+/// the P2P-uuid fallback below would become dead code — the layer would fail
+/// the open instead of being fetched from a peer.
+///
+/// `TryExists` reproduces the kind check exactly: only `ENOENT`/`ENOTDIR`
+/// report absence, so `EACCES` or `ELOOP` keep the original open error, which
+/// is what Rust's chain walk also does.
+bool LocalLayerIsMissing(const std::string& path) {
+    const core::Expected<bool, std::string> present = core::fs::TryExists(path);
+    return present.ok() && !present.value();
 }
 
 core::Expected<uint64_t, std::string> BaseSize(const ImageFileBase& base) {
@@ -280,11 +285,12 @@ core::Expected<OpenedLowerLayer, std::string> OpenLowerLayer(
 
     OpenedLowerLayer opened;
     if (local_path.value().has_value()) {
+        const std::string& local = *local_path.value();
         const core::Expected<std::shared_ptr<VirtualFile>, std::string> file =
-            OpenRoFile(*local_path.value(), *image_service);
+            OpenRoFile(local, *image_service);
         if (file.ok()) {
             opened.file = file.value();
-        } else if (IsNotFound(file.error()) && !layer.uuid.empty()) {
+        } else if (LocalLayerIsMissing(local) && !layer.uuid.empty()) {
             // A layer whose local copy is gone but which names a uuid can
             // still be served by a peer.
             const core::Expected<OpenedLowerLayer, std::string> p2p =
@@ -870,6 +876,105 @@ core::Expected<core::Optional<uint64_t>, std::string> ImageFile::SeekHole(uint64
     if (state_.base.read_write_) return state_.base.read_write_->SeekHole(offset);
     if (state_.base.read_only_) return state_.base.read_only_->SeekHole(offset);
     return core::make_unexpected(std::string("image file has no base layer"));
+}
+
+core::Expected<core::Unit, std::string> ImageFile::EvictRange(uint64_t offset, uint64_t len) {
+    core::ReadGuard guard(state_lock_);
+    if (state_.base.read_write_) return state_.base.read_write_->EvictRange(offset, len);
+    if (state_.base.read_only_) return state_.base.read_only_->EvictRange(offset, len);
+    return core::make_unexpected(std::string("image file has no base layer"));
+}
+
+core::Expected<core::Unit, std::string> ImageFile::EvictAll() {
+    core::ReadGuard guard(state_lock_);
+    if (state_.base.read_write_) return state_.base.read_write_->EvictAll();
+    if (state_.base.read_only_) return state_.base.read_only_->EvictAll();
+    return core::make_unexpected(std::string("image file has no base layer"));
+}
+
+// ---------------------------------------------------------------------------
+// Context-forwarding variants
+// ---------------------------------------------------------------------------
+//
+// These exist to hand `ctx` down, not to use it here: `ImageFile` is always a
+// wrapper, so dropping the context at this level would cut the entire stack
+// below it back to synchronous I/O.
+
+core::Expected<ByteBuffer, std::string> ImageFile::ReadAtWithCtx(const IoCtx& ctx,
+                                                                    uint64_t offset,
+                                                                    size_t len) {
+    // Same foreground accounting as `ReadAt`: ublk queue threads enter here.
+    FgReadGuard fg_guard;
+    core::ReadGuard guard(state_lock_);
+    if (state_.base.read_write_) return state_.base.read_write_->ReadAtWithCtx(ctx, offset, len);
+    if (state_.base.read_only_) return state_.base.read_only_->ReadAtWithCtx(ctx, offset, len);
+    return core::make_unexpected(std::string("image file has no base layer"));
+}
+
+core::Expected<size_t, std::string> ImageFile::ReadAtIntoWithCtx(const IoCtx& ctx,
+                                                                    uint64_t offset,
+                                                                    uint8_t* dst,
+                                                                    size_t len) {
+    FgReadGuard fg_guard;
+    core::ReadGuard guard(state_lock_);
+    if (state_.base.read_write_) {
+        return state_.base.read_write_->ReadAtIntoWithCtx(ctx, offset, dst, len);
+    }
+    if (state_.base.read_only_) {
+        return state_.base.read_only_->ReadAtIntoWithCtx(ctx, offset, dst, len);
+    }
+    return core::make_unexpected(std::string("image file has no base layer"));
+}
+
+core::Expected<size_t, std::string> ImageFile::WriteAtWithCtx(const IoCtx& ctx, uint64_t offset,
+                                                                 const uint8_t* data,
+                                                                 size_t len) {
+    // No `FgReadGuard`, matching Rust: the write path is the one that does not
+    // hold it. The size refresh stays inside the same guard as the write.
+    core::ReadGuard guard(state_lock_);
+    LsmtFile* writable = state_.base.Writable();
+    if (writable == 0) {
+        return core::make_unexpected(std::string("writing read-only image file"));
+    }
+    const core::Expected<size_t, std::string> written =
+        writable->WriteAtWithCtx(ctx, offset, data, len);
+    if (!written.ok()) return written;
+
+    const core::Expected<uint64_t, std::string> refreshed = RefreshSizeMetadataLocked();
+    if (!refreshed.ok()) return core::make_unexpected(refreshed.error());
+    return written.value();
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot export
+// ---------------------------------------------------------------------------
+
+core::Expected<core::Unit, std::string> ExportUpperAsSnapshotLayer(
+    const ImageService& image_service, ImageFile* image,
+    const std::string& output_layer_path) {
+    (void)image_service;  // Rust takes `_image_service` and does not use it.
+    if (image == 0) {
+        return core::make_unexpected(std::string("export snapshot requires an image"));
+    }
+    // Nothing accumulated, nothing to snapshot. Reported as success, and the
+    // output file is deliberately not created -- see the header note.
+    if (image->IsReadOnly()) return core::Unit();
+
+    const core::Expected<std::shared_ptr<LocalFile>, std::string> output_file =
+        LocalFile::New(output_layer_path);
+    if (!output_file.ok()) {
+        return core::make_unexpected("create overlaybd snapshot output failed: " +
+                                     output_layer_path + ": " + output_file.error());
+    }
+
+    const core::Expected<core::Unit, std::string> exported =
+        image->ExportUpperAsSealed(CommitArgs(output_file.value()));
+    if (!exported.ok()) {
+        return core::make_unexpected(
+            "export overlaybd writable upper as snapshot failed: " + output_layer_path + ": " +
+            exported.error());
+    }
+    return core::Unit();
 }
 
 }  // namespace overlaybd

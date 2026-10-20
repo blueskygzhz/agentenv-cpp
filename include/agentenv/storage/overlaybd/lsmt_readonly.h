@@ -224,6 +224,18 @@ class LsmtReadOnlyFile : public VirtualFile {
     core::Expected<ByteBuffer, std::string> ReadAt(uint64_t offset, size_t len) override;
     core::Expected<size_t, std::string> ReadAtInto(uint64_t offset, uint8_t* dst,
                                                     size_t len) override;
+    /// Rust `read_at_with_ctx` / `read_at_into_with_ctx`.
+    ///
+    /// These run the *same* resolver as the plain reads; only the per-layer
+    /// read primitive differs. That is why the resolver is a template over a
+    /// reader strategy (see `DirectLayerRead` / `CtxLayerRead`) instead of a
+    /// plain member: duplicating a hundred lines of hole-and-mapping
+    /// arithmetic to add a context parameter is how the two paths drift, and
+    /// the drift would only show up as a hole read from the wrong layer.
+    core::Expected<ByteBuffer, std::string> ReadAtWithCtx(const IoCtx& ctx, uint64_t offset,
+                                                            size_t len) override;
+    core::Expected<size_t, std::string> ReadAtIntoWithCtx(const IoCtx& ctx, uint64_t offset,
+                                                            uint8_t* dst, size_t len) override;
     /// Always refused -- see the implementation.
     core::Expected<size_t, std::string> WriteAt(uint64_t offset, const uint8_t* data,
                                                  size_t len) override;
@@ -234,7 +246,14 @@ class LsmtReadOnlyFile : public VirtualFile {
     LsmtReadOnlyFile(const LsmtReadOnlyFile&);
     LsmtReadOnlyFile& operator=(const LsmtReadOnlyFile&);
 
-    /// Rust `read_internal_into_generic` — the resolver.
+    /// Rust `read_internal_into_generic` — the resolver, generic in the reader
+    /// strategy. Defined in the .cc, where its two instantiations live.
+    template <typename Reader>
+    core::Expected<size_t, std::string> ReadInternalIntoGeneric(const Reader& reader,
+                                                                  uint64_t offset,
+                                                                  uint8_t* dst, size_t len);
+
+    /// Rust `read_internal_into` — the plain resolver.
     core::Expected<size_t, std::string> ReadInternalInto(uint64_t offset, uint8_t* dst,
                                                            size_t len);
 

@@ -43,25 +43,11 @@ core::Expected<core::Unit, std::string> CheckAlignment(uint64_t offset, size_t l
     return core::Unit();
 }
 
+/// Rust `vfile_io.rs :: DirectRead` / `CtxRead` and `read_exact` live in
+/// `internal.h`: `LsmtFile` needs the same pair.
 core::Expected<core::Unit, std::string> ReadExact(VirtualFile* file, uint64_t offset,
                                                     uint8_t* dst, size_t len) {
-    size_t done = 0;
-    while (done < len) {
-        const core::Expected<size_t, std::string> n =
-            file->ReadAtInto(offset + done, dst + done, len - done);
-        if (!n.ok()) return core::make_unexpected(n.error());
-        if (n.value() == 0) {
-            // A short read is a success at the `VirtualFile` boundary but a
-            // failure here: the index said these bytes are data, so handing
-            // back the zeros already in the buffer would silently substitute
-            // a hole for whatever the layer was supposed to hold.
-            std::ostringstream o;
-            o << "unexpected EOF: still need " << (len - done) << " byte(s)";
-            return core::make_unexpected(o.str());
-        }
-        done += n.value();
-    }
-    return core::Unit();
+    return ReadExactWith(DirectLayerRead(), file, offset, dst, len);
 }
 
 core::Expected<HeaderTrailer, std::string> VerifyHt(VirtualFile* file, bool is_trailer,
@@ -231,9 +217,9 @@ core::Expected<std::string, std::string> LsmtReadOnlyFile::GetUuid(size_t layer_
 // the resolver
 // ---------------------------------------------------------------------------
 
-core::Expected<size_t, std::string> LsmtReadOnlyFile::ReadInternalInto(uint64_t offset,
-                                                                         uint8_t* dst,
-                                                                         size_t len) {
+template <typename Reader>
+core::Expected<size_t, std::string> LsmtReadOnlyFile::ReadInternalIntoGeneric(
+    const Reader& reader, uint64_t offset, uint8_t* dst, size_t len) {
     const core::Expected<core::Unit, std::string> al = CheckAlignment(offset, len);
     if (!al.ok()) return core::make_unexpected(al.error());
 
@@ -308,7 +294,7 @@ core::Expected<size_t, std::string> LsmtReadOnlyFile::ReadInternalInto(uint64_t 
                 }
                 const uint64_t phys = m.moffset * kAlign;
                 const core::Expected<core::Unit, std::string> r =
-                    ReadExact(layers_[layer_idx].get(), phys, dst + local, copy_len);
+                    ReadExactWith(reader, layers_[layer_idx].get(), phys, dst + local, copy_len);
                 if (!r.ok()) return core::make_unexpected(r.error());
             }
             current_blk = m.End();
@@ -328,6 +314,12 @@ core::Expected<size_t, std::string> LsmtReadOnlyFile::ReadInternalInto(uint64_t 
     }
 
     return read_len;
+}
+
+core::Expected<size_t, std::string> LsmtReadOnlyFile::ReadInternalInto(uint64_t offset,
+                                                                         uint8_t* dst,
+                                                                         size_t len) {
+    return ReadInternalIntoGeneric(DirectLayerRead(), offset, dst, len);
 }
 
 // ---------------------------------------------------------------------------
@@ -358,6 +350,34 @@ core::Expected<size_t, std::string> LsmtReadOnlyFile::ReadAtInto(uint64_t offset
         return core::make_unexpected(std::string("lsmt read_at_into: null destination"));
     }
     return ReadInternalInto(offset, dst, len);
+}
+
+core::Expected<ByteBuffer, std::string> LsmtReadOnlyFile::ReadAtWithCtx(const IoCtx& ctx,
+                                                                          uint64_t offset,
+                                                                          size_t len) {
+    // Mirrors `ReadAt` bound for bound: same clamp, same zero-initialised
+    // buffer for holes, same truncate to the bytes actually produced.
+    if (len == 0 || offset >= virtual_size_) return ByteBuffer();
+    const uint64_t room = virtual_size_ - offset;
+    const size_t read_len = room < static_cast<uint64_t>(len) ? static_cast<size_t>(room) : len;
+
+    ByteBuffer buf(read_len, 0);
+    const core::Expected<size_t, std::string> n =
+        ReadInternalIntoGeneric(CtxLayerRead(ctx), offset, &buf[0], read_len);
+    if (!n.ok()) return core::make_unexpected(n.error());
+    buf.resize(n.value());
+    return buf;
+}
+
+core::Expected<size_t, std::string> LsmtReadOnlyFile::ReadAtIntoWithCtx(const IoCtx& ctx,
+                                                                          uint64_t offset,
+                                                                          uint8_t* dst,
+                                                                          size_t len) {
+    if (len == 0) return static_cast<size_t>(0);
+    if (dst == 0) {
+        return core::make_unexpected(std::string("lsmt read_at_into: null destination"));
+    }
+    return ReadInternalIntoGeneric(CtxLayerRead(ctx), offset, dst, len);
 }
 
 core::Expected<size_t, std::string> LsmtReadOnlyFile::WriteAt(uint64_t /*offset*/,

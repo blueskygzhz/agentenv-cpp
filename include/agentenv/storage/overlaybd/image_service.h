@@ -222,10 +222,20 @@ class ImageService {
 
     /// Rust `remote_runtime` — the `OnceCell` init. A failed init is not
     /// cached, matching `get_or_try_init`.
+    ///
+    /// Returns a borrowed pointer, as Rust returns `&RemoteRuntime`: the
+    /// runtime is owned by the shared inner state and is never replaced once
+    /// built, so the pointer stays valid for as long as any `ImageService`
+    /// handle does.
     core::Expected<RemoteRuntime*, std::string> GetRemoteRuntime();
 
     /// Rust `build_remote_runtime`.
-    core::Expected<RemoteRuntime, std::string> BuildRemoteRuntime();
+    ///
+    /// Takes the accelerator address rather than reading it, because the
+    /// caller holds the runtime lock and the address lives behind the mode
+    /// lock -- see the lock-order note in `GetRemoteRuntime`.
+    core::Expected<RemoteRuntime, std::string> BuildRemoteRuntime(
+        const std::string& accelerate_address);
 
     /// Rust `current_accelerate_address`.
     std::string CurrentAccelerateAddress() const;
