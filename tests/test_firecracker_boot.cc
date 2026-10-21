@@ -261,11 +261,13 @@ MT_TEST(boot_issues_the_whole_sequence_in_order) {
     backend.SetConnectorForTesting(std::shared_ptr<Connector>(conn));
 
     core::Expected<Handle, core::AnyError> r = backend.Boot(PlanIn(dir));
-    MT_EXPECT_TRUE(r.ok());
+    // Printed before the assertion, not after: MT_EXPECT_TRUE exits the
+    // process, so a trailing diagnostic never runs -- which is how the cause
+    // of this exact failure stayed hidden.
     if (!r.ok()) {
-        std::printf("boot failed: %s\n", r.error().chain().c_str());
-        return;
+        std::fprintf(stderr, "boot failed: %s\n", r.error().chain().c_str());
     }
+    MT_EXPECT_TRUE(r.ok());
 
     const std::vector<std::string> paths = PathsOf(conn->calls);
     // No logger (blank level), no cpu template, no network slot: what remains
@@ -283,6 +285,13 @@ MT_TEST(boot_issues_the_whole_sequence_in_order) {
     // The handle points at the API socket the VM is actually reachable on.
     MT_EXPECT_EQ(r.value().backend_kind, std::string("firecracker"));
     MT_EXPECT_TRUE(r.value().control_endpoint.find("firecracker.socket") != std::string::npos);
+
+    // The API socket has to be bindable, which `sockaddr_un` caps at 108 bytes
+    // including the NUL. Asserted on a realistic temp base because this is the
+    // constraint that a per-sandbox directory layer used to violate: the path
+    // was still a perfectly good `stat` target, so nothing failed until a real
+    // Firecracker tried to bind it.
+    MT_EXPECT_TRUE(r.value().control_endpoint.size() < 108);
 }
 
 MT_TEST(machine_config_carries_the_plans_cpu_and_memory) {

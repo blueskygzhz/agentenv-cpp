@@ -149,9 +149,17 @@ StartFreshInstance(const FreshStartSpec& spec, std::shared_ptr<Connector> connec
     if (out == NULL) return core::make_unexpected(std::string("no output slot"));
     // 1. Work directory. The caller has already validated the configure plan,
     //    so nothing that fails below is knowable-up-front.
+    //
+    // One level under the base, as Rust's `create_firecracker_work_dir` does.
+    // A `/firecracker/<sandbox_id>/` layer used to be inserted here, which
+    // bought nothing -- `agentenv-fc-<random>` already makes the directory
+    // unique per instance -- and cost 49 bytes of a 108-byte budget: the API
+    // socket lives inside this directory and `sockaddr_un::sun_path` is 108
+    // bytes including the NUL. With the extra layer the default configuration
+    // produced a 107-byte path, one byte from Firecracker being unable to
+    // bind, and no test could use a realistic temp directory.
     const core::Expected<std::string, std::string> work_dir =
-        CreateFirecrackerWorkDir(core::Optional<std::string>(
-            spec.chroot_base_dir + "/firecracker/" + spec.sandbox_id.ToString()));
+        CreateFirecrackerWorkDir(core::Optional<std::string>(spec.chroot_base_dir));
     if (!work_dir.ok()) return core::make_unexpected(work_dir.error());
 
     // The logger path can only be known now; its emptiness was what decided
@@ -231,9 +239,11 @@ StartResumeInstance(const ResumeStartSpec& spec, std::shared_ptr<Connector> conn
         steps = built.value();
     }
 
+    // Same layout as the fresh path -- see the note there on why the
+    // per-sandbox layer is absent: the API socket inside this directory has to
+    // fit in `sockaddr_un::sun_path`.
     const core::Expected<std::string, std::string> work_dir =
-        CreateFirecrackerWorkDir(core::Optional<std::string>(
-            spec.chroot_base_dir + "/firecracker/" + spec.sandbox_id.ToString()));
+        CreateFirecrackerWorkDir(core::Optional<std::string>(spec.chroot_base_dir));
     if (!work_dir.ok()) return core::make_unexpected(work_dir.error());
 
     for (std::size_t i = 0; i < steps.size(); ++i) {

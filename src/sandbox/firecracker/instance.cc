@@ -9,8 +9,10 @@
 // This mirrors the Rust unit tests, which also use /bin/true + socket markers.
 #include "agentenv/sandbox/firecracker/instance.h"
 
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 // `setns` / `CLONE_NEWNET`, for entering a network slot's namespace.
@@ -46,6 +48,70 @@ void sleep_ms(int64_t ms) {
 bool path_exists(const std::string& p) {
     struct stat st;
     return ::stat(p.c_str(), &st) == 0;
+}
+/// Rust `tokio::net::UnixStream::connect(&self.socket_path).await.is_err()`.
+///
+/// A connect attempt, not a `stat`. The socket file is created by Firecracker,
+/// so its mere presence proves nothing about whether the API server is
+/// listening yet, and three of the four states a path can be in are *not*
+/// ready:
+///
+///   * absent                  -> ENOENT, Firecracker has not bound yet
+///   * a leftover socket inode -> ECONNREFUSED, the previous VMM is gone
+///   * a plain file            -> ENOTSOCK, e.g. a half-written artefact
+///   * a listening socket      -> success, the only ready state
+///
+/// Accepting the second and third is what makes a reused work directory
+/// dangerous: `WaitForReady` would return immediately and the first API PUT
+/// would fail with ECONNREFUSED, which reads as "configuration was rejected"
+/// rather than "the VMM never came up".
+///
+/// Deliberately non-blocking: a blocking connect would wait when the listen
+/// backlog is full, which would let a busy VMM stall the poll loop past its
+/// own deadline.
+bool socket_accepts_connections(const std::string& path) {
+    struct sockaddr_un addr;
+    // Checked before `strncpy`, which would otherwise silently truncate and
+    // probe a different path than the one Firecracker was given. The work dir
+    // nests a random component under a configured base, so 108 bytes is not a
+    // comfortable margin.
+    if (path.empty() || path.size() >= sizeof(addr.sun_path)) return false;
+
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (fd < 0) return false;
+
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+
+    int rv;
+    do {
+        rv = ::connect(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+    } while (rv != 0 && errno == EINTR);
+    // EAGAIN on an AF_UNIX stream socket means the backlog is full, which can
+    // only happen when something is listening. Rust's tokio version waits for
+    // writability and succeeds, so reporting ready here matches it; reporting
+    // not-ready would make a VMM under load look like one that never started.
+    const bool ready = rv == 0 || errno == EAGAIN;
+    ::close(fd);
+    return ready;
+}
+/// Rust's `ExitStatus` Display, as interpolated into the early-exit message.
+///
+/// The distinction carried here is the useful one: a non-zero exit means
+/// Firecracker ran and rejected something (127 is a missing binary, 126 a
+/// failed `setns`), while a signal means the host killed it -- which on this
+/// path is usually the OOM killer, since the child is spawned with
+/// `oom_score_adj = 1000`.
+std::string describe_wait_status(int status) {
+    char buf[64];
+    if (WIFSIGNALED(status)) {
+        std::snprintf(buf, sizeof(buf), "signal: %d", WTERMSIG(status));
+        return std::string(buf);
+    }
+    std::snprintf(buf, sizeof(buf), "exit status: %d",
+                  WIFEXITED(status) ? WEXITSTATUS(status) : status);
+    return std::string(buf);
 }
 std::string to_lower_trim(const std::string& s) {
     size_t b = s.find_first_not_of(" \t\r\n");
@@ -271,23 +337,34 @@ std::string FirecrackerInstance::StderrSummary() const {
 core::Expected<core::Unit, std::string>
 FirecrackerInstance::WaitForReady(int64_t timeout_ms, int64_t poll_interval_ms) {
     const int64_t start = now_ms();
-    while (!path_exists(socket_path_)) {
-        // Detect child early-exit.
+    while (!socket_accepts_connections(socket_path_)) {
+        // Detect child early-exit. Checked inside the loop rather than after
+        // it, so a Firecracker that dies on startup is reported now instead of
+        // after the full timeout has elapsed -- the two failures need
+        // different diagnoses and a timeout hides which one happened.
         if (child_pid_ > 0) {
-     int status = 0;
-     pid_t r = ::waitpid(static_cast<pid_t>(child_pid_), &status, WNOHANG);
-    if (r == child_pid_) {
-        child_pid_ = -1;
-       return core::make_unexpected(
-   std::string("firecracker exited before its API socket appeared at ") +
-   socket_path_ + "; stderr: " + StderrSummary());
+            int status = 0;
+            pid_t r = ::waitpid(static_cast<pid_t>(child_pid_), &status, WNOHANG);
+            if (r == child_pid_) {
+                child_pid_ = -1;
+                return core::make_unexpected(
+                    std::string("firecracker exited before its API socket accepted "
+                                "connections at ") +
+                    socket_path_ + " (" + describe_wait_status(status) + "); stderr: " +
+                    StderrSummary());
             }
         }
-     if (now_ms() - start > timeout_ms) {
+        if (now_ms() - start > timeout_ms) {
+            char bound[32];
+            std::snprintf(bound, sizeof(bound), "%lld",
+                          static_cast<long long>(timeout_ms));
+            // The bound is named because it is configuration: "did not accept
+            // connections within 2000 ms" tells an operator whether to raise
+            // the timeout, which "within timeout" does not.
             return core::make_unexpected(
-std::string("firecracker api socket did not appear at ") + socket_path_ +
-       " within timeout; stderr: " + StderrSummary());
-   }
+                std::string("firecracker api socket did not accept connections at ") +
+                socket_path_ + " within " + bound + " ms; stderr: " + StderrSummary());
+        }
         sleep_ms(poll_interval_ms);
     }
     return core::Unit{};

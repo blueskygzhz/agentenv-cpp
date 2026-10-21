@@ -24,24 +24,119 @@ static std::string mkdtemp_dir() {
     return d ? std::string(d) : std::string("/tmp");
 }
 
+namespace {
+/// Binds and listens on `path`, as Firecracker does with `--api-sock`.
+/// Returns -1 on failure. The caller closes the fd.
+int bind_listener(const std::string& path) {
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct sockaddr_un addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+    if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    // Never accepted. A connect completes against the backlog, which is all a
+    // readiness probe needs and all Firecracker guarantees before it is ready
+    // to serve.
+    if (::listen(fd, 4) != 0) {
+        ::close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+struct LateListener {
+    std::string path;
+    int fd;
+};
+
+/// Binds only after a delay, so the test proves `WaitForReady` *waits* rather
+/// than that it happened to be called after the socket was already up.
+void* bind_after_delay(void* arg) {
+    LateListener* late = static_cast<LateListener*>(arg);
+    struct timespec ts;
+    ts.tv_sec = 0;
+    ts.tv_nsec = 20 * 1000000L;
+    nanosleep(&ts, nullptr);
+    late->fd = bind_listener(late->path);
+    return nullptr;
+}
+}  // namespace
+
 // Rust: wait_for_ready_times_out_when_socket_never_appears
-MT_TEST(wait_for_ready_times_out) {
+MT_TEST(wait_for_ready_times_out_when_socket_never_appears) {
     std::string dir = mkdtemp_dir();
     FirecrackerInstance inst(dir, nullptr);
     auto r = inst.WaitForReady(30, 10);
     MT_EXPECT_TRUE(!r.ok());
-    MT_EXPECT_TRUE(r.error().find("did not appear") != std::string::npos);
+    MT_EXPECT_TRUE(r.error().find("did not accept connections") != std::string::npos);
+    // The configured bound is named, so an operator can tell a too-short
+    // timeout from a VMM that will never come up.
+    MT_EXPECT_TRUE(r.error().find("within 30 ms") != std::string::npos);
     ::rmdir(dir.c_str());
 }
 
-// Rust: wait_for_ready_succeeds_when_socket_file_appears
-MT_TEST(wait_for_ready_succeeds_when_socket_appears) {
+// Rust: wait_for_ready_waits_for_listening_socket
+//
+// The case the previous version of this file asserted the *opposite* of: it
+// created a plain file and required `WaitForReady` to report success. Readiness
+// is decided by connecting, so a path that exists but refuses connections is
+// not ready -- which is what keeps a leftover file in a reused work directory
+// from being mistaken for a live VMM.
+MT_TEST(wait_for_ready_waits_for_listening_socket) {
     std::string dir = mkdtemp_dir();
-  FirecrackerInstance inst(dir, nullptr);
-    // Create the socket marker right away; WaitForReady should see it.
-    std::ofstream(inst.SocketPath().c_str()) << "socket";
-    auto r = inst.WaitForReady(100, 10);
+    FirecrackerInstance inst(dir, nullptr);
+    std::ofstream(inst.SocketPath().c_str()) << "not a socket";
+    auto r = inst.WaitForReady(30, 10);
+    MT_EXPECT_TRUE(!r.ok());
+    MT_EXPECT_TRUE(r.error().find("did not accept connections") != std::string::npos);
+    ::unlink(inst.SocketPath().c_str());
+    ::rmdir(dir.c_str());
+}
+
+// Rust: wait_for_ready_succeeds_when_socket_listens
+MT_TEST(wait_for_ready_succeeds_when_socket_listens) {
+    std::string dir = mkdtemp_dir();
+    FirecrackerInstance inst(dir, nullptr);
+    LateListener late;
+    late.path = inst.SocketPath();
+    late.fd = -1;
+
+    pthread_t th;
+    pthread_create(&th, nullptr, bind_after_delay, &late);
+    auto r = inst.WaitForReady(2000, 10);
+    pthread_join(th, nullptr);
+
+    MT_EXPECT_TRUE(late.fd >= 0);
     MT_EXPECT_TRUE(r.ok());
+    if (late.fd >= 0) ::close(late.fd);
+    ::unlink(inst.SocketPath().c_str());
+    ::rmdir(dir.c_str());
+}
+
+// No Rust counterpart. This is the orphaned-socket case: a crashed VMM leaves
+// the socket inode behind, so the path exists and is a socket, but nothing is
+// listening. `stat` cannot tell this apart from a healthy one; `connect` gets
+// ECONNREFUSED. Without this distinction a restart that reuses a work
+// directory would report ready and then fail on the first API PUT, which reads
+// as "Firecracker rejected the configuration" instead of "the VMM is gone".
+MT_TEST(wait_for_ready_rejects_an_orphaned_socket_inode) {
+    std::string dir = mkdtemp_dir();
+    FirecrackerInstance inst(dir, nullptr);
+
+    const int fd = bind_listener(inst.SocketPath());
+    MT_EXPECT_TRUE(fd >= 0);
+    // Closed without unlinking: exactly what a SIGKILLed Firecracker leaves.
+    ::close(fd);
+
+    struct stat st;
+    MT_EXPECT_TRUE(::stat(inst.SocketPath().c_str(), &st) == 0);  // path still there
+    auto r = inst.WaitForReady(30, 10);
+    MT_EXPECT_TRUE(!r.ok());
+    MT_EXPECT_TRUE(r.error().find("did not accept connections") != std::string::npos);
     ::unlink(inst.SocketPath().c_str());
     ::rmdir(dir.c_str());
 }
