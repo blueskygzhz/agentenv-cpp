@@ -34,6 +34,14 @@ struct HttpResponse {
 
 using Handler = std::function<void(const HttpRequest&, HttpResponse*)>;
 
+/// Rust: an axum `middleware::from_fn_with_state` layer.
+///
+/// Returns true to continue to the route handler, false to short-circuit with
+/// whatever it wrote into `*resp`. The request is mutable because Rust's
+/// `require_auth` strips credential headers before calling `next.run`, and a
+/// layer that could not modify the request would be unable to express that.
+using Middleware = std::function<bool(HttpRequest*, HttpResponse*)>;
+
 /// Abstract server interface. Concrete impl selected at compile time via CMake.
 class Server {
  public:
@@ -41,6 +49,14 @@ class Server {
     virtual void Route(const std::string& method,
                        const std::string& path_pattern,
                        Handler h) = 0;
+
+    /// Installs a layer that runs before routing, for every request.
+    ///
+    /// Running before routing is deliberate: Rust's `require_auth` wraps the
+    /// whole router, so an unauthenticated request to an unknown path is
+    /// rejected rather than answered with a 404 that confirms what does not
+    /// exist. Layers run in registration order.
+    virtual void Use(Middleware layer) = 0;
 
     /// Blocking. Returns when Stop() is called from another thread.
     virtual core::Expected<core::Unit, core::AnyError>

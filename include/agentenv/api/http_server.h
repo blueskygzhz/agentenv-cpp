@@ -105,6 +105,8 @@ class HttpServer : public Server {
     void Route(const std::string& method, const std::string& path_pattern,
                Handler h) override;
 
+    void Use(Middleware layer) override;
+
     /// Binds, listens and serves until `Stop`. `bind_addr` is `host:port`.
     core::Expected<core::Unit, core::AnyError>
         ListenAndServe(const std::string& bind_addr) override;

@@ -3,10 +3,15 @@
 // and discovery hint merging (discovery/mod.rs).
 #include "microtest.h"
 
+#include <unistd.h>
+
+#include <atomic>
+#include <thread>
 #include <cstdio>
 
 #include "agentenv/p2p/all.h"
 #include "agentenv/p2p/discovery.h"
+#include "agentenv/p2p/node.h"
 using namespace agentenv::p2p;
 
 // ---- config.rs ----
@@ -16,7 +21,8 @@ MT_TEST(resolved_config_disabled_overrides_transport) {
     c.transport = P2pTransportKind::Iroh;
     ResolvedP2pConfig r = ResolvedP2pConfig::FromConfig(c);
     MT_EXPECT_TRUE(r.transport == P2pTransportKind::Disabled);
-    MT_EXPECT_TRUE(std::string(BackendId(r.transport)) == "");
+    // Rust `backend_id()` is `Option<&str>`: Disabled is None, not Some("").
+    MT_EXPECT_TRUE(!BackendId(r.transport).has_value());
 }
 
 MT_TEST(resolved_config_enabled_iroh) {
@@ -27,7 +33,8 @@ MT_TEST(resolved_config_enabled_iroh) {
     c.peer_discovery_refresh_interval_secs = 0;  // floored to 1
     ResolvedP2pConfig r = ResolvedP2pConfig::FromConfig(c);
     MT_EXPECT_TRUE(r.transport == P2pTransportKind::Iroh);
-    MT_EXPECT_TRUE(std::string(BackendId(r.transport)) == "iroh");
+    MT_EXPECT_TRUE(BackendId(r.transport).has_value());
+    MT_EXPECT_TRUE(*BackendId(r.transport) == "iroh");
     MT_EXPECT_TRUE(r.has_listen_addr);
     MT_EXPECT_TRUE(r.listen_addr == "0.0.0.0:4433");   // trimmed
     MT_EXPECT_TRUE(static_cast<int>(r.peer_discovery_refresh_interval_secs) == 1);
@@ -286,7 +293,11 @@ SchedulerPeerDiscovery::WireFetch(),
 // ---- iroh (gated) ----
 MT_TEST(iroh_disabled_without_feature) {
     std::string err;
-  auto t = IrohBlobsP2pTransport::Start("/tmp/store", "", &err);
+    ResolvedP2pConfig cfg;
+    cfg.transport = P2pTransportKind::Iroh;
+    cfg.store_dir = "/tmp/store";
+  auto t = IrohBlobsP2pTransport::Start(
+      cfg, "node-a", std::shared_ptr<P2pPeerDiscovery>(new NoopP2pPeerDiscovery()), &err);
     MT_EXPECT_TRUE(!t);  // not compiled in
   MT_EXPECT_TRUE(err.find("not compiled in") != std::string::npos);
 
@@ -443,6 +454,252 @@ MT_TEST(scheduler_discovery_peers_for_key_uses_lookup_rpc) {
     MT_EXPECT_TRUE(peers.value()[0].node_id == "keyed-node");
     MT_EXPECT_TRUE(seen_key == "art-1");
     MT_EXPECT_TRUE(seen_exclude == "self");
+}
+
+// Rust has no "client absent" state: it always holds a `SchedulerClient`, so a
+// record/forget that cannot reach the scheduler is a failed RPC. Reporting
+// success would claim the scheduler was told something it was not.
+MT_TEST(scheduler_discovery_record_without_transport_is_an_error) {
+    SchedulerPeerDiscovery d(
+        "self", "cluster-1", true, "backend",
+        SchedulerPeerDiscovery::WireFetch(),
+        SchedulerPeerDiscovery::WireRecord());
+
+    auto recorded = d.RecordKey("art-1");
+    MT_EXPECT_TRUE(!recorded.ok());
+    MT_EXPECT_TRUE(recorded.error().kind == P2pError::Internal);
+    MT_EXPECT_TRUE(recorded.error().message == "record P2P artifact in scheduler");
+
+    auto forgotten = d.ForgetKey("art-1");
+    MT_EXPECT_TRUE(!forgotten.ok());
+    MT_EXPECT_TRUE(forgotten.error().message == "forget P2P artifact in scheduler");
+}
+
+// Rust `refresh_scheduler_peers`: on RPC failure it logs at debug and keeps the
+// previous cache rather than clearing it.
+MT_TEST(scheduler_discovery_failed_refresh_keeps_previous_peers) {
+    bool fail = false;
+    SchedulerPeerDiscovery d(
+        "self", "cluster-1", true, "backend",
+        [&fail](const std::string&, const std::string&, const std::string&,
+                std::vector<SchedulerWirePeer>* out) -> bool {
+            if (fail) return false;
+            SchedulerWirePeer p;
+            p.node_id = "node-a";
+            p.has_endpoint = true;
+            p.endpoint.backend = "backend";
+            p.endpoint.address = "addr-a";
+            out->push_back(p);
+            return true;
+        },
+        SchedulerPeerDiscovery::WireRecord());
+
+    d.Refresh();
+    MT_EXPECT_EQ(static_cast<int>(d.Peers().value().size()), 1);
+
+    fail = true;
+    d.Refresh();
+    MT_EXPECT_EQ(static_cast<int>(d.Peers().value().size()), 1);
+    MT_EXPECT_TRUE(d.Peers().value()[0].node_id == "node-a");
+}
+
+// Rust `SchedulerPeerDiscovery::start` degrades to a Noop discovery when the
+// endpoint does not parse, instead of failing the node.
+MT_TEST(scheduler_discovery_start_degrades_on_invalid_endpoint) {
+    std::shared_ptr<P2pPeerDiscovery> d = SchedulerPeerDiscovery::Start(
+        "not a url", "self", "cluster-1", 1, std::string("backend"),
+        SchedulerPeerDiscovery::WireFetch(),
+        SchedulerPeerDiscovery::WireRecord(),
+        SchedulerPeerDiscovery::WireLookup());
+
+    MT_EXPECT_TRUE(!!d);
+    // A Noop discovery answers every call successfully and emptily; a real
+    // SchedulerPeerDiscovery would report the missing transport as an error.
+    MT_EXPECT_TRUE(d->Peers().ok());
+    MT_EXPECT_EQ(static_cast<int>(d->Peers().value().size()), 0);
+    MT_EXPECT_TRUE(d->RecordKey("art-1").ok());
+}
+
+// The background refresh task must actually poll, and must stop on shutdown.
+MT_TEST(scheduler_discovery_start_runs_background_refresh) {
+    std::atomic<int> polls(0);
+    std::shared_ptr<P2pPeerDiscovery> d = SchedulerPeerDiscovery::Start(
+        "http://127.0.0.1:7000", "self", "cluster-1", 1, std::string("backend"),
+        [&polls](const std::string&, const std::string&, const std::string&,
+                 std::vector<SchedulerWirePeer>* out) -> bool {
+            polls.fetch_add(1);
+            SchedulerWirePeer p;
+            p.node_id = "node-a";
+            p.has_endpoint = true;
+            p.endpoint.backend = "backend";
+            p.endpoint.address = "addr-a";
+            out->push_back(p);
+            return true;
+        },
+        SchedulerPeerDiscovery::WireRecord(),
+        SchedulerPeerDiscovery::WireLookup());
+
+    // The first poll is jittered over [0, 1s), so wait past one full interval.
+    for (int i = 0; i < 200 && polls.load() == 0; ++i) {
+        ::usleep(20 * 1000);
+    }
+    MT_EXPECT_TRUE(polls.load() >= 1);
+    MT_EXPECT_EQ(static_cast<int>(d->Peers().value().size()), 1);
+
+    // Destruction must join the thread; a leaked thread would touch freed
+    // members. Stop() is idempotent and is what the destructor calls.
+    static_cast<SchedulerPeerDiscovery*>(d.get())->Stop();
+    const int after_stop = polls.load();
+    ::usleep(120 * 1000);
+    MT_EXPECT_EQ(polls.load(), after_stop);
+}
+
+// ---- mod.rs: the assembly factories ----
+MT_TEST(transport_from_config_disabled_yields_disabled_transport) {
+    P2pFactoryInputs inputs;
+    inputs.p2p.transport = P2pTransportKind::Disabled;
+    inputs.node_id = "node-a";
+    inputs.cluster_id = "cluster-1";
+
+    auto t = TransportFromConfig(inputs, SchedulerWireTransport());
+    MT_EXPECT_TRUE(t.ok());
+    MT_EXPECT_TRUE(!!t.value());
+    // Rust `DisabledP2pTransport`: lookup is Ok(None), fetch is an error.
+    P2pArtifactDescriptor desc;
+    auto looked_up = t.value()->LookupWithHints("k", std::vector<P2pArtifactProviderHint>(),
+                                                &desc);
+    MT_EXPECT_TRUE(looked_up.ok());
+    MT_EXPECT_TRUE(!looked_up.value());
+    auto fetched = t.value()->FetchWithOptions(desc, "/tmp/x", P2pFetchOptions());
+    MT_EXPECT_TRUE(!fetched.ok());
+    MT_EXPECT_TRUE(fetched.error().kind == P2pError::TransportDisabled);
+}
+
+// Rust `transport_from_config` uses `?` on `IrohBlobsP2pTransport::new`, so a
+// node configured for iroh fails to start rather than silently losing p2p.
+MT_TEST(transport_from_config_iroh_propagates_start_failure) {
+    P2pFactoryInputs inputs;
+    inputs.p2p.transport = P2pTransportKind::Iroh;
+    inputs.p2p.store_dir = "/tmp/store";
+    inputs.node_id = "node-a";
+    inputs.cluster_id = "cluster-1";
+
+    auto t = TransportFromConfig(inputs, SchedulerWireTransport());
+    MT_EXPECT_TRUE(!t.ok());
+    MT_EXPECT_TRUE(t.error().find("not compiled in") != std::string::npos);
+}
+
+// Rust `peer_discovery_from_config`: no scheduler endpoint => Noop.
+MT_TEST(peer_discovery_from_config_without_scheduler_is_noop) {
+    P2pFactoryInputs inputs;
+    inputs.p2p.transport = P2pTransportKind::Iroh;
+    inputs.node_id = "node-a";
+    inputs.cluster_id = "cluster-1";
+    // scheduler_endpoint left as None.
+
+    std::shared_ptr<P2pPeerDiscovery> d =
+        PeerDiscoveryFromConfig(inputs, SchedulerWireTransport());
+    MT_EXPECT_TRUE(!!d);
+    MT_EXPECT_TRUE(d->Peers().ok());
+    MT_EXPECT_EQ(static_cast<int>(d->Peers().value().size()), 0);
+    // Noop: record/forget succeed without a transport.
+    MT_EXPECT_TRUE(d->RecordKey("art-1").ok());
+    MT_EXPECT_TRUE(d->ForgetKey("art-1").ok());
+}
+
+// A disabled transport has no backend id, so the discovery issues no keyed
+// scheduler RPCs at all (Rust: `backend: None` short-circuits).
+MT_TEST(peer_discovery_from_config_disabled_transport_has_no_backend) {
+    P2pFactoryInputs inputs;
+    inputs.p2p.transport = P2pTransportKind::Disabled;
+    inputs.p2p.peer_discovery_refresh_interval_secs = 1;
+    inputs.scheduler_endpoint = std::string("http://127.0.0.1:7000");
+    inputs.node_id = "node-a";
+    inputs.cluster_id = "cluster-1";
+
+    bool lookup_called = false;
+    SchedulerWireTransport wire;
+    wire.lookup = [&lookup_called](const std::string&, const std::string&,
+                                   const std::string&, const std::string&,
+                                   std::vector<SchedulerWirePeer>*) -> bool {
+        lookup_called = true;
+        return true;
+    };
+
+    std::shared_ptr<P2pPeerDiscovery> d = PeerDiscoveryFromConfig(inputs, std::move(wire));
+    MT_EXPECT_TRUE(!!d);
+
+    auto peers = d->PeersForKey("art-1");
+    MT_EXPECT_TRUE(peers.ok());
+    MT_EXPECT_EQ(static_cast<int>(peers.value().size()), 0);
+    MT_EXPECT_TRUE(!lookup_called);
+    // record/forget are no-ops too, not errors.
+    MT_EXPECT_TRUE(d->RecordKey("art-1").ok());
+
+    static_cast<SchedulerPeerDiscovery*>(d.get())->Stop();
+}
+
+// The refresh thread writes `peers_` while request paths read it. Rust holds an
+// `Arc<RwLock<Vec<P2pPeer>>>` for exactly this reason. TSan is unavailable in
+// this toolchain (its link step needs -pie), so the race is instead exercised
+// directly: a writer churning the cache against concurrent readers, asserting
+// every read observes a complete, self-consistent snapshot rather than a torn
+// vector.
+MT_TEST(scheduler_discovery_peers_cache_is_safe_under_concurrent_access) {
+    std::atomic<bool> stop(false);
+    std::atomic<int> generation(0);
+
+    SchedulerPeerDiscovery d(
+        "self", "cluster-1", true, "backend",
+        [&generation](const std::string&, const std::string&, const std::string&,
+                      std::vector<SchedulerWirePeer>* out) -> bool {
+            // Alternate between 1 and 3 peers so a torn read is observable as a
+            // size that is neither.
+            const int n = (generation.fetch_add(1) % 2 == 0) ? 1 : 3;
+            for (int i = 0; i < n; ++i) {
+                SchedulerWirePeer p;
+                p.node_id = "node";
+                p.has_endpoint = true;
+                p.endpoint.backend = "backend";
+                p.endpoint.address = "addr";
+                out->push_back(p);
+            }
+            return true;
+        },
+        SchedulerPeerDiscovery::WireRecord());
+
+    std::thread writer([&d, &stop] {
+        while (!stop.load()) d.Refresh();
+    });
+
+    std::atomic<int> bad_sizes(0);
+    std::atomic<int> reads(0);
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 4; ++r) {
+        readers.push_back(std::thread([&d, &stop, &bad_sizes, &reads] {
+            while (!stop.load()) {
+                std::vector<P2pPeer> snapshot = d.Peers().value();
+                const size_t n = snapshot.size();
+                // FilterSchedulerP2pPeers dedups nothing, so only 1 or 3 are
+                // reachable. 0 is also valid before the first Refresh lands.
+                if (n != 0 && n != 1 && n != 3) bad_sizes.fetch_add(1);
+                for (size_t i = 0; i < n; ++i) {
+                    if (snapshot[i].node_id != "node") bad_sizes.fetch_add(1);
+                    if (snapshot[i].endpoint.address != "addr") bad_sizes.fetch_add(1);
+                }
+                reads.fetch_add(1);
+            }
+        }));
+    }
+
+    ::usleep(300 * 1000);
+    stop.store(true);
+    writer.join();
+    for (size_t i = 0; i < readers.size(); ++i) readers[i].join();
+
+    MT_EXPECT_TRUE(reads.load() > 0);
+    MT_EXPECT_TRUE(generation.load() > 0);
+    MT_EXPECT_EQ(bad_sizes.load(), 0);
 }
 
 MT_MAIN

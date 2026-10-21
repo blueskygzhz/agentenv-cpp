@@ -9,6 +9,8 @@
 #include <memory>
 #include <string>
 
+#include "agentenv/p2p/config.h"
+#include "agentenv/p2p/discovery.h"
 #include "agentenv/p2p/transport.h"
 
 namespace agentenv {
@@ -20,10 +22,16 @@ extern const char* const kIrohBackendIdValue;
 /// Rust: iroh::IrohBlobsP2pTransport.
 class IrohBlobsP2pTransport : public P2pTransport {
  public:
-    /// Rust `IrohBlobsP2pTransport::start(store_dir, listen_addr)`.
+    /// Rust `IrohBlobsP2pTransport::new(config, node_id, peer_discovery)`.
+    ///
     /// Returns null + fills `err` when the iroh backend is not compiled in.
+    /// The parameter list mirrors Rust's rather than only the two fields a
+    /// stub needs: the real transport resolves `lookup_with_hints` through
+    /// `peer_discovery` and advertises itself under `node_id`, so a narrower
+    /// signature here would have to change when the backend lands.
     static std::shared_ptr<IrohBlobsP2pTransport>
-        Start(const std::string& store_dir, const std::string& listen_addr,
+        Start(const ResolvedP2pConfig& config, const std::string& node_id,
+              std::shared_ptr<P2pPeerDiscovery> peer_discovery,
      std::string* err);
 
     P2pResult<bool> LookupWithHints(const P2pArtifactKey& key,

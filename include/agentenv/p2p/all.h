@@ -13,5 +13,6 @@
 #include "agentenv/p2p/discovery.h"   // Rust: discovery/mod.rs + scheduler.rs
 #include "agentenv/p2p/mock.h"        // Rust: mock.rs
 #include "agentenv/p2p/iroh.h"        // Rust: iroh/mod.rs (gated)
+#include "agentenv/p2p/node.h"        // Rust: mod.rs factories
 
 #endif  // AGENTENV_P2P_ALL_H_

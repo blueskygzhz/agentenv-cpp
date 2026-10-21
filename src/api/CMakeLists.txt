@@ -12,6 +12,10 @@ add_library(agentenv-api STATIC
     proxy_route.cc
     # Rust: src/api/impls/auth.rs
     auth.cc
+    # Rust: the `require_auth` layer itself plus the ApiImpl-backed checks.
+    # Separate from auth.cc so the decision stays testable without an
+    # orchestrator or a key store.
+    auth_middleware.cc
     # Rust: src/api/impls/admin.rs
     admin.cc
     # Rust: src/api/impls/volumes.rs
@@ -41,4 +45,7 @@ target_link_libraries(agentenv-api PUBLIC
     agentenv-template
     # `image_build` shell-quotes the rendered HEALTHCHECK command.
     agentenv-shell-util
+    # `auth_middleware` validates the API key. Without this the key store was
+    # compiled but unreachable, which is why every route served unauthenticated.
+    agentenv-rootmod
 )

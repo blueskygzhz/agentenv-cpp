@@ -12,9 +12,13 @@ const char* const kIrohBackendIdValue = "iroh";
 #endif
 
 // Without the iroh stack every op is a Disabled error, and start() fails.
+//
+// Rust `transport_from_config` propagates this failure with `?`, so a node
+// configured for iroh fails to start rather than coming up without p2p.
 std::shared_ptr<IrohBlobsP2pTransport>
-IrohBlobsP2pTransport::Start(const std::string& /*store_dir*/,
-         const std::string& /*listen_addr*/,
+IrohBlobsP2pTransport::Start(const ResolvedP2pConfig& /*config*/,
+         const std::string& /*node_id*/,
+         std::shared_ptr<P2pPeerDiscovery> /*peer_discovery*/,
  std::string* err) {
     if (err) *err = "iroh transport not compiled in (build with AGENTENV_WITH_IROH)";
     return std::shared_ptr<IrohBlobsP2pTransport>();

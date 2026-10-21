@@ -5,6 +5,9 @@ add_library(agentenv-p2p STATIC
     discovery.cc
     mock.cc
     iroh.cc
+    # Rust: src/p2p/mod.rs — the transport/discovery factories. Without these
+    # the library cannot be assembled by a caller.
+    node.cc
     # Rust: the portable half of src/p2p/iroh/catalog.rs — the published
     # artifact catalog and the catalog wire format. The iroh `ProtocolHandler`
     # that serves it stays in iroh.cc behind AGENTENV_WITH_IROH.

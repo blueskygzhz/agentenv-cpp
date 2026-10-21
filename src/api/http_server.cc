@@ -295,6 +295,9 @@ class HttpServer::Impl {
     };
 
     std::vector<RouteEntry> routes;
+    /// Pre-routing layers, in registration order. Rust: the tower layers
+    /// wrapped around the router in `api::server::new`.
+    std::vector<Middleware> layers;
     int      listen_fd;
     uint16_t bound_port;
     /// Read by the accept loop and the (other-thread) `Stop`. The loop also
@@ -349,6 +352,20 @@ class HttpServer::Impl {
     }
 
     HttpResponse Dispatch(const HttpRequest& request) const {
+        // Layers run before routing, matching Rust's `require_auth` wrapping
+        // the whole router: an unauthenticated request to an unknown path is
+        // rejected, not answered with a 404 that confirms what does not exist.
+        HttpRequest current = request;
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            HttpResponse short_circuit;
+            if (!layers[i](&current, &short_circuit)) {
+                return short_circuit;
+            }
+        }
+        return DispatchRouted(current);
+    }
+
+    HttpResponse DispatchRouted(const HttpRequest& request) const {
         bool path_matched = false;
         for (std::size_t i = 0; i < routes.size(); ++i) {
             const RouteEntry& route = routes[i];
@@ -412,6 +429,11 @@ void HttpServer::Route(const std::string& method, const std::string& path_patter
     entry.pattern = path_pattern;
     entry.handler = std::move(h);
     impl_->routes.push_back(std::move(entry));
+}
+
+void HttpServer::Use(Middleware layer) {
+    if (!layer) return;
+    impl_->layers.push_back(std::move(layer));
 }
 
 HttpResponse HttpServer::Dispatch(const HttpRequest& request) const {

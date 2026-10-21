@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Rust: src/p2p/transport.rs — the P2pTransport trait + byte stream.
 //
-// The Rust trait has six required methods and four provided (defaulted) ones.
-// That split is reproduced exactly: required => pure virtual, provided =>
-// virtual with the Rust default body inline.
+// The Rust trait has six required methods (`lookup_with_hints`,
+// `fetch_with_options`, `fetch_bytes_with_options`, `fetch_byte_range`,
+// `publish`, `unpublish`) and five provided (defaulted) ones (`lookup`,
+// `fetch`, `fetch_bytes`, `local_endpoint`, `shutdown`). That split is
+// reproduced exactly: required => pure virtual, provided => virtual with the
+// Rust default body inline.
 #ifndef AGENTENV_P2P_TRANSPORT_H_
 #define AGENTENV_P2P_TRANSPORT_H_
 

@@ -7,12 +7,13 @@ namespace p2p {
 
 const char* const kIrohBackendId = "iroh";
 
-const char* BackendId(P2pTransportKind kind) {
+core::Optional<std::string> BackendId(P2pTransportKind kind) {
     switch (kind) {
-        case P2pTransportKind::Disabled: return "";
-        case P2pTransportKind::Iroh:     return kIrohBackendId;
+        // Rust: `Self::Disabled => None`.
+        case P2pTransportKind::Disabled: return core::Optional<std::string>();
+        case P2pTransportKind::Iroh:     return std::string(kIrohBackendId);
     }
-    return "";
+    return core::Optional<std::string>();
 }
 
 static std::string trim(const std::string& s) {
