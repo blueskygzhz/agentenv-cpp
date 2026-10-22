@@ -419,6 +419,31 @@ struct P2pConfig {
     uint64_t lookup_timeout_ms = 5000;
     uint64_t fetch_timeout_ms = 30000;
     uint64_t peer_discovery_refresh_interval_secs = 5;
+
+    /// `host:port` peers are told to dial. Only read by the `http` transport.
+    ///
+    /// No Rust counterpart and no default, because there is no correct one.
+    /// It cannot be derived from `listen_addr`, whose own default is the
+    /// wildcard `0.0.0.0:0` — advertising that would hand every peer an
+    /// address resolving to itself, and port 0 names no port at all. iroh gets
+    /// the equivalent by asking the endpoint what it ended up reachable on
+    /// after binding; without that machinery it has to be stated. Empty makes
+    /// the `http` transport refuse to start rather than publish an address
+    /// nobody can reach.
+    std::string advertise_addr;
+
+    /// Shared secret guarding the `http` transport's surface.
+    ///
+    /// Cluster-wide, which is why it is configuration and not something a
+    /// node can generate for itself the way `ApiKey::Resolve` does: every
+    /// peer must present the same value, so a per-node secret would mean no
+    /// peer could ever talk to another. Prefer `AENV_P2P_SHARED_TOKEN`, which
+    /// overrides this and keeps the secret out of a file on disk.
+    ///
+    /// Empty disables the check. `core::http` speaks plaintext TCP, so that is
+    /// only defensible when the port is unreachable from outside the cluster
+    /// by other means; the transport warns when it happens.
+    std::string shared_token;
 };
 
 // ---------------------------------------------------------------------------

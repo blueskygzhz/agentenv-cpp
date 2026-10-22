@@ -1325,14 +1325,27 @@ core::Expected<core::Unit, std::string> AppConfig::LoadFrom(const core::TomlTabl
                 p2p.transport = p2p::P2pTransportKind::Disabled;
             } else if (p.value() == "iroh") {
                 p2p.transport = p2p::P2pTransportKind::Iroh;
+            } else if (p.value() == "http") {
+                p2p.transport = p2p::P2pTransportKind::Http;
             } else {
-                return core::make_unexpected(
-                    std::string("p2p.transport: expected \"disabled\" or \"iroh\""));
+                return core::make_unexpected(std::string(
+                    "p2p.transport: expected \"disabled\", \"iroh\" or \"http\""));
             }
         }
     }
     AENV_STR("p2p.store_dir", p2p.store_dir);
     AENV_STR("p2p.listen_addr", p2p.listen_addr);
+    AENV_STR("p2p.advertise_addr", p2p.advertise_addr);
+    AENV_STR("p2p.shared_token", p2p.shared_token);
+    // The env var wins over the file so the secret need not be written to
+    // disk. Blank is treated as unset rather than as "disable the check": an
+    // exported-but-empty variable is far more likely a deployment mistake
+    // than a decision to serve the blob surface unauthenticated.
+    {
+        const core::Optional<std::string> from_env =
+            EnvTrimmedNonEmpty("AENV_P2P_SHARED_TOKEN");
+        if (from_env.has_value()) p2p.shared_token = *from_env;
+    }
     AENV_UNUM("p2p.lookup_timeout_ms", p2p.lookup_timeout_ms, uint64_t);
     AENV_UNUM("p2p.fetch_timeout_ms", p2p.fetch_timeout_ms, uint64_t);
     AENV_UNUM("p2p.peer_discovery_refresh_interval_secs",

@@ -6,12 +6,18 @@ namespace agentenv {
 namespace p2p {
 
 const char* const kIrohBackendId = "iroh";
+const char* const kHttpBackendId = "http";
 
 core::Optional<std::string> BackendId(P2pTransportKind kind) {
     switch (kind) {
         // Rust: `Self::Disabled => None`.
         case P2pTransportKind::Disabled: return core::Optional<std::string>();
         case P2pTransportKind::Iroh:     return std::string(kIrohBackendId);
+        // Must be a real id, never `Some("")`: the scheduler filters peers by
+        // an exact backend match, so an empty string would issue the RPCs and
+        // then discard every peer — a silent no-provider result instead of the
+        // short-circuit `Disabled` gets.
+        case P2pTransportKind::Http:     return std::string(kHttpBackendId);
     }
     return core::Optional<std::string>();
 }

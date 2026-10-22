@@ -2,6 +2,7 @@
 // Rust: src/p2p/mod.rs
 #include "agentenv/p2p/node.h"
 
+#include "agentenv/p2p/http_transport.h"
 #include "agentenv/p2p/iroh.h"
 
 namespace agentenv {
@@ -27,7 +28,8 @@ std::shared_ptr<P2pPeerDiscovery> PeerDiscoveryFromConfig(
 }
 
 core::Expected<std::shared_ptr<P2pTransport>, std::string> TransportFromConfig(
-    const P2pFactoryInputs& inputs, SchedulerWireTransport wire) {
+    const P2pFactoryInputs& inputs, SchedulerWireTransport wire,
+    P2pBlobServerFactory blob_server) {
     switch (inputs.p2p.transport) {
         case P2pTransportKind::Disabled:
             // Rust: `Ok(Arc::new(DisabledP2pTransport))`.
@@ -50,6 +52,33 @@ core::Expected<std::shared_ptr<P2pTransport>, std::string> TransportFromConfig(
                     : err);
             }
             return std::shared_ptr<P2pTransport>(transport);
+        }
+
+        case P2pTransportKind::Http: {
+            if (!blob_server) {
+                return core::make_unexpected(std::string(
+                    "the http P2P transport needs a blob server factory; "
+                    "agentenv-p2p cannot link agentenv-api, so the caller injects one"));
+            }
+            std::shared_ptr<P2pPeerDiscovery> discovery =
+                PeerDiscoveryFromConfig(inputs, std::move(wire));
+
+            HttpP2pTransport::Options options;
+            options.config = inputs.p2p;
+            options.node_id = inputs.node_id;
+            options.advertise_addr = inputs.p2p_advertise_addr;
+            options.shared_token = inputs.p2p_shared_token;
+            options.server = blob_server();
+
+            const core::Expected<std::shared_ptr<HttpP2pTransport>, P2pError> transport =
+                HttpP2pTransport::Start(std::move(options), discovery);
+            if (!transport.ok()) {
+                // Propagated, not downgraded — same reasoning as the iroh arm
+                // above: a node explicitly configured for p2p must not come
+                // up silently without it.
+                return core::make_unexpected(transport.error().ToString());
+            }
+            return std::shared_ptr<P2pTransport>(transport.value());
         }
     }
     return core::make_unexpected(std::string("unknown P2P transport kind"));

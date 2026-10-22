@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -21,8 +22,26 @@ namespace scheduler {
 struct Node {
     std::string id;        // json "node_id"
     std::string endpoint;  // json "endpoint"
+
+    /// Go `observedRecord.node.GetClusterId()`.
+    ///
+    /// Part of every P2P query rather than ambient state: one scheduler can
+    /// serve several clusters, and a peer list that leaked across them would
+    /// hand out addresses the requester has no business dialling.
+    std::string cluster_id;
+
+    /// Go `observedRecord.p2pEndpoint` — the node's P2P backend and address.
+    ///
+    /// Distinct from `endpoint`, which is the control-plane address the
+    /// scheduler itself uses. A node may serve P2P on a different port, a
+    /// different interface, or not at all; collapsing the two would advertise
+    /// the control plane as a blob source.
+    std::string p2p_backend;
+    std::string p2p_address;
+
     bool operator==(const Node& o) const {
-        return id == o.id && endpoint == o.endpoint;
+        return id == o.id && endpoint == o.endpoint && cluster_id == o.cluster_id &&
+               p2p_backend == o.p2p_backend && p2p_address == o.p2p_address;
     }
 };
 
@@ -146,7 +165,41 @@ class NodeRegistry {
     void RecordHeartbeat(const std::string& node_id, const NodeSnapshot& snap);
     void Remove(const std::string& node_id);
     std::vector<RichNode> RichNodes() const;
+
+    /// Go `Resolve` — is this node in the scheduler's list?
+    ///
+    /// `RecordP2PArtifact` gates on it: an unknown node claiming to hold an
+    /// artifact would be advertised to peers who then cannot reach it, so the
+    /// claim is refused rather than indexed.
+    bool Resolve(const std::string& node_id, Node* out) const;
+
+    /// Go `ListP2pPeers` — every ready peer in `cluster_id` on `backend`.
+    ///
+    /// `node_ids` empty means "no restriction" for the list form. The lookup
+    /// form passes the artifact index's answer, and an *empty* allow-list
+    /// there must yield nothing rather than everything — see
+    /// `FilterP2pPeers`, which is why the two are separate entry points.
+    std::vector<Node> ListP2pPeers(const std::string& cluster_id,
+                                   const std::string& backend,
+                                   const std::string& exclude_node_id) const;
+
+    /// Go `FilterP2pPeers` — the peers among `node_ids`, same filtering.
+    ///
+    /// An empty `node_ids` returns empty, matching Go's early return. The
+    /// distinction is load-bearing: a lookup that found no holders must not
+    /// degrade into "here is the whole cluster".
+    std::vector<Node> FilterP2pPeers(const std::string& cluster_id,
+                                     const std::string& backend,
+                                     const std::vector<std::string>& node_ids,
+                                     const std::string& exclude_node_id) const;
+
  private:
+    /// Shared by both public forms. `allowed == nullptr` is no restriction.
+    std::vector<Node> FilterP2pPeersLocked(const std::string& cluster_id,
+                                           const std::string& backend,
+                                           const std::set<std::string>* allowed,
+                                           const std::string& exclude_node_id) const;
+
     mutable std::mutex mu_;
     std::map<std::string, RichNode> nodes_;
 };

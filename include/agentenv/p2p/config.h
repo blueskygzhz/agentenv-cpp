@@ -12,10 +12,21 @@ namespace agentenv {
 namespace p2p {
 
 /// Rust: `P2pTransportKind`.
-enum class P2pTransportKind { Disabled, Iroh };
+///
+/// `Http` has no Rust counterpart. It exists because the iroh backend needs
+/// magicsock and iroh-blobs' verified streaming — protocols to match
+/// bit-for-bit, not libraries to call — while the job it does inside a cluster
+/// is moving bytes between two routable hosts. `P2pEndpoint` was already a
+/// backend tag plus an opaque address, so a second backend is an extension the
+/// types were built for rather than a special case bolted on.
+enum class P2pTransportKind { Disabled, Iroh, Http };
 
 /// Rust: `iroh::IROH_BACKEND_ID`.
 extern const char* const kIrohBackendId;
+
+/// The `Http` backend's id. Lives here beside the iroh one so `BackendId` does
+/// not have to depend on the transport header, which pulls in the HTTP server.
+extern const char* const kHttpBackendId;
 
 /// Rust: `P2pTransportKind::backend_id()` — `Option<&'static str>`.
 ///

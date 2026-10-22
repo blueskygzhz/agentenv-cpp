@@ -13,6 +13,10 @@
 #include "agentenv/p2p/discovery.h"   // Rust: discovery/mod.rs + scheduler.rs
 #include "agentenv/p2p/mock.h"        // Rust: mock.rs
 #include "agentenv/p2p/iroh.h"        // Rust: iroh/mod.rs (gated)
+#include "agentenv/p2p/catalog.h"     // Rust: the portable half of iroh/catalog.rs
+#include "agentenv/p2p/http_blob_store.h"  // no Rust counterpart: the HTTP byte store
+#include "agentenv/p2p/http_transport.h"   // no Rust counterpart: the HTTP transport
 #include "agentenv/p2p/node.h"        // Rust: mod.rs factories
+#include "agentenv/p2p/scheduler_http.h"   // Rust: discovery/scheduler.rs, over HTTP
 
 #endif  // AGENTENV_P2P_ALL_H_

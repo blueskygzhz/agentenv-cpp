@@ -116,6 +116,12 @@ MT_TEST(app_config_defaults_match_rust) {
     MT_EXPECT_EQ(config.p2p.listen_addr, std::string("0.0.0.0:0"));
     MT_EXPECT_EQ(config.p2p.lookup_timeout_ms, 5000u);
     MT_EXPECT_EQ(config.p2p.fetch_timeout_ms, 30000u);
+    // Both empty by default. There is no correct default advertise address --
+    // it cannot be derived from the wildcard `listen_addr` above -- and an
+    // empty token leaves the http transport's check disabled, which it warns
+    // about rather than guessing a secret.
+    MT_EXPECT_EQ(config.p2p.advertise_addr, std::string(""));
+    MT_EXPECT_EQ(config.p2p.shared_token, std::string(""));
     MT_EXPECT_EQ(config.custom_extension.timeout_ms, 5000u);
 
     // cfg/image.rs defaults
@@ -689,6 +695,85 @@ MT_TEST(cluster_normalize_trims_and_drops_blank_scheduler_endpoint) {
         MT_EXPECT_TRUE(config.scheduler_endpoint.has_value());
         MT_EXPECT_EQ(*config.scheduler_endpoint, std::string("http://scheduler:9090"));
     }
+}
+
+// ---------------------------------------------------------------------------
+// No Rust counterpart: the `http` P2P transport, an alternative to iroh for
+// clusters whose peers are directly routable.
+// ---------------------------------------------------------------------------
+
+MT_TEST(p2p_transport_accepts_the_three_backends_and_rejects_the_rest) {
+    struct Case { const char* text; bool ok; agentenv::p2p::P2pTransportKind kind; };
+    const Case cases[] = {
+        {"[p2p]\ntransport = \"disabled\"\n", true,
+         agentenv::p2p::P2pTransportKind::Disabled},
+        {"[p2p]\ntransport = \"iroh\"\n", true, agentenv::p2p::P2pTransportKind::Iroh},
+        {"[p2p]\ntransport = \"http\"\n", true, agentenv::p2p::P2pTransportKind::Http},
+        // An unknown backend is refused rather than silently falling back.
+        // Resolving it to `disabled` would turn a typo into a node that looks
+        // configured for p2p and quietly provides none.
+        {"[p2p]\ntransport = \"quic\"\n", false, agentenv::p2p::P2pTransportKind::Disabled},
+    };
+
+    for (std::size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        auto table = agentenv::core::TomlTable::ParseString(cases[i].text);
+        MT_EXPECT_TRUE(table.ok());
+        AppConfig config;
+        auto loaded = config.LoadFrom(table.value());
+        MT_EXPECT_EQ(loaded.ok(), cases[i].ok);
+        if (cases[i].ok) {
+            MT_EXPECT_TRUE(config.p2p.transport == cases[i].kind);
+        }
+    }
+}
+
+MT_TEST(p2p_advertise_addr_and_shared_token_are_read_from_toml) {
+    const std::string text =
+        "[p2p]\n"
+        "enabled = true\n"
+        "transport = \"http\"\n"
+        "listen_addr = \"0.0.0.0:7000\"\n"
+        "advertise_addr = \"10.0.0.7:7000\"\n"
+        "shared_token = \"from-file\"\n";
+    auto table = agentenv::core::TomlTable::ParseString(text);
+    MT_EXPECT_TRUE(table.ok());
+
+    ::unsetenv("AENV_P2P_SHARED_TOKEN");
+    AppConfig config;
+    MT_EXPECT_TRUE(config.LoadFrom(table.value()).ok());
+
+    MT_EXPECT_TRUE(config.p2p.transport == agentenv::p2p::P2pTransportKind::Http);
+    // The bind address and the advertised one are separate values, because a
+    // wildcard bind is not something a peer can dial.
+    MT_EXPECT_EQ(config.p2p.listen_addr, std::string("0.0.0.0:7000"));
+    MT_EXPECT_EQ(config.p2p.advertise_addr, std::string("10.0.0.7:7000"));
+    MT_EXPECT_EQ(config.p2p.shared_token, std::string("from-file"));
+}
+
+MT_TEST(the_p2p_token_env_var_overrides_the_file_but_blank_does_not) {
+    const std::string text =
+        "[p2p]\nshared_token = \"from-file\"\n";
+    auto table = agentenv::core::TomlTable::ParseString(text);
+    MT_EXPECT_TRUE(table.ok());
+
+    // The env var wins, so the secret need not be written to disk at all.
+    ::setenv("AENV_P2P_SHARED_TOKEN", "from-env", 1);
+    {
+        AppConfig config;
+        MT_EXPECT_TRUE(config.LoadFrom(table.value()).ok());
+        MT_EXPECT_EQ(config.p2p.shared_token, std::string("from-env"));
+    }
+
+    // Exported but blank is treated as unset, not as "disable the check":
+    // that is far more likely a deployment mistake than a decision to serve
+    // the blob surface unauthenticated.
+    ::setenv("AENV_P2P_SHARED_TOKEN", "   ", 1);
+    {
+        AppConfig config;
+        MT_EXPECT_TRUE(config.LoadFrom(table.value()).ok());
+        MT_EXPECT_EQ(config.p2p.shared_token, std::string("from-file"));
+    }
+    ::unsetenv("AENV_P2P_SHARED_TOKEN");
 }
 
 // ---------------------------------------------------------------------------

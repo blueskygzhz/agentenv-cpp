@@ -4,8 +4,10 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 #include "agentenv/api/auth_middleware.h"
 #include "agentenv/api/server.h"
@@ -16,13 +18,93 @@
 #include "agentenv/orchestrator/persistence.h"
 #include "agentenv/orchestrator/service.h"
 #include "agentenv/cfg.h"
+#include "agentenv/p2p/http_transport.h"
 #include "agentenv/p2p/node.h"
+#include "agentenv/p2p/scheduler_http.h"
 #include "agentenv/sandbox/backend.h"
 #include "agentenv/sandbox/firecracker/factory_impl.h"
 
 namespace ae = agentenv;
 
 namespace {
+
+/// Adapts `api::Server` to the contract `agentenv-p2p` declares.
+///
+/// The indirection is a build constraint, not a design preference:
+/// `agentenv-api` already links `agentenv-p2p` transitively (api ->
+/// orchestrator -> snapshot -> p2p), so `p2p` naming `api::Server` directly
+/// would close a CMake cycle. `p2p::P2pBlobServer` is the narrowest contract
+/// that avoids it, and this is the one place in the tree that can see both
+/// types — the same reason `SchedulerWireTransport` is injected rather than
+/// linked.
+///
+/// Note what is deliberately *not* done here: no `Use` layer is installed.
+/// The P2P surface authenticates with a cluster-wide shared token, not the
+/// node's API key, and `api::Server::Use` runs before routing for every
+/// request — sharing the API's server would gate the blob routes with the
+/// wrong credential entirely. A separate server on `p2p.listen_addr` is also
+/// what lets the blob port stay off any public interface.
+class ApiServerBlobServer : public ae::p2p::P2pBlobServer {
+ public:
+    ApiServerBlobServer() : server_(ae::api::MakeServer()) {}
+
+    bool valid() const { return !!server_; }
+
+    void Route(const std::string& method, const std::string& path_pattern,
+               Handler handler) override {
+        if (!server_) return;
+        // The pattern passes straight through: `P2pBlobServer` documents the
+        // same `{name}` placeholder convention `api::Server` matches.
+        server_->Route(method, path_pattern,
+                       [handler](const ae::api::HttpRequest& request,
+                                 ae::api::HttpResponse* response) {
+            ae::p2p::P2pServerRequest translated;
+            translated.method = request.method;
+            translated.path = request.path;
+            translated.body = request.body;
+            // `api` keys headers in an unordered_map and `p2p` in a map; the
+            // casing is preserved either way, and the p2p side looks them up
+            // case-insensitively.
+            for (std::unordered_map<std::string, std::string>::const_iterator it =
+                     request.headers.begin();
+                 it != request.headers.end(); ++it) {
+                translated.headers[it->first] = it->second;
+            }
+
+            ae::p2p::P2pServerResponse produced;
+            handler(translated, &produced);
+
+            response->status = produced.status;
+            response->body = produced.body;
+            for (std::map<std::string, std::string>::const_iterator it =
+                     produced.headers.begin();
+                 it != produced.headers.end(); ++it) {
+                response->headers[it->first] = it->second;
+            }
+        });
+    }
+
+    ae::core::Expected<ae::core::Unit, std::string>
+        ListenAndServe(const std::string& bind_addr) override {
+        if (!server_) {
+            return ae::core::make_unexpected(
+                std::string("no HTTP server backend is compiled in"));
+        }
+        const ae::core::Expected<ae::core::Unit, ae::core::AnyError> served =
+            server_->ListenAndServe(bind_addr);
+        if (!served.ok()) {
+            return ae::core::make_unexpected(served.error().chain());
+        }
+        return ae::core::Unit{};
+    }
+
+    void Stop() override {
+        if (server_) server_->Stop();
+    }
+
+ private:
+    std::unique_ptr<ae::api::Server> server_;
+};
 
 /// Rust `shutdown_signal()` — SIGINT/SIGTERM start a graceful shutdown.
 ///
@@ -84,6 +166,9 @@ ae::p2p::P2pFactoryInputs BuildP2pInputs(const ae::cfg::AppConfig& app_cfg,
     inputs.scheduler_endpoint = app_cfg.cluster.scheduler_endpoint;
     inputs.node_id = identity.id;
     inputs.cluster_id = identity.cluster_id.ToString();
+    // Only read by the `http` transport; the iroh arm ignores both.
+    inputs.p2p_advertise_addr = app_cfg.p2p.advertise_addr;
+    inputs.p2p_shared_token = app_cfg.p2p.shared_token;
     return inputs;
 }
 
@@ -191,11 +276,51 @@ int main(int argc, char** argv) {
         ae::core::NodeIdentity::FromConfig(ToCoreIdentityConfig(app_cfg.node_identity));
     ae::p2p::P2pFactoryInputs p2p_inputs = BuildP2pInputs(app_cfg, identity);
 
-    // The gRPC scheduler wire is gated (AGENTENV_WITH_GRPC) and not yet
-    // implemented, so the callbacks stay empty. A discovery built this way
-    // reports scheduler RPCs as failed rather than as empty successes.
-    auto p2p_built = ae::p2p::TransportFromConfig(p2p_inputs,
-                                                  ae::p2p::SchedulerWireTransport());
+    if (app_cfg.p2p.enabled &&
+        app_cfg.p2p.transport == ae::p2p::P2pTransportKind::Http &&
+        app_cfg.p2p.shared_token.empty()) {
+        // Warned about rather than refused: a single-tenant cluster whose blob
+        // port is unreachable from outside may legitimately run without one.
+        // Silence would be the problem — `core::http` has no TLS, so an
+        // operator who did not mean this has no other hint.
+        AGENTENV_WARN("p2p blob surface is unauthenticated;"
+                      << " set AENV_P2P_SHARED_TOKEN or p2p.shared_token"
+                      << " unless the port is unreachable from outside the cluster");
+    }
+
+    // The scheduler wire.
+    //
+    // Rust reaches the scheduler over gRPC; that path is gated on
+    // AGENTENV_WITH_GRPC and needs a code generator this tree does not carry.
+    // `MakeHttpSchedulerWire` speaks the same four calls over HTTP instead —
+    // see the note at the top of `scheduler_http.h` for why that trade is the
+    // right one for a cluster already running the `http` transport.
+    //
+    // Built only when an endpoint is configured. Without one
+    // `PeerDiscoveryFromConfig` returns a Noop discovery and would never
+    // consult these callbacks; constructing them anyway would log a
+    // "wire ready" line for a scheduler nobody is going to call.
+    ae::p2p::SchedulerWireTransport scheduler_wire;
+    if (app_cfg.cluster.scheduler_endpoint.has_value()) {
+        scheduler_wire = ae::p2p::MakeHttpSchedulerWire(
+            *app_cfg.cluster.scheduler_endpoint, app_cfg.p2p.shared_token,
+            ae::p2p::SchedulerPeerDiscovery::kRefreshRpcTimeoutMs,
+            ae::p2p::SchedulerPeerDiscovery::kArtifactRpcTimeoutMs);
+    }
+
+    // The blob-server factory is only consulted by the `http` transport. It is
+    // a factory rather than an instance so a `disabled` or `iroh` node never
+    // constructs a listener it would not use.
+    auto p2p_built = ae::p2p::TransportFromConfig(
+        p2p_inputs, std::move(scheduler_wire),
+        []() -> std::shared_ptr<ae::p2p::P2pBlobServer> {
+            std::shared_ptr<ApiServerBlobServer> adapter(new ApiServerBlobServer());
+            // Null when no server backend is compiled in. Returning it anyway
+            // would defer the failure to the first request, by which point the
+            // node has already advertised itself as a provider.
+            if (!adapter->valid()) return std::shared_ptr<ae::p2p::P2pBlobServer>();
+            return adapter;
+        });
     if (!p2p_built.ok()) {
         AGENTENV_ERROR("p2p transport startup failed: " << p2p_built.error());
         return 1;

@@ -23,6 +23,7 @@
 #include "agentenv/core/optional.h"
 #include "agentenv/p2p/config.h"
 #include "agentenv/p2p/discovery.h"
+#include "agentenv/p2p/http_transport.h"
 #include "agentenv/p2p/transport.h"
 
 namespace agentenv {
@@ -42,6 +43,23 @@ struct P2pFactoryInputs {
     std::string node_id;
     /// Rust `node_identity.cluster_id.to_string()`.
     std::string cluster_id;
+
+    /// `host:port` peers should dial. Only read by the `Http` transport.
+    ///
+    /// No Rust counterpart: iroh learns what it is reachable on from
+    /// `wait_for_dialable_addr`, which asks the endpoint after it binds.
+    /// Without that machinery the answer has to be configured, and it cannot
+    /// be derived from `p2p.listen_addr` because a node normally binds a
+    /// wildcard — advertising `0.0.0.0:p` would hand every peer an address
+    /// that resolves to itself.
+    std::string p2p_advertise_addr;
+
+    /// Shared secret guarding the `Http` transport's surface.
+    ///
+    /// `core::http` speaks plaintext TCP, so this is the only credential on
+    /// the blob port. Empty disables the check, which is only defensible when
+    /// the port is unreachable from outside the cluster by other means.
+    std::string p2p_shared_token;
 };
 
 /// The gated gRPC scheduler transport, injected rather than linked.
@@ -72,8 +90,14 @@ std::shared_ptr<P2pPeerDiscovery> PeerDiscoveryFromConfig(
 /// a startup error, and a node configured for p2p must not come up silently
 /// without it. In a build without `AGENTENV_WITH_IROH` that failure is exactly
 /// what `IrohBlobsP2pTransport::Start` reports.
+///
+/// `Http` has no Rust counterpart; it needs `blob_server` because
+/// `agentenv-p2p` cannot link `agentenv-api` (api -> orchestrator -> snapshot
+/// -> p2p would make it a cycle). Leaving the factory empty is not a quiet
+/// downgrade: the `Http` arm fails with that as the stated reason.
 core::Expected<std::shared_ptr<P2pTransport>, std::string> TransportFromConfig(
-    const P2pFactoryInputs& inputs, SchedulerWireTransport wire);
+    const P2pFactoryInputs& inputs, SchedulerWireTransport wire,
+    P2pBlobServerFactory blob_server = P2pBlobServerFactory());
 
 }  // namespace p2p
 }  // namespace agentenv

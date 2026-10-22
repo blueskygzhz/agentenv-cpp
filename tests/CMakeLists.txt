@@ -97,6 +97,16 @@ agentenv_add_test(test_image_cache_gc     test_image_cache_gc.cc      agentenv-i
 agentenv_add_test(test_p2p                 test_p2p.cc                 agentenv-p2p)
 # Rust: the catalog tests in src/p2p/iroh/{catalog,endpoint}.rs.
 agentenv_add_test(test_p2p_catalog         test_p2p_catalog.cc         agentenv-p2p)
+# No Rust counterpart: the HTTP transport, an alternative to iroh for clusters
+# whose peers are directly routable.
+agentenv_add_test(test_p2p_http_transport  test_p2p_http_transport.cc  agentenv-p2p)
+# Two transports over real loopback sockets. Needs agentenv-api for the
+# server adapter, which is why this cannot live in the suite above: that one
+# must keep agentenv-p2p testable on its own.
+agentenv_add_test(test_p2p_http_e2e        test_p2p_http_e2e.cc        agentenv-p2p agentenv-api)
+# The scheduler discovery wire. Rust uses gRPC here; this covers the HTTP
+# stand-in, including against a real loopback scheduler -- hence agentenv-api.
+agentenv_add_test(test_p2p_scheduler_http  test_p2p_scheduler_http.cc  agentenv-p2p agentenv-api)
 agentenv_add_test(test_storage_util        test_storage_util.cc        agentenv-storage-util)
 # Rust: storage/util/src/io_ring/ — the submission path ublk commands ride on
 agentenv_add_test(test_io_ring             test_io_ring.cc             agentenv-storage-util)
@@ -116,6 +126,10 @@ agentenv_add_test(test_ublk_daemon_runtime test_ublk_daemon_runtime.cc agentenv-
 agentenv_add_test(test_lsmt                test_lsmt.cc                agentenv-overlaybd)
 agentenv_add_test(test_lsmt_bptree         test_lsmt_bptree.cc         agentenv-overlaybd)
 agentenv_add_test(test_scheduler           test_scheduler.cc           agentenv-scheduler-internal)
+# The scheduler's P2P surface: the artifact index, the handlers, and the real
+# node-side wire pointed at the real handlers over loopback -- the only
+# arrangement that can catch the two halves of the protocol disagreeing.
+agentenv_add_test(test_scheduler_p2p       test_scheduler_p2p.cc       agentenv-scheduler-internal agentenv-p2p)
 agentenv_add_test(test_gateway             test_gateway.cc             agentenv-gateway-internal)
 agentenv_add_test(test_snapshot_repository test_snapshot_repository.cc agentenv-snapshot)
 agentenv_add_test(test_shell_util          test_shell_util.cc  agentenv-shell-util)
