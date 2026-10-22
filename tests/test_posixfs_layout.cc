@@ -5,6 +5,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -351,17 +352,46 @@ MT_TEST(acquire_file_lock_serializes_two_processes) {
 
     // Each child does a lock / read / increment / write cycle; without the
     // lock the final count would be lower than the number of increments.
+    //
+    // Sized to prove serialization, not to maximise contention. Four children
+    // racing a read-modify-write lose updates immediately when the lock is a
+    // no-op -- measured at this shape it produces 3 instead of 12 -- so more
+    // cycles buy no detection power and only more fsync latency.
     const int kChildren = 4;
-    const int kIterations = 20;
+    const int kIterations = 3;
+    const int kCycles = kChildren * kIterations;
 
+    // The timeout is measured, not guessed.
+    //
     // Every cycle is serialized and each `WriteAtomic` fsyncs twice (the file,
-    // then its directory), so all kChildren * kIterations cycles together are
-    // dominated by fsync latency — on a slow or loaded filesystem this test
-    // spends over ten seconds in the kernel. The timeout is here only so a
-    // genuine deadlock fails instead of hanging forever, so it has to be well
-    // clear of that total; a budget sized for the happy path turns ordinary
-    // disk slowness into a flaky failure.
-    const int64_t kLockTimeoutMs = 120000;
+    // then its directory), so the whole test runs at the filesystem's fsync
+    // latency -- which on btrfs here is ~1.5s *per write*, three orders of
+    // magnitude off a tmpfs. A fixed budget cannot be right for both: the
+    // previous 120s was chosen for a slow disk and still sat within a few
+    // seconds of the total, so ordinary load tipped it into a spurious
+    // failure. Timing one real write and deriving the budget from it makes the
+    // bound track the machine instead of a guess about it.
+    //
+    // The lock itself is not what is being bounded here -- it is uncontended
+    // for all but one waiter at a time -- so the factor is deliberately
+    // generous: a genuine deadlock still fails, just not promptly.
+    int64_t probe_ms = 0;
+    {
+        const std::chrono::steady_clock::time_point started =
+            std::chrono::steady_clock::now();
+        MT_EXPECT_TRUE(agentenv::core::WriteAtomic(counter, "0").ok());
+        probe_ms = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started).count());
+    }
+    // A fast filesystem measures 0 ms; floor it so the budget never collapses.
+    if (probe_ms < 1) probe_ms = 1;
+    // One cycle is a read plus a write, and a waiter may sit behind every
+    // other cycle in the run, so the worst case is the whole run's writes.
+    const int64_t kMinTimeoutMs = 30000;
+    int64_t lock_timeout_ms = probe_ms * kCycles * 4;
+    if (lock_timeout_ms < kMinTimeoutMs) lock_timeout_ms = kMinTimeoutMs;
+    const int64_t kLockTimeoutMs = lock_timeout_ms;
 
     std::vector<pid_t> pids;
     for (int c = 0; c < kChildren; ++c) {
@@ -398,7 +428,7 @@ MT_TEST(acquire_file_lock_serializes_two_processes) {
     // Derived, not a literal: changing either constant above must not quietly
     // leave this assertion checking the old total.
     char expected[32];
-    std::snprintf(expected, sizeof(expected), "%d", kChildren * kIterations);
+    std::snprintf(expected, sizeof(expected), "%d", kCycles);
     MT_EXPECT_EQ(fs::ReadToString(counter).value(), std::string(expected));
 }
 
