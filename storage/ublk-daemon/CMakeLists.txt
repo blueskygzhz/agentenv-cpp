@@ -39,6 +39,21 @@ target_link_libraries(agentenv-ublk-daemon-runtime PUBLIC
     agentenv-ublk-daemon-config
 )
 
+# `server.rs`'s socket half: stale-socket handling, the accept loop, and the
+# per-connection dispatch. A library of its own for the same reason
+# `runtime.rs` is: it is the part of the server with no io_uring in it, so it
+# can be driven over a socketpair with a fake device handler. The device plane
+# stays behind `DeviceHandler` and is deliberately not in here.
+add_library(agentenv-ublk-daemon-server STATIC
+    server.cc
+)
+target_include_directories(agentenv-ublk-daemon-server PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(agentenv-ublk-daemon-server PUBLIC
+    agentenv-core
+    agentenv-ublk-daemon-protocol
+    agentenv-ublk-daemon-config
+)
+
 add_executable(agentenv-ublk-daemon main.cc)
 target_link_libraries(agentenv-ublk-daemon PRIVATE
     agentenv-core
@@ -46,4 +61,5 @@ target_link_libraries(agentenv-ublk-daemon PRIVATE
     agentenv-ublk-daemon-protocol
     agentenv-ublk-daemon-config
     agentenv-ublk-daemon-runtime
+    agentenv-ublk-daemon-server
 )

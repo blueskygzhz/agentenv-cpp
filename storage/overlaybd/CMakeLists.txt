@@ -49,6 +49,9 @@ add_library(agentenv-overlaybd STATIC
     dense_export.cc
     # Rust: src/tools/oci.rs — the overlaybd-create/apply/commit wrappers
     tools_oci.cc
+    # Rust: src/tools/packaging.rs — package a raw filesystem as a sealed
+    # overlaybd lower layer (the volume backing path's last step)
+    tools_packaging.cc
 )
 target_include_directories(agentenv-overlaybd PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # `agentenv-observability` is the metrics facade, matching Rust: this crate's

@@ -63,6 +63,9 @@ agentenv_add_test(test_overlaybd_zfile_metrics test_overlaybd_zfile_metrics.cc a
 agentenv_add_test(test_overlaybd_dense_export test_overlaybd_dense_export.cc agentenv-overlaybd)
 # Rust: src/tools/oci.rs
 agentenv_add_test(test_overlaybd_tools_oci test_overlaybd_tools_oci.cc agentenv-overlaybd)
+# Rust: src/tools/packaging.rs + lsmt/file/helper.rs::create_mappings_from_sparse
+agentenv_add_test(test_overlaybd_tools_packaging test_overlaybd_tools_packaging.cc
+                  agentenv-overlaybd)
 agentenv_add_test(test_overlaybd_image_file test_overlaybd_image_file.cc agentenv-overlaybd)
 agentenv_add_test(test_deps                test_deps.cc                agentenv-rootmod)
 agentenv_add_test(test_overlaybd_p2p       test_overlaybd_p2p.cc       agentenv-overlaybd-p2p)
@@ -123,6 +126,10 @@ agentenv_add_test(test_ublk_queue_worker   test_ublk_queue_worker.cc   agentenv-
 agentenv_add_test(test_ublk_daemon_config  test_ublk_daemon_config.cc  agentenv-ublk-daemon-config)
 # Rust: storage/ublk-daemon/src/runtime.rs — claim, upper, resize, rollback
 agentenv_add_test(test_ublk_daemon_runtime test_ublk_daemon_runtime.cc agentenv-ublk-daemon-runtime)
+# Rust: storage/ublk-daemon/src/server.rs — the socket half: framing, dispatch,
+# error classification, and the device-handoff rollback. Links the client too,
+# because the only honest test of the accept loop is a real client calling it.
+agentenv_add_test(test_ublk_daemon_server  test_ublk_daemon_server.cc  agentenv-ublk-daemon-server agentenv-ublk-daemon-protocol)
 agentenv_add_test(test_lsmt                test_lsmt.cc                agentenv-overlaybd)
 agentenv_add_test(test_lsmt_bptree         test_lsmt_bptree.cc         agentenv-overlaybd)
 agentenv_add_test(test_scheduler           test_scheduler.cc           agentenv-scheduler-internal)
@@ -187,6 +194,8 @@ agentenv_add_test(test_firecracker_instance_api test_firecracker_instance_api.cc
 agentenv_add_test(test_firecracker_configure test_firecracker_configure.cc agentenv-sandbox)
 agentenv_add_test(test_firecracker_boot test_firecracker_boot.cc agentenv-sandbox)
 agentenv_add_test(test_firecracker_sandbox_backend test_firecracker_sandbox_backend.cc agentenv-sandbox)
+# Rust: start_fresh's host drives (tools / user rootfs / extra drives / volume slots)
+agentenv_add_test(test_firecracker_fresh_drives test_firecracker_fresh_drives.cc agentenv-sandbox)
 # Rust: from_snapshot_config_with_override + start_resume + build_from_paused_state
 agentenv_add_test(test_firecracker_resume test_firecracker_resume.cc agentenv-sandbox)
 
@@ -209,5 +218,10 @@ if(AGENTENV_BASH AND TARGET agentenv)
     add_test(NAME smoke_api
              COMMAND ${AGENTENV_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/smoke_api.sh
                      $<TARGET_FILE:agentenv>)
-    set_tests_properties(smoke_api PROPERTIES TIMEOUT 60)
+    # 77 means the runtime refused to start for want of CAP_NET_ADMIN /
+    # CAP_SYS_ADMIN, which an unprivileged container cannot grant. Reported as
+    # a skip so the suite stays honest about what it did and did not verify:
+    # a permanent red here would be ignored within a week, and relaxing the
+    # capability gate to suit the test would remove a production check.
+    set_tests_properties(smoke_api PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endif()

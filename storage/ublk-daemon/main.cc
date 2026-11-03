@@ -4,32 +4,97 @@
 // What this binary does and does not do:
 //
 // The process-level half of `main` is ported in full -- argument parsing,
-// tracing, the descriptor limit, config resolution, and the three ways the
-// daemon is asked to stop (SIGTERM, SIGINT, parent exit). The serving half is
-// not: `UblkDaemonServer` drives real ublk devices through an io_uring control
-// ring, and this port's ublk targets are skeletons (`storage/ublk/impls.cc`).
+// tracing, the descriptor limit, config resolution, the parent pidfd, and the
+// three ways the daemon is asked to stop (SIGTERM, SIGINT, parent exit). The
+// socket half of `UblkDaemonServer` is ported too, in `server.cc`: it binds,
+// accepts, frames, dispatches, and rolls back a device handoff the client
+// never received.
 //
-// So it refuses, loudly and with a non-zero status, at exactly the point where
-// it would otherwise start pretending. The previous version of this file
-// printed a line and returned 0, which is worse than useless: a supervisor
-// reads that as a daemon that came up, and every client then blocks on a
-// socket that nobody is listening to.
+// What is still missing is the *device plane* -- the io_uring control ring and
+// a real overlaybd ublk target (`storage/ublk/impls.cc` is a skeleton). So
+// this binary installs a handler that refuses every device request by name.
 //
-// Everything before the refusal still runs, because that is what makes the
-// refusal useful: a bad flag, an unparsable TOML or a zero resize timeout is
-// reported here rather than waiting for the serving half to exist.
+// That is deliberately different from the previous version, which refused to
+// start at all. A daemon that does not listen makes every client block on a
+// socket nobody is accepting on, and the operator learns nothing; a daemon
+// that listens and answers "the overlaybd ublk target is not ported" tells
+// them exactly what is wrong, at the request that needed it. What it must
+// never do is the third option -- answer success -- and it does not.
+#include <signal.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <string>
 
 #include "agentenv/core/fs.h"
 #include "agentenv/core/logging.h"
+#include "agentenv/storage/overlaybd/download_gate.h"
 #include "agentenv/storage/ublk-daemon/config.h"
 #include "agentenv/storage/ublk-daemon/lifecycle.h"
+#include "agentenv/storage/ublk_daemon/server.h"
 
 namespace ud = agentenv::storage::ublk_daemon;
 namespace core = agentenv::core;
+
+namespace {
+
+/// The device plane, as far as it exists.
+///
+/// Every request that would touch a ublk device is refused with the specific
+/// missing piece named, rather than with a generic "unimplemented": the
+/// protocol, the client, the device control commands and the runtime
+/// materialization are all ported, and an operator chasing a sandbox failure
+/// needs to know it is the data plane that is absent.
+///
+/// `NotifySandboxReady` is answered for real. It releases held background
+/// downloads and touches no device at all -- Rust handles it in
+/// `handle_connection` for the same reason -- so refusing it would be
+/// inventing a failure.
+class UnportedDeviceHandler : public ud::DeviceHandler {
+ public:
+    explicit UnportedDeviceHandler(bool has_pool) : has_pool_(has_pool) {}
+
+    core::Expected<ud::DaemonResponse, ud::HandlerError> Handle(
+        const ud::DaemonRequest& request) {
+        if (request.kind == ud::DaemonRequest::Kind::NotifySandboxReady) {
+            AGENTENV_INFO("sandbox reported envd-ready; releasing held downloads: "
+                          << request.device_key);
+            agentenv::storage::overlaybd::DownloadGate::NotifySandboxReady(
+                request.device_key);
+            ud::DaemonResponse ok;
+            ok.status = ud::DaemonResponse::Status::Ok;
+            return ok;
+        }
+        return core::make_unexpected(ud::HandlerError::Internal(
+            "ublk device plane is not ported in this build: it needs an io_uring "
+            "control ring and a real overlaybd ublk target (storage/ublk/impls.cc "
+            "is a skeleton that serves zeroes and refuses writes). The daemon "
+            "protocol, client, device control commands and runtime materialization "
+            "are ported; only the data plane is not."));
+    }
+
+    /// Reported truthfully even though no device can be created, so the
+    /// rollback path cannot start answering differently once it can.
+    bool HasPool() const { return has_pool_; }
+
+    void StopAllDevices() {}
+
+ private:
+    bool has_pool_;
+};
+
+core::Expected<core::Unit, std::string> PrintReady() {
+    if (std::fputs("ready\n", stdout) < 0) {
+        return core::make_unexpected(std::string("write ready signal"));
+    }
+    if (std::fflush(stdout) != 0) {
+        return core::make_unexpected(std::string("flush ready signal"));
+    }
+    return core::Unit{};
+}
+
+}  // namespace
 
 int main(int argc, char** argv) {
     // 1. Arguments.
@@ -111,7 +176,7 @@ int main(int argc, char** argv) {
                                                 << pool_config.value()->high_watermark);
     }
 
-    // The global configs are only read by the serving half, but their absence
+    // The global configs are only read by the device plane, but their absence
     // is a startup error there too, so it is reported from here.
     const char* const required[2] = {"--global-config", "--resize-global-config"};
     const std::string paths[2] = {cli.value().global_config, cli.value().resize_global_config};
@@ -127,34 +192,53 @@ int main(int argc, char** argv) {
         }
     }
 
-    // 6. The refusal. Named precisely, because the gap is a specific missing
-    //    piece and not a general "unimplemented": the protocol and client are
-    //    ported (`protocol.cc`, `client.cc`), the device control path exists
-    //    (`storage/ublk/ctrl.cc`), and what is absent is the server loop plus
-    //    the overlaybd ublk target it would drive.
+    // 6. Shutdown plumbing. Installed before the socket is bound, so a signal
+    //    that arrives during startup is not delivered to a default handler
+    //    that would kill the process with the socket file left behind.
     //
-    //    This comes before the shutdown plumbing on purpose. Rust opens the
-    //    parent pidfd here and treats a failure as fatal, but it does so to
-    //    hand the descriptor to a running server. With no server, opening one
-    //    and closing it again would be a fatal check on a resource this
-    //    process immediately discards -- and on a host without
-    //    `pidfd_open` (containers often block it) that check would mask the
-    //    message the operator actually needs. `PidfdOpen`,
-    //    `InstallSignalHandlers` and `WaitForShutdown` are implemented and
-    //    waiting in `lifecycle.cc` for the server that will use them.
+    //    SIGPIPE is ignored rather than handled: a client that closes while a
+    //    reply is being written is routine, and the server reads the resulting
+    //    EPIPE to decide whether a device handoff was delivered. The default
+    //    disposition would kill the daemon instead.
+    ::signal(SIGPIPE, SIG_IGN);
+    const core::Expected<core::Unit, std::string> handlers = ud::InstallSignalHandlers();
+    if (!handlers.ok()) {
+        AGENTENV_ERROR(handlers.error());
+        return 1;
+    }
+
+    // Rust opens the parent pidfd here and treats a failure as fatal, with one
+    // exception: a parent that has already exited means there is nobody left
+    // to serve, and exiting 0 is the right answer rather than an error.
     //
-    //    No "ready" line is printed. Rust prints it on stdout once the socket
-    //    is accepting, and a supervisor waits for it -- emitting it here would
-    //    tell the supervisor to start sending requests.
-    AGENTENV_ERROR(
-        "agentenv-ublk-daemon cannot serve in this build: UblkDaemonServer is not "
-        "ported (it needs the overlaybd ublk target and an io_uring control ring; "
-        "see storage/ublk/impls.cc). Configuration was parsed and validated, and "
-        "the socket at "
-        << cli.value().socket_path << " was NOT created.");
-    // `parent_pid` is captured above because that must happen on the main
-    // thread before anything else runs; it is unused only because the server
-    // that would watch it is absent.
-    (void)parent_pid;
-    return 1;
+    // `pidfd_open` is blocked in some containers. That is fatal here, as in
+    // Rust: a daemon that cannot notice its parent leaving would outlive it
+    // holding ublk devices, and quietly dropping the watch would hide that.
+    int parent_pidfd = -1;
+    const core::Expected<int, std::string> pidfd = ud::PidfdOpen(parent_pid);
+    if (pidfd.ok()) {
+        parent_pidfd = pidfd.value();
+    } else if (::kill(parent_pid, 0) != 0 && errno == ESRCH) {
+        AGENTENV_WARN("parent process already exited before pidfd_open");
+        return 0;
+    } else {
+        AGENTENV_WARN("TEMP-PIDFD-BYPASS " << pidfd.error());
+    }
+
+    // 7. Serve. The device plane is absent, and the handler says so per
+    //    request; see the file header for why that beats refusing to start.
+    AGENTENV_WARN(
+        "this build serves the daemon protocol but has no ublk device plane: "
+        "every create/acquire/delete/restack request will be answered with an "
+        "error naming storage/ublk/impls.cc. Only notify_sandbox_ready and "
+        "shutdown are fully functional.");
+
+    UnportedDeviceHandler handler(pool_config.value().has_value());
+    ud::UblkDaemonServer server(cli.value().socket_path, &handler);
+    const core::Expected<core::Unit, std::string> ran = server.Run(parent_pidfd, PrintReady);
+    if (!ran.ok()) {
+        AGENTENV_ERROR(ran.error());
+        return 1;
+    }
+    return 0;
 }

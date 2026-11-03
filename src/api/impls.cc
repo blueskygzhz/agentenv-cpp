@@ -88,6 +88,9 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
         if (eq == std::string::npos || eq == 0) continue;
         request.env_vars[kv.substr(0, eq)] = kv.substr(eq + 1);
     }
+    // Rust `secure: body.secure == Some(true)`. Dropping it would launch a
+    // sandbox whose envd port accepts any caller.
+    request.secure = req.secure;
 
     const orchestrator::OrchestratorResult<orchestrator::SandboxMetadata> r =
         svc_->CreateSandbox(request);
@@ -99,6 +102,14 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
     resp.template_id   = meta.template_id;
     resp.state         = orchestrator::SandboxStateName(meta.state);
     resp.created_at_ms = meta.created_at_ms;
+    // Rust `sandbox_model`.
+    const core::Optional<sandbox::EnvdAccessToken> envd = svc_->GetEnvdAccessToken(meta);
+    if (envd.has_value()) {
+        resp.envd_access_token = core::Optional<std::string>(envd->Expose());
+    }
+    if (!meta.network_policy.allow_public_traffic) {
+        resp.traffic_access_token = core::Optional<std::string>(svc_->TrafficAccessToken(meta.id));
+    }
     return resp;
 }
 
@@ -125,7 +136,13 @@ ApiImpl::GetSandbox(const std::string& sandbox_id) {
     // Rust `get_sandbox` yields Ok(None) for a missing sandbox, which the
     // handler turns into the same 404 a bad id gets.
     if (!r.value()) return core::make_unexpected(SandboxNotFound(sandbox_id));
-    return ToGetSandboxResp(*r.value());
+    GetSandboxResp resp = ToGetSandboxResp(*r.value());
+    // Rust `SandboxDetail::envd_access_token`.
+    const core::Optional<sandbox::EnvdAccessToken> envd = svc_->GetEnvdAccessToken(*r.value());
+    if (envd.has_value()) {
+        resp.envd_access_token = core::Optional<std::string>(envd->Expose());
+    }
+    return resp;
 }
 
 // Rust `sandboxes_sandbox_id_fork_post`.

@@ -40,16 +40,19 @@ AuthDecision Decide(const AuthRequest& request, const AuthChecks& checks) {
 
         // A template-builder sandbox is an internal build artifact, so it is
         // hidden rather than refused: the public API must not reveal that the
-        // id exists.
-        core::Optional<HostProxyRoute> route =
-            RouteForAuth(request.path, request.headers, request.proxy_domains);
-        if (route.has_value()) {
-            const AuthSandboxFacts facts = checks.LookupSandbox(route->sandbox_id);
-            if (facts.lookup_failed) {
-                return AuthDecision::Reject(AuthDecision::Action::InternalServerError);
-            }
-            if (facts.exists && facts.template_builder) {
-                return AuthDecision::Reject(AuthDecision::Action::NotFound);
+        // id exists. Rust reads the id from the matched route's `sandbox_id`
+        // path parameter and ignores one that does not parse.
+        if (request.path_sandbox_id.has_value()) {
+            const core::Expected<core::SandboxId, std::string> id =
+                core::SandboxId::Parse(*request.path_sandbox_id);
+            if (id.ok()) {
+                const AuthSandboxFacts facts = checks.LookupSandbox(id.value());
+                if (facts.lookup_failed) {
+                    return AuthDecision::Reject(AuthDecision::Action::InternalServerError);
+                }
+                if (facts.exists && facts.template_builder) {
+                    return AuthDecision::Reject(AuthDecision::Action::NotFound);
+                }
             }
         }
         return AuthDecision::Allow();

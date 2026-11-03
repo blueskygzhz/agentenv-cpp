@@ -10,6 +10,7 @@
 #include <random>
 #include <sstream>
 
+#include "agentenv/core/digest.h"
 #include "agentenv/core/logging.h"
 
 // Build-time injected identity metadata. Mirrors the Rust build using
@@ -74,17 +75,28 @@ std::string Uuid::ToSimpleString() const {
     return std::string(buf);
 }
 
-// UUID v7 per RFC 9562 §5.7. Non-cryptographic randomness suffices for our IDs.
-Uuid Uuid::GenV4() {
-    // Same thread-local stream as GenV7; only the layout differs.
-    thread_local std::mt19937_64 rng{static_cast<uint64_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count()) ^ 0x9e3779b97f4a7c15ull};
-    const uint64_t hi = rng();
-    const uint64_t lo = rng();
+namespace {
 
+/// The `uuid` crate's `new_v4` / `now_v7` take their random bits from the
+/// `rand` CSPRNG. A sandbox id is a bearer-ish handle (it addresses the data
+/// plane, and a public sandbox accepts traffic by id alone), so a clock-seeded
+/// PRNG — whose whole stream follows from one guessable seed — is not an
+/// equivalent. Failure is fatal, as `getrandom` failing is in the crate.
+void FillIdRandom(uint8_t* out, std::size_t len) {
+    const Expected<Unit, std::string> filled = FillSecureRandom(out, len);
+    if (!filled.ok()) {
+        std::fprintf(stderr, "agentenv: OS random source unavailable: %s\n",
+                     filled.error().c_str());
+        std::abort();
+    }
+}
+
+}  // namespace
+
+// UUID v4 per RFC 9562 §5.4.
+Uuid Uuid::GenV4() {
     uint8_t bytes[16] = {};
-    for (int i = 0; i < 8; ++i) bytes[i] = static_cast<uint8_t>((hi >> (8 * (7 - i))) & 0xff);
-    for (int i = 0; i < 8; ++i) bytes[8 + i] = static_cast<uint8_t>((lo >> (8 * (7 - i))) & 0xff);
+    FillIdRandom(bytes, sizeof(bytes));
     // ver = 4 in the high nibble of bytes[6].
     bytes[6] = static_cast<uint8_t>(0x40 | (bytes[6] & 0x0f));
     // var = 10b in the high two bits of bytes[8].
@@ -92,17 +104,19 @@ Uuid Uuid::GenV4() {
     return Uuid(bytes);
 }
 
+// UUID v7 per RFC 9562 §5.7.
 Uuid Uuid::GenV7() {
     using namespace std::chrono;
     // 48-bit unix ms.
     uint64_t ms = duration_cast<milliseconds>(
         system_clock::now().time_since_epoch()).count();
 
-    // Thread-local RNG.
-    thread_local std::mt19937_64 rng{
-        static_cast<uint64_t>(steady_clock::now().time_since_epoch().count())};
-    uint64_t rand_a = rng() & 0x0fffull;         // 12 bits
-    uint64_t rand_b = rng() & 0x3fffffffffffffffull;  // 62 bits
+    uint8_t random[10] = {};
+    FillIdRandom(random, sizeof(random));
+    const uint64_t rand_a = ((static_cast<uint64_t>(random[0]) << 8) | random[1]) & 0x0fffull;
+    uint64_t rand_b = 0;
+    for (int i = 2; i < 10; ++i) rand_b = (rand_b << 8) | random[i];
+    rand_b &= 0x3fffffffffffffffull;
 
     uint8_t bytes[16] = {};
     bytes[0] = static_cast<uint8_t>((ms >> 40) & 0xff);

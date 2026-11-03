@@ -39,7 +39,52 @@ class FirecrackerSandboxFactory::Impl {
     /// block device.
     std::string mem_device_path_for_testing;
     std::shared_ptr<Connector> connector_for_testing;
+    /// Rust `UblkDeviceManager::global()`.
+    std::shared_ptr<ublk::DeviceManager> ublk_device_manager;
+
+    /// Rust `NetworkManager::global()`; NULL means no network.
+    network::SlotNetworkManager* network_manager = NULL;
+
+    /// The node half of Rust `start_resume`'s drive preparation. Absent
+    /// without a device manager -- the configuration the resume tests use,
+    /// where the work directory is not materialized at all.
+    core::Expected<core::Optional<ResumeDrivePlan>, std::string>
+    ResumeDrivesFor(const SnapshotConfig& snapshot_config) const {
+        if (!ublk_device_manager) return core::Optional<ResumeDrivePlan>();
+        if (!has_app_config) {
+            return core::make_unexpected(std::string(
+                "resume needs the node AppConfig to resolve the tools drive "
+                "(construct the factory with one)"));
+        }
+        const core::Expected<std::string, std::string> tools_drive =
+            snapshot_config.common.ResolvedToolsDrivePath(app_config);
+        if (!tools_drive.ok()) {
+            return core::make_unexpected("resolve tools drive: " + tools_drive.error());
+        }
+        ResumeDrivePlan plan;
+        plan.device_manager = ublk_device_manager;
+        plan.tools_drive_path = tools_drive.value();
+        plan.overlaybd_global_config = app_config.ublk.overlaybd.global_config_path;
+        plan.runtime_upper_mode = app_config.ublk.overlaybd.runtime_upper_mode;
+        plan.extra_drive_allow_shrink = app_config.ublk.overlaybd.allow_shrink;
+        return core::Optional<ResumeDrivePlan>(plan);
+    }
 };
+
+namespace {
+
+/// Rust `std::env::consts::ARCH`, which `add_damon_monitor_region` keys on.
+const char* HostArch() {
+#if defined(__x86_64__)
+    return "x86_64";
+#elif defined(__aarch64__)
+    return "aarch64";
+#else
+    return "";
+#endif
+}
+
+}  // namespace
 
 FirecrackerSandboxFactory::FirecrackerSandboxFactory(Config cfg)
     : impl_(new Impl(std::move(cfg))) {}
@@ -58,6 +103,15 @@ void FirecrackerSandboxFactory::SetResumeDepsForTesting(
     const std::string& mem_device_path, std::shared_ptr<Connector> connector) {
     impl_->mem_device_path_for_testing = mem_device_path;
     impl_->connector_for_testing = connector;
+}
+
+void FirecrackerSandboxFactory::SetUblkDeviceManager(
+    std::shared_ptr<ublk::DeviceManager> manager) {
+    impl_->ublk_device_manager = std::move(manager);
+}
+
+void FirecrackerSandboxFactory::SetNetworkManager(network::SlotNetworkManager* manager) {
+    impl_->network_manager = manager;
 }
 
 core::Expected<std::unique_ptr<SandboxBackend>, core::AnyError>
@@ -92,7 +146,9 @@ FirecrackerSandboxFactory::Build(const FreshSandboxBuildSpec& spec,
     start.firecracker_bin = sandbox_config.common.firecracker_binary.empty()
                                 ? impl_->cfg.firecracker_bin
                                 : sandbox_config.common.firecracker_binary;
-    start.chroot_base_dir = impl_->cfg.chroot_base_dir;
+    start.chroot_base_dir = sandbox_config.common.firecracker_work_base_dir.has_value()
+                                ? *sandbox_config.common.firecracker_work_base_dir
+                                : std::string();
     start.sandbox_id = config.sandbox_id;
     start.firecracker_work_dir = sandbox_config.common.firecracker_work_base_dir;
     // Rust `capture_output` follows the log level: both or neither, per
@@ -122,22 +178,66 @@ FirecrackerSandboxFactory::Build(const FreshSandboxBuildSpec& spec,
         plan.cpu_config_json = *sandbox_config.common.cpu_config_json;
     }
     plan.kernel_image = sandbox_config.kernel_image;
-    plan.boot_args = sandbox_config.boot_args;
+    // Rust `start_fresh`: `init=/init`, the guest mount table
+    // (`agentenv_drives=vdc:<mountPath>[:<subPath>],...`) and the DAMON
+    // region. Without the drives argument the guest has the block devices
+    // but nothing tells it where to mount them.
+    plan.boot_args = ComposeFreshBootArgs(sandbox_config.boot_args,
+                                          sandbox_config.common.extra_drives,
+                                          sandbox_config.mem_size_mib, HostArch());
     plan.disk_rate_limit = sandbox_config.common.disk_rate_limit;
     plan.physical_extra_drive_count = sandbox_config.common.physical_extra_drive_count;
     plan.volume_drive_slots = sandbox_config.common.volume_drive_slots;
-    // No network slot is allocated by this port, so the interface, the MMDS
-    // config and the MMDS document stay out together rather than configuring
-    // a document the guest could not reach.
+    // The interface, the MMDS config and the MMDS document move together with
+    // the slot, which only exists at start: `StartFreshInstance` sets
+    // `has_network_slot` once it has allocated one, and recomposes the boot
+    // args so the slot's `ip=` lands before the DAMON region as in Rust.
     plan.has_network_slot = false;
-
-    // The rootfs drive is attached from the ublk device the daemon exports,
-    // which this port does not bring up. Validated here so the failure names
-    // the missing subsystem instead of surfacing as a guest with no root.
-    if (!sandbox_config.common.ublk_config.has_value()) {
-        return core::make_unexpected(
-            NotPorted("Build", "a ublk device for the rootfs image"));
+    if (impl_->network_manager != NULL) {
+        FreshNetworkPlan network;
+        network.manager = impl_->network_manager;
+        network.policy = sandbox_config.common.network_policy;
+        network.boot_args = sandbox_config.boot_args;
+        network.extra_drives = sandbox_config.common.extra_drives;
+        network.arch = HostArch();
+        // Rust `mmds_metadata(&config.common)`: the recorded document, or a
+        // fresh one naming this sandbox with snapshot "unknown".
+        network.mmds_json = sandbox_config.common.mmds_metadata.has_value()
+                                ? sandbox_config.common.mmds_metadata->ToJson()
+                                : MmdsMetadata(start.sandbox_id, "unknown").ToJson();
+        start.network = network;
     }
+
+    // Rust `start_fresh` attaches the user rootfs from a ublk device the
+    // daemon exports, so a node without a reachable daemon cannot boot one.
+    // Refused here, naming the missing subsystem, rather than as a guest with
+    // no root filesystem.
+    if (!sandbox_config.common.rootfs_image_config.has_value()) {
+        return core::make_unexpected(
+            core::err("firecracker build: fresh sandbox rootfs image config is missing"));
+    }
+    if (!impl_->ublk_device_manager || !impl_->ublk_device_manager->is_available()) {
+        return core::make_unexpected(
+            NotPorted("Build", "a reachable ublk daemon for the rootfs image"));
+    }
+    const core::Expected<std::string, std::string> tools_drive =
+        sandbox_config.common.ResolvedToolsDrivePath(impl_->app_config);
+    if (!tools_drive.ok()) {
+        return core::make_unexpected(
+            core::err("firecracker build: resolve tools drive: " + tools_drive.error()));
+    }
+
+    FreshDrivePlan drives;
+    drives.device_manager = impl_->ublk_device_manager;
+    drives.tools_drive_path = tools_drive.value();
+    drives.rootfs_image_config = *sandbox_config.common.rootfs_image_config;
+    drives.rootfs_virtual_size = sandbox_config.common.rootfs_virtual_size;
+    drives.rootfs_allow_shrink = sandbox_config.common.rootfs_allow_shrink;
+    drives.extra_drives = sandbox_config.common.extra_drives;
+    drives.overlaybd_global_config = impl_->app_config.ublk.overlaybd.global_config_path;
+    drives.runtime_upper_mode = impl_->app_config.ublk.overlaybd.runtime_upper_mode;
+    drives.extra_drive_allow_shrink = impl_->app_config.ublk.overlaybd.allow_shrink;
+    start.drives = drives;
 
     SnapshotConfig snapshot_config;
     std::unique_ptr<SandboxBackend> backend(new FirecrackerSandboxBackend(
@@ -202,6 +302,18 @@ FirecrackerSandboxFactory::BuildFromSnapshot(const RunnableSnapshotView& snapsho
     // `start_resume`, and this port has no ublk client, so the refusal lands
     // at start where Rust's own `ensure!` fires.
     spec.mem_device_path = impl_->mem_device_path_for_testing;
+    // Rust `from_snapshot`: the launch's drives are absent from the source
+    // state and are bound and patched after the load.
+    spec.initial_guest_drive_mounts =
+        InitialGuestDriveMountsForSnapshotLaunch(snapshot_config, config);
+    const core::Expected<core::Optional<ResumeDrivePlan>, std::string> drives =
+        impl_->ResumeDrivesFor(snapshot_config);
+    if (!drives.ok()) {
+        return core::make_unexpected(
+            core::err("firecracker build from snapshot: " + drives.error()));
+    }
+    spec.drives = drives.value();
+    spec.network_manager = impl_->network_manager;
 
     std::unique_ptr<SandboxBackend> backend(
         FirecrackerSandboxBackend::NewResuming(spec, impl_->connector_for_testing));
@@ -254,6 +366,15 @@ FirecrackerSandboxFactory::BuildFromPausedState(
     // fails at start -- where Rust's own `ensure!(is_available())` fires too,
     // rather than at construction where Rust would still succeed.
     spec.mem_device_path = impl_->mem_device_path_for_testing;
+    // No `initial_guest_drive_mounts`: every drive of a paused capture is in
+    // its state, so all of them are bound before the load.
+    const core::Expected<core::Optional<ResumeDrivePlan>, std::string> drives =
+        impl_->ResumeDrivesFor(snapshot_config);
+    if (!drives.ok()) {
+        return core::make_unexpected(core::err("firecracker resume: " + drives.error()));
+    }
+    spec.drives = drives.value();
+    spec.network_manager = impl_->network_manager;
 
     std::unique_ptr<SandboxBackend> backend(
         FirecrackerSandboxBackend::NewResuming(spec, impl_->connector_for_testing));

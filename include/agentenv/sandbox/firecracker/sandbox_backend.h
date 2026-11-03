@@ -18,6 +18,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "agentenv/sandbox/backend.h"
@@ -26,10 +27,22 @@
 #include "agentenv/sandbox/firecracker/dirty_memory.h"
 #include "agentenv/sandbox/firecracker/paused_state.h"
 #include "agentenv/sandbox/firecracker/sandbox.h"
+#include "agentenv/sandbox/ublk.h"
+#include "agentenv/sandbox/ublk/device.h"
 
 namespace agentenv {
 namespace sandbox {
+namespace network {
+class Slot;
+class SlotNetworkManager;
+}  // namespace network
+
 namespace firecracker {
+
+/// Rust `GUEST_ARP_NOTIFY_BOOT_ARG` — makes the guest announce its address
+/// when the link comes up, so the namespace learns the VM's MAC without
+/// waiting on the first ARP exchange.
+extern const char* const kGuestArpNotifyBootArg;
 
 /// Rust `publish_memory_overlaybd_layer` — writes the captured guest memory
 /// out as a sealed LSMT layer.
@@ -127,12 +140,184 @@ struct LaunchMode {
     Kind kind = Kind::Fresh;
 };
 
+/// What a fresh start needs to materialize its block devices on the host.
+///
+/// Rust `start_fresh` does this inline before spawning the VMM:
+///   * `link_tools_drive`   — `work_dir/rootfs.ext4` -> the tools drive;
+///   * `attach_user_rootfs` — a writable overlaybd runtime device from the
+///     ublk daemon, linked as `work_dir/user-rootfs`;
+///   * `prepare_extra_drives` — one runtime device per extra drive, linked as
+///     `work_dir/extra-drive-<id>`;
+///   * `prepare_volume_drive_slots` / `bind_volume_drive_slot` — placeholder
+///     `agentenv_volume_slot_<N>.img` files, the used ones replaced by a
+///     symlink to the volume's attachment.
+///
+/// Firecracker only ever sees these relative names, so without this step the
+/// `PUT /drives` calls point at files that do not exist.
+struct FreshDrivePlan {
+    /// Rust `UblkDeviceManager::global()`. Required: the user rootfs is always
+    /// a ublk device, so a missing or unavailable daemon fails the start.
+    std::shared_ptr<ublk::DeviceManager> device_manager;
+    /// Host path of the tools drive (`resolved_tools_drive_path`). Linked
+    /// after `realpath`, as Rust canonicalizes it, so a dangling path fails
+    /// here instead of inside the guest.
+    std::string tools_drive_path;
+    /// Rust `common.rootfs_image_config`.
+    ublk::OverlaybdDeviceConfig rootfs_image_config;
+    /// Rust `common.rootfs_virtual_size` — the requested target size.
+    core::Optional<uint64_t> rootfs_virtual_size;
+    bool rootfs_allow_shrink = false;
+    /// Rust `common.extra_drives` — physical drives first, then volumes.
+    std::vector<ExtraDrive> extra_drives;
+    /// Rust `ublk.overlaybd.global_config_path`.
+    std::string overlaybd_global_config;
+    /// Rust `ublk.overlaybd.runtime_upper_mode` — applied to extra drives.
+    storage::overlaybd::UpperMode runtime_upper_mode =
+        storage::overlaybd::UpperMode::HybridLogStructured;
+    /// Rust `ublk.overlaybd.allow_shrink` — `ExtraDrivePrepareMode::Fresh`.
+    bool extra_drive_allow_shrink = false;
+};
+
+/// Rust `SandboxResources` — the ublk devices and the network slot a start
+/// created.
+///
+/// Released after the VMM has stopped (Rust `SandboxResources::release`): a
+/// device torn down under a running guest turns every I/O into an error.
+/// Device failures are logged, not returned, as Rust does — the handle is
+/// already gone, so nobody could act on them. A network release failure is
+/// the one that is returned, after everything else was released.
+class FreshDriveResources {
+ public:
+    FreshDriveResources() {}
+    ~FreshDriveResources() { (void)Release(); }
+
+    FreshDriveResources(const FreshDriveResources&) = delete;
+    FreshDriveResources& operator=(const FreshDriveResources&) = delete;
+
+    void Adopt(std::shared_ptr<ublk::DeviceManager> manager) { manager_ = std::move(manager); }
+    void SetRootfs(const ublk::OverlaybdRuntimeDevice& device) {
+        rootfs_ = device;
+        has_rootfs_ = true;
+    }
+    void AddExtraDrive(const ublk::OverlaybdRuntimeDevice& device) {
+        extra_drives_.push_back(device);
+    }
+
+    /// Rust `allocate_network_slot` stores the slot "before any fallible
+    /// setup so that `stop()` or `Drop` releases it" — this is that store.
+    /// The slot goes back to `manager` on release (pooled or torn down).
+    void AdoptNetworkSlot(network::SlotNetworkManager* manager, network::Slot* slot) {
+        network_manager_ = manager;
+        network_slot_ = slot;
+    }
+    network::Slot* network_slot() const { return network_slot_; }
+
+    bool empty() const {
+        return !has_rootfs_ && extra_drives_.empty() && network_slot_ == NULL;
+    }
+    const ublk::OverlaybdRuntimeDevice* rootfs() const { return has_rootfs_ ? &rootfs_ : NULL; }
+    const std::vector<ublk::OverlaybdRuntimeDevice>& extra_drives() const {
+        return extra_drives_;
+    }
+
+    /// Rootfs, then extra drives, then the network slot — Rust's order
+    /// ("ublk devices go after FC stop and before network cleanup").
+    /// Idempotent.
+    core::Expected<core::Unit, std::string> Release();
+
+ private:
+    std::shared_ptr<ublk::DeviceManager> manager_;
+    ublk::OverlaybdRuntimeDevice rootfs_;
+    bool has_rootfs_ = false;
+    std::vector<ublk::OverlaybdRuntimeDevice> extra_drives_;
+    network::SlotNetworkManager* network_manager_ = NULL;
+    network::Slot* network_slot_ = NULL;
+};
+
+/// Rust `append_boot_arg`.
+void AppendBootArg(core::Optional<std::string>* boot_args, const std::string& arg);
+
+/// Rust `start_fresh`'s boot-arg composition, minus the custom-extension
+/// contributions this port does not have: `init=/init` (unless an `init=` is
+/// already present), then `agentenv_drives=...`, then `network_args` (the
+/// slot's `ip=` and `kGuestArpNotifyBootArg`), then the DAMON monitor region.
+core::Optional<std::string> ComposeFreshBootArgs(const core::Optional<std::string>& boot_args,
+                                                 const std::vector<ExtraDrive>& extra_drives,
+                                                 uint32_t mem_size_mib,
+                                                 const std::string& arch,
+                                                 const std::vector<std::string>& network_args);
+
+/// The same without network arguments — a start with no network slot.
+core::Optional<std::string> ComposeFreshBootArgs(const core::Optional<std::string>& boot_args,
+                                                 const std::vector<ExtraDrive>& extra_drives,
+                                                 uint32_t mem_size_mib,
+                                                 const std::string& arch);
+
+/// Rust `start_fresh`'s network half: the slot is allocated at start, and its
+/// `ip=` goes before the DAMON region, so the boot args are composed from
+/// these inputs only once the slot exists.
+struct FreshNetworkPlan {
+    /// Rust `NetworkManager::global()`. Non-owning; process-wide.
+    network::SlotNetworkManager* manager = NULL;
+    /// Rust `config.common.network_policy`.
+    core::Optional<network::SandboxNetworkPolicy> policy;
+    /// Inputs to `ComposeFreshBootArgs`, which runs again with the slot's
+    /// arguments and replaces `ConfigurePlan::boot_args`.
+    core::Optional<std::string> boot_args;
+    std::vector<ExtraDrive> extra_drives;
+    std::string arch;
+    /// Rust `self.mmds_metadata(&config.common)`, serialized. Served once the
+    /// interface exists, which is why it lives here and not on the plan.
+    std::string mmds_json;
+};
+
+/// Rust `prepare_volume_drive_slots` + `bind_volume_drive_slot`.
+///
+/// Creates `count` placeholder files `agentenv_volume_slot_<i>.img` of
+/// `kVolumeDrivePlaceholderSize` bytes in `work_dir` (create-new: an existing
+/// file is an error, not reused), then replaces the first
+/// `volume_attachments.size()` of them with a symlink to the volume's
+/// attachment path. Fails when there are more volumes than slots.
+core::Expected<core::Unit, std::string> PrepareVolumeDriveSlots(
+    const std::string& work_dir, std::size_t count,
+    const std::vector<DriveMount>& volume_attachments);
+
+/// Rust `prepare_volume_drive_slots` alone: creates `count` placeholder files
+/// and returns them as slot attachments (`drive_id` = `VolumeDriveSlotId(i)`,
+/// `attachment_path` = `<drive_id>.img`, relative to `work_dir`). Fails when
+/// `physical + count` exceeds `kMaxExtraDrives`.
+core::Expected<std::vector<DriveMount>, std::string> CreateVolumeDriveSlots(
+    const std::string& work_dir, std::size_t physical_extra_drive_count, std::size_t count);
+
+/// Rust `bind_volume_drive_slot`: replaces the slot's placeholder with a
+/// symlink to `drive.attachment_path`. The slot must exist -- a missing one
+/// means it was never reserved, and Firecracker would reopen nothing.
+core::Expected<core::Unit, std::string> BindVolumeDriveSlot(const std::string& work_dir,
+                                                            const DriveMount& slot,
+                                                            const DriveMount& drive);
+
+/// Rust `link_tools_drive` + `attach_user_rootfs` + `prepare_extra_drives`.
+///
+/// Creates the devices and symlinks in `work_dir`, records each device in
+/// `resources` as soon as it exists (so a later failure still releases it),
+/// and returns the extra-drive attachments in slot order. Rolls back the
+/// symlinks it made on failure, as Rust's `PreparedDrives::cleanup` does.
+core::Expected<std::vector<DriveMount>, std::string> PrepareFreshDrives(
+    const std::string& work_dir, const FreshDrivePlan& plan, FreshDriveResources* resources);
+
 /// What a fresh start needs. Separate from `ConfigurePlan`, which describes the
 /// API calls: this is the process-level half (which binary, where it works,
 /// how long to wait).
 struct FreshStartSpec {
     /// Already-validated plan for the pre-boot API calls.
     ConfigurePlan configure;
+    /// Host-side drive materialization. Absent only for callers that attach
+    /// pre-made files themselves (the legacy `Backend` shim and tests); the
+    /// factory always sets it, because Rust's `start_fresh` always runs it.
+    core::Optional<FreshDrivePlan> drives;
+    /// Network slot + guest `ip=` + interface/MMDS. Absent means no network
+    /// (tests, and a factory given no network manager).
+    core::Optional<FreshNetworkPlan> network;
     std::string firecracker_bin;
     /// Parent for the per-instance work directory.
     std::string chroot_base_dir;
@@ -150,12 +335,50 @@ struct FreshStartSpec {
     int64_t envd_poll_ms = 100;
 };
 
+/// Host-side drive materialization for a resume (Rust `start_resume`:
+/// `link_tools_drive`, `attach_user_rootfs`, `prepare_resume_drives`).
+///
+/// The drive list, rootfs config and slot counts come from the snapshot
+/// config itself; this carries only what the node supplies.
+struct ResumeDrivePlan {
+    /// Rust `UblkDeviceManager::global()`.
+    std::shared_ptr<ublk::DeviceManager> device_manager;
+    /// `common.resolved_tools_drive_path(..)` for the capture's tools version.
+    std::string tools_drive_path;
+    /// Rust `ublk.overlaybd.global_config_path`.
+    std::string overlaybd_global_config;
+    /// Rust `ublk.overlaybd.runtime_upper_mode`.
+    storage::overlaybd::UpperMode runtime_upper_mode =
+        storage::overlaybd::UpperMode::HybridLogStructured;
+    /// Rust `ublk.overlaybd.allow_shrink` — only for launch-slot drives new to
+    /// this launch, which carry a requested rather than a recorded size.
+    bool extra_drive_allow_shrink = false;
+};
+
+/// Rust `(slot, drive)` — a reserved slot and the volume attachment that is
+/// to replace its placeholder.
+struct VolumeSlotBind {
+    DriveMount slot;
+    DriveMount drive;
+};
+
+/// Rust `prepare_resume_drives` (after `link_tools_drive` and
+/// `attach_user_rootfs`, which this also performs).
+///
+/// Snapshot load reopens every serialized slot path, so every placeholder is
+/// created here. Volumes that were in the source state are bound now, before
+/// the load. Drives whose index is in `new_drive_indices` (Rust
+/// `initial_guest_drive_mounts`) are absent from the source state: they are
+/// returned unbound, to be bound and `PATCH`ed after the load.
+core::Expected<std::vector<VolumeSlotBind>, std::string> PrepareResumeDrives(
+    const std::string& work_dir, const ResumeDrivePlan& plan, const CommonConfig& common,
+    const std::vector<std::size_t>& new_drive_indices, FreshDriveResources* resources);
+
 /// What a resume start needs, alongside the capture it restores.
 ///
 /// Separate from `FreshStartSpec` because the two differ in what they send the
-/// VMM, not only in their inputs: a resume has no boot source and no drive
-/// attachments to make, and instead carries the state file and the memory
-/// device the load reads from.
+/// VMM, not only in their inputs: a resume has no boot source, and instead
+/// carries the state file and the memory device the load reads from.
 struct ResumeStartSpec {
     /// The capture to restore, already prepared for this launch.
     SnapshotConfig snapshot_config;
@@ -177,6 +400,22 @@ struct ResumeStartSpec {
     /// is a parameter here because this port has no ublk daemon: without one
     /// the resume cannot proceed, and an empty value is what says so.
     std::string mem_device_path;
+
+    /// Rust `initial_guest_drive_mounts` — `(index into extra_drives, drive)`
+    /// for drives this launch adds that the source state does not contain.
+    /// Empty for a paused-state resume, whose drives are all in the state.
+    std::vector<std::pair<std::size_t, ExtraDrive> > initial_guest_drive_mounts;
+
+    /// Host-side drive materialization. Absent only for callers that stage the
+    /// work directory themselves (tests); the factory sets it whenever it has
+    /// a ublk device manager, because Rust's `start_resume` always runs it.
+    core::Optional<ResumeDrivePlan> drives;
+
+    /// Rust `NetworkManager::global()`. When set, a slot is allocated and the
+    /// VMM is spawned into its namespace, so the load's `eth0 -> tap0`
+    /// override finds the tap. NULL means no network (tests). The egress
+    /// policy is the capture's own, `snapshot_config.common.network_policy`.
+    network::SlotNetworkManager* network_manager = NULL;
 };
 
 /// Rust `FirecrackerSandbox::start_resume` — the ordered API sequence a resume
@@ -212,9 +451,12 @@ struct ResumeStep {
     /// `PatchDrivePath` / `PatchRateLimiter`: the drive id.
     std::string id;
     /// `Logger`: log path. `SnapshotLoad`: vm state path.
-    /// `PatchDrivePath`: the new host path.
+    /// `PatchDrivePath`: the reserved slot's attachment path (relative to the
+    /// work dir), which Firecracker reopens.
     std::string path;
     /// `Logger`: level. `SnapshotLoad`: the memory device path.
+    /// `PatchDrivePath`: the volume attachment the slot is bound to just
+    /// before the PATCH (Rust `bind_volume_drive_slot`); empty = no bind.
     std::string text;
     /// `SnapshotLoad`.
     bool track_dirty_pages = false;
@@ -255,9 +497,14 @@ core::Expected<core::Unit, std::string>
 /// `Expected`: this port's `Expected` unconditionally instantiates its value
 /// type's copy constructor, which a `unique_ptr` does not have. Ownership is
 /// still all-or-nothing — `out` is only assigned on success.
+///
+/// When `spec.drives` is set, `resources` is required: it receives the ublk
+/// devices the start created and must outlive the VMM. On failure the devices
+/// are released before returning.
 core::Expected<core::Unit, std::string>
     StartFreshInstance(const FreshStartSpec& spec, std::shared_ptr<Connector> connector,
-                       std::unique_ptr<FirecrackerInstance>* out);
+                       std::unique_ptr<FirecrackerInstance>* out,
+                       FreshDriveResources* resources = NULL);
 
 /// Rust `FirecrackerSandbox::start_resume` — the process half of a resume.
 ///
@@ -265,9 +512,14 @@ core::Expected<core::Unit, std::string>
 /// spawn, wait for the socket, apply) with one difference that matters: there
 /// is no `InstanceStart`. The VM comes into existence already running from the
 /// loaded state, and the sequence's own last step is the resume.
+///
+/// When `spec.drives` is set, `resources` is required, as on the fresh path:
+/// the drives are materialized before the VMM is spawned and released again
+/// on failure.
 core::Expected<core::Unit, std::string>
     StartResumeInstance(const ResumeStartSpec& spec, std::shared_ptr<Connector> connector,
-                        std::unique_ptr<FirecrackerInstance>* out);
+                        std::unique_ptr<FirecrackerInstance>* out,
+                        FreshDriveResources* resources = NULL);
 
 /// Rust `impl SandboxBackend for FirecrackerSandbox`.
 ///

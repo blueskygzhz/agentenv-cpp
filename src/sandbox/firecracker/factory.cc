@@ -81,8 +81,12 @@ InitialGuestDriveMountsForSnapshotLaunch(const SnapshotConfig& config,
     // Already bound before the load, so there is nothing to patch afterwards.
     if (launch_config.extra_drives_in_snapshot) return mounts;
 
-    const std::size_t first_slot = config.common.physical_extra_drive_count;
-    for (std::size_t i = 0; i < launch_config.extra_drives.size(); ++i) {
+    // Rust: launch-time drives follow the snapshot's own drives.
+    const std::size_t total = config.common.extra_drives.size();
+    const std::size_t launched = launch_config.extra_drives.size();
+    if (launched > total) return mounts;  // not an applied config; nothing to index
+    const std::size_t first_slot = total - launched;
+    for (std::size_t i = 0; i < launched; ++i) {
         mounts.push_back(std::make_pair(first_slot + i, launch_config.extra_drives[i]));
     }
     return mounts;

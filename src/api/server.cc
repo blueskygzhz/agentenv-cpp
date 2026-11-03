@@ -94,18 +94,18 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc)
         resp->body = r.value().ToJson().ToString();
     });
 
-    server->Route("GET", "/sandboxes/{id}",
+    server->Route("GET", "/sandboxes/{sandbox_id}",
                   [impl](const HttpRequest& req, HttpResponse* resp) {
         const core::Expected<GetSandboxResp, ApiError> r =
-            impl->GetSandbox(Param(req, "id"));
+            impl->GetSandbox(Param(req, "sandbox_id"));
         if (!r.ok()) return WriteError(r.error(), resp);
         WriteJson(r.value().ToJson(), resp);
     });
 
-    server->Route("DELETE", "/sandboxes/{id}",
+    server->Route("DELETE", "/sandboxes/{sandbox_id}",
                   [impl](const HttpRequest& req, HttpResponse* resp) {
         const core::Expected<core::Unit, ApiError> r =
-            impl->DeleteSandbox(Param(req, "id"));
+            impl->DeleteSandbox(Param(req, "sandbox_id"));
         if (!r.ok()) return WriteError(r.error(), resp);
         // 204: the delete succeeded and there is nothing to return. An empty
         // 200 body would be indistinguishable from a handler that forgot to
@@ -113,23 +113,23 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc)
         resp->status = 204;
     });
 
-    server->Route("POST", "/sandboxes/{id}/pause",
+    server->Route("POST", "/sandboxes/{sandbox_id}/pause",
                   [impl](const HttpRequest& req, HttpResponse* resp) {
         const core::Expected<core::Unit, ApiError> r =
-            impl->PauseSandbox(Param(req, "id"));
+            impl->PauseSandbox(Param(req, "sandbox_id"));
         if (!r.ok()) return WriteError(r.error(), resp);
         resp->status = 204;
     });
 
-    server->Route("POST", "/sandboxes/{id}/resume",
+    server->Route("POST", "/sandboxes/{sandbox_id}/resume",
                   [impl](const HttpRequest& req, HttpResponse* resp) {
         const core::Expected<GetSandboxResp, ApiError> r =
-            impl->ResumeSandbox(Param(req, "id"));
+            impl->ResumeSandbox(Param(req, "sandbox_id"));
         if (!r.ok()) return WriteError(r.error(), resp);
         WriteJson(r.value().ToJson(), resp);
     });
 
-    server->Route("POST", "/sandboxes/{id}/exec",
+    server->Route("POST", "/sandboxes/{sandbox_id}/exec",
                   [impl](const HttpRequest& req, HttpResponse* resp) {
         core::Json body;
         if (!ParseBody(req, &body, resp)) return;
@@ -138,12 +138,12 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc)
             return WriteError(ApiError::Make(400, parsed.error().chain()), resp);
         }
         const core::Expected<ExecResp, ApiError> r =
-            impl->Exec(Param(req, "id"), parsed.value());
+            impl->Exec(Param(req, "sandbox_id"), parsed.value());
         if (!r.ok()) return WriteError(r.error(), resp);
         WriteJson(r.value().ToJson(), resp);
     });
 
-    server->Route("POST", "/sandboxes/{id}/fork",
+    server->Route("POST", "/sandboxes/{sandbox_id}/fork",
                   [impl](const HttpRequest& req, HttpResponse* resp) {
         // The body is optional: Rust's parameter is
         // `Option<SandboxForkRequest>`, and an absent one forks once with the
@@ -160,7 +160,7 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc)
             parsed = decoded.value();
         }
         const core::Expected<ForkSandboxResp, ApiError> r =
-            impl->ForkSandbox(Param(req, "id"), parsed);
+            impl->ForkSandbox(Param(req, "sandbox_id"), parsed);
         if (!r.ok()) return WriteError(r.error(), resp);
         // 201, and the per-child results are in the body. A child that failed
         // is reported there rather than by the status, which describes the
@@ -169,10 +169,10 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc)
         resp->status = 201;
     });
 
-    server->Route("POST", "/sandboxes/{id}/snapshot",
+    server->Route("POST", "/sandboxes/{sandbox_id}/snapshot",
                   [impl](const HttpRequest& req, HttpResponse* resp) {
         const core::Expected<core::Unit, ApiError> r =
-            impl->CreateSnapshot(Param(req, "id"));
+            impl->CreateSnapshot(Param(req, "sandbox_id"));
         if (!r.ok()) return WriteError(r.error(), resp);
         resp->status = 204;
     });

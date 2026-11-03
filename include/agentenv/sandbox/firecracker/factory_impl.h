@@ -17,6 +17,15 @@
 #include "agentenv/core/optional.h"
 #include "agentenv/sandbox/backend.h"
 #include "agentenv/sandbox/firecracker/sandbox.h"
+#include "agentenv/sandbox/ublk/device.h"
+
+namespace agentenv {
+namespace sandbox {
+namespace network {
+class SlotNetworkManager;
+}  // namespace network
+}  // namespace sandbox
+}  // namespace agentenv
 
 namespace agentenv {
 namespace sandbox {
@@ -63,6 +72,18 @@ class FirecrackerSandboxFactory : public SandboxBackendFactory {
     /// is the part that decides whether a restore works at all.
     void SetResumeDepsForTesting(const std::string& mem_device_path,
                                  std::shared_ptr<Connector> connector);
+
+    /// Rust `UblkDeviceManager::global()`. `Build` hands it to every fresh
+    /// sandbox, whose start creates the user rootfs and extra drives through
+    /// it. Without one (or with one whose daemon is unavailable) `Build`
+    /// refuses, as Rust's `require_client` does at start.
+    void SetUblkDeviceManager(std::shared_ptr<ublk::DeviceManager> manager);
+
+    /// Rust `NetworkManager::global()`. Non-owning: the manager is
+    /// process-wide and outlives every sandbox. With one, every fresh and
+    /// resumed sandbox gets a network slot (Rust allocates one
+    /// unconditionally); without one -- tests -- sandboxes have no network.
+    void SetNetworkManager(network::SlotNetworkManager* manager);
 
     FirecrackerSandboxFactory(const FirecrackerSandboxFactory&) = delete;
     FirecrackerSandboxFactory& operator=(const FirecrackerSandboxFactory&) = delete;

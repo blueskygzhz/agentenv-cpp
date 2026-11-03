@@ -6,7 +6,9 @@
 #define AGENTENV_API_SERVER_H_
 
 #include <functional>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 
@@ -21,9 +23,27 @@ namespace api {
 struct HttpRequest {
     std::string method;               // GET / POST / DELETE / PATCH
     std::string path;                 // "/sandboxes/abc"
+    /// The request target's path and query exactly as sent (not
+    /// percent-decoded). Rust's proxy forwards `uri.path()` / `uri.query()`
+    /// verbatim; forwarding the decoded `path` would change what the guest
+    /// sees (an encoded `/` would become a segment separator).
+    std::string raw_path;
+    std::string raw_query;
+    bool        has_query = false;
+    /// Lowercased name -> the *first* value, as `HeaderMap::get` returns it.
     std::unordered_map<std::string, std::string> headers;
+    /// Lowercased names that were sent more than once. Rust's `HeaderMap`
+    /// keeps every value, and `single_header` treats a repeated credential as
+    /// absent; this set is what lets the auth layer see "sent twice" through
+    /// the one-value `headers` map.
+    std::set<std::string> repeated_headers;
     std::unordered_map<std::string, std::string> query;
     std::string body;
+    /// Rust `MatchedPath`: set by the server, before any middleware runs, when
+    /// the path matched a registered route (whatever the method).
+    bool matched_route = false;
+    /// Rust `RawPathParams` of the matched route.
+    std::map<std::string, std::string> path_params;
 };
 
 struct HttpResponse {

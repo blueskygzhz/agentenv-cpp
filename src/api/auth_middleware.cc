@@ -2,6 +2,7 @@
 // Rust: src/api/impls/auth.rs — production checks + the server layer.
 #include "agentenv/api/auth_middleware.h"
 
+#include <map>
 #include <sstream>
 #include <unordered_map>
 
@@ -12,30 +13,28 @@ namespace agentenv {
 namespace api {
 namespace {
 
-/// Removes every value of a header from the request's header map.
-///
-/// `HttpRequest::headers` is an `unordered_map` (one value per name) while
-/// `auth.h` works on a `multimap`. That difference matters: Rust's
-/// `single_header` treats a header sent twice as absent, and an
-/// `unordered_map` cannot represent "sent twice" at all. See
-/// `ToAuthHeaderMap` for how the request is presented to the decision.
-void EraseRequestHeader(std::unordered_map<std::string, std::string>* headers,
-                        const char* name) {
-    if (headers == NULL) return;
-    headers->erase(name);
+/// Removes every value of a header from the request.
+void EraseRequestHeader(HttpRequest* request, const char* name) {
+    if (request == NULL) return;
+    request->headers.erase(name);
+    request->repeated_headers.erase(name);
 }
 
 /// Projects the request's headers into the multimap the decision expects.
 ///
-/// This is lossy in the safe direction only: a duplicate header cannot survive
-/// the parser's `unordered_map`, so `SingleHeader` here can never see the
-/// two-values case that Rust rejects. If the framing layer ever preserves
-/// duplicates, this is the single place that has to carry them through.
-HeaderMap ToAuthHeaderMap(const std::unordered_map<std::string, std::string>& headers) {
+/// A header the client sent more than once is projected twice, so
+/// `SingleHeader` sees the duplicate and treats it as absent exactly as Rust's
+/// `single_header` does. Only the count matters there; the routing helpers
+/// read the first value, which is the one `headers` holds.
+HeaderMap ToAuthHeaderMap(const HttpRequest& request) {
     HeaderMap out;
-    for (std::unordered_map<std::string, std::string>::const_iterator it = headers.begin();
-         it != headers.end(); ++it) {
+    for (std::unordered_map<std::string, std::string>::const_iterator it =
+             request.headers.begin();
+         it != request.headers.end(); ++it) {
         out.insert(std::make_pair(it->first, it->second));
+        if (request.repeated_headers.count(it->first) != 0) {
+            out.insert(std::make_pair(it->first, it->second));
+        }
     }
     return out;
 }
@@ -114,10 +113,10 @@ void ApplyAuthDecision(const AuthDecision& decision, HttpRequest* request,
     // paths too, so a short-circuit response is built from a request that no
     // longer carries a credential it did not use.
     if (decision.strip_api_key) {
-        EraseRequestHeader(&request->headers, kApiKeyHeader);
+        EraseRequestHeader(request, kApiKeyHeader);
     }
     if (decision.strip_envd_access_token) {
-        EraseRequestHeader(&request->headers, kEnvdAccessTokenHeader);
+        EraseRequestHeader(request, kEnvdAccessTokenHeader);
     }
 
     switch (decision.action) {
@@ -150,12 +149,20 @@ Middleware MakeAuthMiddleware(std::shared_ptr<AuthChecks> checks,
         }
 
         AuthRequest auth_request;
-        auth_request.path          = request->path;
-        auth_request.headers       = ToAuthHeaderMap(request->headers);
+        // Rust inspects `uri().path()`, the path as sent: `/proxy%2F..` is not
+        // under the proxy prefix there, and must not be here.
+        auth_request.path          = request->raw_path.empty() ? request->path
+                                                               : request->raw_path;
+        auth_request.headers       = ToAuthHeaderMap(*request);
         auth_request.proxy_domains = proxy_domains;
-        // This port has no sandbox proxy data plane, so a request can never
-        // have been matched as one. Rust derives this from `MatchedPath`.
-        auth_request.matched_api_route = true;
+        // Rust derives these from `MatchedPath` / `RawPathParams`, which the
+        // server records before any layer runs.
+        auth_request.matched_api_route = request->matched_route;
+        std::map<std::string, std::string>::const_iterator param =
+            request->path_params.find("sandbox_id");
+        if (param != request->path_params.end()) {
+            auth_request.path_sandbox_id = core::Optional<std::string>(param->second);
+        }
 
         const AuthDecision decision = Decide(auth_request, *checks);
         ApplyAuthDecision(decision, request, response);

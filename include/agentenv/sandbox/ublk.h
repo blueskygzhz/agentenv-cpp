@@ -90,13 +90,8 @@ struct UblkDaemonConfig {
     int32_t     shutdown_timeout_ms = 5000;
 };
 
-/// Rust trait `UblkDeviceManager`.
-class DeviceManager {
- public:
-    virtual ~DeviceManager() {}
-    virtual core::Expected<std::string, std::string> Attach(const UblkConfig& cfg) = 0;
-    virtual core::Expected<core::Unit, std::string> Detach(const std::string& dev_path) = 0;
-};
+// `UblkDeviceManager` is a concrete struct in Rust, ported as
+// `ublk::DeviceManager` in `agentenv/sandbox/ublk/device.h`.
 
 }  // namespace ublk
 }  // namespace sandbox

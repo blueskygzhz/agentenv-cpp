@@ -28,6 +28,13 @@ data_dir = "$WORK/data"
 server_bind_addr = "127.0.0.1:$PORT"
 EOF
 
+# The auth layer wraps every route, so the control-plane requests below need a
+# credential. Supplying it through AENV_API_KEY exercises the real resolution
+# path (`ApiKey::Resolve`) rather than disabling auth for the test -- which
+# would leave the one check that the server actually authorizes requests
+# untested. 32 URL-safe characters is the documented minimum.
+export AENV_API_KEY="smoke0000api0000key0000000000abcd"
+
 "$BIN" "$WORK/config.toml" > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 
@@ -37,6 +44,21 @@ ready=0
 for _ in $(seq 1 100); do
     if curl -sf -o /dev/null "$BASE/health" 2>/dev/null; then ready=1; break; fi
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        # The runtime refuses to start without CAP_NET_ADMIN / CAP_SYS_ADMIN,
+        # which an unprivileged container cannot grant. That is a missing
+        # precondition for this test, not a defect in what it checks, so it is
+        # reported as a skip -- failing would train everyone to ignore it, and
+        # removing the capability gate to suit the test would drop a real
+        # check from the production path.
+        #
+        # Matched on the binary's own message rather than probing capabilities
+        # here, so there is one definition of "sufficiently privileged" and the
+        # test cannot disagree with the code it is testing.
+        if grep -q "missing required Linux capabilities" "$WORK/server.log"; then
+            echo "SKIP: needs CAP_NET_ADMIN and CAP_SYS_ADMIN (run as root or"
+            echo "      with those capabilities to exercise this test)"
+            exit 77
+        fi
         echo "FAIL: server exited during startup"
         cat "$WORK/server.log"
         exit 1
@@ -52,11 +74,16 @@ fi
 failures=0
 
 # `expect <what> <wanted-status> <curl args...>`
+#
+# Every request carries the API key. `/health` does not need one, but sending
+# it anyway keeps the helper uniform and still asserts the documented
+# behaviour: the bypass is by path, not by the absence of a credential.
 expect() {
     local what="$1"; shift
     local want="$1"; shift
     local got
-    got="$(curl -s -o "$WORK/body" -w '%{http_code}' "$@")"
+    got="$(curl -s -o "$WORK/body" -w '%{http_code}' \
+           -H "x-api-key: $AENV_API_KEY" "$@")"
     if [ "$got" = "$want" ]; then
         echo "  ok    $what ($got)"
     else
@@ -70,6 +97,29 @@ echo "smoke: $BASE"
 
 expect "GET  /health"              200 "$BASE/health"
 expect "GET  /sandboxes"           200 "$BASE/sandboxes"
+
+# The credential has to actually matter. Without this, every assertion above
+# would pass just as well against a server that ignored the key entirely --
+# which is the state the auth wiring exists to end. Checked with the one
+# request known to answer 200 when authorized, so a 401 here can only be the
+# missing key.
+noauth="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/sandboxes")"
+if [ "$noauth" = "401" ]; then
+    echo "  ok    GET  /sandboxes without a key is refused (401)"
+else
+    echo "  FAIL  GET  /sandboxes without a key: expected 401, got $noauth"
+    failures=$((failures + 1))
+fi
+# `/health` stays reachable unauthenticated -- the bypass is by path, and the
+# readiness poll above depends on it.
+noauth_health="$(curl -s -o /dev/null -w '%{http_code}' "$BASE/health")"
+if [ "$noauth_health" = "200" ]; then
+    echo "  ok    GET  /health without a key is allowed (200)"
+else
+    echo "  FAIL  GET  /health without a key: expected 200, got $noauth_health"
+    failures=$((failures + 1))
+fi
+
 expect "GET  unknown sandbox"      404 "$BASE/sandboxes/0192f3a1-4c5d-7e80-9abc-def012345678"
 expect "GET  malformed id"         404 "$BASE/sandboxes/not-a-uuid"
 expect "GET  unknown route"        404 "$BASE/nope"
@@ -86,6 +136,7 @@ expect "POST exec (unported)"      501 -X POST -d '{"cmd":["true"]}' \
 # of a firecracker binary and KVM. What matters is that the error travels: a
 # 500 naming the real cause, not a 201 for a sandbox that does not exist.
 create_status="$(curl -s -o "$WORK/create" -w '%{http_code}' -X POST \
+    -H "x-api-key: $AENV_API_KEY" \
     -H 'Content-Type: application/json' -d '{"template_id":"base"}' "$BASE/sandboxes")"
 if [ "$create_status" = "500" ] || [ "$create_status" = "201" ]; then
     echo "  ok    POST /sandboxes reaches the backend ($create_status)"

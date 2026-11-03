@@ -284,12 +284,61 @@ MT_TEST(auth_control_plane_hides_template_builder_sandbox) {
     checks.facts.template_builder = true;
 
     AuthRequest request = Request("/sandboxes/x");
-    Add(&request, kSandboxIdHeader, kSandbox);
-    Add(&request, kTargetPortHeader, "8080");
     request.matched_api_route = true;  // the router matched an API route
+    // The id comes from the matched route's `sandbox_id` path parameter, which
+    // is the only source the control plane reads -- see the next test.
+    request.path_sandbox_id = core::Optional<std::string>(kSandbox);
 
     // 404 rather than 403: the public API must not reveal that the id exists.
     MT_EXPECT_TRUE(Decide(request, checks).action == AuthDecision::Action::NotFound);
+}
+
+MT_TEST(auth_control_plane_ignores_routing_headers_when_hiding) {
+    // Routing headers address the *data* plane. A control-plane route that did
+    // not capture a `sandbox_id` must not fall back to them: doing so would
+    // let a caller aim the template-builder lookup at an arbitrary sandbox by
+    // attaching a header to an unrelated API call.
+    Checks checks;
+    checks.valid_api_key          = true;
+    checks.facts.template_builder = true;
+
+    AuthRequest request = Request("/sandboxes");
+    Add(&request, kSandboxIdHeader, kSandbox);
+    Add(&request, kTargetPortHeader, "8080");
+    request.matched_api_route = true;
+    // No `path_sandbox_id`: the route captured none.
+
+    MT_EXPECT_TRUE(Decide(request, checks).action == AuthDecision::Action::Allow);
+}
+
+MT_TEST(auth_control_plane_ignores_an_unparseable_path_sandbox_id) {
+    // Rust `SandboxId::parse_str(id).ok()` drops a malformed id and carries on
+    // rather than rejecting the request.
+    Checks checks;
+    checks.valid_api_key          = true;
+    checks.facts.template_builder = true;
+
+    AuthRequest request = Request("/sandboxes/not-a-uuid");
+    request.matched_api_route = true;
+    request.path_sandbox_id = core::Optional<std::string>("not-a-uuid");
+
+    MT_EXPECT_TRUE(Decide(request, checks).action == AuthDecision::Action::Allow);
+}
+
+MT_TEST(auth_control_plane_does_not_hide_an_absent_sandbox) {
+    // `exists == false` with the flag still set is what a stale lookup looks
+    // like; only a sandbox that is actually there may be hidden, or a 404
+    // would be indistinguishable from a missing route.
+    Checks checks;
+    checks.valid_api_key          = true;
+    checks.facts.exists           = false;
+    checks.facts.template_builder = true;
+
+    AuthRequest request = Request("/sandboxes/x");
+    request.matched_api_route = true;
+    request.path_sandbox_id = core::Optional<std::string>(kSandbox);
+
+    MT_EXPECT_TRUE(Decide(request, checks).action == AuthDecision::Action::Allow);
 }
 
 MT_TEST(auth_control_plane_reports_lookup_failure) {
@@ -298,9 +347,8 @@ MT_TEST(auth_control_plane_reports_lookup_failure) {
     checks.facts.lookup_failed = true;
 
     AuthRequest request = Request("/sandboxes/x");
-    Add(&request, kSandboxIdHeader, kSandbox);
-    Add(&request, kTargetPortHeader, "8080");
     request.matched_api_route = true;
+    request.path_sandbox_id = core::Optional<std::string>(kSandbox);
 
     MT_EXPECT_TRUE(Decide(request, checks).action ==
                    AuthDecision::Action::InternalServerError);

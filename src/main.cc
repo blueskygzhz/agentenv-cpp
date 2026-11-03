@@ -3,6 +3,7 @@
 // This is the C++11 analog of Rust `src/bin/agentenv.rs`.
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -10,6 +11,7 @@
 #include <unordered_map>
 
 #include "agentenv/api/auth_middleware.h"
+#include "agentenv/api/proxy.h"
 #include "agentenv/api/server.h"
 #include "agentenv/api_key.h"
 #include "agentenv/core/config.h"
@@ -21,8 +23,11 @@
 #include "agentenv/p2p/http_transport.h"
 #include "agentenv/p2p/node.h"
 #include "agentenv/p2p/scheduler_http.h"
+#include "agentenv/privileges.h"
 #include "agentenv/sandbox/backend.h"
 #include "agentenv/sandbox/firecracker/factory_impl.h"
+#include "agentenv/sandbox/network/manager.h"
+#include "agentenv/setup.h"
 
 namespace ae = agentenv;
 
@@ -188,8 +193,85 @@ ae::core::NodeIdentityConfig ToCoreIdentityConfig(
 
 }  // namespace
 
+namespace {
+
+/// Rust `ServerCli` (clap). `--setup-only` provisioning is not ported, so it
+/// is refused rather than mistaken for a config path and a normal start.
+struct ServerCli {
+    bool setup_host = false;
+    std::string runtime_user = "aenv";
+    std::string runtime_group = "aenv";
+    bool runtime_account_given = false;
+    std::string config_path;
+};
+
+bool ParseServerCli(int argc, char** argv, ServerCli* cli, std::string* error) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        std::string value;
+        bool has_inline = false;
+        std::string name = arg;
+        const std::size_t eq = arg.find('=');
+        if (arg.compare(0, 2, "--") == 0 && eq != std::string::npos) {
+            name = arg.substr(0, eq);
+            value = arg.substr(eq + 1);
+            has_inline = true;
+        }
+        const bool takes_value = name == "--config" || name == "--runtime-user" ||
+                                 name == "--runtime-group";
+        if (takes_value && !has_inline) {
+            if (i + 1 >= argc) {
+                *error = "a value is required for '" + name + "'";
+                return false;
+            }
+            value = argv[++i];
+        }
+        if (name == "--setup-host") {
+            cli->setup_host = true;
+        } else if (name == "--setup-only") {
+            *error = "--setup-only provisioning is not available in this build";
+            return false;
+        } else if (name == "--config") {
+            cli->config_path = value;
+        } else if (name == "--runtime-user") {
+            cli->runtime_user = value;
+            cli->runtime_account_given = true;
+        } else if (name == "--runtime-group") {
+            cli->runtime_group = value;
+            cli->runtime_account_given = true;
+        } else if (arg.compare(0, 1, "-") != 0 && cli->config_path.empty()) {
+            // Positional config path, kept for existing deployments of this
+            // port; Rust only knows `--config`.
+            cli->config_path = arg;
+        } else {
+            *error = "unexpected argument '" + arg + "'";
+            return false;
+        }
+    }
+    if (cli->runtime_account_given && !cli->setup_host) {
+        // clap `requires = "setup_host"`.
+        *error = "--runtime-user/--runtime-group require --setup-host";
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
-    std::string cfg_path = (argc > 1) ? argv[1] : "/etc/agentenv/config.toml";
+    ServerCli cli;
+    std::string cli_error;
+    if (!ParseServerCli(argc, argv, &cli, &cli_error)) {
+        std::fprintf(stderr, "error: %s\n", cli_error.c_str());
+        return 2;
+    }
+    // Rust: `--config`, else `AENV_CONFIG_PATH` (via `init_global`).
+    std::string cfg_path = cli.config_path;
+    if (cfg_path.empty()) {
+        const char* from_env = std::getenv("AENV_CONFIG_PATH");
+        cfg_path = (from_env != NULL && *from_env != '\0') ? from_env
+                                                          : "/etc/agentenv/config.toml";
+    }
 
     // 1) Load config (falls back to defaults if missing).
     ae::core::Config cfg;
@@ -223,6 +305,36 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Rust `server.rs:75-79`.
+    if (cli.setup_host) {
+        auto host = ae::setup::EnsureHost(app_cfg.deps_path, cli.runtime_user,
+                                          cli.runtime_group);
+        if (!host.ok()) {
+            AGENTENV_ERROR("host setup failed: " << host.error());
+            return 1;
+        }
+        AGENTENV_INFO("host setup complete");
+        return 0;
+    }
+
+    // Rust `server.rs:81-82`, before anything that can spawn a process. The
+    // server keeps CAP_NET_ADMIN / CAP_SYS_ADMIN for the operations that need
+    // them (each runs in a capability-scoped thread); clearing the ambient set
+    // is what stops every ordinary child — firecracker, `ip`, `mount` helpers —
+    // from inheriting them across `execve`.
+    {
+        auto required = ae::privileges::RequireRuntimeCapabilities();
+        if (!required.ok()) {
+            AGENTENV_ERROR(required.error());
+            return 1;
+        }
+        auto cleared = ae::privileges::ClearAmbientCapabilities();
+        if (!cleared.ok()) {
+            AGENTENV_ERROR(cleared.error());
+            return 1;
+        }
+    }
+
     auto store = std::shared_ptr<ae::orchestrator::MetadataStore>(
                      new ae::orchestrator::InMemoryMetadataStore());
 
@@ -238,9 +350,39 @@ int main(int argc, char** argv) {
     // The AppConfig goes in too: `Build` projects each request onto it (rootfs
     // image, tools drive, boot-arg allowlist), and a factory without one can
     // only refuse to build.
-    auto factory = std::shared_ptr<ae::sandbox::SandboxBackendFactory>(
-                       new ae::sandbox::firecracker::FirecrackerSandboxFactory(
-                           fc_cfg, app_cfg));
+    auto fc_factory = std::make_shared<ae::sandbox::firecracker::FirecrackerSandboxFactory>(
+        fc_cfg, app_cfg);
+
+    // Rust `UblkDeviceManager::init_global_from_config`: every fresh sandbox's
+    // user rootfs and extra drives (volumes included) are ublk devices the
+    // daemon exports. Rust spawns the daemon itself; this port connects to
+    // one already listening on `ublk.daemon_socket_path` (run
+    // `agentenv-ublk-daemon` beside the server). As in Rust, an unreachable
+    // daemon is not fatal at startup -- the manager is left without a client
+    // and `Build` refuses fresh sandboxes, naming the daemon.
+    {
+        const std::string& socket_path = app_cfg.ublk.daemon_socket_path;
+        std::shared_ptr<ae::storage::ublk_daemon::DaemonClient> client(
+            new ae::storage::ublk_daemon::DaemonClient(
+                ae::storage::ublk_daemon::MakeUnixTransport(socket_path), socket_path));
+        const auto features = client->GetFeatures();
+        if (!features.ok()) {
+            AGENTENV_ERROR("ublk daemon at " << socket_path
+                                             << " is unreachable; fresh sandboxes are disabled: "
+                                             << features.error().message);
+            client.reset();
+        } else {
+            AGENTENV_INFO("connected to ublk daemon at " << socket_path);
+        }
+        fc_factory->SetUblkDeviceManager(std::make_shared<ae::sandbox::ublk::DeviceManager>(
+            client, app_cfg.BlockPoolConfig().has_value()));
+    }
+    // Rust `NetworkManager::global()`: every sandbox gets a slot -- netns,
+    // veth pair, tap0 -- and its VMM is spawned into that namespace. Created
+    // here rather than on first allocation so a missing CAP_NET_ADMIN is
+    // reported at startup (construction only warns, as Rust does).
+    fc_factory->SetNetworkManager(&ae::sandbox::network::SlotNetworkManager::Global());
+    auto factory = std::shared_ptr<ae::sandbox::SandboxBackendFactory>(fc_factory);
 
     auto built = ae::orchestrator::Orchestrator::New(store, factory, persister, app_cfg);
     if (!built.ok()) {
@@ -346,6 +488,15 @@ int main(int argc, char** argv) {
                                             app_cfg.tools.control_plane_port));
     server->Use(ae::api::MakeAuthMiddleware(auth_checks,
                                             app_cfg.sandbox_proxy.domains));
+    // Rust `sandbox_proxy_classifier`, inside the auth layer: every request
+    // addressing a sandbox is answered by the proxy, so one authorized by a
+    // sandbox's data-plane policy can never reach a control-plane route.
+    server->Use(ae::api::MakeSandboxProxyClassifier(
+        app_cfg.sandbox_proxy.domains,
+        ae::api::MakeOrchestratorProxyForwarder(
+            svc.get(),
+            static_cast<int64_t>(app_cfg.orchestrator.auto_resume_min_sandbox_timeout_secs) *
+                1000)));
 
     ae::api::RegisterOrchestratorRoutes(server.get(), svc.get());
 

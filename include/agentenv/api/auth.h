@@ -78,6 +78,10 @@ struct AuthRequest {
     std::vector<std::string> proxy_domains;
     /// Rust's `MatchedPath` extension: the router already matched an API route.
     bool                     matched_api_route = false;
+    /// Rust `RawPathParams` lookup of `sandbox_id` on the matched API route.
+    /// The control plane hides a template-builder sandbox by *this* id, never
+    /// by a routing header or host: those address the data plane.
+    core::Optional<std::string> path_sandbox_id;
 };
 
 /// The credential checks, supplied by the caller so this layer stays free of

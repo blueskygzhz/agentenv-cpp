@@ -116,8 +116,8 @@ MT_TEST(drives_are_attached_in_guest_slot_order) {
     MT_EXPECT_EQ(ids[1], std::string(kUserRootfsDriveId));  // vdb
     MT_EXPECT_EQ(ids[2], std::string("extra0"));            // vdc
     MT_EXPECT_EQ(ids[3], std::string("extra1"));            // vdd
-    MT_EXPECT_EQ(ids[4], VolumeDriveSlotId(2));             // vde
-    MT_EXPECT_EQ(ids[5], VolumeDriveSlotId(3));             // vdf
+    MT_EXPECT_EQ(ids[4], VolumeDriveSlotId(0));             // vde
+    MT_EXPECT_EQ(ids[5], VolumeDriveSlotId(1));             // vdf
 }
 
 // ============================================================
@@ -248,9 +248,11 @@ MT_TEST(volume_slots_are_reserved_even_when_no_volume_uses_them) {
     MT_EXPECT_EQ(ids[4], VolumeDriveSlotId(2));
 }
 
-MT_TEST(volume_slot_ids_continue_after_the_physical_drives) {
-    // Slot ids are offset by the physical count, so a slot never collides with
-    // a physical drive's position in the guest's device order.
+MT_TEST(volume_slot_ids_start_at_zero_after_the_physical_drives) {
+    // Rust `prepare_volume_drive_slots` numbers slots 0..count regardless of
+    // the physical count; the resume path PATCHes `slot_{i - physical}`, so
+    // a fresh boot that offset the ids would leave resume naming a drive the
+    // VMM never had. Position (vdd, vde) still follows the physical drives.
     ConfigurePlan plan = BasePlan();
     plan.extra_drive_attachments.push_back(Mount("p0", "p0.img", false));
     plan.physical_extra_drive_count = 1;
@@ -261,8 +263,9 @@ MT_TEST(volume_slot_ids_continue_after_the_physical_drives) {
     MT_EXPECT_TRUE(seq.ok());
     if (!seq.ok()) return;
     const std::vector<std::string> ids = DriveIds(seq.value());
-    MT_EXPECT_EQ(ids[3], VolumeDriveSlotId(1));
-    MT_EXPECT_EQ(ids[4], VolumeDriveSlotId(2));
+    MT_EXPECT_EQ(ids[2], std::string("p0"));
+    MT_EXPECT_EQ(ids[3], VolumeDriveSlotId(0));
+    MT_EXPECT_EQ(ids[4], VolumeDriveSlotId(1));
 }
 
 // ============================================================

@@ -20,6 +20,9 @@ struct CreateSandboxReq {
     std::string template_id;
     std::vector<std::string> env_vars;
     int64_t     timeout_ms = 300000;
+    /// Rust `secure: body.secure == Some(true)` — only a JSON `true` turns on
+    /// envd access-token enforcement.
+    bool        secure = false;
 
     core::Json ToJson() const;
     static core::Expected<CreateSandboxReq, core::AnyError> FromJson(const core::Json& j);
@@ -31,6 +34,12 @@ struct CreateSandboxResp {
     std::string template_id;
     std::string state;
     int64_t     created_at_ms = 0;
+    /// Rust `models::Sandbox::envd_access_token` — present only for a secure
+    /// sandbox. The client cannot reach envd without it.
+    core::Optional<std::string> envd_access_token;
+    /// Rust `traffic_access_token: Some(Nullable::Present|Null)` — the token
+    /// when public traffic is disallowed, `null` otherwise.
+    core::Optional<std::string> traffic_access_token;
 
     core::Json ToJson() const;
     static core::Expected<CreateSandboxResp, core::AnyError> FromJson(const core::Json& j);
@@ -43,6 +52,9 @@ struct GetSandboxResp {
     std::string template_id;
     int64_t     created_at_ms = 0;
     int64_t     started_at_ms = 0;
+    /// Rust `SandboxDetail::envd_access_token` (detail only; the list leaves
+    /// it unset, as Rust's `ListedSandbox` does).
+    core::Optional<std::string> envd_access_token;
 
     core::Json ToJson() const;
     static core::Expected<GetSandboxResp, core::AnyError> FromJson(const core::Json& j);

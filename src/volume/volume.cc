@@ -13,6 +13,7 @@
 #include "agentenv/core/identity.h"
 #include "agentenv/core/logging.h"
 #include "agentenv/storage/overlaybd/config.h"
+#include "agentenv/storage/overlaybd/tools_packaging.h"
 
 namespace agentenv {
 namespace volume {
@@ -784,14 +785,14 @@ VolumeResult<std::string> VolumeManager::CreateEmptyBacking(const std::string& v
         }
 
         // Rust: `overlaybd::tools::package_raw_as_overlaybd(&raw, &commit)`.
-        // The C++ tree has no port of that packer yet, so rather than emit an
-        // image.json pointing at a raw file that overlaybd cannot open, this
-        // fails with an explicit message. Everything above (sizing, mkfs) is
-        // already the real behaviour, so wiring the packer in is the only
-        // remaining step.
-        failure = VolumeError::Storage(
-            "packaging a raw filesystem as an overlaybd commit layer is not implemented in "
-            "the C++ port yet (Rust: overlaybd::tools::package_raw_as_overlaybd)");
+        const core::Expected<Unit, std::string> packaged =
+            obd::tools::PackageRawAsOverlaybd(raw, commit);
+        if (!packaged.ok()) {
+            failure = VolumeError::Storage(packaged.error());
+            break;
+        }
+        // The raw file is removed after `image.json` is written, not here --
+        // see the `RemoveFile(raw)` below, which is where Rust drops it too.
         break;
     } while (false);
 

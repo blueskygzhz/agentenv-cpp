@@ -25,6 +25,7 @@ core::Json CreateSandboxReq::ToJson() const {
     core::JsonArray arr;
     for (const auto& e : env_vars) arr.emplace_back(core::Json(e));
     j["env_vars"] = core::Json(std::move(arr));
+    if (secure) j["secure"] = core::Json(true);
     return j;
 }
 
@@ -41,6 +42,14 @@ CreateSandboxReq::FromJson(const core::Json& j) {
             if (e.kind() == core::Json::Kind::String) r.env_vars.push_back(e.as_string());
         }
     }
+    // Rust `secure: Option<bool>`: a present non-boolean is a body that does
+    // not deserialize, which must not quietly become "not secure".
+    const auto& secure = j["secure"];
+    if (secure.kind() == core::Json::Kind::Bool) {
+        r.secure = secure.as_bool();
+    } else if (secure.kind() != core::Json::Kind::Null) {
+        return core::make_unexpected(core::err("invalid field: secure must be a boolean"));
+    }
     return r;
 }
 
@@ -51,6 +60,13 @@ core::Json CreateSandboxResp::ToJson() const {
     j["template_id"]   = core::Json(template_id);
     j["state"]         = core::Json(state);
     j["created_at_ms"] = core::Json(created_at_ms);
+    // E2B field names, as Rust's `models::Sandbox` serializes them.
+    if (envd_access_token.has_value()) {
+        j["envdAccessToken"] = core::Json(*envd_access_token);
+    }
+    j["trafficAccessToken"] = traffic_access_token.has_value()
+                                  ? core::Json(*traffic_access_token)
+                                  : core::Json();
     return j;
 }
 core::Expected<CreateSandboxResp, core::AnyError>
@@ -64,6 +80,13 @@ CreateSandboxResp::FromJson(const core::Json& j) {
     r.state         = j["state"].kind() == core::Json::Kind::String
                         ? j["state"].as_string() : "";
     r.created_at_ms = GetIntOr(j, "created_at_ms", 0);
+    if (j["envdAccessToken"].kind() == core::Json::Kind::String) {
+        r.envd_access_token = core::Optional<std::string>(j["envdAccessToken"].as_string());
+    }
+    if (j["trafficAccessToken"].kind() == core::Json::Kind::String) {
+        r.traffic_access_token =
+            core::Optional<std::string>(j["trafficAccessToken"].as_string());
+    }
     return r;
 }
 
@@ -75,6 +98,9 @@ core::Json GetSandboxResp::ToJson() const {
     j["template_id"]   = core::Json(template_id);
     j["created_at_ms"] = core::Json(created_at_ms);
     j["started_at_ms"] = core::Json(started_at_ms);
+    if (envd_access_token.has_value()) {
+        j["envdAccessToken"] = core::Json(*envd_access_token);
+    }
     return j;
 }
 core::Expected<GetSandboxResp, core::AnyError>

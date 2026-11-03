@@ -448,7 +448,9 @@ MT_TEST(unported_capture_methods_report_failure) {
     MT_EXPECT_TRUE(!backend->Start().ok());
     MT_EXPECT_TRUE(!backend->StartNowait().ok());
     MT_EXPECT_TRUE(!backend->WaitForReady().ok());
-    MT_EXPECT_TRUE(!backend->UpdateNetworkPolicy(core::nullopt).ok());
+    // Rust `update_network_policy` with no slot: clearing is accepted, since
+    // there is nothing to clear. Setting one is covered below.
+    MT_EXPECT_TRUE(backend->UpdateNetworkPolicy(core::nullopt).ok());
     // No API call was made by any of them.
     MT_EXPECT_EQ(conn->calls.size(), static_cast<std::size_t>(0));
 }
@@ -547,6 +549,29 @@ MT_TEST(runtime_info_leaves_an_unrecorded_rootfs_size_absent) {
     const SandboxRuntimeInfo info = backend->RuntimeInfoOf();
     MT_EXPECT_TRUE(!info.rootfs_virtual_size.has_value());
     MT_EXPECT_TRUE(!backend->HostInteractionIp().has_value());
+}
+
+MT_TEST(a_policy_without_a_network_slot_is_refused) {
+    // Rust: `bail!("sandbox has no active network slot")`. Accepting it would
+    // leave the caller believing a restriction is enforced.
+    ScriptedConnector* conn = new ScriptedConnector();
+    std::unique_ptr<FirecrackerSandboxBackend> backend = MakeBackend(conn);
+    const std::string policy = network::SandboxNetworkPolicy().ToJson().ToString();
+    const core::Expected<core::Unit, core::AnyError> r =
+        backend->UpdateNetworkPolicy(core::Optional<std::string>(policy));
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+    MT_EXPECT_TRUE(r.error().chain().find("no active network slot") != std::string::npos);
+}
+
+MT_TEST(a_malformed_policy_is_refused_before_any_slot_check) {
+    ScriptedConnector* conn = new ScriptedConnector();
+    std::unique_ptr<FirecrackerSandboxBackend> backend = MakeBackend(conn);
+    const core::Expected<core::Unit, core::AnyError> r =
+        backend->UpdateNetworkPolicy(core::Optional<std::string>("{\"base_policy\":42}"));
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+    MT_EXPECT_TRUE(r.error().chain().find("parse sandbox network policy") != std::string::npos);
 }
 
 

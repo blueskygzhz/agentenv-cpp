@@ -283,7 +283,41 @@ MT_TEST(the_limiter_is_reconciled_with_both_buckets_present) {
 
 MT_TEST(new_volumes_are_patched_in_after_the_load) {
     // A volume absent from the source state loaded as a placeholder, so its
-    // real path is patched once the VM exists.
+    // slot is rebound and PATCHed once the VM exists.
+    SnapshotConfig config = CapturedConfig();
+    config.common.extra_drives.push_back(Drive("phys", false));
+    config.common.extra_drives.push_back(Drive("vol", true));
+    config.common.physical_extra_drive_count = 1;
+    config.common.volume_drive_slots = 2;
+
+    ResumeStartSpec spec = SpecFor(config);
+    spec.initial_guest_drive_mounts.push_back(
+        std::make_pair(static_cast<std::size_t>(1), config.common.extra_drives[1]));
+
+    const core::Expected<std::vector<ResumeStep>, std::string> built =
+        BuildResumeSequence(spec);
+    MT_EXPECT_TRUE(built.ok());
+    if (!built.ok()) return;
+
+    const int load = IndexOf(built.value(), ResumeStep::Kind::SnapshotLoad);
+    const int patch = IndexOf(built.value(), ResumeStep::Kind::PatchDrivePath);
+    const int resume = IndexOf(built.value(), ResumeStep::Kind::Resume);
+    MT_EXPECT_TRUE(patch > load);
+    MT_EXPECT_TRUE(patch < resume);
+    if (patch < 0) return;
+    const ResumeStep& step = built.value()[static_cast<std::size_t>(patch)];
+    // Bound through the reserved slot, not under the volume's own id: the
+    // slot is what the loaded state knows about. The PATCH names the slot's
+    // own file -- the image config JSON is not a block device -- and the bind
+    // target is the volume's attachment link.
+    MT_EXPECT_EQ(step.id, VolumeDriveSlotId(0));
+    MT_EXPECT_EQ(step.path, VolumeDriveSlotId(0) + ".img");
+    MT_EXPECT_EQ(step.text, std::string("extra-drive-vol"));
+}
+
+MT_TEST(volumes_already_in_the_state_are_not_patched) {
+    // A paused-state resume has no new drives: every volume is bound before
+    // the load, and a PATCH afterwards would reopen a drive already open.
     SnapshotConfig config = CapturedConfig();
     config.common.extra_drives.push_back(Drive("phys", false));
     config.common.extra_drives.push_back(Drive("vol", true));
@@ -294,16 +328,48 @@ MT_TEST(new_volumes_are_patched_in_after_the_load) {
         BuildResumeSequence(SpecFor(config));
     MT_EXPECT_TRUE(built.ok());
     if (!built.ok()) return;
+    MT_EXPECT_EQ(IndexOf(built.value(), ResumeStep::Kind::PatchDrivePath), -1);
+}
 
-    const int load = IndexOf(built.value(), ResumeStep::Kind::SnapshotLoad);
-    const int patch = IndexOf(built.value(), ResumeStep::Kind::PatchDrivePath);
-    MT_EXPECT_TRUE(patch > load);
-    if (patch < 0) return;
-    const ResumeStep& step = built.value()[static_cast<std::size_t>(patch)];
-    // Bound through the reserved slot, not under the volume's own id: the
-    // slot is what the loaded state knows about.
-    MT_EXPECT_EQ(step.id, VolumeDriveSlotId(0));
-    MT_EXPECT_EQ(step.path, std::string("/img/vol.json"));
+MT_TEST(only_the_new_volumes_are_patched_at_their_own_slot) {
+    // Slot numbering counts from the first slot drive, so the second volume
+    // is slot 1 even when it is the only new one.
+    SnapshotConfig config = CapturedConfig();
+    config.common.extra_drives.push_back(Drive("phys", false));
+    config.common.extra_drives.push_back(Drive("old", true));
+    config.common.extra_drives.push_back(Drive("new", true));
+    config.common.physical_extra_drive_count = 1;
+    config.common.volume_drive_slots = 3;
+
+    ResumeStartSpec spec = SpecFor(config);
+    spec.initial_guest_drive_mounts.push_back(
+        std::make_pair(static_cast<std::size_t>(2), config.common.extra_drives[2]));
+
+    const core::Expected<std::vector<ResumeStep>, std::string> built =
+        BuildResumeSequence(spec);
+    MT_EXPECT_TRUE(built.ok());
+    if (!built.ok()) return;
+    std::size_t patches = 0;
+    for (std::size_t i = 0; i < built.value().size(); ++i) {
+        const ResumeStep& step = built.value()[i];
+        if (step.kind != ResumeStep::Kind::PatchDrivePath) continue;
+        ++patches;
+        MT_EXPECT_EQ(step.id, VolumeDriveSlotId(1));
+        MT_EXPECT_EQ(step.text, std::string("extra-drive-new"));
+    }
+    MT_EXPECT_EQ(patches, static_cast<std::size_t>(1));
+}
+
+MT_TEST(a_new_drive_index_in_the_physical_range_is_refused) {
+    SnapshotConfig config = CapturedConfig();
+    config.common.extra_drives.push_back(Drive("phys", false));
+    config.common.physical_extra_drive_count = 1;
+    config.common.volume_drive_slots = 1;
+
+    ResumeStartSpec spec = SpecFor(config);
+    spec.initial_guest_drive_mounts.push_back(
+        std::make_pair(static_cast<std::size_t>(0), config.common.extra_drives[0]));
+    MT_EXPECT_TRUE(!BuildResumeSequence(spec).ok());
 }
 
 MT_TEST(a_resume_without_a_memory_device_is_refused_up_front) {
@@ -787,15 +853,19 @@ MT_TEST(launch_custom_params_override_the_snapshots_otherwise_inherit) {
                  std::string("{\"from\":\"launch\"}"));
 }
 
-MT_TEST(initial_guest_drive_mounts_start_after_the_physical_drives) {
-    // Slot indices begin at `physical_extra_drive_count`: a volume bound into
-    // a physical slot is mounted as the wrong filesystem.
+MT_TEST(initial_guest_drive_mounts_follow_the_snapshots_own_drives) {
+    // Rust counts from the end of the applied list: the launch's drives are
+    // the last ones, after the physical drives.
     SnapshotConfig config = CommittedConfig();
+    config.common.extra_drives.push_back(Drive("p1", false));
+    config.common.extra_drives.push_back(Drive("p2", false));
     config.common.physical_extra_drive_count = 2;
 
     SandboxLaunchConfig launch = LaunchConfigFor(ResumedId());
     launch.extra_drives.push_back(Drive("v1", true));
     launch.extra_drives.push_back(Drive("v2", true));
+    MT_EXPECT_TRUE(ApplyLaunchToSnapshotConfig(&config, launch,
+                                               core::Optional<std::string>()).ok());
 
     const std::vector<std::pair<std::size_t, ExtraDrive> > mounts =
         InitialGuestDriveMountsForSnapshotLaunch(config, launch);
@@ -804,6 +874,30 @@ MT_TEST(initial_guest_drive_mounts_start_after_the_physical_drives) {
     MT_EXPECT_EQ(mounts[0].first, static_cast<std::size_t>(2));
     MT_EXPECT_EQ(mounts[1].first, static_cast<std::size_t>(3));
     MT_EXPECT_EQ(mounts[0].second.drive_id, std::string("v1"));
+}
+
+MT_TEST(committed_slot_drives_are_not_mistaken_for_new_ones) {
+    // A snapshot that already committed a launch-slot drive keeps it in its
+    // state, between the physical drives and this launch's. Counting from
+    // `physical_extra_drive_count` would mark it new and leave the actual
+    // new volume bound before a load that never heard of it.
+    SnapshotConfig config = CommittedConfig();
+    config.common.extra_drives.push_back(Drive("phys", false));
+    config.common.extra_drives.push_back(Drive("committed", false));
+    config.common.physical_extra_drive_count = 1;
+    config.common.volume_drive_slots = 3;
+
+    SandboxLaunchConfig launch = LaunchConfigFor(ResumedId());
+    launch.extra_drives.push_back(Drive("v", true));
+    MT_EXPECT_TRUE(ApplyLaunchToSnapshotConfig(&config, launch,
+                                               core::Optional<std::string>()).ok());
+
+    const std::vector<std::pair<std::size_t, ExtraDrive> > mounts =
+        InitialGuestDriveMountsForSnapshotLaunch(config, launch);
+    MT_EXPECT_EQ(mounts.size(), static_cast<std::size_t>(1));
+    if (mounts.size() != 1) return;
+    MT_EXPECT_EQ(mounts[0].first, static_cast<std::size_t>(2));
+    MT_EXPECT_EQ(mounts[0].second.drive_id, std::string("v"));
 }
 
 MT_TEST(drives_already_in_the_snapshot_need_no_patch) {

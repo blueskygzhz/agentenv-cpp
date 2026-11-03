@@ -178,8 +178,12 @@ FramedRequest ParseRequest(const std::string& buffer) {
     out.request.method = method;
     const std::size_t question = target.find('?');
     if (question == std::string::npos) {
+        out.request.raw_path = target;
         out.request.path = PercentDecode(target);
     } else {
+        out.request.raw_path = target.substr(0, question);
+        out.request.raw_query = target.substr(question + 1);
+        out.request.has_query = true;
         out.request.path = PercentDecode(target.substr(0, question));
         const std::map<std::string, std::string> query =
             ParseQuery(target.substr(question + 1));
@@ -203,10 +207,21 @@ FramedRequest ParseRequest(const std::string& buffer) {
             out.error = "malformed header: " + header_line;
             return out;
         }
-        const std::string name = Trim(header_line.substr(0, colon));
+        const std::string name = ToLower(Trim(header_line.substr(0, colon)));
         const std::string value = Trim(header_line.substr(colon + 1));
-        out.request.headers[ToLower(name)] = value;
-        if (ToLower(name) == "content-length") {
+        // The first value wins, as `HeaderMap::get` does; a repeat is
+        // remembered so `single_header` can treat it as absent.
+        if (!out.request.headers.insert(std::make_pair(name, value)).second) {
+            out.request.repeated_headers.insert(name);
+            if (name == "content-length") {
+                // hyper refuses a request carrying two lengths: whichever one a
+                // server picks, an intermediary may have picked the other.
+                out.framing = RequestFraming::Malformed;
+                out.error = "duplicate Content-Length";
+                return out;
+            }
+        }
+        if (name == "content-length") {
             char* parse_end = NULL;
             const unsigned long declared = std::strtoul(value.c_str(), &parse_end, 10);
             if (parse_end == NULL || *parse_end != '\0') {
@@ -356,6 +371,19 @@ class HttpServer::Impl {
         // the whole router: an unauthenticated request to an unknown path is
         // rejected, not answered with a 404 that confirms what does not exist.
         HttpRequest current = request;
+        // Rust's layers run inside the router, after the path has matched, so
+        // they see `MatchedPath` and `RawPathParams`. Recorded here because a
+        // layer here runs before routing.
+        current.matched_route = false;
+        current.path_params.clear();
+        for (std::size_t i = 0; i < routes.size(); ++i) {
+            std::map<std::string, std::string> params;
+            if (MatchPath(routes[i].pattern, current.path, &params)) {
+                current.matched_route = true;
+                current.path_params = params;
+                break;
+            }
+        }
         for (std::size_t i = 0; i < layers.size(); ++i) {
             HttpResponse short_circuit;
             if (!layers[i](&current, &short_circuit)) {

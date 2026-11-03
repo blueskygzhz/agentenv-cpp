@@ -54,14 +54,16 @@ core::Expected<core::Unit, std::string> ApplyLaunchToSnapshotConfig(
 
 /// Rust `FirecrackerSandbox::initial_guest_drive_mounts_for_snapshot_launch`.
 ///
-/// The `(slot_index, drive)` pairs for volumes that are *not* already in the
-/// source state and so were loaded as placeholders. Empty when
-/// `extra_drives_in_snapshot` is set, because those were bound before the load
-/// and need no patch afterwards.
+/// The `(index into config.common.extra_drives, drive)` pairs for drives that
+/// are *not* already in the source state and so were loaded as placeholders.
+/// Empty when `extra_drives_in_snapshot` is set, because those were bound
+/// before the load and need no patch afterwards.
 ///
-/// Slot indices start at `physical_extra_drive_count`: the physical drives
-/// occupy the slots before it, and a volume bound into one of those would be
-/// mounted as the wrong filesystem.
+/// `config` is the one `ApplyLaunchToSnapshotConfig` produced, so the launch
+/// drives are its last `launch_config.extra_drives.size()` entries. Counting
+/// from the end rather than from `physical_extra_drive_count` matters when
+/// the snapshot already committed launch-slot drives: those sit between the
+/// physical drives and this launch's, and are in the source state.
 std::vector<std::pair<std::size_t, ExtraDrive> >
     InitialGuestDriveMountsForSnapshotLaunch(const SnapshotConfig& config,
                                              const SandboxLaunchConfig& launch_config);

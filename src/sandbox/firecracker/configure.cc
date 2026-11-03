@@ -22,6 +22,7 @@
 #include "agentenv/sandbox/firecracker/sandbox_backend.h"
 
 #include <cstdio>
+#include <sstream>
 #include <utility>
 
 namespace agentenv {
@@ -178,11 +179,16 @@ BuildConfigureSequence(const ConfigurePlan& plan) {
     }
     // The slots are attached by slot id, not by the volume's own id: the guest
     // must see the same device names across a restore, and the binding from
-    // slot to volume is a symlink made before this point.
+    // slot to volume is a symlink made before this point (see
+    // `PrepareVolumeDriveSlots`).
+    //
+    // Rust `prepare_volume_drive_slots` numbers slots from 0, independent of
+    // the physical count; the resume path PATCHes `slot_{i - physical}`, so
+    // an offset here would name a drive the resume can never find.
     std::vector<DriveMount> slots;
     for (std::size_t i = 0; i < plan.volume_drive_slots; ++i) {
         DriveMount slot;
-        slot.drive_id = VolumeDriveSlotId(physical_count + i);
+        slot.drive_id = VolumeDriveSlotId(i);
         slot.attachment_path = slot.drive_id + ".img";
         slot.read_only = false;
         slots.push_back(slot);
@@ -355,16 +361,32 @@ BuildResumeSequence(const ResumeStartSpec& spec) {
     load.track_dirty_pages = config.common.track_dirty_pages;
     steps.push_back(load);
 
-    // 3. Volumes absent from the source state were loaded as placeholders, so
-    //    their real paths are patched in after the load. A volume that *was*
-    //    in the source state is bound before the load instead and needs no
-    //    patch -- this port binds none, so only the shape is modelled here.
+    // 3. Rust `attach_new_volume_drives`. Drives new to this launch (Rust
+    //    `initial_guest_drive_mounts`) are absent from the source state, so
+    //    the load opened their slot's 4 KiB placeholder. Each slot is rebound
+    //    to the volume's attachment and PATCHed with the *slot's* path, which
+    //    makes Firecracker reopen it and report the real capacity. Drives
+    //    that were in the source state were bound before the load
+    //    (`PrepareResumeDrives`) and are not patched.
     const std::size_t physical = config.common.physical_extra_drive_count;
-    for (std::size_t i = physical; i < config.common.extra_drives.size(); ++i) {
+    for (std::size_t n = 0; n < spec.initial_guest_drive_mounts.size(); ++n) {
+        const std::size_t index = spec.initial_guest_drive_mounts[n].first;
+        if (index < physical || index >= config.common.extra_drives.size()) {
+            std::ostringstream why;
+            why << "launch-time drive index " << index << " is outside the reserved slots ["
+                << physical << ", " << config.common.extra_drives.size() << ")";
+            return core::make_unexpected(why.str());
+        }
+        if (index - physical >= config.common.volume_drive_slots) {
+            return core::make_unexpected(
+                std::string("snapshot has more launch-time drives than reserved volume slots"));
+        }
+        const std::string slot_id = VolumeDriveSlotId(index - physical);
         ResumeStep patch;
         patch.kind = ResumeStep::Kind::PatchDrivePath;
-        patch.id = VolumeDriveSlotId(i - physical);
-        patch.path = config.common.extra_drives[i].image_config_path;
+        patch.id = slot_id;
+        patch.path = slot_id + ".img";
+        patch.text = config.common.extra_drives[index].AttachmentSymlinkName();
         steps.push_back(patch);
     }
 
@@ -421,9 +443,25 @@ ApplyResumeSequence(FirecrackerInstance* instance, const std::vector<ResumeStep>
                     1, std::make_pair(std::string("eth0"), std::string("tap0"))),
                 /*resume_vm=*/false, step.track_dirty_pages);
             break;
-        case ResumeStep::Kind::PatchDrivePath:
+        case ResumeStep::Kind::PatchDrivePath: {
+            // Rust `attach_new_volume_drives`: bind, then PATCH the slot path.
+            if (!step.text.empty()) {
+                DriveMount slot;
+                slot.drive_id = step.id;
+                slot.attachment_path = step.path;
+                DriveMount drive;
+                drive.attachment_path = step.text;
+                const core::Expected<core::Unit, std::string> bound =
+                    BindVolumeDriveSlot(instance->WorkDir(), slot, drive);
+                if (!bound.ok()) {
+                    return core::make_unexpected("bind new volume " + step.text +
+                                                 " to reserved drive " + step.id + ": " +
+                                                 bound.error());
+                }
+            }
             r = instance->PatchDrivePath(step.id, step.path);
             break;
+        }
         case ResumeStep::Kind::Mmds: {
             const core::Expected<core::Json, core::AnyError> doc =
                 core::Json::Parse(step.text);

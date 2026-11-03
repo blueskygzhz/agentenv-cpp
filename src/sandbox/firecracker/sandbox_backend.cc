@@ -2,11 +2,19 @@
 // Rust: src/sandbox/firecracker/sandbox.rs — `impl SandboxBackend for
 // FirecrackerSandbox`, plus `recover_capture_failure`.
 #include <unistd.h>
+#include <fcntl.h>
+#include <climits>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <cerrno>
 #include <sys/stat.h>
 #include <dirent.h>
 #include "agentenv/sandbox/firecracker/sandbox_backend.h"
+#include "agentenv/sandbox/network.h"
+#include "agentenv/sandbox/network/egress_proxy.h"
+#include "agentenv/sandbox/network/manager.h"
+#include "agentenv/sandbox/network/slot.h"
 
 #include "agentenv/core/logging.h"
 #include "agentenv/sandbox/firecracker/factory.h"
@@ -143,10 +151,461 @@ core::Expected<core::Unit, std::string> PublishMemoryOverlaybdLayer(
     return core::Unit{};
 }
 
+// ── fresh-start host drives (Rust start_fresh / extra_drive.rs) ─────────────
+
+const char* const kGuestArpNotifyBootArg = "sysctl.net.ipv4.conf.all.arp_notify=1";
+
+core::Expected<core::Unit, std::string> FreshDriveResources::Release() {
+    // Rust `SandboxResources::release`: rootfs, then extra drives, then the
+    // network slot. Every device is attempted even after one fails, because
+    // each one left behind is a leaked `/dev/ublkbN` with no handle that
+    // could ever free it.
+    if (!manager_) {
+        has_rootfs_ = false;
+        extra_drives_.clear();
+    } else if (has_rootfs_) {
+        const ublk::daemon::DaemonResult<core::Unit> r = manager_->ReleaseDevice(rootfs_.device);
+        if (!r.ok()) {
+            AGENTENV_WARN("failed to release ublk device during stop: " << r.error().message);
+        }
+        has_rootfs_ = false;
+    }
+    for (std::size_t i = 0; manager_ && i < extra_drives_.size(); ++i) {
+        const ublk::daemon::DaemonResult<core::Unit> r =
+            manager_->ReleaseDevice(extra_drives_[i].device);
+        if (!r.ok()) {
+            AGENTENV_WARN("failed to release extra drive device during stop: "
+                          << r.error().message);
+        }
+    }
+    extra_drives_.clear();
+
+    // Taken before the call, as Rust's `network_slot.take()`: the manager owns
+    // the slot from here whether it pools it or tears it down, so a retry must
+    // not hand it back a second time.
+    network::Slot* slot = network_slot_;
+    network::SlotNetworkManager* manager = network_manager_;
+    network_slot_ = NULL;
+    network_manager_ = NULL;
+    if (slot != NULL && manager != NULL) {
+        const uint32_t idx = slot->Idx();
+        const core::Expected<core::Unit, std::string> r = manager->Release(slot);
+        if (!r.ok()) {
+            return core::make_unexpected("Failed to release network slot: " + r.error());
+        }
+        AGENTENV_DEBUG("network slot released: " << idx);
+    }
+    return core::Unit{};
+}
+
+void AppendBootArg(core::Optional<std::string>* boot_args, const std::string& arg) {
+    if (boot_args->has_value()) {
+        *boot_args = core::Optional<std::string>(**boot_args + " " + arg);
+    } else {
+        *boot_args = core::Optional<std::string>(arg);
+    }
+}
+
+core::Optional<std::string> ComposeFreshBootArgs(const core::Optional<std::string>& boot_args,
+                                                 const std::vector<ExtraDrive>& extra_drives,
+                                                 uint32_t mem_size_mib,
+                                                 const std::string& arch) {
+    return ComposeFreshBootArgs(boot_args, extra_drives, mem_size_mib, arch,
+                                std::vector<std::string>());
+}
+
+core::Optional<std::string> ComposeFreshBootArgs(const core::Optional<std::string>& boot_args,
+                                                 const std::vector<ExtraDrive>& extra_drives,
+                                                 uint32_t mem_size_mib,
+                                                 const std::string& arch,
+                                                 const std::vector<std::string>& network_args) {
+    core::Optional<std::string> out = boot_args;
+
+    // The tools drive carries /init; an operator-supplied `init=` wins.
+    bool has_init = false;
+    if (out.has_value()) {
+        const std::string& s = *out;
+        std::size_t i = 0;
+        while (i < s.size() && !has_init) {
+            while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i;
+            const std::size_t start = i;
+            while (i < s.size() && !std::isspace(static_cast<unsigned char>(s[i]))) ++i;
+            if (s.compare(start, 5, "init=") == 0 && i - start >= 5) has_init = true;
+        }
+    }
+    if (!has_init) AppendBootArg(&out, "init=/init");
+
+    // `agentenv_drives=vdc:<mount>[:<sub>],...` -- the guest's mount table.
+    const core::Optional<std::string> drives = BuildDrivesBootArg(extra_drives);
+    if (drives.has_value()) AppendBootArg(&out, *drives);
+
+    // Rust: `slot.build_ip_boot_arg()` then `GUEST_ARP_NOTIFY_BOOT_ARG`,
+    // after the drives and before the DAMON region.
+    for (std::size_t i = 0; i < network_args.size(); ++i) AppendBootArg(&out, network_args[i]);
+
+    return AddDamonMonitorRegion(out, mem_size_mib, arch);
+}
+
+core::Expected<std::vector<DriveMount>, std::string> CreateVolumeDriveSlots(
+    const std::string& work_dir, std::size_t physical_extra_drive_count, std::size_t count) {
+    // Rust checks this after creating the files; checking first leaves
+    // nothing behind for a request that can never be satisfied.
+    if (physical_extra_drive_count + count > kMaxExtraDrives) {
+        return core::make_unexpected(
+            std::to_string(physical_extra_drive_count) + " physical extra drives plus " +
+            std::to_string(count) + " volume slots exceed Firecracker's " +
+            std::to_string(kMaxExtraDrives) + "-drive limit");
+    }
+    std::vector<DriveMount> slots;
+    slots.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        DriveMount slot;
+        slot.drive_id = VolumeDriveSlotId(i);
+        slot.attachment_path = slot.drive_id + ".img";
+        slot.read_only = false;
+        const std::string path = work_dir + "/" + slot.attachment_path;
+        // create_new: a leftover file would be attached as if it were ours.
+        const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd < 0) {
+            return core::make_unexpected("create reserved volume drive " + path + ": " +
+                                         std::strerror(errno));
+        }
+        const int truncated = ::ftruncate(fd, static_cast<off_t>(kVolumeDrivePlaceholderSize));
+        const int saved = errno;
+        ::close(fd);
+        if (truncated != 0) {
+            return core::make_unexpected("size reserved volume drive " + path + ": " +
+                                         std::strerror(saved));
+        }
+        slots.push_back(slot);
+    }
+    return slots;
+}
+
+core::Expected<core::Unit, std::string> BindVolumeDriveSlot(const std::string& work_dir,
+                                                            const DriveMount& slot,
+                                                            const DriveMount& drive) {
+    const std::string slot_path = work_dir + "/" + slot.attachment_path;
+    if (::unlink(slot_path.c_str()) != 0) {
+        return core::make_unexpected("remove reserved volume drive " + slot_path + ": " +
+                                     std::strerror(errno));
+    }
+    // Relative target, as Rust links `drive.attachment_path`: it resolves
+    // inside the work directory, next to the slot itself.
+    if (::symlink(drive.attachment_path.c_str(), slot_path.c_str()) != 0) {
+        return core::make_unexpected("link reserved volume drive " + slot_path + " to " +
+                                     drive.attachment_path + ": " + std::strerror(errno));
+    }
+    return core::Unit{};
+}
+
+core::Expected<core::Unit, std::string> PrepareVolumeDriveSlots(
+    const std::string& work_dir, std::size_t count,
+    const std::vector<DriveMount>& volume_attachments) {
+    if (volume_attachments.size() > count) {
+        return core::make_unexpected(
+            std::string("fresh sandbox has more volume drives than reserved volume slots"));
+    }
+    const core::Expected<std::vector<DriveMount>, std::string> slots =
+        CreateVolumeDriveSlots(work_dir, 0, count);
+    if (!slots.ok()) return core::make_unexpected(slots.error());
+    for (std::size_t i = 0; i < volume_attachments.size(); ++i) {
+        const core::Expected<core::Unit, std::string> bound =
+            BindVolumeDriveSlot(work_dir, slots.value()[i], volume_attachments[i]);
+        if (!bound.ok()) return core::make_unexpected(bound.error());
+    }
+    return core::Unit{};
+}
+
+namespace {
+
+/// Rust `std::os::unix::fs::symlink` with its error context.
+core::Expected<core::Unit, std::string> Symlink(const std::string& target,
+                                                const std::string& link,
+                                                const std::string& what) {
+    if (::symlink(target.c_str(), link.c_str()) != 0) {
+        return core::make_unexpected("symlink " + what + " " + link + " -> " + target + ": " +
+                                     std::strerror(errno));
+    }
+    return core::Unit{};
+}
+
+/// What `PrepareHostDrives` needs; the fresh and resume paths differ only in
+/// the rootfs sizes and in the per-drive prepare mode.
+struct HostDriveRequest {
+    std::shared_ptr<ublk::DeviceManager> device_manager;
+    std::string tools_drive_path;
+    /// NULL: no user rootfs (Rust resume skips it without a `ublk_config`).
+    const ublk::OverlaybdDeviceConfig* rootfs = NULL;
+    core::Optional<uint64_t> rootfs_requested_size;
+    core::Optional<uint64_t> rootfs_known_size;
+    bool rootfs_allow_shrink = false;
+    const std::vector<ExtraDrive>* extra_drives = NULL;
+    std::string overlaybd_global_config;
+    storage::overlaybd::UpperMode runtime_upper_mode =
+        storage::overlaybd::UpperMode::HybridLogStructured;
+    /// Rust's `mode: impl Fn(usize) -> ExtraDrivePrepareMode`.
+    std::function<ExtraDrivePrepareMode(std::size_t)> mode;
+};
+
+/// Rust `link_tools_drive` + `attach_user_rootfs` + `prepare_extra_drives`.
+core::Expected<std::vector<DriveMount>, std::string> PrepareHostDrives(
+    const std::string& work_dir, const HostDriveRequest& req, FreshDriveResources* resources) {
+    if (resources == NULL) return core::make_unexpected(std::string("no resource holder"));
+
+    // ── Tools drive (Rust `link_tools_drive`) ──
+    // Canonicalized first: a dangling path must fail here, not as a guest
+    // with no root filesystem.
+    {
+        char resolved[PATH_MAX];
+        if (::realpath(req.tools_drive_path.c_str(), resolved) == NULL) {
+            return core::make_unexpected("open tools drive at " + req.tools_drive_path + ": " +
+                                         std::strerror(errno));
+        }
+        const core::Expected<core::Unit, std::string> linked =
+            Symlink(resolved, work_dir + "/" + kRootfsDrivePath, "tools drive");
+        if (!linked.ok()) return core::make_unexpected(linked.error());
+    }
+
+    if (!req.device_manager || !req.device_manager->is_available()) {
+        return core::make_unexpected(std::string("ublk daemon client is unavailable"));
+    }
+    resources->Adopt(req.device_manager);
+
+    // ── User image (Rust `attach_user_rootfs`) ──
+    if (req.rootfs != NULL) {
+        const ublk::daemon::DaemonResult<ublk::OverlaybdRuntimeDevice> created =
+            req.device_manager->CreateOverlaybdRuntimeDevice(
+                req.rootfs->image_config_path, req.overlaybd_global_config,
+                work_dir + "/overlaybd", req.rootfs->read_only,
+                req.rootfs->runtime_upper_mode, req.rootfs_requested_size,
+                req.rootfs_known_size, req.rootfs_allow_shrink);
+        if (!created.ok()) {
+            return core::make_unexpected("create user image overlaybd runtime device: " +
+                                         created.error().message);
+        }
+        // Recorded before the symlink, so a symlink failure still releases it.
+        resources->SetRootfs(created.value());
+        const core::Expected<core::Unit, std::string> linked =
+            Symlink(created.value().device.device_path, work_dir + "/" + kUserRootfsDrivePath,
+                    "user-rootfs to ublk device");
+        if (!linked.ok()) return core::make_unexpected(linked.error());
+    }
+
+    // ── Extra drives (Rust `prepare_extra_drives`) ──
+    const std::vector<ExtraDrive> no_drives;
+    const std::vector<ExtraDrive>& extra_drives =
+        req.extra_drives != NULL ? *req.extra_drives : no_drives;
+    std::vector<DriveMount> mounts;
+    std::vector<std::string> made_links;
+    mounts.reserve(extra_drives.size());
+    for (std::size_t i = 0; i < extra_drives.size(); ++i) {
+        const ExtraDrive& drive = extra_drives[i];
+        const ExtraDrivePrepareMode mode =
+            req.mode ? req.mode(i) : ExtraDrivePrepareMode::MakeResume();
+        core::Optional<uint64_t> target_size;
+        core::Optional<uint64_t> base_size;
+        mode.DeviceSizes(drive, &target_size, &base_size);
+
+        const ublk::daemon::DaemonResult<ublk::OverlaybdRuntimeDevice> created =
+            req.device_manager->CreateOverlaybdRuntimeDevice(
+                drive.image_config_path, req.overlaybd_global_config,
+                drive.RuntimeDir(work_dir), drive.read_only, req.runtime_upper_mode,
+                target_size, base_size, mode.AllowShrink());
+        std::string failure;
+        if (!created.ok()) {
+            failure = "prepare extra drives: create overlaybd extra drive runtime device: " +
+                      created.error().message;
+        } else {
+            resources->AddExtraDrive(created.value());
+            const std::string name = drive.AttachmentSymlinkName();
+            const std::string link = work_dir + "/" + name;
+            const core::Expected<core::Unit, std::string> linked =
+                Symlink(created.value().device.device_path, link, "extra drive");
+            if (!linked.ok()) {
+                failure = "prepare extra drives: " + linked.error();
+            } else {
+                made_links.push_back(link);
+                DriveMount mount;
+                mount.drive_id = drive.drive_id;
+                mount.attachment_path = name;
+                mount.read_only = drive.read_only;
+                mounts.push_back(mount);
+            }
+        }
+        if (!failure.empty()) {
+            // Rust `PreparedDrives::cleanup`: the attachments made so far are
+            // removed; the devices go with the caller's resource release.
+            for (std::size_t k = 0; k < made_links.size(); ++k) {
+                if (::unlink(made_links[k].c_str()) != 0 && errno != ENOENT) {
+                    AGENTENV_WARN("failed to remove prepared extra drive attachment "
+                                  << made_links[k] << " during rollback: "
+                                  << std::strerror(errno));
+                }
+            }
+            return core::make_unexpected(failure);
+        }
+    }
+    return mounts;
+}
+
+bool ContainsIndex(const std::vector<std::size_t>& indices, std::size_t index) {
+    for (std::size_t i = 0; i < indices.size(); ++i) {
+        if (indices[i] == index) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+core::Expected<std::vector<DriveMount>, std::string> PrepareFreshDrives(
+    const std::string& work_dir, const FreshDrivePlan& plan, FreshDriveResources* resources) {
+    HostDriveRequest req;
+    req.device_manager = plan.device_manager;
+    req.tools_drive_path = plan.tools_drive_path;
+    req.rootfs = &plan.rootfs_image_config;
+    req.rootfs_requested_size = plan.rootfs_virtual_size;
+    req.rootfs_allow_shrink = plan.rootfs_allow_shrink;
+    req.extra_drives = &plan.extra_drives;
+    req.overlaybd_global_config = plan.overlaybd_global_config;
+    req.runtime_upper_mode = plan.runtime_upper_mode;
+    const ExtraDrivePrepareMode fresh =
+        ExtraDrivePrepareMode::MakeFresh(plan.extra_drive_allow_shrink);
+    req.mode = [fresh](std::size_t) -> ExtraDrivePrepareMode { return fresh; };
+    return PrepareHostDrives(work_dir, req, resources);
+}
+
+core::Expected<std::vector<VolumeSlotBind>, std::string> PrepareResumeDrives(
+    const std::string& work_dir, const ResumeDrivePlan& plan, const CommonConfig& common,
+    const std::vector<std::size_t>& new_drive_indices, FreshDriveResources* resources) {
+    // Rust `start_resume` checks both before attaching anything.
+    if (!common.rootfs_virtual_size.has_value()) {
+        return core::make_unexpected(std::string("snapshot rootfs virtual size is missing"));
+    }
+    if (!common.rootfs_image_config.has_value()) {
+        return core::make_unexpected(std::string("snapshot rootfs image config is missing"));
+    }
+
+    HostDriveRequest req;
+    req.device_manager = plan.device_manager;
+    req.tools_drive_path = plan.tools_drive_path;
+    // Rust `if config.common.ublk_config.is_some() { attach_user_rootfs(..,
+    // Some(size), Some(size), false) }`: the recorded size is both the target
+    // and the base, and a restored disk is never shrunk.
+    if (common.ublk_config.has_value()) {
+        req.rootfs = &*common.rootfs_image_config;
+        req.rootfs_requested_size = common.rootfs_virtual_size;
+        req.rootfs_known_size = common.rootfs_virtual_size;
+        req.rootfs_allow_shrink = false;
+    }
+    req.extra_drives = &common.extra_drives;
+    req.overlaybd_global_config = plan.overlaybd_global_config;
+    req.runtime_upper_mode = plan.runtime_upper_mode;
+    // Launch-slot drives new to this launch carry the requested size, as on a
+    // fresh boot; every other drive, volumes included, carries its recorded
+    // size. This port has no `ExtraDriveKind::LaunchSlot`: a non-volume drive
+    // among the new ones is one, since every launch drive uses a slot.
+    const std::vector<ExtraDrive>& drives = common.extra_drives;
+    const bool allow_shrink = plan.extra_drive_allow_shrink;
+    req.mode = [&drives, &new_drive_indices, allow_shrink](std::size_t index) {
+        if (ContainsIndex(new_drive_indices, index) && !drives[index].IsVolume()) {
+            return ExtraDrivePrepareMode::MakeFresh(allow_shrink);
+        }
+        return ExtraDrivePrepareMode::MakeResume();
+    };
+    const core::Expected<std::vector<DriveMount>, std::string> prepared =
+        PrepareHostDrives(work_dir, req, resources);
+    if (!prepared.ok()) {
+        return core::make_unexpected("prepare snapshot-backed extra drives for resume: " +
+                                     prepared.error());
+    }
+    const std::vector<DriveMount>& attachments = prepared.value();
+
+    const std::size_t physical = common.physical_extra_drive_count;
+    const core::Expected<std::vector<DriveMount>, std::string> slots =
+        CreateVolumeDriveSlots(work_dir, physical, common.volume_drive_slots);
+    if (!slots.ok()) {
+        return core::make_unexpected("prepare reserved volume drive slots for resume: " +
+                                     slots.error());
+    }
+    if (physical > attachments.size()) {
+        return core::make_unexpected(
+            "snapshot expects " + std::to_string(physical) +
+            " physical extra drives, but only " + std::to_string(attachments.size()) +
+            " were prepared");
+    }
+    if (attachments.size() - physical > slots.value().size()) {
+        return core::make_unexpected(
+            std::string("snapshot has more launch-time drives than reserved volume slots"));
+    }
+
+    std::vector<VolumeSlotBind> new_binds;
+    for (std::size_t offset = 0; offset < attachments.size() - physical; ++offset) {
+        VolumeSlotBind bind;
+        bind.slot = slots.value()[offset];
+        bind.drive = attachments[physical + offset];
+        if (ContainsIndex(new_drive_indices, physical + offset)) {
+            // Absent from the source state: Firecracker loads the placeholder,
+            // and the bind plus PATCH happen after the load.
+            new_binds.push_back(bind);
+            continue;
+        }
+        // In the source state: bound now, so the load reopens the real device.
+        const core::Expected<core::Unit, std::string> bound =
+            BindVolumeDriveSlot(work_dir, bind.slot, bind.drive);
+        if (!bound.ok()) {
+            return core::make_unexpected("bind restored drive " + bind.drive.drive_id +
+                                         " to reserved drive " + bind.slot.drive_id +
+                                         " before snapshot load: " + bound.error());
+        }
+    }
+    return new_binds;
+}
+
+namespace {
+
+/// Rust `allocate_network_slot` — the slot is stored in `resources` before
+/// any fallible setup, so `Stop` or the destructor releases it.
+core::Expected<network::Slot*, std::string> AllocateNetworkSlot(
+    network::SlotNetworkManager* manager, FreshDriveResources* resources) {
+    if (manager == NULL) return core::make_unexpected(std::string("no network manager"));
+    const core::Expected<network::Slot*, std::string> slot = manager->AllocateAny();
+    if (!slot.ok()) {
+        return core::make_unexpected("Failed to allocate network slot: " + slot.error());
+    }
+    resources->AdoptNetworkSlot(manager, slot.value());
+    AGENTENV_DEBUG("allocated network slot " << slot.value()->Idx());
+    return slot.value();
+}
+
+/// Rust `spawn_firecracker` — into the slot's namespace when there is one,
+/// "so it can access tap0".
+core::Expected<core::Unit, std::string> SpawnInto(FirecrackerInstance* instance,
+                                                 const std::string& binary,
+                                                 const core::Optional<std::string>& stdout_path,
+                                                 const core::Optional<std::string>& stderr_path,
+                                                 const std::string& netns) {
+    const std::string out = stdout_path.has_value() ? *stdout_path : std::string();
+    const std::string err = stderr_path.has_value() ? *stderr_path : std::string();
+    if (netns.empty()) return instance->Spawn(binary, out, err);
+    return instance->SpawnWithNetns(binary, out, err, netns);
+}
+
+}  // namespace
+
 core::Expected<core::Unit, std::string>
 StartFreshInstance(const FreshStartSpec& spec, std::shared_ptr<Connector> connector,
-                   std::unique_ptr<FirecrackerInstance>* out) {
+                   std::unique_ptr<FirecrackerInstance>* out,
+                   FreshDriveResources* resources) {
     if (out == NULL) return core::make_unexpected(std::string("no output slot"));
+    if (spec.drives.has_value() && resources == NULL) {
+        return core::make_unexpected(
+            std::string("fresh start with host drives needs a resource holder"));
+    }
+    if (spec.network.has_value() && resources == NULL) {
+        return core::make_unexpected(
+            std::string("fresh start with a network slot needs a resource holder"));
+    }
     // 1. Work directory. The caller has already validated the configure plan,
     //    so nothing that fails below is knowable-up-front.
     //
@@ -162,12 +621,77 @@ StartFreshInstance(const FreshStartSpec& spec, std::shared_ptr<Connector> connec
         CreateFirecrackerWorkDir(core::Optional<std::string>(spec.chroot_base_dir));
     if (!work_dir.ok()) return core::make_unexpected(work_dir.error());
 
+    // Declared before `instance` so it is destroyed *after* it: on an early
+    // return the VMM is killed first and only then are its devices released.
+    // Tearing a ublk device down under a live guest is what Rust's ordering
+    // in `SandboxResources::release` exists to prevent.
+    struct ReleaseOnFailure {
+        FreshDriveResources* resources;
+        bool armed;
+        ~ReleaseOnFailure() {
+            if (armed && resources != NULL) resources->Release();
+        }
+    } release_on_failure = {resources, spec.drives.has_value() || spec.network.has_value()};
+
+    // 1b. Host drives (Rust `start_fresh`: link_tools_drive,
+    //     attach_user_rootfs, prepare_extra_drives, and -- inside
+    //     configure_microvm -- prepare/bind_volume_drive_slot). Firecracker
+    //     only sees the relative names these create in the work directory.
+    ConfigurePlan plan = spec.configure;
+    if (spec.drives.has_value()) {
+        const core::Expected<std::vector<DriveMount>, std::string> prepared =
+            PrepareFreshDrives(work_dir.value(), *spec.drives, resources);
+        if (!prepared.ok()) return core::make_unexpected(prepared.error());
+        plan.extra_drive_attachments = prepared.value();
+
+        const std::size_t physical = plan.physical_extra_drive_count;
+        if (physical > plan.extra_drive_attachments.size()) {
+            return core::make_unexpected(
+                "fresh sandbox expects " + std::to_string(physical) +
+                " physical extra drives, but only " +
+                std::to_string(plan.extra_drive_attachments.size()) + " were prepared");
+        }
+        const std::vector<DriveMount> volumes(
+            plan.extra_drive_attachments.begin() + static_cast<std::ptrdiff_t>(physical),
+            plan.extra_drive_attachments.end());
+        const core::Expected<core::Unit, std::string> slots =
+            PrepareVolumeDriveSlots(work_dir.value(), plan.volume_drive_slots, volumes);
+        if (!slots.ok()) return core::make_unexpected(slots.error());
+    }
+
+    // 1c. Network (Rust `start_fresh`, after the extra drives): allocate the
+    //     slot, apply the egress policy, then compose the boot args with the
+    //     slot's `ip=` and arp_notify ahead of the DAMON region. The interface
+    //     and MMDS steps come with it; the VMM is spawned into the namespace
+    //     below, which is the only way it can open `tap0`.
+    std::string netns;
+    if (spec.network.has_value()) {
+        const FreshNetworkPlan& net = *spec.network;
+        const core::Expected<network::Slot*, std::string> slot =
+            AllocateNetworkSlot(net.manager, resources);
+        if (!slot.ok()) return core::make_unexpected(slot.error());
+        const core::Expected<core::Unit, network::NetworkError> policy =
+            slot.value()->SetEgressPolicy(net.policy, network::kEgressProxyPort);
+        if (!policy.ok()) {
+            return core::make_unexpected("Failed to configure sandbox egress policy: " +
+                                         policy.error().Message());
+        }
+        std::vector<std::string> network_args;
+        network_args.push_back(slot.value()->BuildIpBootArg());
+        network_args.push_back(kGuestArpNotifyBootArg);
+        plan.boot_args = ComposeFreshBootArgs(net.boot_args, net.extra_drives,
+                                              plan.mem_size_mib, net.arch, network_args);
+        plan.has_network_slot = true;
+        plan.mmds_json = net.mmds_json;
+        netns = slot.value()->NamespacePath();
+    }
+
     // The logger path can only be known now; its emptiness was what decided
     // whether the step exists at all.
     std::vector<ConfigureStep> steps;
     {
         const core::Expected<std::vector<ConfigureStep>, std::string> built =
-            BuildConfigureSequence(spec.configure);
+            BuildConfigureSequence(plan);
         if (!built.ok()) return core::make_unexpected(built.error());
         steps = built.value();
     }
@@ -186,10 +710,8 @@ StartFreshInstance(const FreshStartSpec& spec, std::shared_ptr<Connector> connec
     std::unique_ptr<FirecrackerInstance> instance(
         new FirecrackerInstance(work_dir.value(), connector));
 
-    const core::Expected<core::Unit, std::string> spawned = instance->Spawn(
-        spec.firecracker_bin,
-        stdout_path.has_value() ? *stdout_path : std::string(),
-        stderr_path.has_value() ? *stderr_path : std::string());
+    const core::Expected<core::Unit, std::string> spawned =
+        SpawnInto(instance.get(), spec.firecracker_bin, stdout_path, stderr_path, netns);
     if (!spawned.ok()) {
         return core::make_unexpected(std::string("spawn: ") + spawned.error());
     }
@@ -219,13 +741,23 @@ StartFreshInstance(const FreshStartSpec& spec, std::shared_ptr<Connector> connec
     // Only now is ownership handed over; every return above let the unique_ptr
     // unwind, which stops the VMM.
     *out = std::move(instance);
+    release_on_failure.armed = false;
     return core::Unit{};
 }
 
 core::Expected<core::Unit, std::string>
 StartResumeInstance(const ResumeStartSpec& spec, std::shared_ptr<Connector> connector,
-                    std::unique_ptr<FirecrackerInstance>* out) {
+                    std::unique_ptr<FirecrackerInstance>* out,
+                    FreshDriveResources* resources) {
     if (out == NULL) return core::make_unexpected(std::string("no output slot"));
+    if (spec.drives.has_value() && resources == NULL) {
+        return core::make_unexpected(
+            std::string("resume with host drives needs a resource holder"));
+    }
+    if (spec.network_manager != NULL && resources == NULL) {
+        return core::make_unexpected(
+            std::string("resume with a network slot needs a resource holder"));
+    }
 
     // The sequence is built first, exactly as the fresh path builds its
     // configure plan up front: every check inside is a property of the capture
@@ -246,6 +778,33 @@ StartResumeInstance(const ResumeStartSpec& spec, std::shared_ptr<Connector> conn
         CreateFirecrackerWorkDir(core::Optional<std::string>(spec.chroot_base_dir));
     if (!work_dir.ok()) return core::make_unexpected(work_dir.error());
 
+    // Declared before `instance`, as on the fresh path, so the VMM is killed
+    // before its devices are released.
+    struct ReleaseOnFailure {
+        FreshDriveResources* resources;
+        bool armed;
+        ~ReleaseOnFailure() {
+            if (armed && resources != NULL) resources->Release();
+        }
+    } release_on_failure = {resources,
+                            spec.drives.has_value() || spec.network_manager != NULL};
+
+    // Rust `start_resume`: link_tools_drive, attach_user_rootfs and
+    // prepare_resume_drives, all before the spawn. The load reopens every
+    // serialized drive path, so each has to exist by then. The new-volume
+    // binds it returns are the same ones `BuildResumeSequence` derived from
+    // the same indices; they are bound and patched after the load.
+    if (spec.drives.has_value()) {
+        std::vector<std::size_t> new_indices;
+        for (std::size_t i = 0; i < spec.initial_guest_drive_mounts.size(); ++i) {
+            new_indices.push_back(spec.initial_guest_drive_mounts[i].first);
+        }
+        const core::Expected<std::vector<VolumeSlotBind>, std::string> prepared =
+            PrepareResumeDrives(work_dir.value(), *spec.drives, spec.snapshot_config.common,
+                                new_indices, resources);
+        if (!prepared.ok()) return core::make_unexpected(prepared.error());
+    }
+
     for (std::size_t i = 0; i < steps.size(); ++i) {
         if (steps[i].kind == ResumeStep::Kind::Logger) {
             steps[i].path = work_dir.value() + "/firecracker.log";
@@ -257,15 +816,39 @@ StartResumeInstance(const ResumeStartSpec& spec, std::shared_ptr<Connector> conn
     WarmStdioPaths(work_dir.value(), spec.capture_output, &stdout_path, &stderr_path);
 
     if (!connector) connector = MakeUnixConnector();
+    // Rust `start_resume`: "Network + Firecracker spawn" -- the slot after the
+    // drives, the VMM into its namespace so the load's `eth0 -> tap0`
+    // override opens a tap that exists.
+    network::Slot* slot = NULL;
+    if (spec.network_manager != NULL) {
+        const core::Expected<network::Slot*, std::string> allocated =
+            AllocateNetworkSlot(spec.network_manager, resources);
+        if (!allocated.ok()) return core::make_unexpected(allocated.error());
+        slot = allocated.value();
+    }
+
     std::unique_ptr<FirecrackerInstance> instance(
         new FirecrackerInstance(work_dir.value(), connector));
 
-    const core::Expected<core::Unit, std::string> spawned = instance->Spawn(
-        spec.firecracker_bin,
-        stdout_path.has_value() ? *stdout_path : std::string(),
-        stderr_path.has_value() ? *stderr_path : std::string());
+    const core::Expected<core::Unit, std::string> spawned =
+        SpawnInto(instance.get(), spec.firecracker_bin, stdout_path, stderr_path,
+                  slot != NULL ? slot->NamespacePath() : std::string());
     if (!spawned.ok()) {
         return core::make_unexpected(std::string("spawn: ") + spawned.error());
+    }
+
+    // Rust applies the capture's policy right after the spawn: a pooled slot
+    // keeps its namespace across tenants, so a previous tenant's rules are
+    // cleared here even when this capture has none.
+    if (slot != NULL) {
+        const core::Expected<core::Unit, network::NetworkError> policy =
+            slot->SetEgressPolicy(spec.snapshot_config.common.network_policy,
+                                  network::kEgressProxyPort);
+        if (!policy.ok()) {
+            return core::make_unexpected(
+                "Failed to configure sandbox egress policy for resume: " +
+                policy.error().Message());
+        }
     }
 
     // Past the spawn every early return must stop the VMM; the unique_ptr's
@@ -282,7 +865,10 @@ StartResumeInstance(const ResumeStartSpec& spec, std::shared_ptr<Connector> conn
         ApplyResumeSequence(instance.get(), steps);
     if (!applied.ok()) return core::make_unexpected(applied.error());
 
+    // The resources now belong to the running VM; disarming is what keeps the
+    // guard from releasing its devices and slot out from under it.
     *out = std::move(instance);
+    release_on_failure.armed = false;
     return core::Unit{};
 }
 
@@ -313,7 +899,17 @@ class FirecrackerSandboxBackend::Impl {
         spec.envd_poll_ms = resume_spec.envd_poll_ms;
     }
 
+    /// Rust `Drop`: the VMM goes first, then its devices. Member order would
+    /// do the opposite (`drive_resources` is declared after `instance`), and a
+    /// device deleted under a running guest fails every in-flight I/O.
+    ~Impl() {
+        instance.reset();
+        drive_resources.Release();
+    }
+
     std::unique_ptr<FirecrackerInstance> instance;
+    /// Rust `SandboxResources` — the ublk devices behind this VM's drives.
+    FreshDriveResources drive_resources;
     SnapshotConfig snapshot_config;
     FreshStartSpec spec;
     /// Only meaningful when `launch.kind == Resume`.
@@ -440,6 +1036,11 @@ core::Expected<core::Unit, core::AnyError> FirecrackerSandboxBackend::Stop() {
     const core::Expected<core::Unit, std::string> r =
         impl_->instance->Stop(kPoolFirecrackerStopTimeoutMs);
     if (!r.ok()) return core::make_unexpected(core::err(r.error()));
+    // Rust `stop`: devices are released only once the VMM is gone. A failed
+    // stop keeps them, so a retry still has something to release. Only the
+    // network release can fail the stop, and only after every device went.
+    const core::Expected<core::Unit, std::string> released = impl_->drive_resources.Release();
+    if (!released.ok()) return core::make_unexpected(core::err(released.error()));
     return core::Unit{};
 }
 
@@ -613,8 +1214,10 @@ core::Expected<core::Unit, core::AnyError> FirecrackerSandboxBackend::StartNowai
     std::unique_ptr<FirecrackerInstance> started;
     const core::Expected<core::Unit, std::string> r =
         impl_->launch.kind == LaunchMode::Kind::Resume
-            ? StartResumeInstance(impl_->resume_spec, impl_->connector, &started)
-            : StartFreshInstance(impl_->spec, impl_->connector, &started);
+            ? StartResumeInstance(impl_->resume_spec, impl_->connector, &started,
+                                  &impl_->drive_resources)
+            : StartFreshInstance(impl_->spec, impl_->connector, &started,
+                                 &impl_->drive_resources);
     if (!r.ok()) return core::make_unexpected(core::err(r.error()));
     impl_->instance = std::move(started);
     return core::Unit{};
@@ -762,6 +1365,26 @@ FirecrackerSandboxBackend::Fork(const std::vector<SandboxForkSpec>& specs) {
         // Empty on a sandbox that booted fresh, and the resume path reports
         // that as its own error rather than guessing a path.
         spec.mem_device_path = impl_->resume_spec.mem_device_path;
+        // Rust forks through `start_resume`, which materializes the child's
+        // drives from the same node config the parent used.
+        if (impl_->resume_spec.drives.has_value()) {
+            spec.drives = impl_->resume_spec.drives;
+        } else if (impl_->spec.drives.has_value()) {
+            ResumeDrivePlan drives;
+            drives.device_manager = impl_->spec.drives->device_manager;
+            drives.tools_drive_path = impl_->spec.drives->tools_drive_path;
+            drives.overlaybd_global_config = impl_->spec.drives->overlaybd_global_config;
+            drives.runtime_upper_mode = impl_->spec.drives->runtime_upper_mode;
+            drives.extra_drive_allow_shrink = impl_->spec.drives->extra_drive_allow_shrink;
+            spec.drives = drives;
+        }
+        // Each child gets its own slot from the same manager; sharing the
+        // parent's would put two guests behind one tap.
+        spec.network_manager = impl_->resume_spec.network_manager != NULL
+                                   ? impl_->resume_spec.network_manager
+                               : impl_->spec.network.has_value()
+                                   ? impl_->spec.network->manager
+                                   : NULL;
 
         std::unique_ptr<SandboxBackend> backend(
             FirecrackerSandboxBackend::NewResuming(spec, impl_->connector));
@@ -791,16 +1414,51 @@ FirecrackerSandboxBackend::Fork(const std::vector<SandboxForkSpec>& specs) {
     return SandboxCaptureResult<std::vector<SandboxForkResult> >(std::move(results));
 }
 core::Optional<std::string> FirecrackerSandboxBackend::HostInteractionIp() const {
-    // No network slot is allocated by this port, so there is no address to
-    // report. Rust returns `None` in the same situation.
-    return core::nullopt;
+    // Rust: `network_slot.map(|slot| slot.host_interaction_ip)` -- `None`
+    // before start and after stop, when there is no slot.
+    const network::Slot* slot = impl_->drive_resources.network_slot();
+    if (slot == NULL) return core::nullopt;
+    return network::Ipv4ToString(slot->HostInteractionIp());
 }
 RuntimeArtifactSet FirecrackerSandboxBackend::StartupArtifacts() const {
     return FirecrackerPausedState(impl_->snapshot_config).RuntimeArtifacts();
 }
 core::Expected<core::Unit, core::AnyError>
-FirecrackerSandboxBackend::UpdateNetworkPolicy(const core::Optional<std::string>& /*policy*/) {
-    return core::make_unexpected(NotAvailable("update_network_policy"));
+FirecrackerSandboxBackend::UpdateNetworkPolicy(const core::Optional<std::string>& policy_json) {
+    core::Optional<network::SandboxNetworkPolicy> policy;
+    if (policy_json.has_value()) {
+        const core::Expected<core::Json, core::AnyError> doc = core::Json::Parse(*policy_json);
+        if (!doc.ok()) {
+            return core::make_unexpected(
+                core::err("parse sandbox network policy: " + doc.error().chain()));
+        }
+        const core::Expected<network::SandboxNetworkPolicy, std::string> parsed =
+            network::SandboxNetworkPolicy::FromJson(doc.value());
+        if (!parsed.ok()) {
+            return core::make_unexpected(
+                core::err("parse sandbox network policy: " + parsed.error()));
+        }
+        policy = parsed.value();
+    }
+
+    // Rust `update_network_policy`: applied to a live slot; with no slot only
+    // clearing is accepted, since a policy with nowhere to go would be a
+    // restriction the caller believes is enforced.
+    network::Slot* slot = impl_->drive_resources.network_slot();
+    if (slot != NULL) {
+        const core::Expected<core::Unit, network::NetworkError> applied =
+            slot->SetEgressPolicy(policy, network::kEgressProxyPort);
+        if (!applied.ok()) {
+            return core::make_unexpected(
+                core::err("configure sandbox network policy: " + applied.error().Message()));
+        }
+    } else if (policy.has_value()) {
+        return core::make_unexpected(core::err("sandbox has no active network slot"));
+    }
+    // Rust `current_network_policy`, which a later capture persists as
+    // `snapshot_common.network_policy`.
+    impl_->snapshot_config.common.network_policy = policy;
+    return core::Unit{};
 }
 void FirecrackerSandboxBackend::UpdateCustomExtensionParams(
     const core::Optional<std::string>& /*params*/) {
