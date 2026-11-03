@@ -89,6 +89,15 @@ class PosixFsSnapshotRepository : public SnapshotRepository {
     RepositoryResult<core::Unit> PutVolume(const volume::VolumeRecord& record) override;
     RepositoryResult<core::Unit> DeleteVolume(const std::string& volume_id) override;
 
+    // ---- shared documents (Rust posixfs `backend.rs` -> catalog store) -----
+
+    RepositoryResult<core::Optional<std::string> > GetDocument(const DocumentKey& key) override;
+    RepositoryResult<core::Unit> PutDocument(const DocumentKey& key,
+                                             const std::string& bytes) override;
+    RepositoryResult<core::Optional<std::string> > UpdateDocument(
+        const DocumentKey& key, const DocumentUpdate& update) override;
+    RepositoryResult<core::Unit> DeleteDocument(const DocumentKey& key) override;
+
  private:
     std::shared_ptr<PosixFsCatalogStore> catalog_store_;
 };

@@ -164,6 +164,20 @@ class PosixFsCatalogStore {
     static bool MatchesRecordFilter(const SnapshotRecord& record,
                                     const SnapshotListFilter& filter);
 
+    // ---- shared documents (Rust src/repository/backends/posixfs/catalog.rs)
+
+    /// Rust `get_document` — reads `root/posix_path`, without a lock: writes
+    /// are atomic renames, so a reader never sees half a document.
+    RepositoryResult<core::Optional<std::string> > GetDocument(const DocumentKey& key) const;
+    /// Rust `put_document` — under the document's lock file.
+    RepositoryResult<core::Unit> PutDocument(const DocumentKey& key,
+                                             const std::string& bytes) const;
+    /// Rust `update_document`.
+    RepositoryResult<core::Optional<std::string> > UpdateDocument(
+        const DocumentKey& key, const DocumentUpdate& update) const;
+    /// Rust `delete_document`.
+    RepositoryResult<core::Unit> DeleteDocument(const DocumentKey& key) const;
+
     const std::string& root() const { return root_; }
 
  private:

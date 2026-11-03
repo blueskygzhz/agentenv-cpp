@@ -137,6 +137,25 @@ SnapshotRepository::MaterializeVolumeBacking(const std::string&,
     return core::make_unexpected(RepositoryError::Unsupported("volume backing materialization"));
 }
 
+RepositoryResult<core::Optional<std::string> > SnapshotRepository::GetDocument(
+    const DocumentKey&) {
+    return core::make_unexpected(RepositoryError::Unsupported("repository documents"));
+}
+
+RepositoryResult<core::Unit> SnapshotRepository::PutDocument(const DocumentKey&,
+                                                             const std::string&) {
+    return core::make_unexpected(RepositoryError::Unsupported("repository documents"));
+}
+
+RepositoryResult<core::Optional<std::string> > SnapshotRepository::UpdateDocument(
+    const DocumentKey&, const DocumentUpdate&) {
+    return core::make_unexpected(RepositoryError::Unsupported("repository documents"));
+}
+
+RepositoryResult<core::Unit> SnapshotRepository::DeleteDocument(const DocumentKey&) {
+    return core::make_unexpected(RepositoryError::Unsupported("repository documents"));
+}
+
 }  // namespace repository
 }  // namespace snapshot
 }  // namespace agentenv

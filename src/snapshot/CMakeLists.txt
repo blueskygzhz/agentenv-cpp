@@ -15,6 +15,10 @@ add_library(agentenv-snapshot STATIC
     mock.cc
     repository/errors.cc
     repository/interfaces.cc
+    # Rust: src/repository/layout.rs — `DocumentKey`.
+    repository/documents.cc
+    # Rust: src/types/image_tag.rs
+    image_tag.cc
     repository/backends.cc
     repository/posixfs/layout.cc
     repository/posixfs/catalog.cc

@@ -579,8 +579,13 @@ core::Expected<ResolvedImage, ImageError> ConvertContentImage(
     const BuildkitContent& content, const FetchedManifest& fetched,
     const OverlaybdConversionEnv& conversion, ImageConversion* sink);
 
-/// `FetchContentManifest` and `ConvertContentImage` with the converter
-/// supplied, for tests.
+/// `ConvertFetchedOciImageToOverlaybd` and `ConvertContentImage` with the
+/// converter supplied, so the full flow runs in tests without the overlaybd
+/// binaries.
+core::Expected<ResolvedImage, ImageError> ConvertFetchedOciImageToOverlaybdWith(
+    const std::string& image_ref, const FetchedManifest& fetched,
+    const OverlaybdConversionEnv& conversion, ImageConversion* sink,
+    const std::string& host_arch, LayerConverter* converter);
 core::Expected<ResolvedImage, ImageError> ConvertContentImageWith(
     const BuildkitContent& content, const FetchedManifest& fetched,
     const OverlaybdConversionEnv& conversion, ImageConversion* sink, LayerConverter* converter);

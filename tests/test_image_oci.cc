@@ -2,16 +2,17 @@
 // Rust: src/image/oci_image.rs — `mod tests`, the pure-logic subset.
 //
 // One case per `#[test]` that exercises a ported function, carrying the same
-// name so the two sides can be diffed by eye. Tests whose Rust counterpart
-// needs a temp OCI layout on disk (`read_image_manifest_*`) are not here,
-// because the function they cover reads blobs and is not part of this port;
-// `select_manifest_for_platform`, which is the decision inside it, is.
+// name so the two sides can be diffed by eye. The `read_image_manifest_*`
+// cases rebuild Rust's test-only helpers over a temp OCI layout.
 #include "microtest.h"
 
+#include <cstdio>
 #include <string>
 #include <vector>
 
 #include "agentenv/core/digest.h"
+#include "agentenv/core/fs.h"
+#include "agentenv/core/json.h"
 #include "agentenv/image/oci_image.h"
 
 using namespace agentenv;
@@ -653,6 +654,198 @@ MT_TEST(classify_manifest_rejects_manifest_without_layers) {
     MT_EXPECT_TRUE(!got.ok());
     MT_EXPECT_TRUE(got.error().kind == ImageError::kUnsupportedImage);
     MT_EXPECT_TRUE(got.error().IsUserError());
+}
+
+MT_TEST(converted_layer_p2p_metadata_rejects_protocol_mismatch) {
+    ConvertedLayerP2pMetadata metadata;
+    metadata.protocol = "other-protocal";
+    metadata.commit_digest = "sha256:aaa";
+    metadata.size = 1234;
+    const core::Json serialized = metadata.ToJson();
+    MT_EXPECT_TRUE(!ConvertedLayerP2pMetadata::Parse(serialized).ok());
+}
+
+MT_TEST(converted_layer_p2p_metadata_round_trips_its_own_protocol) {
+    ConvertedLayerP2pMetadata metadata;
+    metadata.protocol = "agentenv-oci-layer-v1";
+    metadata.commit_digest = "sha256:aaa";
+    metadata.size = 1234;
+    const core::Expected<ConvertedLayerP2pMetadata, std::string> parsed =
+        ConvertedLayerP2pMetadata::Parse(metadata.ToJson());
+    MT_EXPECT_TRUE(parsed.ok());
+    MT_EXPECT_TRUE(parsed.value().commit_digest == "sha256:aaa");
+    MT_EXPECT_TRUE(parsed.value().size == 1234u);
+}
+
+// ---- read_image_manifest (Rust test helpers over a temp OCI layout) -------
+
+namespace {
+
+bool IsIndexMediaType(const std::string& media_type) {
+    return media_type == "application/vnd.oci.image.index.v1+json" ||
+           media_type == "application/vnd.docker.distribution.manifest.list.v2+json";
+}
+
+core::Expected<core::Json, std::string> ReadJson(const std::string& path) {
+    const core::Expected<std::string, std::string> bytes = core::fs::ReadToString(path);
+    if (!bytes.ok()) return core::make_unexpected("read " + path + ": " + bytes.error());
+    const core::Expected<core::Json, core::AnyError> value = core::Json::Parse(bytes.value());
+    if (!value.ok()) return core::make_unexpected("parse " + path);
+    return value.value();
+}
+
+/// Rust test helper `resolve_nested_index`.
+core::Expected<OciManifestDescriptor, std::string> ResolveNestedIndex(
+    OciManifestDescriptor current, const std::string& layout, const std::string& arch,
+    const std::string& os) {
+    for (std::size_t depth = 0; depth < kMaxIndexResolutionDepth; ++depth) {
+        if (!IsIndexMediaType(current.media_type)) return current;
+        const core::Expected<std::string, std::string> path =
+            BlobPathForDigest(layout, current.digest);
+        if (!path.ok()) return core::make_unexpected(path.error());
+        const core::Expected<core::Json, std::string> raw = ReadJson(path.value());
+        if (!raw.ok()) return core::make_unexpected(raw.error());
+        const core::Expected<OciIndex, std::string> nested = ParseOciIndex(raw.value());
+        if (!nested.ok()) return core::make_unexpected(nested.error());
+        const core::Expected<std::size_t, std::string> picked =
+            SelectManifestForPlatform(nested.value().manifests, arch, os);
+        if (!picked.ok()) return core::make_unexpected(picked.error());
+        current = nested.value().manifests[picked.value()];
+    }
+    return core::make_unexpected(
+        "nested OCI index depth exceeded maximum of " + std::to_string(kMaxIndexResolutionDepth) +
+        " while reading local OCI layout");
+}
+
+/// Rust test helper `read_image_manifest`.
+core::Expected<OciManifest, std::string> ReadImageManifest(const std::string& layout,
+                                                           const std::string& arch,
+                                                           const std::string& os) {
+    const core::Expected<core::Json, std::string> raw =
+        ReadJson(core::fs::Join(layout, "index.json"));
+    if (!raw.ok()) return core::make_unexpected(raw.error());
+    const core::Expected<OciIndex, std::string> index = ParseOciIndex(raw.value());
+    if (!index.ok()) return core::make_unexpected(index.error());
+    if (index.value().manifests.empty()) {
+        return core::make_unexpected(std::string("OCI index has no manifests"));
+    }
+    const core::Expected<std::size_t, std::string> picked =
+        SelectManifestForPlatform(index.value().manifests, arch, os);
+    if (!picked.ok()) return core::make_unexpected(picked.error());
+    const core::Expected<OciManifestDescriptor, std::string> descriptor =
+        ResolveNestedIndex(index.value().manifests[picked.value()], layout, arch, os);
+    if (!descriptor.ok()) return core::make_unexpected(descriptor.error());
+    const core::Expected<std::string, std::string> path =
+        BlobPathForDigest(layout, descriptor.value().digest);
+    if (!path.ok()) return core::make_unexpected(path.error());
+    const core::Expected<core::Json, std::string> manifest = ReadJson(path.value());
+    if (!manifest.ok()) return core::make_unexpected(manifest.error());
+    return ParseOciManifest(manifest.value());
+}
+
+struct TempLayout {
+    std::string path;
+    TempLayout() {
+        const core::Expected<std::string, std::string> dir =
+            core::fs::CreateTempDir("agentenv-oci-layout-");
+        MT_EXPECT_TRUE(dir.ok());
+        path = dir.value();
+        MT_EXPECT_TRUE(core::fs::CreateDirAll(core::fs::Join(path, "blobs/sha256")).ok());
+    }
+    ~TempLayout() { core::fs::RemoveDirAll(path); }
+    void Write(const std::string& rel, const std::string& contents) const {
+        MT_EXPECT_TRUE(core::fs::Write(core::fs::Join(path, rel), contents).ok());
+    }
+};
+
+}  // namespace
+
+MT_TEST(read_image_manifest_handles_single_arch_layout) {
+    TempLayout layout;
+    const std::string manifest =
+        "{\"config\":{\"digest\":\"sha256:config\"},\"layers\":[{\"digest\":\"sha256:layer0\","
+        "\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\",\"size\":123}],"
+        "\"schemaVersion\":2}";
+    layout.Write("blobs/sha256/aa01", manifest);
+    layout.Write("index.json",
+                 "{\"manifests\":[{\"digest\":\"sha256:aa01\",\"mediaType\":"
+                 "\"application/vnd.oci.image.manifest.v1+json\",\"size\":" +
+                     std::to_string(manifest.size()) +
+                     "}],\"mediaType\":\"application/vnd.oci.image.index.v1+json\","
+                     "\"schemaVersion\":2}");
+
+    const core::Expected<OciManifest, std::string> got =
+        ReadImageManifest(layout.path, "amd64", "linux");
+    MT_EXPECT_TRUE(got.ok());
+    MT_EXPECT_TRUE(got.value().layers.size() == 1u);
+    MT_EXPECT_TRUE(got.value().layers[0].digest == "sha256:layer0");
+}
+
+MT_TEST(read_image_manifest_picks_matching_arch_from_multi_arch_layout) {
+    TempLayout layout;
+    const std::string amd =
+        "{\"config\":{\"digest\":\"sha256:amd-config\"},\"layers\":[{\"digest\":"
+        "\"sha256:amd-layer\",\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
+        "\"size\":1}],\"schemaVersion\":2}";
+    const std::string arm =
+        "{\"config\":{\"digest\":\"sha256:arm-config\"},\"layers\":[{\"digest\":"
+        "\"sha256:arm-layer\",\"mediaType\":\"application/vnd.oci.image.layer.v1.tar+gzip\","
+        "\"size\":1}],\"schemaVersion\":2}";
+    layout.Write("blobs/sha256/a0d64", amd);
+    layout.Write("blobs/sha256/a2a64", arm);
+    layout.Write(
+        "index.json",
+        "{\"manifests\":[{\"digest\":\"sha256:a0d64\",\"mediaType\":"
+        "\"application/vnd.oci.image.manifest.v1+json\",\"platform\":{\"architecture\":\"amd64\","
+        "\"os\":\"linux\"},\"size\":" +
+            std::to_string(amd.size()) +
+            "},{\"digest\":\"sha256:a2a64\",\"mediaType\":"
+            "\"application/vnd.oci.image.manifest.v1+json\",\"platform\":{\"architecture\":"
+            "\"arm64\",\"os\":\"linux\"},\"size\":" +
+            std::to_string(arm.size()) +
+            "}],\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"schemaVersion\":2}");
+
+    const core::Expected<OciManifest, std::string> picked_arm =
+        ReadImageManifest(layout.path, "arm64", "linux");
+    MT_EXPECT_TRUE(picked_arm.ok());
+    MT_EXPECT_TRUE(picked_arm.value().layers[0].digest == "sha256:arm-layer");
+
+    const core::Expected<OciManifest, std::string> picked_amd =
+        ReadImageManifest(layout.path, "amd64", "linux");
+    MT_EXPECT_TRUE(picked_amd.ok());
+    MT_EXPECT_TRUE(picked_amd.value().layers[0].digest == "sha256:amd-layer");
+}
+
+MT_TEST(read_image_manifest_rejects_excessively_nested_indexes) {
+    TempLayout layout;
+    for (std::size_t level = 0; level <= kMaxIndexResolutionDepth; ++level) {
+        char hex[32];
+        std::snprintf(hex, sizeof(hex), "%zx", level);
+        const bool last = level == kMaxIndexResolutionDepth;
+        char next_hex[32];
+        std::snprintf(next_hex, sizeof(next_hex), "%zx", level + 1);
+        const std::string next_digest = last ? "sha256:f1a1" : "sha256:1de" + std::string(next_hex);
+        const std::string media_type = last ? "application/vnd.oci.image.manifest.v1+json"
+                                            : "application/vnd.oci.image.index.v1+json";
+        layout.Write("blobs/sha256/1de" + std::string(hex),
+                     "{\"manifests\":[{\"digest\":\"" + next_digest + "\",\"mediaType\":\"" +
+                         media_type +
+                         "\",\"platform\":{\"architecture\":\"amd64\",\"os\":\"linux\"},"
+                         "\"size\":1}],\"mediaType\":\"application/vnd.oci.image.index.v1+json\","
+                         "\"schemaVersion\":2}");
+    }
+    layout.Write("blobs/sha256/f1a1",
+                 "{\"config\":{\"digest\":\"sha256:config\"},\"layers\":[],\"schemaVersion\":2}");
+    layout.Write("index.json",
+                 "{\"manifests\":[{\"digest\":\"sha256:1de0\",\"mediaType\":"
+                 "\"application/vnd.oci.image.index.v1+json\",\"platform\":{\"architecture\":"
+                 "\"amd64\",\"os\":\"linux\"},\"size\":1}],\"mediaType\":"
+                 "\"application/vnd.oci.image.index.v1+json\",\"schemaVersion\":2}");
+
+    const core::Expected<OciManifest, std::string> got =
+        ReadImageManifest(layout.path, "amd64", "linux");
+    MT_EXPECT_TRUE(!got.ok());
+    MT_EXPECT_TRUE(Contains(got.error(), "nested OCI index depth exceeded"));
 }
 
 MT_TEST(image_format_to_string_matches_the_rust_display_impl) {

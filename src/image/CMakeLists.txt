@@ -2,11 +2,21 @@ add_library(agentenv-image STATIC
     # Rust: src/image/mod.rs — the 4xx/5xx classification every API below
     # returns. Listed first because everything else depends on it.
     error.cc
+    # Rust: src/image/mod.rs — `PublishedImage`, `IMAGE_TAG_PREFIX`.
+    published_image.cc
+    # Rust: src/image/catalog.rs
+    catalog.cc
+    # Rust: src/image/resolver.rs — free functions (referrers, image.json).
+    resolver.cc
     reference.cc
     metadata.cc
     local_layer.cc
     layers.cc
     oci_image.cc
+    # Rust: the rest of src/image/oci_image.rs -- credentials and regctl, then
+    # the layer conversion pipeline.
+    oci_registry.cc
+    oci_convert.cc
     commit_index.cc
     cache.cc
     # Rust: the `ImageCacheMetadataStore` half of src/image/cache/graph.rs.
@@ -30,4 +40,8 @@ target_link_libraries(agentenv-image PUBLIC
     agentenv-local-store
     agentenv-p2p
     agentenv-overlaybd
+    # `PublishedImage` carries `snapshot::OverlaybdLayerRef` (Rust
+    # `crate::types::OverlaybdLayerRef`). The snapshot library does not link
+    # back to this one.
+    agentenv-snapshot
 )

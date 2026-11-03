@@ -116,6 +116,25 @@ PosixFsSnapshotRepository::DeleteVolume(const std::string& volume_id) {
     return catalog_store_->DeleteVolume(volume_id);
 }
 
+RepositoryResult<core::Optional<std::string> > PosixFsSnapshotRepository::GetDocument(
+    const DocumentKey& key) {
+    return catalog_store_->GetDocument(key);
+}
+
+RepositoryResult<core::Unit> PosixFsSnapshotRepository::PutDocument(const DocumentKey& key,
+                                                                    const std::string& bytes) {
+    return catalog_store_->PutDocument(key, bytes);
+}
+
+RepositoryResult<core::Optional<std::string> > PosixFsSnapshotRepository::UpdateDocument(
+    const DocumentKey& key, const DocumentUpdate& update) {
+    return catalog_store_->UpdateDocument(key, update);
+}
+
+RepositoryResult<core::Unit> PosixFsSnapshotRepository::DeleteDocument(const DocumentKey& key) {
+    return catalog_store_->DeleteDocument(key);
+}
+
 }  // namespace posixfs
 }  // namespace repository
 }  // namespace snapshot

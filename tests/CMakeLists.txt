@@ -92,6 +92,14 @@ agentenv_add_test(test_orchestrator_types  test_orchestrator_types.cc  agentenv-
 agentenv_add_test(test_store               test_store.cc               agentenv-orchestrator)
 agentenv_add_test(test_image_reference     test_image_reference.cc     agentenv-image)
 agentenv_add_test(test_image_oci  test_image_oci.cc   agentenv-image)
+# Rust: src/image/mod.rs (`PublishedImage`)
+agentenv_add_test(test_image_published   test_image_published.cc   agentenv-image)
+# Rust: src/image/catalog.rs
+agentenv_add_test(test_image_catalog     test_image_catalog.cc     agentenv-image agentenv-volume-record)
+# Rust: src/image/resolver.rs (free functions)
+agentenv_add_test(test_image_resolver    test_image_resolver.cc    agentenv-image)
+# Rust: src/types/image_tag.rs, src/repository/layout.rs, posixfs documents
+agentenv_add_test(test_repository_documents test_repository_documents.cc agentenv-snapshot agentenv-volume-record)
 # Rust: src/image/local_layer.rs
 agentenv_add_test(test_image_local_layer   test_image_local_layer.cc   agentenv-image)
 agentenv_add_test(test_image_commit_index  test_image_commit_index.cc  agentenv-image)

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Rust: src/image/oci_image.rs — `RegistryAuth`, `RegistryConfig`,
 // `ecr_credentials`, the regctl helpers and the manifest fetch.
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 

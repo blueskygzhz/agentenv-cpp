@@ -1237,6 +1237,81 @@ RepositoryResult<core::Unit> PosixFsCatalogStore::ForgetRetiredBuildCache(
                      state.value().ToJson());
 }
 
+// ---- shared documents -------------------------------------------------------
+
+RepositoryResult<core::Optional<std::string> > PosixFsCatalogStore::GetDocument(
+    const DocumentKey& key) const {
+    const std::string path = core::fs::Join(root_, key.PosixPath());
+    const core::Expected<core::Optional<core::fs::FileDescriptor>, std::string> opened =
+        core::fs::OpenReadFollowOptional(path);
+    if (!opened.ok()) {
+        return core::make_unexpected(Backend("read '" + path + "'", opened.error()));
+    }
+    if (!opened.value().has_value()) return core::Optional<std::string>();
+    const core::Expected<std::string, std::string> bytes =
+        core::fs::ReadFdToString(opened.value()->get(), static_cast<std::size_t>(-1));
+    if (!bytes.ok()) {
+        return core::make_unexpected(Backend("read '" + path + "'", bytes.error()));
+    }
+    return core::Optional<std::string>(bytes.value());
+}
+
+RepositoryResult<core::Unit> PosixFsCatalogStore::PutDocument(const DocumentKey& key,
+                                                              const std::string& bytes) const {
+    RepositoryResult<core::FileLockGuard> guard =
+        AcquireCatalogLock(core::fs::Join(root_, key.PosixLockPath()), "document");
+    if (!guard.ok()) return core::make_unexpected(guard.error());
+    const core::FileLockGuard held(std::move(guard.value()));
+
+    const std::string path = core::fs::Join(root_, key.PosixPath());
+    const core::Expected<core::Unit, std::string> written = core::WriteAtomic(path, bytes);
+    if (!written.ok()) {
+        return core::make_unexpected(Backend("write '" + path + "'", written.error()));
+    }
+    return core::Unit();
+}
+
+RepositoryResult<core::Optional<std::string> > PosixFsCatalogStore::UpdateDocument(
+    const DocumentKey& key, const DocumentUpdate& update) const {
+    RepositoryResult<core::FileLockGuard> guard =
+        AcquireCatalogLock(core::fs::Join(root_, key.PosixLockPath()), "document");
+    if (!guard.ok()) return core::make_unexpected(guard.error());
+    const core::FileLockGuard held(std::move(guard.value()));
+
+    const RepositoryResult<core::Optional<std::string> > current = GetDocument(key);
+    if (!current.ok()) return current;
+    const RepositoryResult<DocumentChange> change = update(current.value());
+    if (!change.ok()) return core::make_unexpected(change.error());
+
+    const std::string path = core::fs::Join(root_, key.PosixPath());
+    switch (change.value().kind) {
+        case DocumentChange::Kind::Keep:
+            break;
+        case DocumentChange::Kind::Put: {
+            const core::Expected<core::Unit, std::string> written =
+                core::WriteAtomic(path, change.value().bytes);
+            if (!written.ok()) {
+                return core::make_unexpected(Backend("write '" + path + "'", written.error()));
+            }
+            break;
+        }
+        case DocumentChange::Kind::Delete: {
+            const RepositoryResult<core::Unit> removed = RemoveFileIfExists(path);
+            if (!removed.ok()) return core::make_unexpected(removed.error());
+            break;
+        }
+    }
+    return current;
+}
+
+RepositoryResult<core::Unit> PosixFsCatalogStore::DeleteDocument(const DocumentKey& key) const {
+    RepositoryResult<core::FileLockGuard> guard =
+        AcquireCatalogLock(core::fs::Join(root_, key.PosixLockPath()), "document");
+    if (!guard.ok()) return core::make_unexpected(guard.error());
+    const core::FileLockGuard held(std::move(guard.value()));
+    return RemoveFileIfExists(core::fs::Join(root_, key.PosixPath()));
+}
+
 }  // namespace posixfs
 }  // namespace repository
 }  // namespace snapshot

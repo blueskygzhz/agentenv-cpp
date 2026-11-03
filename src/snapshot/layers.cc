@@ -70,8 +70,13 @@ core::Expected<ManagedLayer, std::string> ManagedLayerFromJson(const core::Json&
     if (!size.ok()) return core::make_unexpected(size.error());
     layer.size = size.value();
 
+    // serde `Option<String>` with `#[serde(default)]`: absent or null is None,
+    // any other non-string is a type error rather than silently dropped.
     const core::JsonObject::const_iterator uuid = fields.find("uuid");
-    if (uuid != fields.end() && uuid->second.kind() == core::Json::Kind::String) {
+    if (uuid != fields.end() && uuid->second.kind() != core::Json::Kind::Null) {
+        if (uuid->second.kind() != core::Json::Kind::String) {
+            return core::make_unexpected(std::string("field `uuid` must be a string"));
+        }
         layer.uuid = core::Optional<std::string>(uuid->second.as_string());
     }
     return layer;
@@ -124,6 +129,11 @@ core::Expected<OverlaybdLayerRef, std::string> LayerRefFromJson(const core::Json
         return core::make_unexpected(std::string("layer reference must be an object"));
     }
     const core::JsonObject& fields = json.as_object();
+    // serde's externally tagged enum is a map with exactly one entry.
+    if (fields.size() != 1) {
+        return core::make_unexpected(
+            std::string("layer reference must be a map with a single `Managed` or `External` key"));
+    }
 
     const core::JsonObject::const_iterator managed = fields.find("Managed");
     if (managed != fields.end()) {

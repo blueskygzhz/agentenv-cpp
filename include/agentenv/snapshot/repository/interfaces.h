@@ -33,6 +33,7 @@
 // The one definition of `SnapshotRecord`, `SnapshotSourceKind`,
 // `TemplateBuildStatus` and `TemplateBuildErrorReason`.
 #include "agentenv/snapshot/record.h"
+#include "agentenv/snapshot/repository/documents.h"
 #include "agentenv/snapshot/repository/errors.h"
 #include "agentenv/snapshot/types.h"
 #include "agentenv/volume/record.h"
@@ -161,6 +162,22 @@ class SnapshotRepository {
         MaterializeVolumeBacking(const std::string& volume_id,
                                  const std::vector<OverlaybdLayerRef>& layers,
                                  const std::string& destination);
+
+    // --- shared documents (Rust src/repository/interfaces.rs; default bodies
+    // returning `unsupported("repository documents")`) ----------------------
+
+    /// Rust `get_document` — `None` when absent.
+    virtual RepositoryResult<core::Optional<std::string> > GetDocument(const DocumentKey& key);
+    /// Rust `put_document` — atomically replaces one document.
+    virtual RepositoryResult<core::Unit> PutDocument(const DocumentKey& key,
+                                                     const std::string& bytes);
+    /// Rust `update_document` — applies `update` atomically against
+    /// concurrent writers on every node, returning the document it was
+    /// applied to.
+    virtual RepositoryResult<core::Optional<std::string> > UpdateDocument(
+        const DocumentKey& key, const DocumentUpdate& update);
+    /// Rust `delete_document` — a missing document is success.
+    virtual RepositoryResult<core::Unit> DeleteDocument(const DocumentKey& key);
 };
 
 /// Rust trait `SnapshotRuntimeResolver`.
