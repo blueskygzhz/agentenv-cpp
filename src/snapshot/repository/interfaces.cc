@@ -2,6 +2,13 @@
 // Rust: src/snapshot/repository/interfaces.rs
 #include "agentenv/snapshot/repository/interfaces.h"
 
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+
+#include "agentenv/core/fs.h"
+#include "agentenv/storage/overlaybd/config.h"
+
 namespace agentenv {
 namespace snapshot {
 namespace repository {
@@ -154,6 +161,105 @@ RepositoryResult<core::Optional<std::string> > SnapshotRepository::UpdateDocumen
 
 RepositoryResult<core::Unit> SnapshotRepository::DeleteDocument(const DocumentKey&) {
     return core::make_unexpected(RepositoryError::Unsupported("repository documents"));
+}
+
+core::Optional<std::string> SnapshotRepository::ManagedLayersRepoBlobUrl() const {
+    return core::Optional<std::string>();
+}
+
+RepositoryResult<core::Unit> SnapshotRepository::PutBlob(const BlobKey&, const BlobBody&) {
+    return core::make_unexpected(RepositoryError::Unsupported("blob storage"));
+}
+
+RepositoryResult<BlobLocation> SnapshotRepository::LocateBlob(const BlobKey&) const {
+    return core::make_unexpected(RepositoryError::Unsupported("blob storage"));
+}
+
+RepositoryResult<bool> SnapshotRepository::HasBlob(const BlobKey&) {
+    return core::make_unexpected(RepositoryError::Unsupported("blob storage"));
+}
+
+RepositoryResult<std::string> SnapshotRepository::ReadBlob(const BlobKey&) {
+    return core::make_unexpected(RepositoryError::Unsupported("blob storage"));
+}
+
+namespace {
+
+/// Rust `managed_layer_config` (layer_config.rs) — a managed layer read in
+/// place when the repository allows it; otherwise overlaybd reads it by
+/// digest from the repository's `repoBlobUrl`.
+RepositoryResult<storage::overlaybd::LayerConfig> ManagedLayerConfig(
+    const SnapshotRepository& repository, const ManagedLayer& layer, LayerRole role) {
+    const RepositoryResult<BlobLocation> location =
+        repository.LocateBlob(BlobKey::Layer(layer.digest, role));
+    if (!location.ok()) return core::make_unexpected(location.error());
+    storage::overlaybd::LayerConfig config;
+    if (location.value().kind == BlobLocation::Kind::Local) config.file = location.value().value;
+    config.digest = layer.digest;
+    config.size = layer.size;
+    if (layer.uuid.has_value()) config.uuid = *layer.uuid;
+    return config;
+}
+
+}  // namespace
+
+RepositoryResult<std::string> MaterializeVolumeBacking(
+    const SnapshotRepository& repository, const std::vector<OverlaybdLayerRef>& layers,
+    const std::string& destination) {
+    const core::Optional<std::string> managed_repo_blob_url =
+        repository.ManagedLayersRepoBlobUrl();
+    storage::overlaybd::ImageConfig image_config;
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        const OverlaybdLayerRef& layer = layers[i];
+        if (layer.kind == OverlaybdLayerRef::Kind::Managed) {
+            RepositoryResult<storage::overlaybd::LayerConfig> config =
+                ManagedLayerConfig(repository, layer.managed, LayerRole::Rootfs);
+            if (!config.ok()) return core::make_unexpected(config.error());
+            if (managed_repo_blob_url.has_value()) {
+                config.value().repo_blob_url = *managed_repo_blob_url;
+            }
+            image_config.lowers.push_back(config.value());
+        } else {
+            storage::overlaybd::LayerConfig config;
+            config.repo_blob_url = layer.external.repo_blob_url;
+            config.digest = layer.external.digest;
+            config.size = layer.external.size;
+            image_config.lowers.push_back(config);
+        }
+    }
+
+    const core::Optional<std::string> parent = core::fs::Parent(destination);
+    if (!parent.has_value() || parent->empty()) {
+        return core::make_unexpected(
+            RepositoryError::Backend("volume image config '" + destination + "' has no parent"));
+    }
+    const core::Expected<core::Unit, std::string> created = core::fs::CreateDirAll(*parent);
+    if (!created.ok()) {
+        return core::make_unexpected(RepositoryError::Backend(
+            "create volume image config dir '" + *parent + "'", created.error()));
+    }
+    const std::string bytes = storage::overlaybd::ImageConfigToJson(image_config);
+    // Rust `destination.with_extension(format!("tmp-{}", Uuid::now_v7().simple()))`.
+    std::string stem = destination;
+    const std::size_t slash = destination.rfind('/');
+    const std::size_t dot = destination.rfind('.');
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash + 1)) {
+        stem = destination.substr(0, dot);
+    }
+    const std::string temporary = stem + ".tmp-" + core::Uuid::GenV7().ToSimpleString();
+    const core::Expected<core::Unit, std::string> written = core::fs::Write(temporary, bytes);
+    if (!written.ok()) {
+        core::fs::RemoveFile(temporary);
+        return core::make_unexpected(RepositoryError::Backend(
+            "write temporary volume image config '" + temporary + "'", written.error()));
+    }
+    if (std::rename(temporary.c_str(), destination.c_str()) != 0) {
+        const std::string error = std::strerror(errno);
+        core::fs::RemoveFile(temporary);
+        return core::make_unexpected(RepositoryError::Backend(
+            "install volume image config '" + destination + "'", error));
+    }
+    return destination;
 }
 
 }  // namespace repository

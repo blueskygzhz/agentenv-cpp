@@ -22,6 +22,7 @@
 #include "agentenv/sandbox/manifest.h"
 #include "agentenv/snapshot/drive.h"
 #include "agentenv/snapshot/layers.h"
+#include "agentenv/snapshot/repository/blobs.h"
 #include "agentenv/snapshot/repository/errors.h"
 
 namespace agentenv {
@@ -43,6 +44,14 @@ class PosixFsArtifactStore {
 
     /// Rust `managed_layer_path`.
     std::string ManagedLayerPath(const std::string& digest) const;
+
+    // ---- blobs (Rust posixfs `artifacts.rs` `put_blob` / `blob_path`) -------
+
+    /// Rust `blob_path` — `<root>/<key.posix_path()>`.
+    std::string BlobPath(const BlobKey& key) const;
+    /// Rust `put_blob` — layers are kept when already stored (a size mismatch
+    /// is an error); snapshot files are replaced atomically.
+    RepositoryResult<core::Unit> PutBlob(const BlobKey& key, const BlobBody& body);
 
     /// Rust `publish_volume_backing` — a volume's lowers are allowed to be
     /// descriptorless because the volume manager owns them locally.
@@ -103,6 +112,16 @@ class PosixFsArtifactStore {
         CopyLocalArtifact(const std::string& destination, const std::string& source);
 
  private:
+    /// Rust `put_layer`.
+    RepositoryResult<core::Unit> PutLayer(const std::string& digest,
+                                          const std::string& destination,
+                                          const std::string& source);
+    /// Rust `write_snapshot_file`, with `put_snapshot_bytes`' directory
+    /// creation.
+    RepositoryResult<core::Unit> PutSnapshotBytes(const core::SnapshotId& snapshot_id,
+                                                  const std::string& name,
+                                                  const std::vector<uint8_t>& bytes);
+
     std::string root_;
 };
 

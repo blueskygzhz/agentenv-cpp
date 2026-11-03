@@ -62,6 +62,13 @@ class MockTransport : public P2pTransport {
 
     bool HasBlob(const P2pArtifactKey& key) const;
 
+    /// Rust `descriptors` (a pub field): read one published descriptor
+    /// without counting as a lookup.
+    bool Descriptor(const P2pArtifactKey& key, P2pArtifactDescriptor* out) const;
+    /// Rust `descriptors.write().insert(..)` — advertise a descriptor with no
+    /// backing blob, so a later fetch fails.
+    void InsertDescriptor(const P2pArtifactDescriptor& descriptor);
+
  private:
     mutable std::mutex mu_;
     std::map<P2pArtifactKey, P2pArtifactDescriptor> descriptors_;

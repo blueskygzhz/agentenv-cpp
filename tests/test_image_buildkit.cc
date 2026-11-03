@@ -386,4 +386,15 @@ MT_TEST(from_utf8_lossy_matches_rust_replacement_rules) {
     MT_EXPECT_EQ(core::FromUtf8Lossy(std::string("\xED\xA0\x80")), fffd + fffd + fffd);
 }
 
+MT_TEST(trim_unicode_whitespace_matches_rust_str_trim) {
+    MT_EXPECT_EQ(core::TrimUnicodeWhitespace(" \t\r\n\v\fabc \n"), std::string("abc"));
+    // U+00A0, U+0085, U+3000 and U+2009 are Unicode White_Space.
+    MT_EXPECT_EQ(core::TrimUnicodeWhitespace("\xC2\xA0\xC2\x85x y\xE3\x80\x80\xE2\x80\x89"),
+                 std::string("x y"));
+    // U+200B (zero width space) is not White_Space and survives.
+    MT_EXPECT_EQ(core::TrimUnicodeWhitespace("\xE2\x80\x8Bz"), std::string("\xE2\x80\x8Bz"));
+    MT_EXPECT_EQ(core::TrimUnicodeWhitespace("   "), std::string());
+    MT_EXPECT_EQ(core::TrimUnicodeWhitespace(""), std::string());
+}
+
 MT_MAIN

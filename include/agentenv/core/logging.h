@@ -31,6 +31,11 @@ class Logger {
 /// becomes U+FFFD, exactly as Rust's `Utf8Chunks` delimits them.
 std::string FromUtf8Lossy(const std::string& bytes);
 
+/// Rust `str::trim` — strips Unicode `White_Space` (so `\v`, `\f`, U+0085,
+/// U+00A0, U+2000..U+200A, U+3000 and friends too) from both ends. `text`
+/// must be valid UTF-8, e.g. the output of `FromUtf8Lossy`.
+std::string TrimUnicodeWhitespace(const std::string& text);
+
 /// Rust `logging::BuildLogSink` — receives one build's log lines.
 class BuildLogSink {
  public:

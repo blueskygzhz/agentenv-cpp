@@ -108,6 +108,8 @@ agentenv_add_test(test_image_cache     test_image_cache.cc    agentenv-image)
 agentenv_add_test(test_image_cache_metadata_store test_image_cache_metadata_store.cc agentenv-image)
 # Rust: the deleting-GC tests in src/image/cache/service.rs.
 agentenv_add_test(test_image_cache_gc     test_image_cache_gc.cc      agentenv-image)
+# Rust: the tests in src/image/cache/{service,source_config}.rs.
+agentenv_add_test(test_image_cache_service test_image_cache_service.cc agentenv-image)
 agentenv_add_test(test_p2p                 test_p2p.cc                 agentenv-p2p)
 # Rust: the catalog tests in src/p2p/iroh/{catalog,endpoint}.rs.
 agentenv_add_test(test_p2p_catalog         test_p2p_catalog.cc         agentenv-p2p)

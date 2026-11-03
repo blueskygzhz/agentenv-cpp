@@ -17,6 +17,8 @@ add_library(agentenv-snapshot STATIC
     repository/interfaces.cc
     # Rust: src/repository/layout.rs — `DocumentKey`.
     repository/documents.cc
+    # Rust: src/repository/layout.rs — `BlobKey`; interfaces.rs blob types.
+    repository/blobs.cc
     # Rust: src/types/image_tag.rs
     image_tag.cc
     repository/backends.cc

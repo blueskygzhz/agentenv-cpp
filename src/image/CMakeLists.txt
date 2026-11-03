@@ -6,7 +6,7 @@ add_library(agentenv-image STATIC
     published_image.cc
     # Rust: src/image/catalog.rs
     catalog.cc
-    # Rust: src/image/resolver.rs — free functions (referrers, image.json).
+    # Rust: src/image/resolver.rs — `ImageResolver` and its free functions.
     resolver.cc
     reference.cc
     metadata.cc
@@ -25,6 +25,13 @@ add_library(agentenv-image STATIC
     cache_gc.cc
     # Rust: src/image/cache/service.rs (operation-hold lifecycle)
     cache_hold.cc
+    # Rust: src/image/cache/source_config.rs
+    cache_source_config.cc
+    # Rust: src/image/cache/service.rs (`ImageCacheService`) and the data
+    # types of src/image/cache/store.rs.
+    cache_service.cc
+    # Rust: src/image/cache/store.rs — the cache ports and their adapter.
+    cache_store.cc
     # Rust: src/image/buildkit.rs and buildkit/history.rs. The tonic channels
     # are behind the `*Wire` interfaces; buildkit_wire.cc supplies the transport.
     buildkit.cc
@@ -44,4 +51,13 @@ target_link_libraries(agentenv-image PUBLIC
     # `crate::types::OverlaybdLayerRef`). The snapshot library does not link
     # back to this one.
     agentenv-snapshot
+    # `ImageCacheService` is built from `cfg::AppConfig` /
+    # `cfg::ResolvedImageCacheConfig`. agentenv-cfg does not link back here.
+    agentenv-cfg
+    # The resolver records `MetricGuard` stage timings (prometheus.cc); neither
+    # library links back here.
+    agentenv-observability-node
+    # `ImageResolver::resolve_tools` provisions the pinned tools converter
+    # (src/setup/overlaybd.cc). agentenv-rootmod does not link back here.
+    agentenv-rootmod
 )

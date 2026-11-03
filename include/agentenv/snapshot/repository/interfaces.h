@@ -33,6 +33,7 @@
 // The one definition of `SnapshotRecord`, `SnapshotSourceKind`,
 // `TemplateBuildStatus` and `TemplateBuildErrorReason`.
 #include "agentenv/snapshot/record.h"
+#include "agentenv/snapshot/repository/blobs.h"
 #include "agentenv/snapshot/repository/documents.h"
 #include "agentenv/snapshot/repository/errors.h"
 #include "agentenv/snapshot/types.h"
@@ -178,7 +179,37 @@ class SnapshotRepository {
         const DocumentKey& key, const DocumentUpdate& update);
     /// Rust `delete_document` — a missing document is success.
     virtual RepositoryResult<core::Unit> DeleteDocument(const DocumentKey& key);
+
+    // --- blobs (Rust src/repository/interfaces.rs; default bodies returning
+    // `unsupported("blob storage")`, `None` for the URL) -----------------------
+    //
+    // Rust's `fetch_blob`, `delete_snapshot_blobs` and `staging_file` are not
+    // ported yet; nothing in this tree calls them.
+
+    /// Rust `managed_layers_repo_blob_url` — set when readers address managed
+    /// layers by URL.
+    virtual core::Optional<std::string> ManagedLayersRepoBlobUrl() const;
+    /// Rust `put_blob` — a layer already stored is kept, since its digest
+    /// names its contents; a snapshot file is replaced.
+    virtual RepositoryResult<core::Unit> PutBlob(const BlobKey& key, const BlobBody& body);
+    /// Rust `locate_blob` — in place on a shared filesystem, or by URL.
+    virtual RepositoryResult<BlobLocation> LocateBlob(const BlobKey& key) const;
+    /// Rust `has_blob`.
+    virtual RepositoryResult<bool> HasBlob(const BlobKey& key);
+    /// Rust `read_blob` — `ArtifactNotFound` when absent.
+    virtual RepositoryResult<std::string> ReadBlob(const BlobKey& key);
 };
+
+/// Rust `repository::materialize_volume_backing` (layer_config.rs) — writes a
+/// runtime image config for `layers` at `destination`, atomically, and
+/// returns its path. Managed layers are read in place when the repository
+/// allows it, otherwise by digest from its `repoBlobUrl`.
+///
+/// A free function, as in Rust; the `MaterializeVolumeBacking` member above
+/// is the older per-volume shape.
+RepositoryResult<std::string> MaterializeVolumeBacking(
+    const SnapshotRepository& repository, const std::vector<OverlaybdLayerRef>& layers,
+    const std::string& destination);
 
 /// Rust trait `SnapshotRuntimeResolver`.
 class SnapshotRuntimeResolver {

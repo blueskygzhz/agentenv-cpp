@@ -2,6 +2,7 @@
 #include "agentenv/core/logging.h"
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -52,6 +53,45 @@ void Logger::Log(LogLevel lv, const char* file, int line, const std::string& msg
 
     std::lock_guard<std::mutex> lg(g_out_mu);
     std::fprintf(stderr, "%s %s %s:%d  %s\n", ts, LevelName(lv), base, line, msg.c_str());
+}
+
+namespace {
+
+/// Length of the `White_Space` character encoded at `s[i]`, or 0.
+std::size_t WhitespaceAt(const std::string& s, std::size_t i) {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    if (c == ' ' || (c >= 0x09 && c <= 0x0d)) return 1;
+    if (c < 0x80) return 0;
+    const std::size_t len = c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : c >= 0xc0 ? 2 : 1;
+    if (len == 1 || i + len > s.size()) return 0;
+    uint32_t cp = len == 2 ? (c & 0x1f) : len == 3 ? (c & 0x0f) : (c & 0x07);
+    for (std::size_t k = 1; k < len; ++k) {
+        cp = (cp << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3f);
+    }
+    const bool ws = cp == 0x85 || cp == 0xa0 || cp == 0x1680 || (cp >= 0x2000 && cp <= 0x200a) ||
+                    cp == 0x2028 || cp == 0x2029 || cp == 0x202f || cp == 0x205f ||
+                    cp == 0x3000;
+    return ws ? len : 0;
+}
+
+}  // namespace
+
+std::string TrimUnicodeWhitespace(const std::string& s) {
+    std::size_t begin = 0;
+    for (std::size_t n; begin < s.size() && (n = WhitespaceAt(s, begin)) != 0;) begin += n;
+    // Walk forward: UTF-8 cannot be decoded backwards without resynchronizing.
+    std::size_t end = begin;
+    for (std::size_t i = begin; i < s.size();) {
+        const std::size_t n = WhitespaceAt(s, i);
+        if (n != 0) {
+            i += n;
+            continue;
+        }
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        i += c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : c >= 0xc0 ? 2 : 1;
+        end = i < s.size() ? i : s.size();
+    }
+    return s.substr(begin, end - begin);
 }
 
 std::string FromUtf8Lossy(const std::string& bytes) {

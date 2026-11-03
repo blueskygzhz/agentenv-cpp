@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <sstream>
 
@@ -197,6 +198,126 @@ HardLinkOrCopyManagedLayer(const std::string& source, const std::string& destina
 
 std::string PosixFsArtifactStore::ManagedLayerPath(const std::string& digest) const {
     return PosixFsSnapshotArtifactLayout::ManagedLayerPath(root_, digest);
+}
+
+std::string PosixFsArtifactStore::BlobPath(const BlobKey& key) const {
+    return core::fs::Join(root_, key.PosixPath());
+}
+
+namespace {
+
+/// Writes `bytes` to a fresh temp file in `dir` and fsyncs it. The caller
+/// owns the returned path.
+RepositoryResult<std::string> WriteStagedFile(const std::string& dir,
+                                              const std::vector<uint8_t>& bytes,
+                                              const std::string& what) {
+    core::Expected<core::fs::TempFile, std::string> temp =
+        core::fs::CreateTempFileIn(dir, ".tmp");
+    if (!temp.ok()) {
+        return core::make_unexpected(
+            RepositoryError::Backend("create " + what + " in '" + dir + "'", temp.error()));
+    }
+    const std::string contents(bytes.begin(), bytes.end());
+    core::Expected<core::Unit, std::string> written =
+        core::fs::WriteFd(temp.value().fd.get(), contents);
+    if (written.ok()) written = core::fs::SyncFd(temp.value().fd.get());
+    if (!written.ok()) {
+        core::fs::RemoveFile(temp.value().path);
+        return core::make_unexpected(
+            RepositoryError::Backend("write '" + temp.value().path + "'", written.error()));
+    }
+    return temp.value().path;
+}
+
+}  // namespace
+
+RepositoryResult<core::Unit> PosixFsArtifactStore::PutBlob(const BlobKey& key,
+                                                           const BlobBody& body) {
+    if (key.kind() == BlobKey::Kind::Layer) {
+        if (body.kind == BlobBody::Kind::File) {
+            return PutLayer(key.digest(), BlobPath(key), body.path);
+        }
+        // Staged on the repository's filesystem, so storing it links it in
+        // without copying.
+        const std::string staging_dir = core::fs::Join(root_, BlobKey::kPosixStagingDir);
+        const core::Expected<core::Unit, std::string> mk = core::fs::CreateDirAll(staging_dir);
+        if (!mk.ok()) {
+            return core::make_unexpected(RepositoryError::Backend(
+                "create staging dir '" + staging_dir + "'", mk.error()));
+        }
+        const RepositoryResult<std::string> staged =
+            WriteStagedFile(staging_dir, body.bytes, "staging file");
+        if (!staged.ok()) return core::make_unexpected(staged.error());
+        const RepositoryResult<core::Unit> put =
+            PutLayer(key.digest(), BlobPath(key), staged.value());
+        core::fs::RemoveFile(staged.value());
+        return put;
+    }
+    if (body.kind == BlobBody::Kind::File) return CopyLocalArtifact(BlobPath(key), body.path);
+    return PutSnapshotBytes(key.snapshot_id(), SnapshotFileName(key.file()), body.bytes);
+}
+
+RepositoryResult<core::Unit> PosixFsArtifactStore::PutLayer(const std::string& digest,
+                                                            const std::string& destination,
+                                                            const std::string& source) {
+    if (core::fs::Exists(destination)) {
+        const core::Expected<uint64_t, std::string> size = core::fs::FileSize(source);
+        if (!size.ok()) {
+            return core::make_unexpected(RepositoryError::Backend(
+                "read managed layer metadata '" + source + "'", size.error()));
+        }
+        const core::Expected<uint64_t, std::string> destination_size =
+            core::fs::FileSize(destination);
+        if (!destination_size.ok()) {
+            return core::make_unexpected(RepositoryError::Backend(
+                "read managed layer metadata '" + destination + "'", destination_size.error()));
+        }
+        if (destination_size.value() != size.value()) {
+            return core::make_unexpected(RepositoryError::Backend(
+                "managed layer '" + digest + "' size mismatch: new file has " +
+                ToStr(size.value()) + ", existing file has " + ToStr(destination_size.value())));
+        }
+        return core::Unit();
+    }
+
+    const core::Optional<std::string> parent = core::fs::Parent(destination);
+    if (!parent.has_value()) {
+        return core::make_unexpected(RepositoryError::Backend(
+            "resolve parent dir for managed layer '" + destination + "'"));
+    }
+    const core::Expected<core::Unit, std::string> mk = core::fs::CreateDirAll(*parent);
+    if (!mk.ok()) {
+        return core::make_unexpected(
+            RepositoryError::Backend("create managed layer dir '" + *parent + "'", mk.error()));
+    }
+    // Fast path for expected immutable overlaybd lower layers, which are
+    // sealed or content-addressed after publication.
+    const RepositoryResult<core::Unit> put =
+        HardLinkOrCopyManagedLayer(source, destination, *parent);
+    if (!put.ok()) return put;
+    return SyncDir(*parent);
+}
+
+RepositoryResult<core::Unit> PosixFsArtifactStore::PutSnapshotBytes(
+    const core::SnapshotId& snapshot_id, const std::string& name,
+    const std::vector<uint8_t>& bytes) {
+    const std::string snapshot_dir =
+        core::fs::Join(root_, BlobKey::PosixSnapshotDir(snapshot_id));
+    const core::Expected<core::Unit, std::string> mk = core::fs::CreateDirAll(snapshot_dir);
+    if (!mk.ok()) {
+        return core::make_unexpected(RepositoryError::Backend(
+            "create snapshot dir '" + snapshot_dir + "'", mk.error()));
+    }
+    const std::string path = core::fs::Join(snapshot_dir, name);
+    const RepositoryResult<std::string> staged =
+        WriteStagedFile(snapshot_dir, bytes, "temp file");
+    if (!staged.ok()) return core::make_unexpected(staged.error());
+    if (std::rename(staged.value().c_str(), path.c_str()) != 0) {
+        const std::string error = std::strerror(errno);
+        core::fs::RemoveFile(staged.value());
+        return core::make_unexpected(RepositoryError::Backend("persist '" + path + "'", error));
+    }
+    return SyncDir(snapshot_dir);
 }
 
 RepositoryResult<core::Unit>

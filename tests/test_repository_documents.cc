@@ -9,7 +9,9 @@
 #include "agentenv/core/fs.h"
 #include "agentenv/snapshot/image_tag.h"
 #include "agentenv/snapshot/repository/documents.h"
+#include "agentenv/snapshot/repository/interfaces.h"
 #include "agentenv/snapshot/repository/posixfs/catalog.h"
+#include "agentenv/storage/overlaybd/config.h"
 
 using namespace agentenv;
 using namespace agentenv::snapshot;
@@ -194,6 +196,96 @@ MT_TEST(posixfs_documents_round_trip_update_and_delete) {
     MT_EXPECT_TRUE(core::fs::Exists(core::fs::Join(root, "volumes/aliases/data")));
 
     core::fs::RemoveDirAll(root);
+}
+
+// ---- blobs (Rust src/repository/layout.rs, layer_config.rs) ----------------
+
+MT_TEST(blob_paths_match_existing_repositories) {
+    const BlobKey layer = BlobKey::Layer("sha256:abc", LayerRole::Rootfs);
+    MT_EXPECT_EQ(layer.Path(), std::string("managed-layers/sha256:abc"));
+    MT_EXPECT_EQ(layer.PosixPath(), std::string("managed-layers/sha256_abc.overlaybd.commit"));
+    const core::SnapshotId id = core::SnapshotId::Fresh();
+    const std::string id_str = id.ToString();
+    const BlobKey vm_state = BlobKey::Snapshot(id, SnapshotFile::VmState);
+    MT_EXPECT_EQ(vm_state.Path(), "artifacts/" + id_str + "/vm_state.bin");
+    MT_EXPECT_EQ(vm_state.PosixPath(), "snapshots/" + id_str + "/vm_state.bin");
+    const BlobKey manifest = BlobKey::Snapshot(id, SnapshotFile::FirecrackerManifest);
+    MT_EXPECT_EQ(manifest.Path(), "artifacts/" + id_str + "/firecracker-manifest.json");
+    const BlobKey startup = BlobKey::Snapshot(id, SnapshotFile::StartupManifest);
+    MT_EXPECT_EQ(startup.PosixPath(), "snapshots/" + id_str + "/memory-startup.pack");
+    const std::string dir = BlobKey::SnapshotDir(id) + "/";
+    MT_EXPECT_TRUE(vm_state.Path().compare(0, dir.size(), dir) == 0);
+}
+
+namespace {
+
+/// Stands in for Rust's `OssRepository` in
+/// `materializes_volume_backing_with_backend_layer_urls`: managed layers are
+/// remote and addressed through `s3://bucket/prefix/managed-layers`.
+class RemoteBlobRepository : public SnapshotRepository {
+ public:
+    RepositoryResult<SnapshotRecord> Create(const SnapshotRecord& record) override {
+        return record;
+    }
+    RepositoryResult<core::Optional<SnapshotRecord> > Get(const std::string&) override {
+        return core::Optional<SnapshotRecord>();
+    }
+    RepositoryResult<std::vector<SnapshotRecord> > List(const SnapshotListFilter&) override {
+        return std::vector<SnapshotRecord>();
+    }
+    RepositoryResult<core::Unit> Delete(const std::string&) override { return core::Unit(); }
+    RepositoryResult<core::Optional<core::SnapshotId> > ResolveAlias(const std::string&) override {
+        return core::Optional<core::SnapshotId>();
+    }
+    RepositoryResult<SnapshotRecord> TryStartBuild(const core::SnapshotId&) override {
+        return core::make_unexpected(RepositoryError::Unsupported("builds"));
+    }
+    RepositoryResult<core::Unit> MarkBuildError(const core::SnapshotId&,
+                                                const TemplateBuildErrorReason&) override {
+        return core::Unit();
+    }
+
+    core::Optional<std::string> ManagedLayersRepoBlobUrl() const override {
+        return std::string("s3://bucket/prefix/managed-layers");
+    }
+    RepositoryResult<BlobLocation> LocateBlob(const BlobKey& key) const override {
+        return BlobLocation::Remote("s3://bucket/prefix/" + key.Path());
+    }
+};
+
+}  // namespace
+
+MT_TEST(materializes_volume_backing_with_backend_layer_urls) {
+    const std::string temp = core::fs::CreateTempDir("agentenv-materialize-").value();
+    const RemoteBlobRepository repository;
+    const std::string destination = temp + "/volume/image.json";
+    std::vector<OverlaybdLayerRef> layers;
+    ManagedLayer managed;
+    managed.digest = "sha256:managed";
+    managed.size = 12;
+    layers.push_back(OverlaybdLayerRef::Managed(managed));
+    ExternalLayer external;
+    external.digest = "sha256:external";
+    external.repo_blob_url = "https://registry.example/v2/data/blobs";
+    external.size = 24;
+    layers.push_back(OverlaybdLayerRef::External(external));
+
+    const RepositoryResult<std::string> path =
+        MaterializeVolumeBacking(repository, layers, destination);
+    MT_EXPECT_TRUE(path.ok());
+    MT_EXPECT_EQ(path.value(), destination);
+    const core::Expected<storage::overlaybd::ImageConfig, std::string> config =
+        storage::overlaybd::LoadImageConfig(destination);
+    MT_EXPECT_TRUE(config.ok());
+    MT_EXPECT_EQ(config.value().lowers.size(), static_cast<std::size_t>(2));
+    MT_EXPECT_EQ(config.value().lowers[0].repo_blob_url,
+                 std::string("s3://bucket/prefix/managed-layers"));
+    MT_EXPECT_EQ(config.value().lowers[1].repo_blob_url,
+                 std::string("https://registry.example/v2/data/blobs"));
+    for (std::size_t i = 0; i < config.value().lowers.size(); ++i) {
+        MT_EXPECT_TRUE(config.value().lowers[i].file.empty());
+    }
+    core::fs::RemoveDirAll(temp);
 }
 
 MT_MAIN

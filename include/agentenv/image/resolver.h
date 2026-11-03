@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
-// Rust: src/image/resolver.rs — the free functions and constants around
-// `ImageResolver`: OverlayBD referrer discovery, the registry-auth/format
-// rule, and the overlaybd `image.json` shape for a resolved image.
-//
-// `ImageResolver::resolve` itself drives `cache::ImageCacheService` and is not
-// here; `layers.h` keeps the seam its consumers call.
+// Rust: src/image/resolver.rs — the `ImageResolver` struct (here
+// `DefaultImageResolver`; `layers.h` keeps the abstract `ImageResolver` seam
+// its consumers call) and the free functions and constants around it:
+// OverlayBD referrer discovery, the registry-auth/format rule, and the
+// overlaybd `image.json` shape for a resolved image.
 #ifndef AGENTENV_IMAGE_RESOLVER_H_
 #define AGENTENV_IMAGE_RESOLVER_H_
 
+#include <functional>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -15,13 +16,97 @@
 #include "agentenv/core/expected.h"
 #include "agentenv/core/json.h"
 #include "agentenv/core/optional.h"
+#include "agentenv/image/buildkit.h"
+#include "agentenv/image/cache_store.h"
 #include "agentenv/image/error.h"
 #include "agentenv/image/layers.h"
 #include "agentenv/image/metadata.h"
 #include "agentenv/image/oci_image.h"
+#include "agentenv/snapshot/layers.h"
+#include "agentenv/snapshot/repository/interfaces.h"
 
 namespace agentenv {
+namespace cfg {
+struct AppConfig;
+}  // namespace cfg
+
 namespace image {
+
+/// Rust `ImageResolver` (the struct). Resolves a reference to a local
+/// overlaybd `image.json`:
+///
+///  * `aenv/<name>[:<tag>]` — an AgentENV image tag, read from the repository;
+///  * `sha256:<hex>` — an AgentENV published image, read from the repository;
+///  * anything else — an OCI reference, tried against each candidate
+///    registry, then converted (or streamed) through the node image cache.
+///
+/// Calls block; Rust's are `async`.
+class DefaultImageResolver : public ImageResolver {
+ public:
+    /// Rust `publish_image`'s `store_layers` — copies the built image's layers
+    /// into the repository and returns their references.
+    typedef std::function<snapshot::repository::RepositoryResult<
+        std::vector<snapshot::OverlaybdLayerRef> >(snapshot::repository::SnapshotRepository&,
+                                                   const std::string& image_config_path)>
+        StoreLayersFn;
+
+    /// Rust `ImageResolver::new`.
+    explicit DefaultImageResolver(const cfg::AppConfig& config);
+
+    /// Rust `with_repository`.
+    DefaultImageResolver& WithRepository(
+        std::shared_ptr<snapshot::repository::SnapshotRepository> repository);
+
+    /// Rust `default_image`.
+    const std::string& DefaultImage() const override { return default_image_; }
+
+    /// Rust `resolve`.
+    core::Expected<ResolvedBlockImage, ImageError> Resolve(const std::string& image_ref) override;
+
+    /// Rust `resolve_with_registry_auth` — `auth` is optional.
+    core::Expected<ResolvedBlockImage, ImageError> ResolveWithRegistryAuth(
+        const std::string& image_ref, const RegistryAuth* auth);
+
+    /// Rust `resolve_buildkit`.
+    core::Expected<ResolvedBlockImage, std::string> ResolveBuildkit(
+        const BuildkitContent& content, const std::string& digest);
+
+    /// Rust `resolve_tools` — `None` when the image is neither overlaybd-native
+    /// nor labelled as a tools drive. Uses a copy of this resolver, as Rust
+    /// consumes `self`.
+    core::Expected<core::Optional<ResolvedBlockImage>, ImageError> ResolveTools(
+        const std::string& image_ref) const;
+
+    /// Rust `publish_image` — returns the published image's digest.
+    core::Expected<std::string, std::string> PublishImage(const ResolvedBlockImage& image,
+                                                          const StoreLayersFn& store_layers);
+
+    /// Rust tests assign `resolver.allowed_registries` directly.
+    void SetAllowedRegistriesForTesting(
+        const core::Optional<std::vector<std::string> >& allowed_registries) {
+        allowed_registries_ = allowed_registries;
+    }
+
+ private:
+    core::Expected<ResolvedBlockImage, ImageError> ResolvePublished(const std::string& digest);
+    core::Expected<ResolvedBlockImage, ImageError> ResolveTag(const std::string& reference);
+    core::Expected<ResolvedBlockImage, ImageError> ResolveFetchedManifest(
+        const std::string& image_ref, const std::string& arch, FetchedManifest fetched,
+        const core::Optional<std::string>& registry_config);
+    OverlaybdConversionEnv ConversionEnv(const core::Optional<std::string>& registry_config) const;
+
+    std::shared_ptr<snapshot::repository::SnapshotRepository> repository_;
+    std::shared_ptr<cache::SourceImageStore> store_;
+    std::string overlaybd_install_root_;
+    std::string overlaybd_convert_global_config_;
+    std::string overlaybd_oci_converter_id_;
+    std::string regctl_binary_;
+    std::string default_image_;
+    std::vector<std::string> search_registries_;
+    core::Optional<std::vector<std::string> > allowed_registries_;
+    std::vector<std::string> try_referrers_overlaybd_prefixes_;
+    bool convert_standard_oci_;
+};
 
 /// Rust `IMAGE_RESOLVE_STAGE_DURATION`.
 extern const char* const kImageResolveStageDuration;

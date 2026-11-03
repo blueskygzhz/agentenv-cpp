@@ -58,6 +58,11 @@ class PosixFsSnapshotRepository : public SnapshotRepository {
  public:
     explicit PosixFsSnapshotRepository(std::shared_ptr<PosixFsCatalogStore> catalog_store)
         : catalog_store_(std::move(catalog_store)) {}
+    /// With blob storage: Rust `PosixFsRepository::new(root)` keeps the
+    /// catalog and the artifacts under one root.
+    PosixFsSnapshotRepository(std::shared_ptr<PosixFsCatalogStore> catalog_store,
+                              std::shared_ptr<PosixFsArtifactStore> artifact_store)
+        : catalog_store_(std::move(catalog_store)), artifact_store_(std::move(artifact_store)) {}
 
     // ---- snapshot records -------------------------------------------------
 
@@ -98,8 +103,18 @@ class PosixFsSnapshotRepository : public SnapshotRepository {
         const DocumentKey& key, const DocumentUpdate& update) override;
     RepositoryResult<core::Unit> DeleteDocument(const DocumentKey& key) override;
 
+    // ---- blobs (Rust posixfs `backend.rs` -> artifact store). Without an
+    // artifact store these keep the base class's "unsupported" answers. -----
+
+    RepositoryResult<core::Unit> PutBlob(const BlobKey& key, const BlobBody& body) override;
+    /// Always `Local`: a POSIX repository is read in place.
+    RepositoryResult<BlobLocation> LocateBlob(const BlobKey& key) const override;
+    RepositoryResult<bool> HasBlob(const BlobKey& key) override;
+    RepositoryResult<std::string> ReadBlob(const BlobKey& key) override;
+
  private:
     std::shared_ptr<PosixFsCatalogStore> catalog_store_;
+    std::shared_ptr<PosixFsArtifactStore> artifact_store_;
 };
 
 /// Rust `struct PosixFsBackend`.

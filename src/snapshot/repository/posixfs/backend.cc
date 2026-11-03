@@ -2,6 +2,8 @@
 // Rust: src/snapshot/repository/backends/posixfs/backend.rs
 #include "agentenv/snapshot/repository/posixfs/backend.h"
 
+#include "agentenv/core/fs.h"
+
 namespace agentenv {
 namespace snapshot {
 namespace repository {
@@ -34,7 +36,7 @@ std::shared_ptr<SnapshotRepository> PosixFsBackend::repository() {
     // on-disk file locks, and handing out independent repositories would be
     // correct but would hide that they contend on the same locks.
     if (!repository_) {
-        repository_.reset(new PosixFsSnapshotRepository(catalog_store_));
+        repository_.reset(new PosixFsSnapshotRepository(catalog_store_, artifact_store_));
     }
     return repository_;
 }
@@ -133,6 +135,42 @@ RepositoryResult<core::Optional<std::string> > PosixFsSnapshotRepository::Update
 
 RepositoryResult<core::Unit> PosixFsSnapshotRepository::DeleteDocument(const DocumentKey& key) {
     return catalog_store_->DeleteDocument(key);
+}
+
+RepositoryResult<core::Unit> PosixFsSnapshotRepository::PutBlob(const BlobKey& key,
+                                                                const BlobBody& body) {
+    if (!artifact_store_) return SnapshotRepository::PutBlob(key, body);
+    return artifact_store_->PutBlob(key, body);
+}
+
+RepositoryResult<BlobLocation> PosixFsSnapshotRepository::LocateBlob(const BlobKey& key) const {
+    if (!artifact_store_) return SnapshotRepository::LocateBlob(key);
+    return BlobLocation::Local(artifact_store_->BlobPath(key));
+}
+
+RepositoryResult<bool> PosixFsSnapshotRepository::HasBlob(const BlobKey& key) {
+    if (!artifact_store_) return SnapshotRepository::HasBlob(key);
+    const std::string path = artifact_store_->BlobPath(key);
+    const core::Expected<bool, std::string> exists = core::fs::TryExists(path);
+    if (!exists.ok()) {
+        return core::make_unexpected(
+            RepositoryError::Backend("check '" + path + "'", exists.error()));
+    }
+    return exists.value();
+}
+
+RepositoryResult<std::string> PosixFsSnapshotRepository::ReadBlob(const BlobKey& key) {
+    if (!artifact_store_) return SnapshotRepository::ReadBlob(key);
+    const std::string path = artifact_store_->BlobPath(key);
+    const core::Expected<bool, std::string> exists = core::fs::TryExists(path);
+    if (exists.ok() && !exists.value()) {
+        return core::make_unexpected(RepositoryError::ArtifactNotFound("'" + path + "'"));
+    }
+    const core::Expected<std::string, std::string> bytes = core::fs::ReadToString(path);
+    if (!bytes.ok()) {
+        return core::make_unexpected(RepositoryError::Backend("read '" + path + "'", bytes.error()));
+    }
+    return bytes.value();
 }
 
 }  // namespace posixfs

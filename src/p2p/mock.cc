@@ -264,5 +264,18 @@ bool MockTransport::HasBlob(const P2pArtifactKey& key) const {
     return blobs_.find(key) != blobs_.end();
 }
 
+bool MockTransport::Descriptor(const P2pArtifactKey& key, P2pArtifactDescriptor* out) const {
+    std::lock_guard<std::mutex> g(mu_);
+    std::map<P2pArtifactKey, P2pArtifactDescriptor>::const_iterator it = descriptors_.find(key);
+    if (it == descriptors_.end()) return false;
+    if (out) *out = it->second;
+    return true;
+}
+
+void MockTransport::InsertDescriptor(const P2pArtifactDescriptor& descriptor) {
+    std::lock_guard<std::mutex> g(mu_);
+    descriptors_[descriptor.key] = descriptor;
+}
+
 }  // namespace p2p
 }  // namespace agentenv
