@@ -15,6 +15,11 @@ add_library(agentenv-image STATIC
     cache_gc.cc
     # Rust: src/image/cache/service.rs (operation-hold lifecycle)
     cache_hold.cc
+    # Rust: src/image/buildkit.rs and buildkit/history.rs. The tonic channels
+    # are behind the `*Wire` interfaces; buildkit_wire.cc supplies the transport.
+    buildkit.cc
+    buildkit_history.cc
+    buildkit_wire.cc
 )
 target_include_directories(agentenv-image PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-image PUBLIC

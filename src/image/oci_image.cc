@@ -271,11 +271,8 @@ LayerClass ClassifyLayer(const OciLayerDescriptor& layer) {
 }
 
 core::Expected<ImageFormat, ImageError> ClassifyManifest(const OciManifest& manifest) {
-    // `kOther`, not `kUnsupportedImage`: a layerless manifest is not a shape a
-    // publisher chose, it is a manifest that should not exist, so this is a
-    // 5xx and not advice to the caller.
     if (manifest.layers.empty()) {
-        return core::make_unexpected(OtherError("OCI manifest has no layers"));
+        return core::make_unexpected(UnsupportedImage("OCI manifest has no layers"));
     }
 
     const std::string turbo_suffix =
@@ -377,6 +374,16 @@ core::Expected<ImageResolutionMetadata, std::string> ParseOciImageConfig(
     const std::string& raw) {
     const core::Expected<core::Json, core::AnyError> document = core::Json::Parse(raw);
     if (!document.ok()) {
+        return core::make_unexpected(std::string("parse OCI image config JSON"));
+    }
+    // `OciImageConfigDocument` is a struct, so serde rejects a scalar document.
+    // It also accepts the positional sequence form; an empty sequence is the
+    // default document and a non-empty one is not something any publisher
+    // writes, so only the former is honoured.
+    const core::Json::Kind document_kind = document.value().kind();
+    const bool empty_sequence = document_kind == core::Json::Kind::Array &&
+                                document.value().as_array().empty();
+    if (document_kind != core::Json::Kind::Object && !empty_sequence) {
         return core::make_unexpected(std::string("parse OCI image config JSON"));
     }
 
@@ -639,6 +646,164 @@ core::Uuid UuidFromLayerDigest(const std::string& digest) {
 
 bool RegctlStderrIsNotFound(const std::string& stderr_text) {
     return Contains(stderr_text, "[http 404]");
+}
+
+namespace {
+
+core::Expected<std::string, std::string> RequiredStringField(const core::Json& object,
+                                                             const char* key) {
+    const core::Json* field = Member(object, key);
+    if (field == 0) return core::make_unexpected(std::string("missing field `") + key + "`");
+    if (field->kind() != core::Json::Kind::String) {
+        return core::make_unexpected(std::string("invalid type for `") + key +
+                                     "`: expected a string");
+    }
+    return field->as_string();
+}
+
+/// `Option<String>`: missing and null are both `None`.
+core::Expected<core::Optional<std::string>, std::string> OptionalStringField(
+    const core::Json& object, const char* key) {
+    const core::Json* field = OptionalMember(object, key);
+    if (field == 0) return core::Optional<std::string>();
+    if (field->kind() != core::Json::Kind::String) {
+        return core::make_unexpected(std::string("invalid type for `") + key +
+                                     "`: expected a string");
+    }
+    return core::Optional<std::string>(field->as_string());
+}
+
+core::Expected<OciLayerDescriptor, std::string> ParseLayerDescriptor(const core::Json& value) {
+    if (value.kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(std::string("invalid type: expected struct "
+                                                 "OciLayerDescriptor"));
+    }
+    OciLayerDescriptor layer;
+    const core::Expected<std::string, std::string> media_type =
+        RequiredStringField(value, "mediaType");
+    if (!media_type.ok()) return core::make_unexpected(media_type.error());
+    layer.media_type = media_type.value();
+    const core::Expected<std::string, std::string> digest = RequiredStringField(value, "digest");
+    if (!digest.ok()) return core::make_unexpected(digest.error());
+    layer.digest = digest.value();
+
+    const core::Json* size = Member(value, "size");
+    if (size == 0) return core::make_unexpected(std::string("missing field `size`"));
+    if (size->kind() != core::Json::Kind::Int || size->as_int() < 0) {
+        return core::make_unexpected(std::string("invalid value for `size`: expected u64"));
+    }
+    layer.size = static_cast<uint64_t>(size->as_int());
+
+    // `#[serde(default)] BTreeMap`: missing is empty, null is a type error.
+    if (const core::Json* annotations = Member(value, "annotations")) {
+        if (annotations->kind() != core::Json::Kind::Object) {
+            return core::make_unexpected(std::string("invalid type for `annotations`: expected "
+                                                     "a map"));
+        }
+        const core::JsonObject& map = annotations->as_object();
+        for (core::JsonObject::const_iterator it = map.begin(); it != map.end(); ++it) {
+            if (it->second.kind() != core::Json::Kind::String) {
+                return core::make_unexpected(std::string("invalid type in `annotations`: "
+                                                         "expected a string"));
+            }
+            layer.annotations[it->first] = it->second.as_string();
+        }
+    }
+    return layer;
+}
+
+core::Expected<OciManifestDescriptor, std::string> ParseManifestDescriptor(
+    const core::Json& value) {
+    if (value.kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(std::string("invalid type: expected struct "
+                                                 "OciManifestDescriptor"));
+    }
+    OciManifestDescriptor descriptor;
+    const core::Expected<std::string, std::string> media_type =
+        RequiredStringField(value, "mediaType");
+    if (!media_type.ok()) return core::make_unexpected(media_type.error());
+    descriptor.media_type = media_type.value();
+    const core::Expected<std::string, std::string> digest = RequiredStringField(value, "digest");
+    if (!digest.ok()) return core::make_unexpected(digest.error());
+    descriptor.digest = digest.value();
+
+    if (const core::Json* platform = OptionalMember(value, "platform")) {
+        if (platform->kind() != core::Json::Kind::Object) {
+            return core::make_unexpected(std::string("invalid type for `platform`: expected "
+                                                     "struct OciPlatform"));
+        }
+        OciPlatform parsed;
+        const core::Expected<core::Optional<std::string>, std::string> architecture =
+            OptionalStringField(*platform, "architecture");
+        if (!architecture.ok()) return core::make_unexpected(architecture.error());
+        parsed.architecture = architecture.value();
+        const core::Expected<core::Optional<std::string>, std::string> os =
+            OptionalStringField(*platform, "os");
+        if (!os.ok()) return core::make_unexpected(os.error());
+        parsed.os = os.value();
+        descriptor.platform = core::Optional<OciPlatform>(parsed);
+    }
+    return descriptor;
+}
+
+}  // namespace
+
+core::Expected<OciManifest, std::string> ParseOciManifest(const core::Json& value) {
+    if (value.kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(std::string("invalid type: expected struct OciManifest"));
+    }
+    OciManifest manifest;
+    const core::Expected<core::Optional<std::string>, std::string> artifact_type =
+        OptionalStringField(value, "artifactType");
+    if (!artifact_type.ok()) return core::make_unexpected(artifact_type.error());
+    manifest.artifact_type = artifact_type.value();
+
+    const core::Json* config = Member(value, "config");
+    if (config == 0) return core::make_unexpected(std::string("missing field `config`"));
+    if (config->kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(std::string("invalid type for `config`: expected struct "
+                                                 "OciManifestConfigDescriptor"));
+    }
+    const core::Expected<std::string, std::string> config_digest =
+        RequiredStringField(*config, "digest");
+    if (!config_digest.ok()) return core::make_unexpected(config_digest.error());
+    manifest.config.digest = config_digest.value();
+
+    const core::Json* layers = Member(value, "layers");
+    if (layers == 0) return core::make_unexpected(std::string("missing field `layers`"));
+    if (layers->kind() != core::Json::Kind::Array) {
+        return core::make_unexpected(std::string("invalid type for `layers`: expected a "
+                                                 "sequence"));
+    }
+    const core::JsonArray& array = layers->as_array();
+    for (std::size_t i = 0; i < array.size(); ++i) {
+        const core::Expected<OciLayerDescriptor, std::string> layer =
+            ParseLayerDescriptor(array[i]);
+        if (!layer.ok()) return core::make_unexpected(layer.error());
+        manifest.layers.push_back(layer.value());
+    }
+    return manifest;
+}
+
+core::Expected<OciIndex, std::string> ParseOciIndex(const core::Json& value) {
+    if (value.kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(std::string("invalid type: expected struct OciIndex"));
+    }
+    const core::Json* manifests = Member(value, "manifests");
+    if (manifests == 0) return core::make_unexpected(std::string("missing field `manifests`"));
+    if (manifests->kind() != core::Json::Kind::Array) {
+        return core::make_unexpected(std::string("invalid type for `manifests`: expected a "
+                                                 "sequence"));
+    }
+    OciIndex index;
+    const core::JsonArray& array = manifests->as_array();
+    for (std::size_t i = 0; i < array.size(); ++i) {
+        const core::Expected<OciManifestDescriptor, std::string> descriptor =
+            ParseManifestDescriptor(array[i]);
+        if (!descriptor.ok()) return core::make_unexpected(descriptor.error());
+        index.manifests.push_back(descriptor.value());
+    }
+    return index;
 }
 
 }  // namespace image

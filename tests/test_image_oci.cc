@@ -648,14 +648,11 @@ MT_TEST(classify_manifest_rejects_turbo_oci_by_version_annotation_only) {
     MT_EXPECT_TRUE(got.error().kind == ImageError::kUnsupportedImage);
 }
 
-MT_TEST(classify_manifest_rejects_empty_layers_as_a_server_error) {
-    // No Rust counterpart, and the one case that is deliberately *not* a user
-    // error: a layerless manifest is not a shape a publisher chose, so it maps
-    // to 5xx rather than telling the caller to fix their reference.
+MT_TEST(classify_manifest_rejects_manifest_without_layers) {
     const core::Expected<ImageFormat, ImageError> got = ClassifyManifest(OciManifest());
     MT_EXPECT_TRUE(!got.ok());
-    MT_EXPECT_TRUE(got.error().kind == ImageError::kOther);
-    MT_EXPECT_TRUE(!got.error().IsUserError());
+    MT_EXPECT_TRUE(got.error().kind == ImageError::kUnsupportedImage);
+    MT_EXPECT_TRUE(got.error().IsUserError());
 }
 
 MT_TEST(image_format_to_string_matches_the_rust_display_impl) {

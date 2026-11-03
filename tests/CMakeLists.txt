@@ -174,6 +174,8 @@ agentenv_add_test(test_firecracker_dirty_memory test_firecracker_dirty_memory.cc
 agentenv_add_test(test_api_image_build     test_api_image_build.cc     agentenv-api)
 # Rust: src/image/cache/service.rs (operation holds)
 agentenv_add_test(test_image_cache_hold    test_image_cache_hold.cc    agentenv-image)
+# Rust: src/image/buildkit.rs, src/image/buildkit/history.rs
+agentenv_add_test(test_image_buildkit test_image_buildkit.cc agentenv-image)
 agentenv_add_test(test_posixfs_layout     test_posixfs_layout.cc      agentenv-snapshot)
 agentenv_add_test(test_snapshot_record    test_snapshot_record.cc     agentenv-snapshot agentenv-template)
 agentenv_add_test(test_posixfs_catalog    test_posixfs_catalog.cc     agentenv-snapshot agentenv-volume-record)
