@@ -19,10 +19,7 @@
 #include "agentenv/image/catalog.h"
 #include "agentenv/image/resolver.h"
 #include "agentenv/snapshot/image_tag.h"
-#include "agentenv/snapshot/repository/posixfs/artifacts.h"
-#include "agentenv/snapshot/repository/posixfs/backend.h"
-#include "agentenv/snapshot/repository/posixfs/catalog.h"
-#include "agentenv/storage/overlaybd/config.h"
+#include "image_test_support.h"
 
 using namespace agentenv;
 using namespace agentenv::image;
@@ -312,60 +309,9 @@ std::unique_ptr<DefaultImageResolver> LocalResolver(const TempDir& temp) {
     return std::unique_ptr<DefaultImageResolver>(new DefaultImageResolver(config));
 }
 
-/// Rust `PosixFsRepository::new(root)` — catalog and blobs under one root.
-std::shared_ptr<snapshot::repository::SnapshotRepository> PosixRepository(
-    const std::string& root) {
-    namespace posixfs = snapshot::repository::posixfs;
-    return std::make_shared<posixfs::PosixFsSnapshotRepository>(
-        std::make_shared<posixfs::PosixFsCatalogStore>(root),
-        std::make_shared<posixfs::PosixFsArtifactStore>(root));
-}
-
-/// Rust `test_support::write_built_image`.
-std::string WriteBuiltImage(const std::string& root) {
-    MT_EXPECT_TRUE(core::fs::CreateDirAll(root).ok());
-    const std::string layer = core::fs::Join(root, "base.overlaybd.commit");
-    MT_EXPECT_TRUE(core::fs::Write(layer, "base-layer").ok());
-    const core::Expected<core::FileDigest, std::string> descriptor = core::DescribeFile(layer);
-    MT_EXPECT_TRUE(descriptor.ok());
-    core::Json lower = core::Json(core::JsonObject());
-    lower["file"] = layer;
-    lower["digest"] = descriptor.value().sha256;
-    lower["size"] = static_cast<int64_t>(descriptor.value().size);
-    core::Json config = core::Json(core::JsonObject());
-    config["repoBlobUrl"] = "";
-    config["lowers"] = core::Json(core::JsonArray(1, lower));
-    config["upper"] = core::Json(core::JsonObject());
-    config["resultFile"] = "";
-    const std::string path = core::fs::Join(root, "image.json");
-    MT_EXPECT_TRUE(core::fs::Write(path, config.ToString()).ok());
-    return path;
-}
-
-/// Rust `test_support::store_layers`.
-snapshot::repository::RepositoryResult<std::vector<snapshot::OverlaybdLayerRef> > StoreLayers(
-    snapshot::repository::SnapshotRepository& repository, const std::string& image_config_path) {
-    namespace repo = snapshot::repository;
-    const core::Expected<storage::overlaybd::ImageConfig, std::string> config =
-        storage::overlaybd::LoadImageConfig(image_config_path);
-    if (!config.ok()) {
-        return core::make_unexpected(repo::RepositoryError::Backend("load image config",
-                                                                     config.error()));
-    }
-    std::vector<snapshot::OverlaybdLayerRef> layers;
-    for (std::size_t i = 0; i < config.value().lowers.size(); ++i) {
-        const storage::overlaybd::LayerConfig& lower = config.value().lowers[i];
-        const repo::RepositoryResult<core::Unit> put = repository.PutBlob(
-            repo::BlobKey::Layer(lower.digest, repo::LayerRole::Rootfs),
-            repo::BlobBody::File(lower.file));
-        if (!put.ok()) return core::make_unexpected(put.error());
-        snapshot::ManagedLayer managed;
-        managed.digest = lower.digest;
-        managed.size = lower.size;
-        layers.push_back(snapshot::OverlaybdLayerRef::Managed(managed));
-    }
-    return layers;
-}
+using image_test_support::PosixRepository;
+using image_test_support::StoreLayers;
+using image_test_support::WriteBuiltImage;
 
 core::Json CmdConfig(const std::string& cmd) {
     core::Json config = core::Json(core::JsonObject());

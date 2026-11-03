@@ -1,8 +1,5 @@
 // SPDX-License-Identifier: MIT
 // Rust: src/image/cache/service.rs and src/image/cache/source_config.rs tests.
-//
-// `published_posix_image_does_not_own_or_charge_local_commits` drives
-// `ImageResolver::resolve`/`publish_image` and is ported with the resolver.
 #include "agentenv/image/cache_service.h"
 
 #include <map>
@@ -10,13 +7,16 @@
 #include <string>
 #include <vector>
 
+#include "agentenv/cfg.h"
 #include "agentenv/core/digest.h"
 #include "agentenv/core/fs.h"
 #include "agentenv/core/identity.h"
 #include "agentenv/image/commit_index.h"
+#include "agentenv/image/resolver.h"
 #include "agentenv/p2p/mock.h"
 #include "agentenv/storage/overlaybd/local_file.h"
 #include "agentenv/storage/overlaybd/lsmt_rw.h"
+#include "image_test_support.h"
 #include "microtest.h"
 
 using namespace agentenv;                // NOLINT
@@ -505,6 +505,73 @@ MT_TEST(publish_source_image_config_writes_files_and_records_refs) {
     std::vector<ImageCacheConfigId> expected;
     expected.push_back(ImageCacheConfigId::FromConfigPath(published_path.value()).value());
     MT_EXPECT_TRUE(referrers.value()[Hard("sha256:layer")] == expected);
+}
+
+MT_TEST(published_posix_image_does_not_own_or_charge_local_commits) {
+    TempRoot temp;
+    const std::string node = temp.path + "/node";
+    cfg::AppConfig config;
+    cfg::ImageConfig::Normalize(&config.image, node, node);
+    std::shared_ptr<ImageCacheService> service = ImageCacheService::SharedFromAppConfig(config);
+    DefaultImageResolver resolver(config);
+    resolver.WithRepository(image_test_support::PosixRepository(temp.path + "/repository"));
+    ResolvedBlockImage built;
+    built.image_ref = core::Sha256Digest(std::string("source manifest"));
+    built.overlaybd_config_path = image_test_support::WriteBuiltImage(temp.path + "/build");
+    core::Json raw = core::Json(core::JsonObject());
+    raw["Cmd"] = core::Json(core::JsonArray(1, core::Json("/bin/true")));
+    built.raw_config = raw;
+    const core::Expected<std::string, std::string> digest =
+        resolver.PublishImage(built, image_test_support::StoreLayers);
+    MT_EXPECT_TRUE(digest.ok());
+
+    core::Expected<std::shared_ptr<ImageCacheMetadataStore>, std::string> metadata =
+        service->MetadataStore();
+    MT_EXPECT_TRUE(metadata.ok());
+    const core::Expected<ResolvedBlockImage, ImageError> resolved =
+        resolver.Resolve(digest.value());
+    MT_EXPECT_TRUE(resolved.ok());
+    const std::string config_dir_prefix = service->config_dir() + "/";
+    MT_EXPECT_TRUE(resolved.value().overlaybd_config_path.compare(
+                       0, config_dir_prefix.size(), config_dir_prefix) == 0);
+    MT_EXPECT_TRUE(service->RebuildMetadataFromConfigs().ok());
+    MT_EXPECT_TRUE(metadata.value()->ListHardCommitObjects().value().empty());
+
+    // A converted source can have a separate local copy of the same layer.
+    const core::Expected<storage::overlaybd::ImageConfig, std::string> published =
+        storage::overlaybd::LoadImageConfig(resolved.value().overlaybd_config_path);
+    MT_EXPECT_TRUE(published.ok());
+    const storage::overlaybd::LayerConfig layer = published.value().lowers[0];
+    const std::string repository_file = layer.file;
+    const std::string payload = core::fs::ReadToString(repository_file).value();
+    const std::string local = WriteCommitFile(*service, layer.digest, payload);
+    const std::string source_config = service->config_dir() + "/converted-image.json";
+    WriteImageConfig(source_config, "", Lowers(Lower(local, layer.digest, layer.size)));
+    MT_EXPECT_TRUE(service->RecordSourceConfigRefsFromConfigPath(source_config).ok());
+    MT_EXPECT_TRUE(service->RebuildMetadataFromConfigs().ok());
+    const std::vector<HardCommitObjectRecord> records =
+        metadata.value()->ListHardCommitObjects().value();
+    MT_EXPECT_EQ(records.size(), static_cast<std::size_t>(1));
+    MT_EXPECT_TRUE(records[0].file.has_value() && *records[0].file == local);
+    MT_EXPECT_EQ(metadata.value()
+                     ->PlanCapacityEvictionFromStore(0, 0, UINT64_MAX)
+                     .value()
+                     .total_bytes,
+                 layer.size);
+
+    // Evicting the source must collect only its local copy, even while the
+    // published config continues to refer to the same digest in POSIX.
+    const core::Expected<ImageCacheGcSummary, std::string> report = service->RunMaintenance(
+        std::vector<std::pair<std::string, std::vector<std::string> > >(),
+        core::Optional<std::pair<uint64_t, uint64_t> >(std::make_pair(0, 0)), 0);
+    MT_EXPECT_TRUE(report.ok());
+    MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(1));
+    MT_EXPECT_EQ(report.value().freed_bytes, layer.size);
+    MT_EXPECT_TRUE(!core::fs::Exists(source_config));
+    MT_EXPECT_TRUE(!core::fs::Exists(local));
+    MT_EXPECT_EQ(core::fs::ReadToString(repository_file).value(), payload);
+    MT_EXPECT_TRUE(core::fs::Exists(resolved.value().overlaybd_config_path));
+    MT_EXPECT_TRUE(metadata.value()->ListHardCommitObjects().value().empty());
 }
 
 MT_TEST(overlaybd_layer_location_binds_file_for_cache_local_and_dir_for_remote) {
