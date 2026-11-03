@@ -122,6 +122,42 @@ std::string DocumentKey::PosixLockPath() const {
     return std::string();
 }
 
+const char* DocumentCollectionPrefix(DocumentCollection collection) {
+    switch (collection) {
+        case DocumentCollection::VolumeRecords:
+            return kVolumeRecordsPrefix;
+        case DocumentCollection::SnapshotRecords:
+            return kSnapshotRecordsPrefix;
+    }
+    return kVolumeRecordsPrefix;
+}
+
+core::Optional<DocumentKey> DocumentCollectionKey(DocumentCollection collection,
+                                                  const std::string& id) {
+    switch (collection) {
+        case DocumentCollection::VolumeRecords:
+            return DocumentKey::VolumeRecord(id);
+        case DocumentCollection::SnapshotRecords: {
+            const core::Expected<core::SnapshotId, std::string> parsed =
+                core::SnapshotId::Parse(id);
+            if (!parsed.ok()) return core::Optional<DocumentKey>();
+            return DocumentKey::SnapshotRecord(parsed.value());
+        }
+    }
+    return core::Optional<DocumentKey>();
+}
+
+core::Optional<std::string> DocumentCollectionIdFromFileName(DocumentCollection,
+                                                             const std::string& file_name) {
+    // Both collections: Rust `file_name.strip_suffix(".json")`.
+    static const std::string kSuffix = ".json";
+    if (file_name.size() < kSuffix.size() ||
+        file_name.compare(file_name.size() - kSuffix.size(), kSuffix.size(), kSuffix) != 0) {
+        return core::Optional<std::string>();
+    }
+    return file_name.substr(0, file_name.size() - kSuffix.size());
+}
+
 }  // namespace repository
 }  // namespace snapshot
 }  // namespace agentenv

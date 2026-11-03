@@ -186,8 +186,9 @@ MT_TEST(descriptorless_lower_rejected_unless_allowed) {
     MT_EXPECT_TRUE(!rejected.ok());
     MT_EXPECT_TRUE(rejected.error().kind == RepositoryErrorKind::Unsupported);
 
-    // publish_volume_backing passes allow_descriptorless = true.
-    auto allowed = store.PublishVolumeBacking(image);
+    // Volumes publish through `snapshot::StoreVolumeLayers`, which passes
+    // allow_descriptorless = true.
+    auto allowed = store.DeriveRootfsLayers(image, true);
     MT_EXPECT_TRUE(allowed.ok());
     MT_EXPECT_EQ(static_cast<int>(allowed.value().size()), 1);
     MT_EXPECT_TRUE(allowed.value()[0].is_managed());

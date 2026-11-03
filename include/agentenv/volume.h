@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Rust: src/volume.rs — `VolumeManager` and `VolumeLimits`.
+// Rust: src/volume/mod.rs — `VolumeManager` and `VolumeLimits`.
 //
 // Porting notes
 // -------------
@@ -11,11 +11,15 @@
 //   `std::mutex`. Rust distinguishes read and write locks; the critical
 //   sections here are all tiny map lookups, so a plain mutex keeps the same
 //   invariants without a reader-writer implementation.
-// * `Arc<dyn SnapshotRepository>` becomes `std::shared_ptr<SnapshotRepository>`.
+// * `Arc<dyn Repository>` becomes `std::shared_ptr<SnapshotRepository>`. The
+//   durable catalog is reached through the `VolumeCatalog` free functions in
+//   `agentenv/volume/catalog.h`, layers are published with
+//   `snapshot::StoreVolumeLayers` and materialized with
+//   `snapshot::repository::MaterializeVolumeBacking` — the same three entry
+//   points Rust uses, none of them backend-specific.
 // * The two backing-creation paths shell out (`mkfs.ext4`,
-//   `package_raw_as_overlaybd`). They are gated: without those tools the call
-//   returns a precise `Storage` error instead of silently producing a bad
-//   volume. See `CreateEmptyBacking`.
+//   `package_raw_as_overlaybd`). Without those tools the call returns a
+//   `Storage` error, as upstream does. See `CreateEmptyBacking`.
 #ifndef AGENTENV_VOLUME_H_
 #define AGENTENV_VOLUME_H_
 
@@ -144,8 +148,9 @@ class VolumeManager {
     core::Expected<core::Unit, VolumeError> RecoverAndPublishBackings(
         const std::string& owner, const std::vector<std::string>& volume_ids);
 
-    /// Rust `VolumeManager::persist_catalog`. Exposed because the upstream
-    /// tests drive status transitions through it directly.
+    /// Rust `VolumeManager::persist_catalog` (private upstream). Exposed
+    /// because the upstream tests, which live in the same module, drive status
+    /// transitions through it directly.
     core::Expected<core::Unit, VolumeError> PersistCatalog(const VolumeRecord& record);
 
  private:

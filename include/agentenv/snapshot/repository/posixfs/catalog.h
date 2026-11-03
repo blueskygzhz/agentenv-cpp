@@ -25,8 +25,8 @@
 #include "agentenv/core/optional.h"
 #include "agentenv/snapshot/record.h"
 #include "agentenv/snapshot/repository/errors.h"
-// `SnapshotListFilter` / `VolumeRecordPage` — shared with the repository
-// interface rather than redeclared here.
+// `SnapshotListFilter` — shared with the repository interface rather than
+// redeclared here.
 #include "agentenv/snapshot/repository/interfaces.h"
 #include "agentenv/snapshot/repository/posixfs/layout.h"
 #include "agentenv/volume/record.h"
@@ -39,10 +39,14 @@ namespace posixfs {
 /// Rust `FILE_LOCK_TIMEOUT`.
 const int64_t kFileLockTimeoutMs = 10000;
 
-// `SnapshotListFilter` and `VolumeRecordPage` used to be declared again here,
-// field for field. They belong to the repository interface, not to this
-// backend, so they now come from `interfaces.h` — one definition, which is
-// what lets a `SnapshotRepository` adapter over this store typecheck at all.
+// `SnapshotListFilter` used to be declared again here, field for field. It
+// belongs to the repository interface, not to this backend, so it now comes
+// from `interfaces.h` — one definition, which is what lets a
+// `SnapshotRepository` adapter over this store typecheck at all.
+//
+// There are no volume methods here: as in Rust, the volume catalog is built
+// on the shared documents below (`agentenv/volume/catalog.h`), so this store
+// only stores bytes under the same paths and locks.
 
 /// Rust `struct BuildCacheState` (src/snapshot/repository/build_cache.rs).
 struct BuildCacheState {
@@ -115,39 +119,6 @@ class PosixFsCatalogStore {
     RepositoryResult<core::Unit> MarkError(const core::SnapshotId& id,
                                            const TemplateBuildErrorReason& reason);
 
-    // ---- volumes ---------------------------------------------------------
-
-    /// Rust `get_volume` — accepts an id or a name.
-    RepositoryResult<core::Optional<volume::VolumeRecord> > GetVolume(
-        const std::string& reference);
-
-    /// Rust `list_volumes_page`.
-    RepositoryResult<VolumeRecordPage> ListVolumesPage(
-        const core::Optional<std::string>& after_volume_id, std::size_t limit);
-
-    /// Rust `create_volume`.
-    RepositoryResult<core::Unit> CreateVolume(const volume::VolumeRecord& record);
-
-    /// Rust `put_volume`.
-    RepositoryResult<core::Unit> PutVolume(const volume::VolumeRecord& record);
-
-    /// Rust `delete_volume` — refuses while the volume is still mounted.
-    RepositoryResult<core::Unit> DeleteVolume(const std::string& volume_id);
-
-    /// Rust `reserve_volume` — returns the current owner when the lease is
-    /// already held by someone else, rather than failing.
-    RepositoryResult<core::Optional<std::string> > ReserveVolume(const std::string& volume_id,
-                                                                 const std::string& owner);
-
-    /// Rust `reserve_read_only_volume`.
-    RepositoryResult<core::Unit> ReserveReadOnlyVolume(const std::string& volume_id,
-                                                       const std::string& owner);
-
-    /// Rust `replace_volume_owner_for` — an unset `to` releases the lease.
-    RepositoryResult<core::Unit> ReplaceVolumeOwnerFor(const std::string& volume_id,
-                                                       const std::string& from,
-                                                       const core::Optional<std::string>& to);
-
     // ---- build cache ------------------------------------------------------
 
     /// Rust `get_build_cache_state`.
@@ -177,6 +148,11 @@ class PosixFsCatalogStore {
         const DocumentKey& key, const DocumentUpdate& update) const;
     /// Rust `delete_document`.
     RepositoryResult<core::Unit> DeleteDocument(const DocumentKey& key) const;
+    /// Rust `list_documents` — the ids of the collection's `.json` files
+    /// strictly after `after`, sorted, at most `limit`.
+    RepositoryResult<std::vector<std::string> > ListDocuments(
+        DocumentCollection collection, const core::Optional<std::string>& after,
+        std::size_t limit) const;
 
     const std::string& root() const { return root_; }
 
@@ -200,8 +176,6 @@ class PosixFsCatalogStore {
     RepositoryResult<core::FileLockGuard> AcquireRecordLock(const core::SnapshotId& id) const;
     RepositoryResult<core::FileLockGuard> AcquireVolumeAliasLock(
         const std::string& alias) const;
-    RepositoryResult<core::FileLockGuard> AcquireVolumeRecordLock(
-        const std::string& volume_id) const;
 
     RepositoryResult<core::Optional<SnapshotRecord> > LoadRecordByIdUnlocked(
         const core::SnapshotId& id) const;
@@ -218,12 +192,6 @@ class PosixFsCatalogStore {
     RepositoryResult<core::Unit> CleanupUncommittedSnapshotDir(
         const core::SnapshotId& id) const;
 
-    RepositoryResult<core::Unit> EnsureVolumeComponent(const std::string& value,
-                                                       const std::string& kind) const;
-    RepositoryResult<core::Unit> EnsureVolumeId(const std::string& volume_id) const;
-    RepositoryResult<std::vector<std::string> > VolumeIdsUnlocked() const;
-    RepositoryResult<core::Optional<volume::VolumeRecord> > LoadVolumeByIdUnlocked(
-        const std::string& volume_id) const;
 
     std::string root_;
 };

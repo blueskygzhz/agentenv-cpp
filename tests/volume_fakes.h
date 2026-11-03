@@ -2,20 +2,21 @@
 // Shared fakes for the volume tests.
 //
 // Extracted from test_volume.cc so the API-layer volume tests can drive a real
-// `VolumeManager` instead of duplicating a 200-line repository fake. Rust gets
-// this for free by having both test modules in the same crate.
+// `VolumeManager` over the same repository. Rust gets this for free by having
+// both test modules in the same crate.
 #ifndef AGENTENV_TESTS_VOLUME_FAKES_H_
 #define AGENTENV_TESTS_VOLUME_FAKES_H_
 
-#include <map>
 #include <memory>
-#include <sstream>
 #include <string>
 #include <vector>
 
 #include "agentenv/core/digest.h"
 #include "agentenv/core/fs.h"
 #include "agentenv/snapshot/layers.h"
+#include "agentenv/snapshot/repository/posixfs/artifacts.h"
+#include "agentenv/snapshot/repository/posixfs/backend.h"
+#include "agentenv/snapshot/repository/posixfs/catalog.h"
 #include "agentenv/storage/overlaybd/config.h"
 #include "agentenv/volume.h"
 #include "microtest.h"
@@ -37,274 +38,122 @@ using agentenv::volume::VolumeStatus;
 namespace obd = agentenv::storage::overlaybd;
 namespace repo = agentenv::snapshot::repository;
 
-/// Stands in for the Rust tests' `PosixFsBackend`: a durable catalog plus the
-/// layer store, kept in memory but with the same ordering, aliasing and
-/// reservation semantics the volume manager relies on.
+/// The Rust tests' `PosixFsBackend::new(root.join("store"))`: a real POSIX
+/// repository, so the catalog, the layer store and the materializer under
+/// test are the production ones. The only addition is a create cutoff.
+///
+/// A fork creates one clone per child, and the behaviour worth testing is a
+/// failure *partway through* — the clones already made have to be cleaned up.
+/// Clone names carry a fresh uuid, so a name collision cannot be staged in
+/// advance; counting record inserts is the only way in from outside.
 class FakeVolumeRepository : public repo::SnapshotRepository {
  public:
-    explicit FakeVolumeRepository(const std::string& store_root) : store_root_(store_root) {}
+    explicit FakeVolumeRepository(const std::string& store_root)
+        : inner_(std::make_shared<repo::posixfs::PosixFsCatalogStore>(store_root),
+                 std::make_shared<repo::posixfs::PosixFsArtifactStore>(store_root)) {}
 
-    // --- snapshot half: unused here, so minimally satisfied ----------------
-    //
-    // Every one carries `override`. Without it these were plain member
-    // functions that merely resembled the interface: when `ResolveAlias`,
-    // `TryStartBuild` and `MarkBuildError` changed to take ids and a
-    // structured reason, the fake silently stopped overriding anything and
-    // became abstract, which is what broke the build here rather than any
-    // mismatch being reported at the declaration.
-    repo::RepositoryResult<repo::SnapshotRecord> Create(
-        const repo::SnapshotRecord& record) override {
-        return record;
-    }
-    repo::RepositoryResult<Optional<repo::SnapshotRecord> > Get(const std::string&) override {
-        return Optional<repo::SnapshotRecord>();
-    }
-    repo::RepositoryResult<std::vector<repo::SnapshotRecord> > List(
-        const repo::SnapshotListFilter&) override {
-        return std::vector<repo::SnapshotRecord>();
-    }
-    repo::RepositoryResult<Unit> Delete(const std::string&) override { return Unit(); }
-    repo::RepositoryResult<Optional<agentenv::core::SnapshotId> > ResolveAlias(
-        const std::string&) override {
-        return Optional<agentenv::core::SnapshotId>();
-    }
-    repo::RepositoryResult<repo::SnapshotRecord> TryStartBuild(
-        const agentenv::core::SnapshotId&) override {
-        return repo::SnapshotRecord();
-    }
-    repo::RepositoryResult<Unit> MarkBuildError(
-        const agentenv::core::SnapshotId&,
-        const agentenv::snapshot::TemplateBuildErrorReason&) override {
-        return Unit();
-    }
-
-    // --- volume half --------------------------------------------------------
-    repo::RepositoryResult<Optional<VolumeRecord> > GetVolume(const std::string& reference) {
-        // Upstream resolves by id first, then by name alias.
-        const std::map<std::string, VolumeRecord>::const_iterator by_id = records_.find(reference);
-        if (by_id != records_.end()) return Optional<VolumeRecord>(by_id->second);
-        for (std::map<std::string, VolumeRecord>::const_iterator it = records_.begin();
-             it != records_.end(); ++it) {
-            if (it->second.name == reference) return Optional<VolumeRecord>(it->second);
-        }
-        return Optional<VolumeRecord>();
-    }
-
-    repo::RepositoryResult<repo::VolumeRecordPage> ListVolumesPage(
-        const Optional<std::string>& after_volume_id, std::size_t limit) {
-        repo::VolumeRecordPage page;
-        // `records_` is a std::map, so iteration is already id-ordered, which
-        // is what makes the cursor stable.
-        std::map<std::string, VolumeRecord>::const_iterator it = records_.begin();
-        if (after_volume_id.has_value()) {
-            it = records_.upper_bound(*after_volume_id);
-        }
-        for (; it != records_.end() && page.records.size() < limit; ++it) {
-            page.records.push_back(it->second);
-        }
-        if (it != records_.end()) {
-            page.next_volume_id = page.records.back().id;
-        }
-        return page;
-    }
-
-    /// Creates made so far, and an optional cutoff.
-    ///
-    /// The cutoff exists because a fork creates one clone per child, and the
-    /// behaviour worth testing is a failure *partway through* -- the clones
-    /// already made have to be cleaned up. The clone names carry a fresh uuid,
-    /// so a name collision cannot be staged in advance; counting the calls is
-    /// the only way in from outside.
+    /// Volume records created so far, and an optional cutoff.
     int create_volume_calls = 0;
     /// Refuse once this many creates have succeeded. Negative never refuses.
     int fail_create_volume_after = -1;
 
-    repo::RepositoryResult<Unit> CreateVolume(const VolumeRecord& record) {
-        if (fail_create_volume_after >= 0 &&
-            create_volume_calls >= fail_create_volume_after) {
+    // --- snapshot half: delegated ------------------------------------------
+    repo::RepositoryResult<repo::SnapshotRecord> Create(
+        const repo::SnapshotRecord& record) override {
+        return inner_.Create(record);
+    }
+    repo::RepositoryResult<Optional<repo::SnapshotRecord> > Get(
+        const std::string& id_or_alias) override {
+        return inner_.Get(id_or_alias);
+    }
+    repo::RepositoryResult<std::vector<repo::SnapshotRecord> > List(
+        const repo::SnapshotListFilter& filter) override {
+        return inner_.List(filter);
+    }
+    repo::RepositoryResult<Unit> Delete(const std::string& id_or_alias) override {
+        return inner_.Delete(id_or_alias);
+    }
+    repo::RepositoryResult<Optional<agentenv::core::SnapshotId> > ResolveAlias(
+        const std::string& alias) override {
+        return inner_.ResolveAlias(alias);
+    }
+    repo::RepositoryResult<repo::SnapshotRecord> TryStartBuild(
+        const agentenv::core::SnapshotId& id) override {
+        return inner_.TryStartBuild(id);
+    }
+    repo::RepositoryResult<Unit> MarkBuildError(
+        const agentenv::core::SnapshotId& id,
+        const agentenv::snapshot::TemplateBuildErrorReason& reason) override {
+        return inner_.MarkBuildError(id, reason);
+    }
+
+    // --- documents: delegated, record inserts counted ----------------------
+    repo::RepositoryResult<Optional<std::string> > GetDocument(
+        const repo::DocumentKey& key) override {
+        return inner_.GetDocument(key);
+    }
+    repo::RepositoryResult<Unit> PutDocument(const repo::DocumentKey& key,
+                                             const std::string& bytes) override {
+        return inner_.PutDocument(key, bytes);
+    }
+    repo::RepositoryResult<Optional<std::string> > UpdateDocument(
+        const repo::DocumentKey& key, const repo::DocumentUpdate& update) override {
+        if (key.kind() != repo::DocumentKey::Kind::VolumeRecord) {
+            return inner_.UpdateDocument(key, update);
+        }
+        const repo::RepositoryResult<Optional<std::string> > before = inner_.GetDocument(key);
+        if (!before.ok()) return before;
+        if (before.value().has_value()) return inner_.UpdateDocument(key, update);
+        // A missing record being written is `create_volume`'s insert.
+        if (fail_create_volume_after >= 0 && create_volume_calls >= fail_create_volume_after) {
             ++create_volume_calls;
             return agentenv::core::make_unexpected(
                 repo::RepositoryError::InvalidRequest("injected create failure"));
         }
-        for (std::map<std::string, VolumeRecord>::const_iterator it = records_.begin();
-             it != records_.end(); ++it) {
-            if (it->second.name == record.name) {
-                return agentenv::core::make_unexpected(
-                    repo::RepositoryError::AliasConflict(record.name, it->second.id, record.id));
-            }
-        }
-        ++create_volume_calls;
-        records_[record.id] = Persisted(record);
-        return Unit();
+        const repo::RepositoryResult<Optional<std::string> > applied =
+            inner_.UpdateDocument(key, update);
+        if (applied.ok() && !applied.value().has_value()) ++create_volume_calls;
+        return applied;
+    }
+    repo::RepositoryResult<Unit> DeleteDocument(const repo::DocumentKey& key) override {
+        return inner_.DeleteDocument(key);
+    }
+    repo::RepositoryResult<std::vector<std::string> > ListDocuments(
+        repo::DocumentCollection collection, const Optional<std::string>& after,
+        std::size_t limit) override {
+        return inner_.ListDocuments(collection, after, limit);
     }
 
-    repo::RepositoryResult<Unit> PutVolume(const VolumeRecord& record) {
-        const std::map<std::string, VolumeRecord>::iterator found = records_.find(record.id);
-        if (found == records_.end()) {
-            return agentenv::core::make_unexpected(
-                repo::RepositoryError::SnapshotNotFound(record.id));
-        }
-        // The durable catalog enforces the same transition rules upstream.
-        const agentenv::core::Expected<Unit, std::string> allowed =
-            found->second.ValidateCatalogUpdate(record);
-        if (!allowed.ok()) {
-            return agentenv::core::make_unexpected(
-                repo::RepositoryError::InvalidRequest(allowed.error()));
-        }
-        found->second = Persisted(record);
-        return Unit();
+    // --- blobs: delegated --------------------------------------------------
+    Optional<std::string> ManagedLayersRepoBlobUrl() const override {
+        return inner_.ManagedLayersRepoBlobUrl();
+    }
+    repo::RepositoryResult<Unit> PutBlob(const repo::BlobKey& key,
+                                         const repo::BlobBody& body) override {
+        return inner_.PutBlob(key, body);
+    }
+    repo::RepositoryResult<repo::BlobLocation> LocateBlob(
+        const repo::BlobKey& key) const override {
+        return inner_.LocateBlob(key);
+    }
+    repo::RepositoryResult<bool> HasBlob(const repo::BlobKey& key) override {
+        return inner_.HasBlob(key);
+    }
+    repo::RepositoryResult<std::string> ReadBlob(const repo::BlobKey& key) override {
+        return inner_.ReadBlob(key);
     }
 
-    repo::RepositoryResult<Unit> DeleteVolume(const std::string& volume_id) {
-        if (records_.erase(volume_id) == 0) {
-            return agentenv::core::make_unexpected(
-                repo::RepositoryError::SnapshotNotFound(volume_id));
-        }
-        return Unit();
+    /// Durable volume records, deleting ones included.
+    std::size_t volume_count() {
+        const repo::RepositoryResult<std::vector<std::string> > ids = inner_.ListDocuments(
+            repo::DocumentCollection::VolumeRecords, Optional<std::string>(),
+            static_cast<std::size_t>(-1));
+        MT_EXPECT_TRUE(ids.ok());
+        return ids.ok() ? ids.value().size() : 0;
     }
-
-    repo::RepositoryResult<Optional<std::string> > ReserveVolume(const std::string& volume_id,
-                                                                 const std::string& owner) {
-        const std::map<std::string, VolumeRecord>::iterator found = records_.find(volume_id);
-        if (found == records_.end()) {
-            return agentenv::core::make_unexpected(
-                repo::RepositoryError::SnapshotNotFound(volume_id));
-        }
-        if (found->second.reserved_by_sandbox_id.has_value() &&
-            *found->second.reserved_by_sandbox_id != owner) {
-            return Optional<std::string>(*found->second.reserved_by_sandbox_id);
-        }
-        found->second.reserved_by_sandbox_id = owner;
-        return Optional<std::string>();
-    }
-
-    repo::RepositoryResult<Unit> ReserveReadOnlyVolume(const std::string& volume_id,
-                                                       const std::string& owner) {
-        const std::map<std::string, VolumeRecord>::iterator found = records_.find(volume_id);
-        if (found == records_.end()) {
-            return agentenv::core::make_unexpected(
-                repo::RepositoryError::SnapshotNotFound(volume_id));
-        }
-        std::vector<std::string>& mounts = found->second.read_only_mounts;
-        for (std::size_t i = 0; i < mounts.size(); ++i) {
-            if (mounts[i] == owner) return Unit();
-        }
-        mounts.push_back(owner);
-        return Unit();
-    }
-
-    repo::RepositoryResult<Unit> ReplaceVolumeOwnerFor(const std::string& volume_id,
-                                                       const std::string& owner,
-                                                       const Optional<std::string>& new_owner) {
-        const std::map<std::string, VolumeRecord>::iterator found = records_.find(volume_id);
-        if (found == records_.end()) {
-            return agentenv::core::make_unexpected(
-                repo::RepositoryError::SnapshotNotFound(volume_id));
-        }
-        found->second.ReplaceOwner(owner, new_owner);
-        return Unit();
-    }
-
-    /// Mirrors the POSIX backend: every local lower becomes a managed layer
-    /// keyed by content digest, while entries that only carry a remote URL are
-    /// preserved as external references.
-    repo::RepositoryResult<std::vector<OverlaybdLayerRef> > PublishVolumeBacking(
-        const std::string&, const std::string& image_config_path) {
-        const agentenv::core::Expected<obd::ImageConfig, std::string> loaded =
-            obd::LoadImageConfig(image_config_path);
-        if (!loaded.ok()) {
-            return agentenv::core::make_unexpected(repo::RepositoryError::Backend(loaded.error()));
-        }
-
-        std::vector<OverlaybdLayerRef> published;
-        for (std::size_t i = 0; i < loaded.value().lowers.size(); ++i) {
-            const obd::LayerConfig& layer = loaded.value().lowers[i];
-            if (layer.file.empty()) {
-                ExternalLayer external;
-                external.digest = layer.digest;
-                external.repo_blob_url = layer.repo_blob_url;
-                external.size = layer.size;
-                published.push_back(OverlaybdLayerRef::External(external));
-                continue;
-            }
-            const agentenv::core::Expected<std::string, std::string> bytes =
-                agentenv::core::fs::ReadToString(layer.file);
-            if (!bytes.ok()) {
-                return agentenv::core::make_unexpected(
-                    repo::RepositoryError::Backend(bytes.error()));
-            }
-            ManagedLayer managed;
-            managed.digest = agentenv::core::Sha256Digest(bytes.value());
-            managed.size = bytes.value().size();
-            blobs_[managed.digest] = bytes.value();
-            published.push_back(OverlaybdLayerRef::Managed(managed));
-        }
-        return published;
-    }
-
-    repo::RepositoryResult<std::string> MaterializeVolumeBacking(
-        const std::string&, const std::vector<OverlaybdLayerRef>& layers,
-        const std::string& destination) {
-        obd::ImageConfig config;
-        for (std::size_t i = 0; i < layers.size(); ++i) {
-            obd::LayerConfig layer;
-            if (layers[i].is_managed()) {
-                const std::map<std::string, std::string>::const_iterator blob =
-                    blobs_.find(layers[i].managed.digest);
-                if (blob == blobs_.end()) {
-                    return agentenv::core::make_unexpected(
-                        repo::RepositoryError::Backend("managed layer blob is missing"));
-                }
-                std::ostringstream name;
-                name << "materialized-" << i << ".commit";
-                const std::string path =
-                    agentenv::core::fs::Join(store_root_, name.str());
-                const agentenv::core::Expected<Unit, std::string> created =
-                    agentenv::core::fs::CreateDirAll(store_root_);
-                if (!created.ok()) {
-                    return agentenv::core::make_unexpected(
-                        repo::RepositoryError::Backend(created.error()));
-                }
-                const agentenv::core::Expected<Unit, std::string> written =
-                    agentenv::core::fs::Write(path, blob->second);
-                if (!written.ok()) {
-                    return agentenv::core::make_unexpected(
-                        repo::RepositoryError::Backend(written.error()));
-                }
-                layer.file = path;
-                layer.digest = layers[i].managed.digest;
-                layer.size = layers[i].managed.size;
-            } else {
-                // External layers stay by reference: no local file is written.
-                layer.repo_blob_url = layers[i].external.repo_blob_url;
-                layer.digest = layers[i].external.digest;
-                layer.size = layers[i].external.size;
-            }
-            config.lowers.push_back(layer);
-        }
-        const agentenv::core::Expected<bool, std::string> saved =
-            obd::SaveImageConfig(destination, config);
-        if (!saved.ok()) {
-            return agentenv::core::make_unexpected(repo::RepositoryError::Backend(saved.error()));
-        }
-        return destination;
-    }
-
-    std::size_t volume_count() const { return records_.size(); }
 
  private:
-    /// `backing_image_config` is `#[serde(skip)]`, so the durable copy must not
-    /// keep the node-local path. Dropping it here is what lets the tests prove
-    /// a stale local file cannot shadow committed layers.
-    static VolumeRecord Persisted(const VolumeRecord& record) {
-        VolumeRecord stored = record;
-        stored.backing_image_config = Optional<std::string>();
-        return stored;
-    }
-
-    std::string store_root_;
-    std::map<std::string, VolumeRecord> records_;
-    std::map<std::string, std::string> blobs_;
+    repo::posixfs::PosixFsSnapshotRepository inner_;
 };
 
 /// Named `VolumeFixture` rather than `Fixture` because `orchestrator_fakes.h`

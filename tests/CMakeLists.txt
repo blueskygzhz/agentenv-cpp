@@ -27,6 +27,8 @@ agentenv_add_test(test_config              test_config.cc              agentenv-
 agentenv_add_test(test_toml                test_toml.cc                agentenv-core)
 agentenv_add_test(test_cfg                 test_cfg.cc                 agentenv-cfg)
 agentenv_add_test(test_volume              test_volume.cc              agentenv-volume)
+# Rust: src/volume/catalog.rs
+agentenv_add_test(test_volume_catalog      test_volume_catalog.cc      agentenv-volume)
 agentenv_add_test(test_template_spec       test_template_spec.cc       agentenv-template)
 # Rust: src/template/step_executor.rs
 agentenv_add_test(test_template_step_executor test_template_step_executor.cc agentenv-template)

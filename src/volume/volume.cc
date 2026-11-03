@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Rust: src/volume.rs — `VolumeManager`.
+// Rust: src/volume/mod.rs — `VolumeManager`.
 #include "agentenv/volume.h"
 
 #include <cstdlib>
@@ -12,8 +12,10 @@
 #include "agentenv/core/fs.h"
 #include "agentenv/core/identity.h"
 #include "agentenv/core/logging.h"
+#include "agentenv/snapshot/store.h"
 #include "agentenv/storage/overlaybd/config.h"
 #include "agentenv/storage/overlaybd/tools_packaging.h"
+#include "agentenv/volume/catalog.h"
 
 namespace agentenv {
 namespace volume {
@@ -25,18 +27,9 @@ using snapshot::OverlaybdLayerRef;
 namespace obd = storage::overlaybd;
 namespace repo = snapshot::repository;
 
-/// Rust `format!("vol_{}", Uuid::now_v7().simple())`. `simple()` is the
-/// dash-free hex form, so the dashes from `Uuid::ToString` are stripped here —
-/// which also keeps the id inside `is_valid_volume_component`.
-std::string FreshVolumeId() {
-    const std::string dashed = core::Uuid::GenV7().ToString();
-    std::string simple;
-    simple.reserve(32);
-    for (std::size_t i = 0; i < dashed.size(); ++i) {
-        if (dashed[i] != '-') simple.push_back(dashed[i]);
-    }
-    return "vol_" + simple;
-}
+/// Rust `format!("vol_{}", Uuid::now_v7().simple())` — the dash-free hex
+/// form, which also keeps the id inside `is_valid_volume_component`.
+std::string FreshVolumeId() { return "vol_" + core::Uuid::GenV7().ToSimpleString(); }
 
 /// Runs `argv` and returns its exit status, or an error when it could not be
 /// spawned. Replaces `tokio::process::Command::status()`.
@@ -101,10 +94,10 @@ VolumeError RepositoryErrorToVolumeError(const repo::RepositoryError& error) {
     // Rust `repository_error`. Only the two volume-shaped variants are
     // translated; anything else keeps its message under `Storage`.
     switch (error.kind) {
-        case repo::RepositoryErrorKind::SnapshotNotFound:
+        case repo::RepositoryErrorKind::VolumeNotFound:
             return VolumeError::NotFound(error.message);
-        case repo::RepositoryErrorKind::AliasConflict:
-            return VolumeError::NameConflict(error.alias);
+        case repo::RepositoryErrorKind::VolumeNameConflict:
+            return VolumeError::NameConflict(error.message);
         default:
             return VolumeError::Storage(error.ToString());
     }
@@ -169,7 +162,7 @@ void VolumeManager::CacheRecord(const VolumeRecord& record) {
 // ---------------------------------------------------------------------------
 
 VolumeResult<VolumeRecord> VolumeManager::Get(const std::string& reference) {
-    repo::RepositoryResult<Optional<VolumeRecord> > fetched = repository_->GetVolume(reference);
+    repo::RepositoryResult<Optional<VolumeRecord> > fetched = GetVolume(*repository_, reference);
     if (!fetched.ok()) {
         return core::make_unexpected(RepositoryErrorToVolumeError(fetched.error()));
     }
@@ -199,8 +192,8 @@ VolumeResult<VolumePage> VolumeManager::ListPage(const Optional<std::string>& ne
         after_volume_id = decoded.value();
     }
 
-    repo::RepositoryResult<repo::VolumeRecordPage> fetched =
-        repository_->ListVolumesPage(after_volume_id, limit);
+    repo::RepositoryResult<VolumeRecordPage> fetched =
+        ListVolumesPage(*repository_, after_volume_id, limit);
     if (!fetched.ok()) {
         return core::make_unexpected(RepositoryErrorToVolumeError(fetched.error()));
     }
@@ -235,7 +228,7 @@ VolumeResult<VolumeRecord> VolumeManager::MaterializeBacking(const std::string& 
                                                              << record.backing_layers.size());
 
     repo::RepositoryResult<std::string> materialized =
-        repository_->MaterializeVolumeBacking(record.id, record.backing_layers, destination);
+        repo::MaterializeVolumeBacking(*repository_, record.backing_layers, destination);
     if (!materialized.ok()) {
         return core::make_unexpected(RepositoryErrorToVolumeError(materialized.error()));
     }
@@ -383,7 +376,7 @@ VolumeResult<VolumeRecord> VolumeManager::CreateWithSourceOwner(
         if (!published.ok()) failure = published.error();
     }
     if (!failure.has_value()) {
-        repo::RepositoryResult<Unit> created = repository_->CreateVolume(record);
+        repo::RepositoryResult<Unit> created = CreateVolume(*repository_, record);
         if (!created.ok()) failure = RepositoryErrorToVolumeError(created.error());
     }
     if (failure.has_value()) {
@@ -434,7 +427,7 @@ VolumeResult<VolumeRecord> VolumeManager::CreateFromSnapshot(
                    << record.id << " mode=" << VolumeModeToString(record.mode)
                    << " size_mb=" << record.size_mb);
 
-    repo::RepositoryResult<Unit> created = repository_->CreateVolume(record);
+    repo::RepositoryResult<Unit> created = CreateVolume(*repository_, record);
     if (!created.ok()) {
         return core::make_unexpected(RepositoryErrorToVolumeError(created.error()));
     }
@@ -488,7 +481,7 @@ core::Expected<Unit, VolumeError> VolumeManager::Remove(const std::string& refer
     }
 
     AGENTENV_DEBUG("deleting volume volume_id=" << record.id);
-    repo::RepositoryResult<Unit> deleted = repository_->DeleteVolume(record.id);
+    repo::RepositoryResult<Unit> deleted = DeleteVolume(*repository_, record.id);
     if (!deleted.ok()) {
         return core::make_unexpected(RepositoryErrorToVolumeError(deleted.error()));
     }
@@ -525,7 +518,7 @@ core::Expected<Unit, VolumeError> VolumeManager::Reserve(const std::string& refe
 
     if (record.mode == VolumeMode::ReadOnly) {
         repo::RepositoryResult<Unit> reserved =
-            repository_->ReserveReadOnlyVolume(record.id, owner);
+            ReserveReadOnlyVolume(*repository_, record.id, owner);
         if (!reserved.ok()) {
             return core::make_unexpected(RepositoryErrorToVolumeError(reserved.error()));
         }
@@ -543,7 +536,7 @@ core::Expected<Unit, VolumeError> VolumeManager::Reserve(const std::string& refe
     }
 
     repo::RepositoryResult<Optional<std::string> > reserved =
-        repository_->ReserveVolume(record.id, owner);
+        ReserveVolume(*repository_, record.id, owner);
     if (!reserved.ok()) {
         return core::make_unexpected(RepositoryErrorToVolumeError(reserved.error()));
     }
@@ -562,7 +555,7 @@ core::Expected<Unit, VolumeError> VolumeManager::ReplaceOwnerFor(
     for (std::size_t i = 0; i < volume_ids.size(); ++i) {
         const std::string& volume_id = volume_ids[i];
         repo::RepositoryResult<Unit> replaced =
-            repository_->ReplaceVolumeOwnerFor(volume_id, owner, new_owner);
+            ReplaceVolumeOwnerFor(*repository_, volume_id, owner, new_owner);
         if (!replaced.ok()) {
             return core::make_unexpected(RepositoryErrorToVolumeError(replaced.error()));
         }
@@ -719,8 +712,9 @@ void VolumeManager::MarkPublicationFailed(VolumeRecord record, const char* stage
 
 core::Expected<Unit, VolumeError> VolumeManager::PublishBacking(VolumeRecord* record) {
     if (!record->backing_image_config.has_value()) return Unit();
+    // Rust `crate::snapshot::store::store_volume_layers(repository, path)`.
     repo::RepositoryResult<std::vector<OverlaybdLayerRef> > published =
-        repository_->PublishVolumeBacking(record->id, *record->backing_image_config);
+        snapshot::StoreVolumeLayers(*repository_, *record->backing_image_config);
     if (!published.ok()) {
         return core::make_unexpected(RepositoryErrorToVolumeError(published.error()));
     }
@@ -729,7 +723,7 @@ core::Expected<Unit, VolumeError> VolumeManager::PublishBacking(VolumeRecord* re
 }
 
 core::Expected<Unit, VolumeError> VolumeManager::PersistCatalog(const VolumeRecord& record) {
-    repo::RepositoryResult<Unit> stored = repository_->PutVolume(record);
+    repo::RepositoryResult<Unit> stored = PutVolume(*repository_, record);
     if (!stored.ok()) {
         return core::make_unexpected(RepositoryErrorToVolumeError(stored.error()));
     }

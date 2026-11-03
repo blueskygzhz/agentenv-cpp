@@ -79,21 +79,6 @@ class PosixFsSnapshotRepository : public SnapshotRepository {
         MarkBuildError(const core::SnapshotId& id,
                        const TemplateBuildErrorReason& reason) override;
 
-    // ---- volume catalog ---------------------------------------------------
-    //
-    // The base class defaults these to "unsupported". Forwarded here because
-    // the catalog store does implement them durably, and leaving the defaults
-    // would make a configured posix-fs node report no volume support at all.
-
-    RepositoryResult<core::Optional<volume::VolumeRecord> >
-        GetVolume(const std::string& reference) override;
-    RepositoryResult<VolumeRecordPage>
-        ListVolumesPage(const core::Optional<std::string>& after_volume_id,
-                        std::size_t limit) override;
-    RepositoryResult<core::Unit> CreateVolume(const volume::VolumeRecord& record) override;
-    RepositoryResult<core::Unit> PutVolume(const volume::VolumeRecord& record) override;
-    RepositoryResult<core::Unit> DeleteVolume(const std::string& volume_id) override;
-
     // ---- shared documents (Rust posixfs `backend.rs` -> catalog store) -----
 
     RepositoryResult<core::Optional<std::string> > GetDocument(const DocumentKey& key) override;
@@ -102,6 +87,9 @@ class PosixFsSnapshotRepository : public SnapshotRepository {
     RepositoryResult<core::Optional<std::string> > UpdateDocument(
         const DocumentKey& key, const DocumentUpdate& update) override;
     RepositoryResult<core::Unit> DeleteDocument(const DocumentKey& key) override;
+    RepositoryResult<std::vector<std::string> > ListDocuments(
+        DocumentCollection collection, const core::Optional<std::string>& after,
+        std::size_t limit) override;
 
     // ---- blobs (Rust posixfs `backend.rs` -> artifact store). Without an
     // artifact store these keep the base class's "unsupported" answers. -----

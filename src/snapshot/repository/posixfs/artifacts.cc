@@ -538,11 +538,6 @@ PosixFsArtifactStore::DeriveMemoryLayers(const std::string& mem_image_config_pat
     return layers;
 }
 
-RepositoryResult<std::vector<OverlaybdLayerRef> >
-PosixFsArtifactStore::PublishVolumeBacking(const std::string& image_config_path) {
-    return DeriveRootfsLayers(image_config_path, true);
-}
-
 RepositoryResult<CollectedBuiltArtifacts>
 PosixFsArtifactStore::ImportBuiltArtifacts(const core::SnapshotId& snapshot_id,
                                            const sandbox::SandboxSnapshotManifest& manifest) {

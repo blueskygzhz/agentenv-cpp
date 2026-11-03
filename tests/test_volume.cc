@@ -289,13 +289,25 @@ MT_TEST(a_snake_case_document_is_rejected_rather_than_silently_defaulted) {
     MT_EXPECT_TRUE(parsed.ok());
     if (!parsed.ok()) return;
 
-    // Rust would fail the same way -- `size_mb` has no `#[serde(default)]`,
-    // so a missing `sizeMb` is a hard parse error. Defaulting it to zero
-    // instead would hand back a record claiming a zero-byte volume.
+    // Rust would fail the same way -- only `reservedBySandboxId` and
+    // `deleting` may be absent, and serde reports the first missing field in
+    // declaration order, which is `mode`.
     const agentenv::core::Expected<VolumeRecord, std::string> record =
         VolumeRecord::FromJson(parsed.value());
     MT_EXPECT_TRUE(!record.ok());
-    if (!record.ok()) MT_EXPECT_EQ(record.error(), std::string("missing field `sizeMb`"));
+    if (!record.ok()) MT_EXPECT_EQ(record.error(), std::string("missing field `mode`"));
+
+    // With every other field present, the snake_case size is still not
+    // `sizeMb`: defaulting it to zero would claim a zero-byte volume.
+    const agentenv::core::Expected<agentenv::core::Json, agentenv::core::AnyError> sized =
+        agentenv::core::Json::Parse(
+            "{\"id\":\"vol_abc\",\"name\":\"demo\",\"mode\":\"Exclusive\",\"size_mb\":1024,"
+            "\"status\":\"ready\",\"backingLayers\":[],\"readOnlyMounts\":[]}");
+    MT_EXPECT_TRUE(sized.ok());
+    const agentenv::core::Expected<VolumeRecord, std::string> unsized =
+        VolumeRecord::FromJson(sized.value());
+    MT_EXPECT_TRUE(!unsized.ok());
+    if (!unsized.ok()) MT_EXPECT_EQ(unsized.error(), std::string("missing field `sizeMb`"));
 }
 
 // ---------------------------------------------------------------------------
@@ -833,9 +845,10 @@ MT_TEST(unsupported_repository_reports_the_upstream_feature_names) {
         VolumeManager::OpenWithRepository("/tmp/aenv/catalog", repository);
     MT_EXPECT_TRUE(opened.ok());
 
+    // The catalog is built on documents, so that is the feature reported.
     const agentenv::volume::VolumeResult<VolumeRecord> got = opened.value()->Get("anything");
     MT_EXPECT_EQ(got.error().kind, VolumeErrorKind::Storage);
-    MT_EXPECT_TRUE(got.error().detail.find("volume catalog") != std::string::npos);
+    MT_EXPECT_TRUE(got.error().detail.find("repository documents") != std::string::npos);
 }
 
 int main() { return microtest::RunAll(); }

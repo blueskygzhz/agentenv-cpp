@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
-// Rust: src/volume.rs — the record/enum/error half.
+// Rust: src/volume/mod.rs — the record/enum/error half (`VolumeRecord`,
+// `VolumeStatus`, `VolumePage`, `VolumeError`, the cursor codec and the
+// validators); `VolumeMode` is Rust's src/types/volume_mode.rs.
 //
-// Split out of `volume.h` so that `snapshot/repository/interfaces.h` can name
-// `VolumeRecord` (its catalog methods traffic in it) without pulling in
-// `VolumeManager`, which itself depends on the repository interface. Rust has no
-// such cycle because both live in one crate.
+// Split out of `volume.h` into its own library (`agentenv-volume-record`)
+// because snapshot types carry a `VolumeMode` (`SnapshotVolume`) while
+// `VolumeManager` depends on the snapshot repository. Rust has no such cycle
+// because both live in one crate.
 #ifndef AGENTENV_VOLUME_RECORD_H_
 #define AGENTENV_VOLUME_RECORD_H_
 
@@ -35,7 +37,8 @@ const std::size_t kDefaultVolumePageSize = 100;
 /// Rust `BYTES_PER_MB`.
 const uint64_t kBytesPerMb = 1024ULL * 1024ULL;
 
-/// Rust `is_valid_volume_component` — non-empty, <= 128 bytes, and only ASCII
+/// Rust `is_valid_volume_component` (src/repository/layout.rs, re-exported by
+/// src/volume/mod.rs) — non-empty, <= 128 bytes, and only ASCII
 /// alphanumerics plus `_` and `-`. Used for both names and ids, which is what
 /// keeps a decoded pagination cursor from escaping the data directory.
 bool IsValidVolumeComponent(const std::string& value);
@@ -96,6 +99,10 @@ struct VolumeRecord {
     /// path, so writing it into the durable record would make the catalog
     /// node-specific.
     core::Json ToJson() const;
+    /// Rust `Deserialize` — as strict as serde's derive: every field except
+    /// `reservedBySandboxId` (an `Option`) and `deleting` (`#[serde(default)]`)
+    /// is required, and a value of the wrong type is an error. Unknown keys
+    /// are ignored, as there is no `deny_unknown_fields`.
     static core::Expected<VolumeRecord, std::string> FromJson(const core::Json& json);
 
     bool operator==(const VolumeRecord& other) const;

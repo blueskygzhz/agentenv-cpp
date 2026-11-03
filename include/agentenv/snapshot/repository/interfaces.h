@@ -37,7 +37,6 @@
 #include "agentenv/snapshot/repository/documents.h"
 #include "agentenv/snapshot/repository/errors.h"
 #include "agentenv/snapshot/types.h"
-#include "agentenv/volume/record.h"
 
 namespace agentenv {
 namespace snapshot {
@@ -83,22 +82,18 @@ struct SnapshotListFilter {
     bool Matches(const SnapshotRecord& r) const;
 };
 
-/// Rust struct `VolumeRecordPage` — one page of the durable volume catalog.
-struct VolumeRecordPage {
-    std::vector<volume::VolumeRecord> records;
-    /// The last returned volume id. Supplying it to the next request resumes
-    /// after that record in the repository's stable shard-and-id order.
-    /// Absent when this is the last page.
-    core::Optional<std::string> next_volume_id;
-};
-
-/// Rust trait `SnapshotRepository`.
+/// Rust trait `SnapshotRepository`, which has since become `Repository`.
 ///
-/// The volume half of the trait carries `unsupported("...")` default bodies
+/// The document and blob halves carry `unsupported("...")` default bodies
 /// upstream, so a backend that only implements snapshots keeps compiling and
 /// reports the same error at runtime. The C++ port mirrors that exactly: these
-/// are virtual functions *with* a default implementation, not pure virtuals —
-/// adding them therefore does not break existing backends.
+/// are virtual functions *with* a default implementation, not pure virtuals.
+///
+/// There is no volume half. Rust's repository "stores; it does not decide":
+/// the volume catalog (`src/volume/catalog.rs`, ported as
+/// `agentenv/volume/catalog.h`) is built on the documents below and is the
+/// same on every backend, and volume layers go through `put_blob` like any
+/// other layer (`agentenv/snapshot/store.h`).
 class SnapshotRepository {
  public:
     virtual ~SnapshotRepository() {}
@@ -128,42 +123,6 @@ class SnapshotRepository {
         MarkBuildError(const core::SnapshotId& id,
                        const TemplateBuildErrorReason& reason) = 0;
 
-    // --- volume catalog (Rust: default bodies returning `unsupported`) ------
-
-    /// Rust `get_volume` — looked up by id *or* name.
-    virtual RepositoryResult<core::Optional<volume::VolumeRecord> >
-        GetVolume(const std::string& reference);
-    /// Rust `list_volumes_page`.
-    virtual RepositoryResult<VolumeRecordPage>
-        ListVolumesPage(const core::Optional<std::string>& after_volume_id, std::size_t limit);
-    /// Rust `create_volume` — inserts a new durable record.
-    virtual RepositoryResult<core::Unit> CreateVolume(const volume::VolumeRecord& record);
-    /// Rust `put_volume` — updates one existing durable record.
-    virtual RepositoryResult<core::Unit> PutVolume(const volume::VolumeRecord& record);
-    /// Rust `delete_volume`.
-    virtual RepositoryResult<core::Unit> DeleteVolume(const std::string& volume_id);
-    /// Rust `reserve_volume` — atomic where supported. A returned owner string
-    /// reports an existing conflicting reservation.
-    virtual RepositoryResult<core::Optional<std::string> >
-        ReserveVolume(const std::string& volume_id, const std::string& owner);
-    /// Rust `reserve_read_only_volume`.
-    virtual RepositoryResult<core::Unit>
-        ReserveReadOnlyVolume(const std::string& volume_id, const std::string& owner);
-    /// Rust `replace_volume_owner_for` — `new_owner` unset releases the lease.
-    virtual RepositoryResult<core::Unit>
-        ReplaceVolumeOwnerFor(const std::string& volume_id, const std::string& owner,
-                              const core::Optional<std::string>& new_owner);
-    /// Rust `publish_volume_backing` — uploads the local image config's layers
-    /// and returns the repository-owned descriptors.
-    virtual RepositoryResult<std::vector<OverlaybdLayerRef> >
-        PublishVolumeBacking(const std::string& volume_id, const std::string& image_config_path);
-    /// Rust `materialize_volume_backing` — writes a node-local image config for
-    /// the given repository-owned layers and returns its path.
-    virtual RepositoryResult<std::string>
-        MaterializeVolumeBacking(const std::string& volume_id,
-                                 const std::vector<OverlaybdLayerRef>& layers,
-                                 const std::string& destination);
-
     // --- shared documents (Rust src/repository/interfaces.rs; default bodies
     // returning `unsupported("repository documents")`) ----------------------
 
@@ -179,6 +138,11 @@ class SnapshotRepository {
         const DocumentKey& key, const DocumentUpdate& update);
     /// Rust `delete_document` — a missing document is success.
     virtual RepositoryResult<core::Unit> DeleteDocument(const DocumentKey& key);
+    /// Rust `list_documents` — up to `limit` document ids strictly after
+    /// `after`, in the backend's stable order.
+    virtual RepositoryResult<std::vector<std::string> > ListDocuments(
+        DocumentCollection collection, const core::Optional<std::string>& after,
+        std::size_t limit);
 
     // --- blobs (Rust src/repository/interfaces.rs; default bodies returning
     // `unsupported("blob storage")`, `None` for the URL) -----------------------
@@ -204,9 +168,6 @@ class SnapshotRepository {
 /// runtime image config for `layers` at `destination`, atomically, and
 /// returns its path. Managed layers are read in place when the repository
 /// allows it, otherwise by digest from its `repoBlobUrl`.
-///
-/// A free function, as in Rust; the `MaterializeVolumeBacking` member above
-/// is the older per-volume shape.
 RepositoryResult<std::string> MaterializeVolumeBacking(
     const SnapshotRepository& repository, const std::vector<OverlaybdLayerRef>& layers,
     const std::string& destination);

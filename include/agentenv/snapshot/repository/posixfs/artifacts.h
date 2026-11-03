@@ -53,11 +53,6 @@ class PosixFsArtifactStore {
     /// is an error); snapshot files are replaced atomically.
     RepositoryResult<core::Unit> PutBlob(const BlobKey& key, const BlobBody& body);
 
-    /// Rust `publish_volume_backing` — a volume's lowers are allowed to be
-    /// descriptorless because the volume manager owns them locally.
-    RepositoryResult<std::vector<OverlaybdLayerRef> >
-        PublishVolumeBacking(const std::string& image_config_path);
-
     /// Rust `import_built_artifacts`.
     ///
     /// 1. copy committed fixed-layout runtime files (`vm_state.bin`)

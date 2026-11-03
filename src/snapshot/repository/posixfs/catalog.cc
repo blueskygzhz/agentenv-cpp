@@ -2,10 +2,14 @@
 // Rust: src/snapshot/repository/backends/posixfs/catalog.rs
 #include "agentenv/snapshot/repository/posixfs/catalog.h"
 
+#include <dirent.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdio>
+#include <cstring>
 
 #include "agentenv/core/fs.h"
 
@@ -243,11 +247,6 @@ RepositoryResult<core::FileLockGuard> PosixFsCatalogStore::AcquireRecordLock(
 RepositoryResult<core::FileLockGuard> PosixFsCatalogStore::AcquireVolumeAliasLock(
     const std::string& alias) const {
     return AcquireCatalogLock(Paths::VolumeAliasLockPath(root_, alias), "volume alias");
-}
-
-RepositoryResult<core::FileLockGuard> PosixFsCatalogStore::AcquireVolumeRecordLock(
-    const std::string& volume_id) const {
-    return AcquireCatalogLock(Paths::VolumeRecordLockPath(root_, volume_id), "volume record");
 }
 
 // ---- record helpers -------------------------------------------------------
@@ -767,424 +766,6 @@ RepositoryResult<core::Unit> PosixFsCatalogStore::MarkError(
     return WriteRecordUnlocked(record);
 }
 
-// ---- volumes --------------------------------------------------------------
-
-RepositoryResult<core::Unit> PosixFsCatalogStore::EnsureVolumeComponent(
-    const std::string& value, const std::string& kind) const {
-    if (!volume::IsValidVolumeComponent(value)) {
-        // These become path components, so a `..` or `/` would escape the
-        // volumes directory.
-        return core::make_unexpected(RepositoryError::InvalidRequest(
-            "invalid volume " + kind + " '" + value + "'"));
-    }
-    return core::Unit();
-}
-
-RepositoryResult<core::Unit> PosixFsCatalogStore::EnsureVolumeId(
-    const std::string& volume_id) const {
-    return EnsureVolumeComponent(volume_id, "id");
-}
-
-RepositoryResult<core::Optional<volume::VolumeRecord> >
-PosixFsCatalogStore::LoadVolumeByIdUnlocked(const std::string& volume_id) const {
-    const RepositoryResult<core::Unit> valid = EnsureVolumeId(volume_id);
-    if (!valid.ok()) return core::make_unexpected(valid.error());
-
-    const std::string path = Paths::VolumeRecordPath(root_, volume_id);
-    if (!core::fs::Exists(path)) return core::Optional<volume::VolumeRecord>();
-
-    const RepositoryResult<core::Json> json = ReadJson(path);
-    if (!json.ok()) return core::make_unexpected(json.error());
-    const core::Expected<volume::VolumeRecord, std::string> record =
-        volume::VolumeRecord::FromJson(json.value());
-    if (!record.ok()) {
-        return core::make_unexpected(Backend("parse json '" + path + "'", record.error()));
-    }
-
-    const RepositoryResult<core::Unit> id_valid = EnsureVolumeId(record.value().id);
-    if (!id_valid.ok()) return core::make_unexpected(id_valid.error());
-    if (record.value().id != volume_id) {
-        // The file name is the lookup key, so a record whose own id differs
-        // would be reachable under two names.
-        return core::make_unexpected(RepositoryError::InvalidRequest(
-            "volume record id '" + record.value().id + "' does not match path '" + path + "'"));
-    }
-    return core::Optional<volume::VolumeRecord>(record.value());
-}
-
-RepositoryResult<std::vector<std::string> > PosixFsCatalogStore::VolumeIdsUnlocked() const {
-    const std::string directory = Paths::VolumeRecordsDir(root_);
-    if (!core::fs::Exists(directory)) return std::vector<std::string>();
-
-    const core::Expected<std::vector<std::string>, std::string> entries =
-        core::fs::ReadDir(directory);
-    if (!entries.ok()) {
-        return core::make_unexpected(
-            Backend("read volume directory '" + directory + "'", entries.error()));
-    }
-
-    std::vector<std::string> volume_ids;
-    for (std::size_t i = 0; i < entries.value().size(); ++i) {
-        const std::string stem = JsonFileStem(entries.value()[i]);
-        if (stem.empty()) continue;
-        if (!core::fs::IsFile(core::fs::Join(directory, entries.value()[i]))) continue;
-
-        const RepositoryResult<core::Unit> valid = EnsureVolumeId(stem);
-        if (!valid.ok()) return core::make_unexpected(valid.error());
-        volume_ids.push_back(stem);
-    }
-    std::sort(volume_ids.begin(), volume_ids.end());
-    return volume_ids;
-}
-
-RepositoryResult<core::Optional<volume::VolumeRecord> > PosixFsCatalogStore::GetVolume(
-    const std::string& reference) {
-    const RepositoryResult<core::Unit> valid =
-        EnsureVolumeComponent(reference, "reference");
-    if (!valid.ok()) return core::make_unexpected(valid.error());
-
-    const RepositoryResult<core::Optional<volume::VolumeRecord> > by_id =
-        LoadVolumeByIdUnlocked(reference);
-    if (!by_id.ok()) return core::make_unexpected(by_id.error());
-    if (by_id.value().has_value()) return by_id;
-
-    RepositoryResult<core::FileLockGuard> guard = AcquireVolumeAliasLock(reference);
-    if (!guard.ok()) return core::make_unexpected(guard.error());
-    const core::FileLockGuard held(std::move(guard.value()));
-
-    const std::string alias_path = Paths::VolumeAliasPath(root_, reference);
-    if (!core::fs::Exists(alias_path)) return core::Optional<volume::VolumeRecord>();
-
-    const RepositoryResult<core::Json> json = ReadJson(alias_path);
-    if (!json.ok()) return core::make_unexpected(json.error());
-    if (json.value().kind() != core::Json::Kind::String) {
-        return core::make_unexpected(
-            Backend("parse json '" + alias_path + "'", "not a string"));
-    }
-    const std::string volume_id = json.value().as_string();
-    const RepositoryResult<core::Unit> id_valid = EnsureVolumeId(volume_id);
-    if (!id_valid.ok()) return core::make_unexpected(id_valid.error());
-
-    const RepositoryResult<core::Optional<volume::VolumeRecord> > record =
-        LoadVolumeByIdUnlocked(volume_id);
-    if (!record.ok()) return core::make_unexpected(record.error());
-    if (record.value().has_value()) return record;
-
-    const RepositoryResult<core::Unit> removed = RemoveFileIfExists(alias_path);
-    if (!removed.ok()) return core::make_unexpected(removed.error());
-    return core::Optional<volume::VolumeRecord>();
-}
-
-RepositoryResult<VolumeRecordPage> PosixFsCatalogStore::ListVolumesPage(
-    const core::Optional<std::string>& after_volume_id, std::size_t limit) {
-    if (limit == 0) {
-        return core::make_unexpected(
-            RepositoryError::InvalidRequest("volume page limit must be greater than zero"));
-    }
-    if (after_volume_id.has_value()) {
-        const RepositoryResult<core::Unit> valid = EnsureVolumeId(*after_volume_id);
-        if (!valid.ok()) return core::make_unexpected(valid.error());
-    }
-
-    const RepositoryResult<std::vector<std::string> > all = VolumeIdsUnlocked();
-    if (!all.ok()) return core::make_unexpected(all.error());
-
-    std::vector<std::string> selected;
-    for (std::size_t i = 0; i < all.value().size(); ++i) {
-        // Strictly greater, so the cursor's own volume is not repeated.
-        if (after_volume_id.has_value() && !(all.value()[i] > *after_volume_id)) continue;
-        selected.push_back(all.value()[i]);
-    }
-
-    const bool has_more = selected.size() > limit;
-    if (has_more) selected.resize(limit);
-
-    VolumeRecordPage page;
-    for (std::size_t i = 0; i < selected.size(); ++i) {
-        const RepositoryResult<core::Optional<volume::VolumeRecord> > record =
-            LoadVolumeByIdUnlocked(selected[i]);
-        if (!record.ok()) return core::make_unexpected(record.error());
-        // A record deleted between listing and loading is simply skipped.
-        if (record.value().has_value()) page.records.push_back(*record.value());
-    }
-    if (has_more && !page.records.empty()) {
-        page.next_volume_id =
-            core::Optional<std::string>(page.records[page.records.size() - 1].id);
-    }
-    return page;
-}
-
-RepositoryResult<core::Unit> PosixFsCatalogStore::CreateVolume(
-    const volume::VolumeRecord& record) {
-    const RepositoryResult<core::Unit> id_valid = EnsureVolumeId(record.id);
-    if (!id_valid.ok()) return core::make_unexpected(id_valid.error());
-    const RepositoryResult<core::Unit> name_valid =
-        EnsureVolumeComponent(record.name, "name");
-    if (!name_valid.ok()) return core::make_unexpected(name_valid.error());
-
-    RepositoryResult<core::FileLockGuard> alias_guard = AcquireVolumeAliasLock(record.name);
-    if (!alias_guard.ok()) return core::make_unexpected(alias_guard.error());
-    const core::FileLockGuard alias_held(std::move(alias_guard.value()));
-
-    RepositoryResult<core::FileLockGuard> record_guard =
-        AcquireVolumeRecordLock(record.id);
-    if (!record_guard.ok()) return core::make_unexpected(record_guard.error());
-    const core::FileLockGuard record_held(std::move(record_guard.value()));
-
-    const std::string record_path = Paths::VolumeRecordPath(root_, record.id);
-    if (core::fs::Exists(record_path)) {
-        return core::make_unexpected(RepositoryError::InvalidRequest(
-            std::string("volume '") + record.id + "' already exists"));
-    }
-
-    const std::string alias_path = Paths::VolumeAliasPath(root_, record.name);
-    if (core::fs::Exists(alias_path)) {
-        const RepositoryResult<core::Json> json = ReadJson(alias_path);
-        if (!json.ok()) return core::make_unexpected(json.error());
-        if (json.value().kind() != core::Json::Kind::String) {
-            return core::make_unexpected(
-                Backend("parse json '" + alias_path + "'", "not a string"));
-        }
-        const std::string existing_id = json.value().as_string();
-        const RepositoryResult<core::Unit> existing_valid = EnsureVolumeId(existing_id);
-        if (!existing_valid.ok()) return core::make_unexpected(existing_valid.error());
-
-        if (core::fs::Exists(Paths::VolumeRecordPath(root_, existing_id))) {
-            return core::make_unexpected(RepositoryError::VolumeNameConflict(record.name));
-        }
-        // The alias outlived its record, so it is stale rather than taken.
-        const RepositoryResult<core::Unit> removed = RemoveFileIfExists(alias_path);
-        if (!removed.ok()) return core::make_unexpected(removed.error());
-    }
-
-    // Names and ids share one namespace on disk: a name that collides with
-    // some other volume's id (or vice versa) would make one of them
-    // unreachable.
-    if (core::fs::Exists(Paths::VolumeRecordPath(root_, record.name)) ||
-        core::fs::Exists(Paths::VolumeAliasPath(root_, record.id))) {
-        return core::make_unexpected(RepositoryError::VolumeNameConflict(record.name));
-    }
-
-    volume::VolumeRecord durable = record;
-    // `backing_image_config` is a node-local cache path; persisting it would
-    // make the catalog node-specific.
-    durable.backing_image_config = core::Optional<std::string>();
-
-    const RepositoryResult<core::Unit> written = WriteJson(record_path, durable.ToJson());
-    if (!written.ok()) return core::make_unexpected(written.error());
-
-    const RepositoryResult<core::Unit> bound =
-        WriteJson(alias_path, core::Json(record.id));
-    if (!bound.ok()) {
-        // Roll the record back, or the volume would exist with no name.
-        RemoveFileIfExists(record_path);
-        return core::make_unexpected(bound.error());
-    }
-    return core::Unit();
-}
-
-RepositoryResult<core::Unit> PosixFsCatalogStore::PutVolume(
-    const volume::VolumeRecord& record) {
-    const RepositoryResult<core::Unit> id_valid = EnsureVolumeId(record.id);
-    if (!id_valid.ok()) return core::make_unexpected(id_valid.error());
-    const RepositoryResult<core::Unit> name_valid =
-        EnsureVolumeComponent(record.name, "name");
-    if (!name_valid.ok()) return core::make_unexpected(name_valid.error());
-
-    RepositoryResult<core::FileLockGuard> guard = AcquireVolumeRecordLock(record.id);
-    if (!guard.ok()) return core::make_unexpected(guard.error());
-    const core::FileLockGuard held(std::move(guard.value()));
-
-    const std::string path = Paths::VolumeRecordPath(root_, record.id);
-    if (!core::fs::Exists(path)) {
-        return core::make_unexpected(RepositoryError::VolumeNotFound(record.id));
-    }
-
-    const RepositoryResult<core::Json> json = ReadJson(path);
-    if (!json.ok()) return core::make_unexpected(json.error());
-    const core::Expected<volume::VolumeRecord, std::string> existing =
-        volume::VolumeRecord::FromJson(json.value());
-    if (!existing.ok()) {
-        return core::make_unexpected(Backend("parse json '" + path + "'", existing.error()));
-    }
-    const RepositoryResult<core::Unit> existing_valid = EnsureVolumeId(existing.value().id);
-    if (!existing_valid.ok()) return core::make_unexpected(existing_valid.error());
-
-    const core::Expected<core::Unit, std::string> allowed =
-        existing.value().ValidateCatalogUpdate(record);
-    if (!allowed.ok()) {
-        return core::make_unexpected(RepositoryError::InvalidRequest(allowed.error()));
-    }
-
-    volume::VolumeRecord durable = record;
-    durable.backing_image_config = core::Optional<std::string>();
-    // Reservation state belongs to the reservation APIs alone: a concurrent
-    // backing or status update must not resurrect a released owner.
-    durable.reserved_by_sandbox_id = existing.value().reserved_by_sandbox_id;
-    durable.read_only_mounts = existing.value().read_only_mounts;
-    return WriteJson(path, durable.ToJson());
-}
-
-RepositoryResult<core::Unit> PosixFsCatalogStore::DeleteVolume(
-    const std::string& volume_id) {
-    const RepositoryResult<core::Unit> valid = EnsureVolumeId(volume_id);
-    if (!valid.ok()) return core::make_unexpected(valid.error());
-
-    const RepositoryResult<core::Optional<volume::VolumeRecord> > existing =
-        LoadVolumeByIdUnlocked(volume_id);
-    if (!existing.ok()) return core::make_unexpected(existing.error());
-    if (!existing.value().has_value()) return core::Unit();
-
-    RepositoryResult<core::FileLockGuard> alias_guard =
-        AcquireVolumeAliasLock(existing.value()->name);
-    if (!alias_guard.ok()) return core::make_unexpected(alias_guard.error());
-    const core::FileLockGuard alias_held(std::move(alias_guard.value()));
-
-    RepositoryResult<core::FileLockGuard> record_guard =
-        AcquireVolumeRecordLock(volume_id);
-    if (!record_guard.ok()) return core::make_unexpected(record_guard.error());
-    const core::FileLockGuard record_held(std::move(record_guard.value()));
-
-    // Re-read under the lock: the record may have changed since the check
-    // above, which ran unlocked.
-    const RepositoryResult<core::Optional<volume::VolumeRecord> > current =
-        LoadVolumeByIdUnlocked(volume_id);
-    if (!current.ok()) return core::make_unexpected(current.error());
-    if (!current.value().has_value()) return core::Unit();
-
-    const volume::VolumeRecord record = *current.value();
-    if (record.reserved_by_sandbox_id.has_value()) {
-        return core::make_unexpected(RepositoryError::InvalidRequest(
-            "volume '" + volume_id + "' is reserved by sandbox '" +
-            *record.reserved_by_sandbox_id + "'"));
-    }
-    if (!record.read_only_mounts.empty()) {
-        return core::make_unexpected(RepositoryError::InvalidRequest(
-            "volume '" + volume_id + "' is mounted read-only by sandbox '" +
-            record.read_only_mounts[0] + "'"));
-    }
-
-    const RepositoryResult<core::Unit> removed =
-        RemoveFileIfExists(Paths::VolumeRecordPath(root_, volume_id));
-    if (!removed.ok()) return core::make_unexpected(removed.error());
-
-    const std::string alias_path = Paths::VolumeAliasPath(root_, record.name);
-    if (core::fs::Exists(alias_path)) {
-        const RepositoryResult<core::Json> json = ReadJson(alias_path);
-        if (!json.ok()) return core::make_unexpected(json.error());
-        // Only unbind a name that still points at this volume.
-        if (json.value().kind() == core::Json::Kind::String &&
-            json.value().as_string() == volume_id) {
-            return RemoveFileIfExists(alias_path);
-        }
-    }
-    return core::Unit();
-}
-
-RepositoryResult<core::Optional<std::string> > PosixFsCatalogStore::ReserveVolume(
-    const std::string& volume_id, const std::string& owner) {
-    const RepositoryResult<core::Unit> id_valid = EnsureVolumeId(volume_id);
-    if (!id_valid.ok()) return core::make_unexpected(id_valid.error());
-    const RepositoryResult<core::Unit> owner_valid = EnsureVolumeComponent(owner, "owner");
-    if (!owner_valid.ok()) return core::make_unexpected(owner_valid.error());
-
-    RepositoryResult<core::FileLockGuard> guard = AcquireVolumeRecordLock(volume_id);
-    if (!guard.ok()) return core::make_unexpected(guard.error());
-    const core::FileLockGuard held(std::move(guard.value()));
-
-    const RepositoryResult<core::Optional<volume::VolumeRecord> > existing =
-        LoadVolumeByIdUnlocked(volume_id);
-    if (!existing.ok()) return core::make_unexpected(existing.error());
-    if (!existing.value().has_value()) {
-        return core::make_unexpected(RepositoryError::VolumeNotFound(volume_id));
-    }
-
-    volume::VolumeRecord record = *existing.value();
-    // A read-only volume has no exclusive lease to take.
-    if (record.mode == volume::VolumeMode::ReadOnly) return core::Optional<std::string>();
-
-    if (record.reserved_by_sandbox_id.has_value()) {
-        // Held by someone else: report the owner rather than failing, so the
-        // caller can surface a useful conflict.
-        if (*record.reserved_by_sandbox_id != owner) {
-            return core::Optional<std::string>(*record.reserved_by_sandbox_id);
-        }
-        // Already ours; re-reserving is a no-op.
-        return core::Optional<std::string>();
-    }
-
-    record.reserved_by_sandbox_id = core::Optional<std::string>(owner);
-    const RepositoryResult<core::Unit> written =
-        WriteJson(Paths::VolumeRecordPath(root_, volume_id), record.ToJson());
-    if (!written.ok()) return core::make_unexpected(written.error());
-    return core::Optional<std::string>();
-}
-
-RepositoryResult<core::Unit> PosixFsCatalogStore::ReserveReadOnlyVolume(
-    const std::string& volume_id, const std::string& owner) {
-    const RepositoryResult<core::Unit> id_valid = EnsureVolumeId(volume_id);
-    if (!id_valid.ok()) return core::make_unexpected(id_valid.error());
-    const RepositoryResult<core::Unit> owner_valid = EnsureVolumeComponent(owner, "owner");
-    if (!owner_valid.ok()) return core::make_unexpected(owner_valid.error());
-
-    RepositoryResult<core::FileLockGuard> guard = AcquireVolumeRecordLock(volume_id);
-    if (!guard.ok()) return core::make_unexpected(guard.error());
-    const core::FileLockGuard held(std::move(guard.value()));
-
-    const RepositoryResult<core::Optional<volume::VolumeRecord> > existing =
-        LoadVolumeByIdUnlocked(volume_id);
-    if (!existing.ok()) return core::make_unexpected(existing.error());
-    if (!existing.value().has_value()) {
-        return core::make_unexpected(RepositoryError::VolumeNotFound(volume_id));
-    }
-
-    volume::VolumeRecord record = *existing.value();
-    if (record.mode != volume::VolumeMode::ReadOnly) {
-        return core::make_unexpected(
-            RepositoryError::InvalidRequest("volume '" + volume_id + "' is not read-only"));
-    }
-    for (std::size_t i = 0; i < record.read_only_mounts.size(); ++i) {
-        // Idempotent: mounting twice from one sandbox is not an error.
-        if (record.read_only_mounts[i] == owner) return core::Unit();
-    }
-
-    record.read_only_mounts.push_back(owner);
-    return WriteJson(Paths::VolumeRecordPath(root_, volume_id), record.ToJson());
-}
-
-RepositoryResult<core::Unit> PosixFsCatalogStore::ReplaceVolumeOwnerFor(
-    const std::string& volume_id, const std::string& from,
-    const core::Optional<std::string>& to) {
-    const RepositoryResult<core::Unit> id_valid = EnsureVolumeId(volume_id);
-    if (!id_valid.ok()) return core::make_unexpected(id_valid.error());
-    const RepositoryResult<core::Unit> from_valid = EnsureVolumeComponent(from, "owner");
-    if (!from_valid.ok()) return core::make_unexpected(from_valid.error());
-    if (to.has_value()) {
-        const RepositoryResult<core::Unit> to_valid = EnsureVolumeComponent(*to, "owner");
-        if (!to_valid.ok()) return core::make_unexpected(to_valid.error());
-        // Nothing to do, and taking the lock would be pointless contention.
-        if (*to == from) return core::Unit();
-    }
-
-    RepositoryResult<core::FileLockGuard> guard = AcquireVolumeRecordLock(volume_id);
-    if (!guard.ok()) return core::make_unexpected(guard.error());
-    const core::FileLockGuard held(std::move(guard.value()));
-
-    const RepositoryResult<core::Optional<volume::VolumeRecord> > existing =
-        LoadVolumeByIdUnlocked(volume_id);
-    if (!existing.ok()) return core::make_unexpected(existing.error());
-    if (!existing.value().has_value()) {
-        return core::make_unexpected(RepositoryError::VolumeNotFound(volume_id));
-    }
-
-    volume::VolumeRecord record = *existing.value();
-    if (record.ReplaceOwner(from, to)) {
-        return WriteJson(Paths::VolumeRecordPath(root_, volume_id), record.ToJson());
-    }
-    // `from` did not hold anything, so there is nothing to persist.
-    return core::Unit();
-}
-
 // ---- build cache ----------------------------------------------------------
 
 RepositoryResult<BuildCacheState> PosixFsCatalogStore::GetBuildCacheState() const {
@@ -1310,6 +891,46 @@ RepositoryResult<core::Unit> PosixFsCatalogStore::DeleteDocument(const DocumentK
     if (!guard.ok()) return core::make_unexpected(guard.error());
     const core::FileLockGuard held(std::move(guard.value()));
     return RemoveFileIfExists(core::fs::Join(root_, key.PosixPath()));
+}
+
+RepositoryResult<std::vector<std::string> > PosixFsCatalogStore::ListDocuments(
+    DocumentCollection collection, const core::Optional<std::string>& after,
+    std::size_t limit) const {
+    const std::string directory = core::fs::Join(root_, DocumentCollectionPrefix(collection));
+    DIR* entries = ::opendir(directory.c_str());
+    if (entries == NULL) {
+        if (errno == ENOENT) return std::vector<std::string>();
+        return core::make_unexpected(Backend("read '" + directory + "'", std::strerror(errno)));
+    }
+    std::vector<std::string> ids;
+    errno = 0;
+    struct dirent* entry = NULL;
+    while ((entry = ::readdir(entries)) != NULL) {
+        const std::string file_name = entry->d_name;
+        if (file_name == "." || file_name == "..") continue;
+        // Rust `entry.file_type()` — the entry itself, symlinks not followed.
+        const std::string path = core::fs::Join(directory, file_name);
+        struct stat info;
+        if (::lstat(path.c_str(), &info) != 0) {
+            const std::string error = std::strerror(errno);
+            ::closedir(entries);
+            return core::make_unexpected(Backend("inspect '" + path + "'", error));
+        }
+        // Lock files share the directory and are not documents.
+        const core::Optional<std::string> id =
+            DocumentCollectionIdFromFileName(collection, file_name);
+        if (!id.has_value() || !S_ISREG(info.st_mode)) continue;
+        if (!after.has_value() || *id > *after) ids.push_back(*id);
+        errno = 0;
+    }
+    const int read_error = errno;
+    ::closedir(entries);
+    if (read_error != 0) {
+        return core::make_unexpected(Backend("read '" + directory + "'", std::strerror(read_error)));
+    }
+    std::sort(ids.begin(), ids.end());
+    if (ids.size() > limit) ids.resize(limit);
+    return ids;
 }
 
 }  // namespace posixfs

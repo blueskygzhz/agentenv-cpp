@@ -78,6 +78,28 @@ class DocumentKey {
     core::Optional<snapshot::ImageTag> tag_;
 };
 
+/// Rust enum `DocumentCollection` (layout.rs) — documents that are listed
+/// together, in id order.
+enum class DocumentCollection {
+    VolumeRecords,
+    SnapshotRecords,
+};
+
+/// Rust `DocumentCollection::prefix` — the directory or object prefix that
+/// holds every document in the collection.
+const char* DocumentCollectionPrefix(DocumentCollection collection);
+
+/// Rust `DocumentCollection::key` — the key of the document with `id`; unset
+/// when `id` is not valid for the collection.
+core::Optional<DocumentKey> DocumentCollectionKey(DocumentCollection collection,
+                                                  const std::string& id);
+
+/// Rust `DocumentCollection::id_from_file_name` — the id from a file name
+/// under the collection's prefix; unset for anything that is not a document
+/// (lock files share the directory).
+core::Optional<std::string> DocumentCollectionIdFromFileName(DocumentCollection collection,
+                                                             const std::string& file_name);
+
 /// Rust enum `DocumentChange` — what an update does to a document.
 struct DocumentChange {
     enum class Kind { Keep, Put, Delete };

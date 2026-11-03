@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Rust: src/volume.rs — record/enum/error half.
+// Rust: src/volume/mod.rs — record/enum/error half.
 #include "agentenv/volume/record.h"
 
 #include <sstream>
@@ -386,7 +386,7 @@ std::ostream& operator<<(std::ostream& os, VolumeStatus status) {
 
 std::ostream& operator<<(std::ostream& os, VolumeErrorKind kind) {
     // Names match the Rust variant identifiers so failures are greppable
-    // against src/volume.rs.
+    // against src/volume/mod.rs.
     switch (kind) {
         case VolumeErrorKind::InvalidName:
             return os << "InvalidName";
@@ -494,78 +494,104 @@ core::Json VolumeRecord::ToJson() const {
     return core::Json(object);
 }
 
+namespace {
+
+/// serde's `invalid type` wording, so a malformed record reads the same as
+/// upstream's parse error.
+std::string InvalidType(const char* field, const char* expected) {
+    return std::string("invalid type for field `") + field + "`: expected " + expected;
+}
+
+core::Expected<std::string, std::string> RequiredString(const core::JsonObject& fields,
+                                                        const char* field) {
+    const core::JsonObject::const_iterator found = fields.find(field);
+    if (found == fields.end()) {
+        return core::make_unexpected(std::string("missing field `") + field + "`");
+    }
+    if (found->second.kind() != core::Json::Kind::String) {
+        return core::make_unexpected(InvalidType(field, "a string"));
+    }
+    return found->second.as_string();
+}
+
+}  // namespace
+
 core::Expected<VolumeRecord, std::string> VolumeRecord::FromJson(const core::Json& json) {
     if (json.kind() != core::Json::Kind::Object) {
-        return core::make_unexpected(std::string("volume record must be an object"));
+        return core::make_unexpected(std::string("invalid type: expected struct VolumeRecord"));
     }
     const core::JsonObject& fields = json.as_object();
     VolumeRecord record;
 
-    const core::JsonObject::const_iterator id_field = fields.find("id");
-    if (id_field == fields.end() || id_field->second.kind() != core::Json::Kind::String) {
-        return core::make_unexpected(std::string("missing field `id`"));
-    }
-    record.id = id_field->second.as_string();
+    const core::Expected<std::string, std::string> id = RequiredString(fields, "id");
+    if (!id.ok()) return core::make_unexpected(id.error());
+    record.id = id.value();
 
-    const core::JsonObject::const_iterator name_field = fields.find("name");
-    if (name_field == fields.end() || name_field->second.kind() != core::Json::Kind::String) {
-        return core::make_unexpected(std::string("missing field `name`"));
-    }
-    record.name = name_field->second.as_string();
+    const core::Expected<std::string, std::string> name = RequiredString(fields, "name");
+    if (!name.ok()) return core::make_unexpected(name.error());
+    record.name = name.value();
 
-    const core::JsonObject::const_iterator mode_field = fields.find("mode");
-    if (mode_field != fields.end() && mode_field->second.kind() == core::Json::Kind::String) {
-        const core::Expected<VolumeMode, std::string> parsed =
-            VolumeModeParse(mode_field->second.as_string());
-        if (!parsed.ok()) return core::make_unexpected(parsed.error());
-        record.mode = parsed.value();
-    }
+    const core::Expected<std::string, std::string> mode = RequiredString(fields, "mode");
+    if (!mode.ok()) return core::make_unexpected(mode.error());
+    const core::Expected<VolumeMode, std::string> parsed_mode = VolumeModeParse(mode.value());
+    if (!parsed_mode.ok()) return core::make_unexpected(parsed_mode.error());
+    record.mode = parsed_mode.value();
 
     const core::JsonObject::const_iterator size_field = fields.find("sizeMb");
-    if (size_field == fields.end() || size_field->second.kind() != core::Json::Kind::Int ||
-        size_field->second.as_int() < 0) {
+    if (size_field == fields.end()) {
         return core::make_unexpected(std::string("missing field `sizeMb`"));
+    }
+    if (size_field->second.kind() != core::Json::Kind::Int || size_field->second.as_int() < 0) {
+        return core::make_unexpected(InvalidType("sizeMb", "u64"));
     }
     record.size_mb = static_cast<uint64_t>(size_field->second.as_int());
 
-    const core::JsonObject::const_iterator status_field = fields.find("status");
-    if (status_field != fields.end() &&
-        status_field->second.kind() == core::Json::Kind::String) {
-        const core::Expected<VolumeStatus, std::string> parsed =
-            VolumeStatusParse(status_field->second.as_string());
-        if (!parsed.ok()) return core::make_unexpected(parsed.error());
-        record.status = parsed.value();
-    }
+    const core::Expected<std::string, std::string> status = RequiredString(fields, "status");
+    if (!status.ok()) return core::make_unexpected(status.error());
+    const core::Expected<VolumeStatus, std::string> parsed_status =
+        VolumeStatusParse(status.value());
+    if (!parsed_status.ok()) return core::make_unexpected(parsed_status.error());
+    record.status = parsed_status.value();
 
+    // `Option<String>`: absent and `null` are both `None`.
     const core::JsonObject::const_iterator reserved = fields.find("reservedBySandboxId");
-    if (reserved != fields.end() && reserved->second.kind() == core::Json::Kind::String) {
-        record.reserved_by_sandbox_id =
-            core::Optional<std::string>(reserved->second.as_string());
+    if (reserved != fields.end() && reserved->second.kind() != core::Json::Kind::Null) {
+        if (reserved->second.kind() != core::Json::Kind::String) {
+            return core::make_unexpected(InvalidType("reservedBySandboxId", "a string"));
+        }
+        record.reserved_by_sandbox_id = core::Optional<std::string>(reserved->second.as_string());
     }
 
     const core::JsonObject::const_iterator layers = fields.find("backingLayers");
-    if (layers != fields.end()) {
-        const core::Expected<std::vector<snapshot::OverlaybdLayerRef>, std::string> parsed =
-            snapshot::LayerRefsFromJson(layers->second);
-        if (!parsed.ok()) return core::make_unexpected(parsed.error());
-        record.backing_layers = parsed.value();
+    if (layers == fields.end()) {
+        return core::make_unexpected(std::string("missing field `backingLayers`"));
     }
+    const core::Expected<std::vector<snapshot::OverlaybdLayerRef>, std::string> parsed_layers =
+        snapshot::LayerRefsFromJson(layers->second);
+    if (!parsed_layers.ok()) return core::make_unexpected(parsed_layers.error());
+    record.backing_layers = parsed_layers.value();
 
     const core::JsonObject::const_iterator mounts = fields.find("readOnlyMounts");
-    if (mounts != fields.end() && mounts->second.kind() == core::Json::Kind::Array) {
-        const core::JsonArray& values = mounts->second.as_array();
-        for (std::size_t i = 0; i < values.size(); ++i) {
-            if (values[i].kind() != core::Json::Kind::String) {
-                return core::make_unexpected(
-                    std::string("field `readOnlyMounts` must contain strings"));
-            }
-            record.read_only_mounts.push_back(values[i].as_string());
+    if (mounts == fields.end()) {
+        return core::make_unexpected(std::string("missing field `readOnlyMounts`"));
+    }
+    if (mounts->second.kind() != core::Json::Kind::Array) {
+        return core::make_unexpected(InvalidType("readOnlyMounts", "a sequence"));
+    }
+    const core::JsonArray& values = mounts->second.as_array();
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (values[i].kind() != core::Json::Kind::String) {
+            return core::make_unexpected(InvalidType("readOnlyMounts", "a string"));
         }
+        record.read_only_mounts.push_back(values[i].as_string());
     }
 
+    // `#[serde(default)]`: absent is `false`.
     const core::JsonObject::const_iterator deleting_field = fields.find("deleting");
-    if (deleting_field != fields.end() &&
-        deleting_field->second.kind() == core::Json::Kind::Bool) {
+    if (deleting_field != fields.end()) {
+        if (deleting_field->second.kind() != core::Json::Kind::Bool) {
+            return core::make_unexpected(InvalidType("deleting", "a boolean"));
+        }
         record.deleting = deleting_field->second.as_bool();
     }
 

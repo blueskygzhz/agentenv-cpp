@@ -92,32 +92,6 @@ PosixFsSnapshotRepository::MarkBuildError(const core::SnapshotId& id,
     return catalog_store_->MarkError(id, reason);
 }
 
-RepositoryResult<core::Optional<volume::VolumeRecord> >
-PosixFsSnapshotRepository::GetVolume(const std::string& reference) {
-    return catalog_store_->GetVolume(reference);
-}
-
-RepositoryResult<VolumeRecordPage>
-PosixFsSnapshotRepository::ListVolumesPage(
-    const core::Optional<std::string>& after_volume_id, std::size_t limit) {
-    return catalog_store_->ListVolumesPage(after_volume_id, limit);
-}
-
-RepositoryResult<core::Unit>
-PosixFsSnapshotRepository::CreateVolume(const volume::VolumeRecord& record) {
-    return catalog_store_->CreateVolume(record);
-}
-
-RepositoryResult<core::Unit>
-PosixFsSnapshotRepository::PutVolume(const volume::VolumeRecord& record) {
-    return catalog_store_->PutVolume(record);
-}
-
-RepositoryResult<core::Unit>
-PosixFsSnapshotRepository::DeleteVolume(const std::string& volume_id) {
-    return catalog_store_->DeleteVolume(volume_id);
-}
-
 RepositoryResult<core::Optional<std::string> > PosixFsSnapshotRepository::GetDocument(
     const DocumentKey& key) {
     return catalog_store_->GetDocument(key);
@@ -135,6 +109,12 @@ RepositoryResult<core::Optional<std::string> > PosixFsSnapshotRepository::Update
 
 RepositoryResult<core::Unit> PosixFsSnapshotRepository::DeleteDocument(const DocumentKey& key) {
     return catalog_store_->DeleteDocument(key);
+}
+
+RepositoryResult<std::vector<std::string> > PosixFsSnapshotRepository::ListDocuments(
+    DocumentCollection collection, const core::Optional<std::string>& after,
+    std::size_t limit) {
+    return catalog_store_->ListDocuments(collection, after, limit);
 }
 
 RepositoryResult<core::Unit> PosixFsSnapshotRepository::PutBlob(const BlobKey& key,

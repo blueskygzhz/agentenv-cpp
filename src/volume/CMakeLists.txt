@@ -1,5 +1,8 @@
 add_library(agentenv-volume STATIC
+    # Rust: src/volume/mod.rs — `VolumeManager`.
     volume.cc
+    # Rust: src/volume/catalog.rs — `VolumeCatalog` over repository documents.
+    catalog.cc
 )
 target_include_directories(agentenv-volume PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # `snapshot` brings the repository interface and the layer descriptors;

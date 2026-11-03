@@ -13,6 +13,8 @@ add_library(agentenv-snapshot STATIC
     p2p.cc
     runtime_support.cc
     mock.cc
+    # Rust: src/snapshot/store.rs — `store_volume_layers`.
+    store.cc
     repository/errors.cc
     repository/interfaces.cc
     # Rust: src/repository/layout.rs — `DocumentKey`.

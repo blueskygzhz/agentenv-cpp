@@ -86,63 +86,13 @@ bool SnapshotListFilter::Matches(const SnapshotRecord& r) const {
 }
 
 // ---------------------------------------------------------------------------
-// Volume catalog defaults.
+// Document and blob defaults.
 //
 // Rust gives each of these a body of `unsupported("<feature>")`, so a backend
 // that only deals in snapshots still satisfies the trait and fails loudly at
 // runtime. The feature strings below are copied verbatim from upstream because
 // they surface in API error messages.
 // ---------------------------------------------------------------------------
-
-RepositoryResult<core::Optional<volume::VolumeRecord> >
-SnapshotRepository::GetVolume(const std::string&) {
-    return core::make_unexpected(RepositoryError::Unsupported("volume catalog"));
-}
-
-RepositoryResult<VolumeRecordPage>
-SnapshotRepository::ListVolumesPage(const core::Optional<std::string>&, std::size_t) {
-    return core::make_unexpected(RepositoryError::Unsupported("volume catalog"));
-}
-
-RepositoryResult<core::Unit> SnapshotRepository::CreateVolume(const volume::VolumeRecord&) {
-    return core::make_unexpected(RepositoryError::Unsupported("volume catalog"));
-}
-
-RepositoryResult<core::Unit> SnapshotRepository::PutVolume(const volume::VolumeRecord&) {
-    return core::make_unexpected(RepositoryError::Unsupported("volume catalog"));
-}
-
-RepositoryResult<core::Unit> SnapshotRepository::DeleteVolume(const std::string&) {
-    return core::make_unexpected(RepositoryError::Unsupported("volume catalog"));
-}
-
-RepositoryResult<core::Optional<std::string> >
-SnapshotRepository::ReserveVolume(const std::string&, const std::string&) {
-    return core::make_unexpected(RepositoryError::Unsupported("volume reservations"));
-}
-
-RepositoryResult<core::Unit>
-SnapshotRepository::ReserveReadOnlyVolume(const std::string&, const std::string&) {
-    return core::make_unexpected(RepositoryError::Unsupported("read-only volume reservations"));
-}
-
-RepositoryResult<core::Unit>
-SnapshotRepository::ReplaceVolumeOwnerFor(const std::string&, const std::string&,
-                                          const core::Optional<std::string>&) {
-    return core::make_unexpected(RepositoryError::Unsupported("volume reservations"));
-}
-
-RepositoryResult<std::vector<OverlaybdLayerRef> >
-SnapshotRepository::PublishVolumeBacking(const std::string&, const std::string&) {
-    return core::make_unexpected(RepositoryError::Unsupported("volume backing publication"));
-}
-
-RepositoryResult<std::string>
-SnapshotRepository::MaterializeVolumeBacking(const std::string&,
-                                             const std::vector<OverlaybdLayerRef>&,
-                                             const std::string&) {
-    return core::make_unexpected(RepositoryError::Unsupported("volume backing materialization"));
-}
 
 RepositoryResult<core::Optional<std::string> > SnapshotRepository::GetDocument(
     const DocumentKey&) {
@@ -160,6 +110,11 @@ RepositoryResult<core::Optional<std::string> > SnapshotRepository::UpdateDocumen
 }
 
 RepositoryResult<core::Unit> SnapshotRepository::DeleteDocument(const DocumentKey&) {
+    return core::make_unexpected(RepositoryError::Unsupported("repository documents"));
+}
+
+RepositoryResult<std::vector<std::string> > SnapshotRepository::ListDocuments(
+    DocumentCollection, const core::Optional<std::string>&, std::size_t) {
     return core::make_unexpected(RepositoryError::Unsupported("repository documents"));
 }
 
