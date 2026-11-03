@@ -21,6 +21,7 @@
 #include "agentenv/core/identity.h"
 #include "agentenv/core/logging.h"
 #include "agentenv/privileges.h"
+#include "agentenv/sandbox/network/egress_proxy.h"
 #include "agentenv/sandbox/network/iptables_util.h"
 
 namespace agentenv {
@@ -268,14 +269,15 @@ std::string Slot::HostVethName(uint32_t idx) {
 }
 
 Slot::Slot(uint32_t idx, const NetworkAddressPlan& address_plan,
-           const std::string& netns_dir, uint32_t host_interaction_ip,
-           uint32_t veth_host_ip, uint32_t veth_vm_ip)
+           const std::string& netns_dir, EgressProxy* egress_proxy,
+           uint32_t host_interaction_ip, uint32_t veth_host_ip, uint32_t veth_vm_ip)
     : idx_(idx),
       host_interaction_ip_(host_interaction_ip),
       veth_host_ip_(veth_host_ip),
       veth_vm_ip_(veth_vm_ip),
       address_plan_(address_plan),
       netns_dir_(netns_dir),
+      egress_proxy_(egress_proxy),
       cleanup_armed_(false),
       user_egress_rules_present_(false) {
     namespace_id_ = std::string(kNetnsPrefix) + core::Uuid::GenV7().ToString();
@@ -284,7 +286,7 @@ Slot::Slot(uint32_t idx, const NetworkAddressPlan& address_plan,
 // Rust `Slot::new`.
 core::Expected<Slot*, NetworkError> Slot::New(
     uint32_t idx, const NetworkAddressPlan& address_plan,
-    const std::string& netns_dir) {
+    const std::string& netns_dir, EgressProxy* egress_proxy) {
     // Slot 0 is reserved and the plan cannot address anything at or past the
     // configured ceiling.
     const uint32_t max = static_cast<uint32_t>(cfg::kNetworkMaxSlots);
@@ -302,7 +304,7 @@ core::Expected<Slot*, NetworkError> Slot::New(
         return core::make_unexpected(NetworkError::Namespace(ips.error()));
     }
 
-    return new Slot(idx, address_plan, netns_dir, host_interaction_ip,
+    return new Slot(idx, address_plan, netns_dir, egress_proxy, host_interaction_ip,
                     veth_host_ip, veth_vm_ip);
 }
 
@@ -611,15 +613,37 @@ core::Expected<core::Unit, NetworkError> Slot::CreateNetwork() {
 }
 
 // Rust `set_egress_policy`.
-core::Expected<core::Unit, NetworkError> Slot::SetEgressPolicy(
-    const core::Optional<SandboxNetworkPolicy>& policy,
-    uint16_t egress_proxy_port) {
+//
+// Policy updates run under the owning sandbox's operation lock, and cleanup
+// owns the slot exclusively, so no second lock is held across namespace I/O,
+// iptables, or proxy joins.
+core::Expected<core::Unit, std::string> Slot::SetEgressPolicy(
+    const core::Optional<SandboxNetworkPolicy>& policy) {
     // A warm-pool slot keeps its namespace between tenants, so "no rules
     // wanted and none present" is the only case that can skip the work.
     const bool wants_rules = policy && policy->HasRuntimeEgressRules();
     if (!wants_rules && !user_egress_rules_present_) return core::Unit();
 
+    const bool requires_egress_proxy = policy && policy->RequiresEgressProxy();
+    if (requires_egress_proxy && egress_proxy_ == NULL) {
+        return core::make_unexpected(
+            std::string("egress policy needs the egress proxy, but this slot has none"));
+    }
+    const bool had_active_proxy_policy =
+        egress_proxy_ != NULL && egress_proxy_->HasActive(host_interaction_ip_);
+    if (requires_egress_proxy) {
+        core::Expected<core::Unit, std::string> listening =
+            egress_proxy_->EnsureListener(host_interaction_ip_, NamespacePath());
+        if (!listening.ok()) return listening;
+        egress_proxy_->Prepare(host_interaction_ip_, *policy);
+        // There was no old proxy policy to preserve. Activating before the
+        // redirect is installed keeps the old default-allow behaviour while
+        // the namespace rules are being committed.
+        if (!had_active_proxy_policy) egress_proxy_->Activate(host_interaction_ip_);
+    }
+
     const std::string netns_path = NamespacePath();
+    const uint16_t egress_proxy_port = kEgressProxyPort;
 
     // Entering a namespace is per-thread, so this runs on a dedicated thread
     // exactly as in Rust.
@@ -645,15 +669,21 @@ core::Expected<core::Unit, NetworkError> Slot::SetEgressPolicy(
     });
     worker.join();
 
-    if (!result.ok()) {
-        // Rust keeps the slot marked dirty when a cleanup apply fails, so the
-        // next tenant retries the clear instead of inheriting stale rules.
-        if (wants_rules) user_egress_rules_present_ = true;
-        return core::make_unexpected(NetworkError::Namespace(result.error()));
+    if (result.ok()) {
+        user_egress_rules_present_ = wants_rules;
+        if (requires_egress_proxy && had_active_proxy_policy) {
+            egress_proxy_->Activate(host_interaction_ip_);
+        } else if (!requires_egress_proxy && egress_proxy_ != NULL) {
+            egress_proxy_->Deactivate(host_interaction_ip_);
+        }
+    } else if (requires_egress_proxy) {
+        if (had_active_proxy_policy) {
+            egress_proxy_->DiscardPending(host_interaction_ip_);
+        } else {
+            egress_proxy_->Teardown(host_interaction_ip_);
+        }
     }
-
-    user_egress_rules_present_ = wants_rules;
-    return core::Unit();
+    return result;
 }
 
 // Rust `cleanup`.
@@ -661,6 +691,11 @@ core::Expected<core::Unit, NetworkError> Slot::Cleanup(bool /*best_effort*/) {
     // A slot that never created anything must not touch host networking.
     if (!cleanup_armed_) return core::Unit();
     cleanup_armed_ = false;
+
+    // A namespace-local listener pins the namespace. Stop proxy acceptance
+    // before removing the veth and unmounting the namespace, including the
+    // destructor path that bypasses the normal release.
+    if (egress_proxy_ != NULL) egress_proxy_->Teardown(host_interaction_ip_);
 
     // Deleting the host end destroys the pair.
     {

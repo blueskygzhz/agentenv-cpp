@@ -11,7 +11,12 @@
 #include <string>
 #include <vector>
 
+#include <cerrno>
+
+#include <sys/mount.h>
+
 #include "agentenv/cfg/network.h"
+#include "agentenv/core/fs.h"
 #include "agentenv/sandbox/network/slot.h"
 
 using namespace agentenv;
@@ -23,6 +28,13 @@ uint32_t Ip(const std::string& dotted) {
     uint32_t v = 0;
     Ipv4Parse(dotted, &v);
     return v;
+}
+
+// Whether this process may call umount2 at all. Being root is not enough:
+// containers commonly drop CAP_SYS_ADMIN, and then every umount2 is EPERM.
+// `path` must exist and not be a mount point, so a capable caller gets EINVAL.
+bool CanUnmount(const std::string& path) {
+    return ::umount2(path.c_str(), MNT_DETACH) == 0 || errno != EPERM;
 }
 
 }  // namespace
@@ -261,6 +273,78 @@ MT_TEST(network_error_messages_match_rust_format_strings) {
                  std::string("IO error: gone"));
     MT_EXPECT_EQ(NetworkError::SlotOutOfRangeErr(9, 4).Message(),
                  std::string("Slot index out of range (max 4): 9"));
+}
+
+// ============================================================
+// mod.rs :: prepare_runtime
+// ============================================================
+MT_TEST(prepare_runtime_creates_the_netns_directory) {
+    core::Expected<std::string, std::string> tmp = core::fs::CreateTempDir("aenv-prep-");
+    MT_EXPECT_TRUE(tmp.ok());
+    const std::string runtime = core::fs::Join(tmp.value(), "run");
+
+    MT_EXPECT_TRUE(PrepareRuntime(runtime).ok());
+    MT_EXPECT_TRUE(core::fs::IsDir(core::fs::Join(runtime, "netns")));
+    // Idempotent on an already-prepared directory.
+    MT_EXPECT_TRUE(PrepareRuntime(runtime).ok());
+    (void)core::fs::RemoveDirAll(tmp.value());
+}
+
+MT_TEST(prepare_runtime_removes_only_prefixed_entries) {
+    core::Expected<std::string, std::string> tmp = core::fs::CreateTempDir("aenv-prep-");
+    MT_EXPECT_TRUE(tmp.ok());
+    const std::string netns = core::fs::Join(tmp.value(), "netns");
+    MT_EXPECT_TRUE(core::fs::CreateDirAll(netns).ok());
+
+    const std::string stale = core::fs::Join(netns, std::string(kNetnsPrefix) + "stale");
+    const std::string foreign = core::fs::Join(netns, "someone-else");
+    MT_EXPECT_TRUE(core::fs::Write(stale, "").ok());
+    MT_EXPECT_TRUE(core::fs::Write(foreign, "").ok());
+
+    const bool can_unmount = CanUnmount(foreign);
+    core::Expected<core::Unit, std::string> prepared = PrepareRuntime(tmp.value());
+    if (can_unmount) {
+        // An unmounted file makes umount2 report EINVAL, which ends the loop.
+        MT_EXPECT_TRUE(prepared.ok());
+        MT_EXPECT_TRUE(!core::fs::Exists(stale));
+    } else {
+        // Without CAP_SYS_ADMIN umount2 is EPERM: reported, as Rust does,
+        // rather than ignored.
+        MT_EXPECT_TRUE(!prepared.ok());
+        MT_EXPECT_TRUE(prepared.error().find("unmount stale AENV network namespace") == 0);
+    }
+    MT_EXPECT_TRUE(core::fs::Exists(foreign));
+    (void)core::fs::RemoveDirAll(tmp.value());
+}
+
+MT_TEST(prepare_runtime_detaches_every_stacked_bind_mount) {
+    core::Expected<std::string, std::string> tmp = core::fs::CreateTempDir("aenv-prep-");
+    MT_EXPECT_TRUE(tmp.ok());
+    const std::string netns = core::fs::Join(tmp.value(), "netns");
+    MT_EXPECT_TRUE(core::fs::CreateDirAll(netns).ok());
+
+    const std::string source = core::fs::Join(tmp.value(), "source");
+    const std::string stale = core::fs::Join(netns, std::string(kNetnsPrefix) + "mounted");
+    MT_EXPECT_TRUE(core::fs::Write(source, "").ok());
+    MT_EXPECT_TRUE(core::fs::Write(stale, "").ok());
+    if (!CanUnmount(source)) {
+        (void)core::fs::RemoveDirAll(tmp.value());
+        return;
+    }
+
+    // Two stacked binds, as a namespace re-pinned over an old one leaves.
+    // Environments that forbid mounting (some containers) skip the check.
+    if (::mount(source.c_str(), stale.c_str(), NULL, MS_BIND, NULL) != 0) {
+        (void)core::fs::RemoveDirAll(tmp.value());
+        return;
+    }
+    MT_EXPECT_EQ(::mount(source.c_str(), stale.c_str(), NULL, MS_BIND, NULL), 0);
+
+    MT_EXPECT_TRUE(PrepareRuntime(tmp.value()).ok());
+    MT_EXPECT_TRUE(!core::fs::Exists(stale));
+    // The bind source itself is untouched.
+    MT_EXPECT_TRUE(core::fs::Exists(source));
+    (void)core::fs::RemoveDirAll(tmp.value());
 }
 
 MT_MAIN

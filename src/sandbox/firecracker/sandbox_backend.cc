@@ -12,9 +12,10 @@
 #include <dirent.h>
 #include "agentenv/sandbox/firecracker/sandbox_backend.h"
 #include "agentenv/sandbox/network.h"
-#include "agentenv/sandbox/network/egress_proxy.h"
 #include "agentenv/sandbox/network/manager.h"
 #include "agentenv/sandbox/network/slot.h"
+#include "agentenv/sandbox/firecracker/pool.h"
+#include "agentenv/core/fs.h"
 
 #include "agentenv/core/logging.h"
 #include "agentenv/sandbox/firecracker/factory.h"
@@ -562,7 +563,129 @@ core::Expected<std::vector<VolumeSlotBind>, std::string> PrepareResumeDrives(
     return new_binds;
 }
 
+FirecrackerLogPaths ResolveFirecrackerLogPaths(
+    const core::Optional<std::string>& serial_output_base_dir,
+    const core::Optional<std::string>& stdout_dir, const core::Optional<std::string>& stderr_dir,
+    bool capture_output, const core::SandboxId& sandbox_id, const std::string& work_dir) {
+    FirecrackerLogPaths paths;
+    // Rust `default_log_dir`.
+    paths.default_log_dir = serial_output_base_dir.has_value()
+                                ? *serial_output_base_dir + "/" + sandbox_id.ToString()
+                                : work_dir + "/logs";
+    paths.stdout_target =
+        (stdout_dir.has_value() ? *stdout_dir : paths.default_log_dir) + "/firecracker-stdout.log";
+    paths.stderr_target =
+        (stderr_dir.has_value() ? *stderr_dir : paths.default_log_dir) + "/firecracker-stderr.log";
+    // Rust `firecracker_stdio_paths`.
+    if (capture_output || stdout_dir.has_value()) paths.stdout_path = paths.stdout_target;
+    if (capture_output || stderr_dir.has_value()) paths.stderr_path = paths.stderr_target;
+    paths.logger_path = paths.default_log_dir + "/firecracker.log";
+    return paths;
+}
+
+core::Expected<core::Unit, std::string> RelocateWarmLog(const core::Optional<std::string>& src,
+                                                       const std::string& target) {
+    if (!src.has_value()) return core::Unit();
+    if (*src == target || !core::fs::Exists(*src)) return core::Unit();
+    const std::string::size_type slash = target.find_last_of('/');
+    if (slash != std::string::npos && slash > 0) {
+        const std::string parent = target.substr(0, slash);
+        const core::Expected<core::Unit, std::string> made = core::fs::CreateDirAll(parent);
+        if (!made.ok()) {
+            return core::make_unexpected("create firecracker log directory " + parent + ": " +
+                                         made.error());
+        }
+    }
+    if (core::fs::Exists(target) && ::unlink(target.c_str()) != 0) {
+        return core::make_unexpected("remove existing firecracker log " + target + ": " +
+                                     std::strerror(errno));
+    }
+    if (::rename(src->c_str(), target.c_str()) == 0) return core::Unit();
+    if (errno != EXDEV) {
+        return core::make_unexpected("move warm firecracker log " + *src + " to " + target +
+                                     ": " + std::strerror(errno));
+    }
+    const core::Expected<core::Unit, std::string> copied = core::fs::Copy(*src, target);
+    if (!copied.ok()) {
+        return core::make_unexpected("copy warm firecracker log " + *src + " to " + target +
+                                     " after cross-device rename failed: " + copied.error());
+    }
+    if (::unlink(src->c_str()) != 0 && errno != ENOENT) {
+        return core::make_unexpected("remove warm firecracker log " + *src +
+                                     " after cross-device copy: " + std::strerror(errno));
+    }
+    return core::Unit();
+}
+
 namespace {
+
+/// Rust `TempDir` drop for a start that did not hand its work dir over.
+struct RemoveWorkDirOnFailure {
+    std::string path;
+    bool armed;
+    ~RemoveWorkDirOnFailure() {
+        if (armed && !path.empty()) (void)core::fs::RemoveDirAll(path);
+    }
+};
+
+/// Rust `adopt_warm_firecracker` — take a pre-spawned Firecracker and its
+/// network slot from the warm pool when this launch uses the default log
+/// paths. On success the slot is already in `resources`, `*instance` holds
+/// the running VMM and `*work_dir` is the entry's work dir.
+bool AdoptWarmFirecracker(const ResumeStartSpec& spec, FreshDriveResources* resources,
+                          std::unique_ptr<FirecrackerInstance>* instance,
+                          network::Slot** slot, std::string* work_dir) {
+    const CommonConfig& common = spec.snapshot_config.common;
+    if (spec.firecracker_pool == NULL) return false;
+    if (common.stdout_path.has_value() || common.stderr_path.has_value()) return false;
+    const bool capture_output = LoggingEnabled(common.firecracker_log_level);
+    const core::Expected<std::shared_ptr<WarmFirecracker>, std::string> acquired =
+        spec.firecracker_pool->AcquireFor(capture_output);
+    if (!acquired.ok()) return false;
+    const std::shared_ptr<WarmFirecracker>& warm = acquired.value();
+
+    core::Optional<std::string> warm_stdout;
+    core::Optional<std::string> warm_stderr;
+    WarmStdioPaths(warm->WorkDir(), capture_output, &warm_stdout, &warm_stderr);
+    AGENTENV_DEBUG("using warm firecracker from pool slot=" << warm->GetSlot()->Idx()
+                                                            << " pool_work_dir="
+                                                            << warm->WorkDir());
+
+    resources->AdoptNetworkSlot(spec.firecracker_pool->NetworkManager(), warm->GetSlot());
+    *slot = warm->GetSlot();
+    // The work dir is switched before relocating logs, since the fallback log
+    // paths are relative to it.
+    *work_dir = warm->WorkDir();
+    *instance = warm->TakeInstance();
+
+    const FirecrackerLogPaths paths =
+        ResolveFirecrackerLogPaths(common.serial_output_base_dir, common.stdout_path,
+                                   common.stderr_path, capture_output, spec.sandbox_id,
+                                   *work_dir);
+    const core::Expected<core::Unit, std::string> out =
+        RelocateWarmLog(warm_stdout, paths.stdout_target);
+    if (!out.ok()) {
+        AGENTENV_WARN("failed to relocate warm firecracker stdout log: " << out.error());
+    }
+    const core::Expected<core::Unit, std::string> err =
+        RelocateWarmLog(warm_stderr, paths.stderr_target);
+    if (!err.ok()) {
+        AGENTENV_WARN("failed to relocate warm firecracker stderr log: " << err.error());
+    }
+    return true;
+}
+
+/// Rust `configure_logger`'s directory step: the logger file is opened by the
+/// VMM, so its directory has to exist first.
+core::Expected<core::Unit, std::string> PrepareLoggerDir(const FirecrackerLogPaths& paths) {
+    const core::Expected<core::Unit, std::string> made =
+        core::fs::CreateDirAll(paths.default_log_dir);
+    if (!made.ok()) {
+        return core::make_unexpected("create firecracker log directory " +
+                                     paths.default_log_dir + ": " + made.error());
+    }
+    return core::Unit();
+}
 
 /// Rust `allocate_network_slot` — the slot is stored in `resources` before
 /// any fallible setup, so `Stop` or the destructor releases it.
@@ -620,6 +743,9 @@ StartFreshInstance(const FreshStartSpec& spec, std::shared_ptr<Connector> connec
     const core::Expected<std::string, std::string> work_dir =
         CreateFirecrackerWorkDir(core::Optional<std::string>(spec.chroot_base_dir));
     if (!work_dir.ok()) return core::make_unexpected(work_dir.error());
+    // Destroyed last: the VMM is gone and its devices released before the
+    // directory holding their symlinks and the API socket is removed.
+    RemoveWorkDirOnFailure remove_work_dir = {work_dir.value(), true};
 
     // Declared before `instance` so it is destroyed *after* it: on an early
     // return the VMM is killed first and only then are its devices released.
@@ -670,11 +796,11 @@ StartFreshInstance(const FreshStartSpec& spec, std::shared_ptr<Connector> connec
         const core::Expected<network::Slot*, std::string> slot =
             AllocateNetworkSlot(net.manager, resources);
         if (!slot.ok()) return core::make_unexpected(slot.error());
-        const core::Expected<core::Unit, network::NetworkError> policy =
-            slot.value()->SetEgressPolicy(net.policy, network::kEgressProxyPort);
+        const core::Expected<core::Unit, std::string> policy =
+            slot.value()->SetEgressPolicy(net.policy);
         if (!policy.ok()) {
             return core::make_unexpected("Failed to configure sandbox egress policy: " +
-                                         policy.error().Message());
+                                         policy.error());
         }
         std::vector<std::string> network_args;
         network_args.push_back(slot.value()->BuildIpBootArg());
@@ -695,16 +821,20 @@ StartFreshInstance(const FreshStartSpec& spec, std::shared_ptr<Connector> connec
         if (!built.ok()) return core::make_unexpected(built.error());
         steps = built.value();
     }
+    const FirecrackerLogPaths log_paths = ResolveFirecrackerLogPaths(
+        spec.serial_output_base_dir, spec.stdout_path, spec.stderr_path, spec.capture_output,
+        spec.sandbox_id, work_dir.value());
     for (std::size_t i = 0; i < steps.size(); ++i) {
         if (steps[i].kind == ConfigureStep::Kind::Logger) {
-            steps[i].path = work_dir.value() + "/firecracker.log";
+            const core::Expected<core::Unit, std::string> dir = PrepareLoggerDir(log_paths);
+            if (!dir.ok()) return core::make_unexpected(dir.error());
+            steps[i].path = log_paths.logger_path;
         }
     }
 
     // 2. Spawn.
-    core::Optional<std::string> stdout_path;
-    core::Optional<std::string> stderr_path;
-    WarmStdioPaths(work_dir.value(), spec.capture_output, &stdout_path, &stderr_path);
+    const core::Optional<std::string>& stdout_path = log_paths.stdout_path;
+    const core::Optional<std::string>& stderr_path = log_paths.stderr_path;
 
     if (!connector) connector = MakeUnixConnector();
     std::unique_ptr<FirecrackerInstance> instance(
@@ -742,6 +872,7 @@ StartFreshInstance(const FreshStartSpec& spec, std::shared_ptr<Connector> connec
     // unwind, which stops the VMM.
     *out = std::move(instance);
     release_on_failure.armed = false;
+    remove_work_dir.armed = false;
     return core::Unit{};
 }
 
@@ -758,6 +889,10 @@ StartResumeInstance(const ResumeStartSpec& spec, std::shared_ptr<Connector> conn
         return core::make_unexpected(
             std::string("resume with a network slot needs a resource holder"));
     }
+    if (spec.firecracker_pool != NULL && resources == NULL) {
+        return core::make_unexpected(
+            std::string("resume from the warm pool needs a resource holder"));
+    }
 
     // The sequence is built first, exactly as the fresh path builds its
     // configure plan up front: every check inside is a property of the capture
@@ -771,13 +906,9 @@ StartResumeInstance(const ResumeStartSpec& spec, std::shared_ptr<Connector> conn
         steps = built.value();
     }
 
-    // Same layout as the fresh path -- see the note there on why the
-    // per-sandbox layer is absent: the API socket inside this directory has to
-    // fit in `sockaddr_un::sun_path`.
-    const core::Expected<std::string, std::string> work_dir =
-        CreateFirecrackerWorkDir(core::Optional<std::string>(spec.chroot_base_dir));
-    if (!work_dir.ok()) return core::make_unexpected(work_dir.error());
-
+    // Destroyed last (declared first): the VMM goes, then its devices and
+    // slot, then the directory -- Rust's `TempDir` drop for a failed launch.
+    RemoveWorkDirOnFailure remove_work_dir = {std::string(), true};
     // Declared before `instance`, as on the fresh path, so the VMM is killed
     // before its devices are released.
     struct ReleaseOnFailure {
@@ -788,6 +919,26 @@ StartResumeInstance(const ResumeStartSpec& spec, std::shared_ptr<Connector> conn
         }
     } release_on_failure = {resources,
                             spec.drives.has_value() || spec.network_manager != NULL};
+    std::unique_ptr<FirecrackerInstance> instance;
+    network::Slot* slot = NULL;
+
+    // Rust `adopt_warm_firecracker`, ahead of the drives: an adopted entry's
+    // work dir becomes this sandbox's, so the drives are linked into the
+    // directory its VMM already runs in.
+    std::string work_dir;
+    const bool adopted = AdoptWarmFirecracker(spec, resources, &instance, &slot, &work_dir);
+    if (adopted) {
+        release_on_failure.armed = true;
+    } else {
+        // Same layout as the fresh path -- see the note there on why the
+        // per-sandbox layer is absent: the API socket inside this directory
+        // has to fit in `sockaddr_un::sun_path`.
+        const core::Expected<std::string, std::string> created =
+            CreateFirecrackerWorkDir(core::Optional<std::string>(spec.chroot_base_dir));
+        if (!created.ok()) return core::make_unexpected(created.error());
+        work_dir = created.value();
+    }
+    remove_work_dir.path = work_dir;
 
     // Rust `start_resume`: link_tools_drive, attach_user_rootfs and
     // prepare_resume_drives, all before the spawn. The load reopens every
@@ -800,62 +951,65 @@ StartResumeInstance(const ResumeStartSpec& spec, std::shared_ptr<Connector> conn
             new_indices.push_back(spec.initial_guest_drive_mounts[i].first);
         }
         const core::Expected<std::vector<VolumeSlotBind>, std::string> prepared =
-            PrepareResumeDrives(work_dir.value(), *spec.drives, spec.snapshot_config.common,
+            PrepareResumeDrives(work_dir, *spec.drives, spec.snapshot_config.common,
                                 new_indices, resources);
         if (!prepared.ok()) return core::make_unexpected(prepared.error());
     }
 
+    const CommonConfig& common = spec.snapshot_config.common;
+    const FirecrackerLogPaths log_paths = ResolveFirecrackerLogPaths(
+        common.serial_output_base_dir, common.stdout_path, common.stderr_path,
+        spec.capture_output, spec.sandbox_id, work_dir);
     for (std::size_t i = 0; i < steps.size(); ++i) {
         if (steps[i].kind == ResumeStep::Kind::Logger) {
-            steps[i].path = work_dir.value() + "/firecracker.log";
+            const core::Expected<core::Unit, std::string> dir = PrepareLoggerDir(log_paths);
+            if (!dir.ok()) return core::make_unexpected(dir.error());
+            steps[i].path = log_paths.logger_path;
         }
     }
 
-    core::Optional<std::string> stdout_path;
-    core::Optional<std::string> stderr_path;
-    WarmStdioPaths(work_dir.value(), spec.capture_output, &stdout_path, &stderr_path);
-
-    if (!connector) connector = MakeUnixConnector();
-    // Rust `start_resume`: "Network + Firecracker spawn" -- the slot after the
-    // drives, the VMM into its namespace so the load's `eth0 -> tap0`
-    // override opens a tap that exists.
-    network::Slot* slot = NULL;
-    if (spec.network_manager != NULL) {
-        const core::Expected<network::Slot*, std::string> allocated =
-            AllocateNetworkSlot(spec.network_manager, resources);
-        if (!allocated.ok()) return core::make_unexpected(allocated.error());
-        slot = allocated.value();
-    }
-
-    std::unique_ptr<FirecrackerInstance> instance(
-        new FirecrackerInstance(work_dir.value(), connector));
-
-    const core::Expected<core::Unit, std::string> spawned =
-        SpawnInto(instance.get(), spec.firecracker_bin, stdout_path, stderr_path,
-                  slot != NULL ? slot->NamespacePath() : std::string());
-    if (!spawned.ok()) {
-        return core::make_unexpected(std::string("spawn: ") + spawned.error());
+    // Rust "Network + Firecracker spawn (a warm Firecracker already has
+    // both)": the slot after the drives, the VMM into its namespace so the
+    // load's `eth0 -> tap0` override opens a tap that exists.
+    const bool needs_socket_wait = !adopted;
+    if (needs_socket_wait) {
+        if (spec.network_manager != NULL) {
+            const core::Expected<network::Slot*, std::string> allocated =
+                AllocateNetworkSlot(spec.network_manager, resources);
+            if (!allocated.ok()) return core::make_unexpected(allocated.error());
+            slot = allocated.value();
+        }
+        if (!connector) connector = MakeUnixConnector();
+        instance.reset(new FirecrackerInstance(work_dir, connector));
+        const core::Expected<core::Unit, std::string> spawned =
+            SpawnInto(instance.get(), spec.firecracker_bin, log_paths.stdout_path,
+                      log_paths.stderr_path,
+                      slot != NULL ? slot->NamespacePath() : std::string());
+        if (!spawned.ok()) {
+            return core::make_unexpected(std::string("spawn: ") + spawned.error());
+        }
     }
 
     // Rust applies the capture's policy right after the spawn: a pooled slot
     // keeps its namespace across tenants, so a previous tenant's rules are
     // cleared here even when this capture has none.
     if (slot != NULL) {
-        const core::Expected<core::Unit, network::NetworkError> policy =
-            slot->SetEgressPolicy(spec.snapshot_config.common.network_policy,
-                                  network::kEgressProxyPort);
+        const core::Expected<core::Unit, std::string> policy =
+            slot->SetEgressPolicy(spec.snapshot_config.common.network_policy);
         if (!policy.ok()) {
             return core::make_unexpected(
-                "Failed to configure sandbox egress policy for resume: " +
-                policy.error().Message());
+                "Failed to configure sandbox egress policy for resume: " + policy.error());
         }
     }
 
     // Past the spawn every early return must stop the VMM; the unique_ptr's
-    // destructor is this port's `Drop` and does it on unwind.
-    const core::Expected<core::Unit, std::string> ready =
-        instance->WaitForReady(spec.socket_timeout_ms, spec.socket_poll_ms);
-    if (!ready.ok()) return core::make_unexpected(ready.error());
+    // destructor is this port's `Drop` and does it on unwind. A warm VMM is
+    // already answering on its socket.
+    if (needs_socket_wait) {
+        const core::Expected<core::Unit, std::string> ready =
+            instance->WaitForReady(spec.socket_timeout_ms, spec.socket_poll_ms);
+        if (!ready.ok()) return core::make_unexpected(ready.error());
+    }
 
     // No `InstanceStart` on this path: the VM comes into existence already
     // running from the loaded state, and the sequence's own final step is the
@@ -866,9 +1020,10 @@ StartResumeInstance(const ResumeStartSpec& spec, std::shared_ptr<Connector> conn
     if (!applied.ok()) return core::make_unexpected(applied.error());
 
     // The resources now belong to the running VM; disarming is what keeps the
-    // guard from releasing its devices and slot out from under it.
+    // guards from releasing its devices, slot and directory out from under it.
     *out = std::move(instance);
     release_on_failure.armed = false;
+    remove_work_dir.armed = false;
     return core::Unit{};
 }
 
@@ -897,6 +1052,8 @@ class FirecrackerSandboxBackend::Impl {
         spec.socket_poll_ms = resume_spec.socket_poll_ms;
         spec.envd_timeout_ms = resume_spec.envd_timeout_ms;
         spec.envd_poll_ms = resume_spec.envd_poll_ms;
+        spec.control_plane_port = resume_spec.snapshot_config.common.control_plane_port;
+        spec.envd_access_token = resume_spec.snapshot_config.common.envd_access_token;
     }
 
     /// Rust `Drop`: the VMM goes first, then its devices. Member order would
@@ -904,10 +1061,17 @@ class FirecrackerSandboxBackend::Impl {
     /// device deleted under a running guest fails every in-flight I/O.
     ~Impl() {
         instance.reset();
-        drive_resources.Release();
+        (void)drive_resources.Release();
+        // Rust drops `work_dir: TempDir` with the sandbox, after the VMM and
+        // its resources are gone.
+        if (!owned_work_dir.empty()) (void)core::fs::RemoveDirAll(owned_work_dir);
     }
 
     std::unique_ptr<FirecrackerInstance> instance;
+    /// Rust `work_dir: TempDir` — the per-instance directory a start created
+    /// (or adopted from the warm pool). Empty for a handed-in instance, whose
+    /// directory belongs to the caller.
+    std::string owned_work_dir;
     /// Rust `SandboxResources` — the ublk devices behind this VM's drives.
     FreshDriveResources drive_resources;
     SnapshotConfig snapshot_config;
@@ -1220,6 +1384,7 @@ core::Expected<core::Unit, core::AnyError> FirecrackerSandboxBackend::StartNowai
                                  &impl_->drive_resources);
     if (!r.ok()) return core::make_unexpected(core::err(r.error()));
     impl_->instance = std::move(started);
+    impl_->owned_work_dir = impl_->instance->WorkDir();
     return core::Unit{};
 }
 
@@ -1227,16 +1392,28 @@ core::Expected<core::Unit, core::AnyError> FirecrackerSandboxBackend::WaitForRea
     if (!impl_->instance) {
         return core::make_unexpected(core::err("wait_for_ready: sandbox is not started"));
     }
-    // Rust errors when no envd instance is initialized. This port has no envd
-    // client, so without an injected probe it must say it cannot confirm
-    // readiness -- claiming readiness it never observed would hand the
-    // orchestrator a sandbox that accepts work and answers nothing.
-    if (!impl_->envd_probe) {
+    // Rust `init_envd_instance(interaction_ip, common)` ran at start: envd is
+    // reached at `http://<host_interaction_ip>:<control_plane_port>`. Without
+    // a slot there is no address, which is Rust's "not initialized" -- and
+    // claiming readiness never observed would hand the orchestrator a sandbox
+    // that accepts work and answers nothing.
+    if (impl_->envd_probe) {
+        // Test override for the probe; the readiness loop is the real one.
+        EnvdInstance envd(std::string("http://127.0.0.1"));
+        const core::Expected<core::Unit, std::string> r = envd.WaitForReady(
+            impl_->spec.envd_timeout_ms, impl_->spec.envd_poll_ms, impl_->envd_probe);
+        if (!r.ok()) return core::make_unexpected(core::err(r.error()));
+        return core::Unit{};
+    }
+    const core::Optional<std::string> interaction_ip = HostInteractionIp();
+    if (!interaction_ip.has_value()) {
         return core::make_unexpected(core::err("wait_for_ready: envd instance not initialized"));
     }
-    EnvdInstance envd(std::string("http://127.0.0.1"));
-    const core::Expected<core::Unit, std::string> r = envd.WaitForReady(
-        impl_->spec.envd_timeout_ms, impl_->spec.envd_poll_ms, impl_->envd_probe);
+    EnvdInstance envd("http://" + *interaction_ip + ":" +
+                          std::to_string(impl_->spec.control_plane_port),
+                      impl_->spec.envd_access_token);
+    const core::Expected<core::Unit, std::string> r =
+        envd.WaitForReady(impl_->spec.envd_timeout_ms, impl_->spec.envd_poll_ms);
     if (!r.ok()) return core::make_unexpected(core::err(r.error()));
     return core::Unit{};
 }
@@ -1385,6 +1562,11 @@ FirecrackerSandboxBackend::Fork(const std::vector<SandboxForkSpec>& specs) {
                                : impl_->spec.network.has_value()
                                    ? impl_->spec.network->manager
                                    : NULL;
+        // Rust forks through `start_resume`, whose `adopt_warm_firecracker`
+        // reads the same global pool for every child.
+        spec.firecracker_pool = impl_->resume_spec.firecracker_pool != NULL
+                                    ? impl_->resume_spec.firecracker_pool
+                                    : impl_->spec.firecracker_pool;
 
         std::unique_ptr<SandboxBackend> backend(
             FirecrackerSandboxBackend::NewResuming(spec, impl_->connector));
@@ -1446,11 +1628,10 @@ FirecrackerSandboxBackend::UpdateNetworkPolicy(const core::Optional<std::string>
     // restriction the caller believes is enforced.
     network::Slot* slot = impl_->drive_resources.network_slot();
     if (slot != NULL) {
-        const core::Expected<core::Unit, network::NetworkError> applied =
-            slot->SetEgressPolicy(policy, network::kEgressProxyPort);
+        const core::Expected<core::Unit, std::string> applied = slot->SetEgressPolicy(policy);
         if (!applied.ok()) {
             return core::make_unexpected(
-                core::err("configure sandbox network policy: " + applied.error().Message()));
+                core::err("configure sandbox network policy: " + applied.error()));
         }
     } else if (policy.has_value()) {
         return core::make_unexpected(core::err("sandbox has no active network slot"));

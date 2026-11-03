@@ -7,10 +7,12 @@
 #include <vector>
 
 #include "agentenv/core/fs.h"
+#include "agentenv/image/commit_index.h"
 #include "agentenv/storage/overlaybd/config.h"
 #include "microtest.h"
 
 using namespace agentenv;                // NOLINT
+using namespace agentenv::image;         // NOLINT
 using namespace agentenv::image::cache;  // NOLINT
 
 namespace {
@@ -54,7 +56,10 @@ struct Fixture {
         if (with_transport) transport.reset(new p2p::DisabledP2pTransport());
     }
 
-    ImageCacheGc Gc() { return ImageCacheGc(commit_store, metadata, transport); }
+    ImageCacheGc Gc() {
+        return ImageCacheGc(commit_store, root.path + "/configs", root.path + "/index", metadata,
+                            transport);
+    }
 
     /// Writes `body` into the commit store and records the matching object.
     HardCommitId SeedCommit(const std::string& digest, const std::string& body) {
@@ -80,7 +85,7 @@ MT_TEST(image_cache_gc_collects_free_commit) {
     const HardCommitId digest = fx.SeedCommit("sha256:free", "0123456789");
 
     ImageCacheGc gc = fx.Gc();
-    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs());
+    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs(), false);
     MT_EXPECT_TRUE(report.ok());
     MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(1));
     MT_EXPECT_EQ(report.value().freed_bytes, static_cast<uint64_t>(10));
@@ -110,10 +115,10 @@ MT_TEST(image_cache_gc_skips_commit_rooted_by_config) {
     const std::string config_path = fx.root.path + "/app-image.json";
     MT_EXPECT_TRUE(
         core::fs::Write(config_path, storage::overlaybd::ImageConfigToJson(config)).ok());
-    MT_EXPECT_TRUE(fx.metadata->RecordConfigRefsFromConfigPath(config_path).ok());
+    MT_EXPECT_TRUE(fx.metadata->RecordConfigRefsFromConfigPath(config_path, fx.commit_store).ok());
 
     ImageCacheGc gc = fx.Gc();
-    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs());
+    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs(), false);
     MT_EXPECT_TRUE(report.ok());
     MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(0));
     MT_EXPECT_EQ(report.value().blocked.size(), static_cast<std::size_t>(1));
@@ -133,7 +138,7 @@ MT_TEST(image_cache_gc_skips_held_commit) {
         fx.metadata->CreateOrReplaceHold(Owner(kRuntimeHoldNamespace, "sb-1"), refs).ok());
 
     ImageCacheGc gc = fx.Gc();
-    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs());
+    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs(), false);
     MT_EXPECT_TRUE(report.ok());
     MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(0));
     MT_EXPECT_EQ(report.value().blocked.size(), static_cast<std::size_t>(1));
@@ -149,7 +154,7 @@ MT_TEST(image_cache_gc_skips_live_runtime_commit) {
     live[digest].push_back(Owner(kRuntimeHoldNamespace, "sb-live"));
 
     ImageCacheGc gc = fx.Gc();
-    auto report = gc.RunGc(live);
+    auto report = gc.RunGc(live, false);
     MT_EXPECT_TRUE(report.ok());
     MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(0));
     MT_EXPECT_EQ(report.value().blocked.size(), static_cast<std::size_t>(1));
@@ -168,7 +173,7 @@ MT_TEST(image_cache_gc_empty_live_ref_entry_does_not_block) {
     live[digest] = std::vector<ImageCacheHoldOwner>();
 
     ImageCacheGc gc = fx.Gc();
-    auto report = gc.RunGc(live);
+    auto report = gc.RunGc(live, false);
     MT_EXPECT_TRUE(report.ok());
     MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(1));
 }
@@ -183,7 +188,7 @@ MT_TEST(image_cache_gc_blocks_commit_outside_store) {
         core::Optional<uint64_t>(4), std::set<p2p::P2pArtifactKey>()).ok());
 
     ImageCacheGc gc = fx.Gc();
-    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs());
+    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs(), false);
     MT_EXPECT_TRUE(report.ok());
     MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(0));
     MT_EXPECT_EQ(report.value().blocked.size(), static_cast<std::size_t>(1));
@@ -202,7 +207,7 @@ MT_TEST(image_cache_gc_blocks_on_size_mismatch) {
         core::Optional<uint64_t>(999), std::set<p2p::P2pArtifactKey>()).ok());
 
     ImageCacheGc gc = fx.Gc();
-    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs());
+    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs(), false);
     MT_EXPECT_TRUE(report.ok());
     MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(0));
     MT_EXPECT_TRUE(report.value().blocked[0].reason.kind ==
@@ -222,7 +227,7 @@ MT_TEST(image_cache_gc_blocks_missing_file_and_fileless_record) {
         core::Optional<uint64_t>(), std::set<p2p::P2pArtifactKey>()).ok());
 
     ImageCacheGc gc = fx.Gc();
-    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs());
+    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs(), false);
     MT_EXPECT_TRUE(report.ok());
     MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(0));
     MT_EXPECT_EQ(report.value().blocked.size(), static_cast<std::size_t>(2));
@@ -241,7 +246,7 @@ MT_TEST(image_cache_gc_blocks_directory_recorded_as_commit) {
         core::Optional<uint64_t>(), std::set<p2p::P2pArtifactKey>()).ok());
 
     ImageCacheGc gc = fx.Gc();
-    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs());
+    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs(), false);
     MT_EXPECT_TRUE(report.ok());
     MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(0));
     MT_EXPECT_TRUE(report.value().blocked[0].reason.kind ==
@@ -261,7 +266,7 @@ MT_TEST(image_cache_gc_refuses_p2p_commit_without_transport) {
         core::Optional<uint64_t>(4), keys).ok());
 
     ImageCacheGc gc = fx.Gc();
-    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs());
+    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs(), false);
     MT_EXPECT_TRUE(report.ok());
     // Deleting would leave peers advertising bytes that no longer exist, so
     // the commit is reported as DeleteFailed and the file survives.
@@ -285,7 +290,7 @@ MT_TEST(image_cache_gc_unpublishes_before_unlinking) {
     // The disabled transport accepts unpublish as a no-op, so the delete
     // proceeds through the full unpublish-then-unlink path.
     ImageCacheGc gc = fx.Gc();
-    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs());
+    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs(), false);
     MT_EXPECT_TRUE(report.ok());
     MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(1));
     MT_EXPECT_TRUE(!core::fs::Exists(file));
@@ -298,7 +303,7 @@ MT_TEST(image_cache_gc_own_operation_hold_does_not_block) {
     // The second check must ignore GC's own hold; if it did not, nothing would
     // ever be collectable.
     ImageCacheGc gc = fx.Gc();
-    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs());
+    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs(), false);
     MT_EXPECT_TRUE(report.ok());
     MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(1));
     (void)digest;
@@ -347,7 +352,7 @@ MT_TEST(image_cache_gc_prunes_empty_digest_dir_but_not_store_root) {
         core::Optional<uint64_t>(4), std::set<p2p::P2pArtifactKey>()).ok());
 
     ImageCacheGc gc = fx.Gc();
-    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs());
+    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs(), false);
     MT_EXPECT_TRUE(report.ok());
     MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(1));
     MT_EXPECT_TRUE(!core::fs::Exists(nested_dir));
@@ -357,10 +362,90 @@ MT_TEST(image_cache_gc_prunes_empty_digest_dir_but_not_store_root) {
 MT_TEST(image_cache_gc_empty_store_is_noop) {
     Fixture fx;
     ImageCacheGc gc = fx.Gc();
-    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs());
+    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs(), false);
     MT_EXPECT_TRUE(report.ok());
     MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(0));
     MT_EXPECT_TRUE(report.value().blocked.empty());
+}
+
+// Rust `run_gc(.., true)` rebuilds config roots from disk first: a config
+// that was never recorded through the store still protects its commit.
+MT_TEST(image_cache_gc_rebuild_metadata_roots_configs_on_disk) {
+    Fixture fx;
+    const HardCommitId digest = fx.SeedCommit("sha256:ondisk", "body");
+
+    storage::overlaybd::ImageConfig config;
+    storage::overlaybd::LayerConfig layer;
+    layer.file   = "../commits/sha256:ondisk";
+    layer.digest = "sha256:ondisk";
+    layer.size   = 4;
+    config.lowers.push_back(layer);
+    const std::string configs = fx.root.path + "/configs";
+    MT_EXPECT_TRUE(core::fs::CreateDirAll(configs).ok());
+    MT_EXPECT_TRUE(core::fs::Write(configs + "/app-image.json",
+                                   storage::overlaybd::ImageConfigToJson(config)).ok());
+
+    ImageCacheGc gc = fx.Gc();
+    auto report = gc.RunGc(ImageCacheLiveRuntimeRefs(), true);
+    MT_EXPECT_TRUE(report.ok());
+    MT_EXPECT_EQ(report.value().collected, static_cast<std::size_t>(0));
+    MT_EXPECT_EQ(report.value().blocked.size(), static_cast<std::size_t>(1));
+    MT_EXPECT_TRUE(report.value().blocked[0].reason.kind ==
+                   ImageCacheGcBlockedReason::RootedByConfig);
+    MT_EXPECT_TRUE(core::fs::Exists(fx.CommitPath("sha256:ondisk")));
+
+    // Once the config is gone, the next rebuilding pass un-roots and collects it.
+    MT_EXPECT_TRUE(core::fs::RemoveFile(configs + "/app-image.json").ok());
+    auto second = gc.RunGc(ImageCacheLiveRuntimeRefs(), true);
+    MT_EXPECT_TRUE(second.ok());
+    MT_EXPECT_EQ(second.value().collected, static_cast<std::size_t>(1));
+    (void)digest;
+}
+
+MT_TEST(image_cache_gc_rebuild_metadata_fails_closed_on_malformed_config) {
+    Fixture fx;
+    fx.SeedCommit("sha256:kept", "body");
+    const std::string configs = fx.root.path + "/configs";
+    MT_EXPECT_TRUE(core::fs::CreateDirAll(configs).ok());
+    MT_EXPECT_TRUE(core::fs::Write(configs + "/bad-image.json", "{not json").ok());
+
+    ImageCacheGc gc = fx.Gc();
+    MT_EXPECT_TRUE(!gc.RunGc(ImageCacheLiveRuntimeRefs(), true).ok());
+    MT_EXPECT_TRUE(core::fs::Exists(fx.CommitPath("sha256:kept")));
+}
+
+// Rust `maintenance_sweeps_stale_indexes`.
+MT_TEST(image_cache_gc_reclaims_stale_indexes) {
+    Fixture fx;
+    const std::string index_dir = fx.root.path + "/index";
+    const std::string live_file = CommitFile(fx.commit_store, "sha256:live");
+    MT_EXPECT_TRUE(core::fs::CreateDirAll(CommitDir(fx.commit_store, "sha256:live")).ok());
+    MT_EXPECT_TRUE(core::fs::Write(live_file, "live").ok());
+
+    const char* const sources[] = {"sha256:src-live", "sha256:src-dead"};
+    const char* const commits[] = {"sha256:live", "sha256:dead"};
+    for (int i = 0; i < 2; ++i) {
+        const CommitIndex index = CommitIndex::OciLayer(
+            sources[i], commits[i], 4, "test-converter", 1, false,
+            core::Optional<std::string>());
+        MT_EXPECT_TRUE(index.Write(IndexPath(index_dir, sources[i], "test-converter", 1, false,
+                                             core::Optional<std::string>())).ok());
+    }
+
+    ImageCacheGc gc = fx.Gc();
+    auto removed = gc.ReclaimStaleIndexes();
+    MT_EXPECT_TRUE(removed.ok());
+    MT_EXPECT_EQ(removed.value(), static_cast<std::size_t>(1));
+    MT_EXPECT_TRUE(core::fs::Exists(index_dir + "/" + DigestSlug("sha256:src-live")));
+    MT_EXPECT_TRUE(!core::fs::Exists(index_dir + "/" + DigestSlug("sha256:src-dead")));
+}
+
+MT_TEST(image_cache_gc_reclaim_stale_indexes_missing_dir_is_noop) {
+    Fixture fx;
+    ImageCacheGc gc = fx.Gc();
+    auto removed = gc.ReclaimStaleIndexes();
+    MT_EXPECT_TRUE(removed.ok());
+    MT_EXPECT_EQ(removed.value(), static_cast<std::size_t>(0));
 }
 
 MT_TEST(image_cache_gc_summary_from_report) {

@@ -32,6 +32,8 @@ extern const char* const kNetnsPrefix;
 /// Rust `HOST_VETH_PREFIX`.
 extern const char* const kHostVethPrefix;
 
+class EgressProxy;
+
 /// Rust `ARP_RETRANS_TIME_MS` / `NEIGH_SYSCTL_RETRIES` /
 /// `NEIGH_SYSCTL_RETRY_DELAY_MS`.
 extern const char* const kArpRetransTimeMs;
@@ -81,9 +83,14 @@ class Slot {
  public:
     /// Rust `Slot::new` — validates the index and derives the slot's addresses.
     /// Creates no kernel state; `CreateNetwork` does that.
+    ///
+    /// `egress_proxy` is Rust's `Arc<EgressProxy>`: shared by every slot of a
+    /// manager and owned by it, so it must outlive the slot. NULL is allowed
+    /// for slots that never get a domain policy (tests); `SetEgressPolicy`
+    /// then refuses one that needs the proxy.
     static core::Expected<Slot*, NetworkError>
         New(uint32_t idx, const NetworkAddressPlan& address_plan,
-            const std::string& netns_dir);
+            const std::string& netns_dir, EgressProxy* egress_proxy = NULL);
 
     ~Slot();
 
@@ -103,9 +110,12 @@ class Slot {
     /// Tracks whether the namespace's user egress chain currently holds rules:
     /// a warm-pool slot keeps its namespace across tenants, so the next tenant
     /// has to clear what the previous one installed.
-    core::Expected<core::Unit, NetworkError>
-        SetEgressPolicy(const core::Optional<SandboxNetworkPolicy>& policy,
-                        uint16_t egress_proxy_port);
+    ///
+    /// A policy with domain rules also starts the namespace's egress-proxy
+    /// listener and stages the policy on it, activating it around the
+    /// iptables commit so neither the old nor the new policy is ever missing.
+    core::Expected<core::Unit, std::string>
+        SetEgressPolicy(const core::Optional<SandboxNetworkPolicy>& policy);
 
     /// Rust `Slot::build_ip_boot_arg` — the guest's `ip=` kernel argument.
     std::string BuildIpBootArg() const;
@@ -124,8 +134,8 @@ class Slot {
 
  private:
     Slot(uint32_t idx, const NetworkAddressPlan& address_plan,
-         const std::string& netns_dir, uint32_t host_interaction_ip,
-         uint32_t veth_host_ip, uint32_t veth_vm_ip);
+         const std::string& netns_dir, EgressProxy* egress_proxy,
+         uint32_t host_interaction_ip, uint32_t veth_host_ip, uint32_t veth_vm_ip);
 
     Slot(const Slot&);
     Slot& operator=(const Slot&);
@@ -147,6 +157,7 @@ class Slot {
     uint32_t    veth_vm_ip_;
     NetworkAddressPlan address_plan_;
     std::string netns_dir_;
+    EgressProxy* egress_proxy_;
     bool        cleanup_armed_;
     bool        user_egress_rules_present_;
 };

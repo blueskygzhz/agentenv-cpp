@@ -24,6 +24,9 @@ namespace sandbox {
 namespace network {
 class SlotNetworkManager;
 }  // namespace network
+namespace firecracker {
+class FirecrackerPool;
+}  // namespace firecracker
 }  // namespace sandbox
 }  // namespace agentenv
 
@@ -84,6 +87,10 @@ class FirecrackerSandboxFactory : public SandboxBackendFactory {
     /// resumed sandbox gets a network slot (Rust allocates one
     /// unconditionally); without one -- tests -- sandboxes have no network.
     void SetNetworkManager(network::SlotNetworkManager* manager);
+
+    /// Rust `FirecrackerPool::global()` — the warm pool resumes adopt a
+    /// pre-spawned VMM from. NULL (the default) disables adoption.
+    void SetFirecrackerPool(FirecrackerPool* pool);
 
     FirecrackerSandboxFactory(const FirecrackerSandboxFactory&) = delete;
     FirecrackerSandboxFactory& operator=(const FirecrackerSandboxFactory&) = delete;

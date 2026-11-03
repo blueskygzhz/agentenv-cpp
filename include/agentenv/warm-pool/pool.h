@@ -17,10 +17,15 @@
 #define AGENTENV_WARM_POOL_H_
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdio>
 #include <deque>
+#include <functional>
 #include <mutex>
+#include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -49,6 +54,7 @@ struct PoolMaintenanceAction {
         return kind == o.kind && count == o.count;
     }
     bool operator!=(const PoolMaintenanceAction& o) const { return !(*this == o); }
+    bool IsIdle() const { return kind == PoolMaintenanceKind::Idle; }
 };
 
 /// Configuration for a warm pool. Mirrors Rust `PoolConfig`.
@@ -246,15 +252,63 @@ class WarmPool {
         return true;
     }
 
-    /// Signal any maintenance driver to stop and wake it up.
+    /// Signal any maintenance driver to stop and wake it up, then join the
+    /// worker started by `StartMaintenanceWorker` (Rust
+    /// `stop_maintenance_worker`). Must not be called from `run_cycle`.
     void StopMaintenance() {
-        std::lock_guard<std::mutex> lg(mu_);
-        stop_ = true;
-        pending_ = true;
-        cv_.notify_all();
+        {
+            std::lock_guard<std::mutex> lg(mu_);
+            stop_ = true;
+            pending_ = true;
+            cv_.notify_all();
+        }
+        std::thread worker;
+        {
+            std::lock_guard<std::mutex> lg(worker_mu_);
+            worker.swap(worker_);
+        }
+        if (worker.joinable()) worker.join();
+    }
+
+    /// Rust `start_maintenance_worker` — starts the background worker that
+    /// runs `run_cycle` whenever maintenance is requested, and again right
+    /// away while the watermarks still call for work. No-op when maintenance
+    /// is disabled or a worker was already started. The pool must outlive the
+    /// worker (Rust requires `&'static self`); `DrainAll` joins it.
+    void StartMaintenanceWorker(std::function<void()> run_cycle) {
+        if (!config_.maintenance_enabled) return;
+        if (maintenance_started_.exchange(true)) return;
+        try {
+            std::thread worker(&WarmPool::MaintenanceWorkerLoop, this, run_cycle);
+            std::lock_guard<std::mutex> lg(worker_mu_);
+            worker_.swap(worker);
+        } catch (const std::system_error& err) {
+            maintenance_started_.store(false);
+            std::fprintf(stderr, "failed to start warm pool maintenance worker: %s\n",
+                         err.what());
+            return;
+        }
+        RequestMaintenance();
     }
 
  private:
+    /// Rust `maintenance_worker_loop`.
+    void MaintenanceWorkerLoop(std::function<void()> run_cycle) {
+        bool has_immediate_work = false;
+        for (;;) {
+            if (!has_immediate_work && !WaitForMaintenance()) break;
+            if (IsShuttingDown()) break;
+            run_cycle();
+            if (IsShuttingDown()) break;
+            {
+                std::lock_guard<std::mutex> lg(mu_);
+                if (stop_) break;
+                has_immediate_work =
+                    !ComputeMaintenanceActionLocked(pool_.size()).IsIdle();
+            }
+        }
+    }
+
     PoolMaintenanceAction ComputeMaintenanceActionLocked(std::size_t pool_len) const {
         std::size_t fill_target = CurrentFillTargetLocked();
         if (pool_len < fill_target) {
@@ -313,6 +367,9 @@ class WarmPool {
     bool shutting_down_;
     mutable std::mutex mu_;
     mutable std::condition_variable cv_;
+    std::atomic<bool> maintenance_started_{false};
+    std::mutex worker_mu_;
+    std::thread worker_;
 };
 
 }  // namespace warmpool

@@ -29,7 +29,7 @@ extern const char* const kOverlaybdCommitFile;
 struct CommitIndex {
     uint32_t     schema = 0;
     std::string  source_kind;
-  std::string  source_digest;
+    std::string  source_digest;
     std::string  commit_digest;
     uint64_t     size = 0;
     std::string  converter;
@@ -39,26 +39,26 @@ struct CommitIndex {
 
     /// Rust `CommitIndex::oci_layer`.
     static CommitIndex OciLayer(std::string source_digest,
-        std::string commit_digest,
-      uint64_t size,
-    std::string converter,
- uint64_t virtual_size_gib,
-         bool mkfs,
-            core::Optional<std::string> parent_commit_digest);
+                                std::string commit_digest,
+                                uint64_t size,
+                                std::string converter,
+                                uint64_t virtual_size_gib,
+                                bool mkfs,
+                                core::Optional<std::string> parent_commit_digest);
 
-  /// Rust `CommitIndex::matches_oci_context`.
+    /// Rust `CommitIndex::matches_oci_context`.
     bool MatchesOciContext(const std::string& source_digest,
-      const std::string& converter,
-           uint64_t virtual_size_gib,
-      bool mkfs,
-              const core::Optional<std::string>& parent_commit_digest) const;
+                           const std::string& converter,
+                           uint64_t virtual_size_gib,
+                           bool mkfs,
+                           const core::Optional<std::string>& parent_commit_digest) const;
 
     /// Rust `CommitIndex::read` — returns None when the file is absent, an error
-  /// when it exists but cannot be read/parsed.
+    /// when it exists but cannot be read/parsed.
     static core::Expected<core::Optional<CommitIndex>, std::string> Read(
         const std::string& path);
 
- /// Rust `CommitIndex::write` — atomically writes pretty JSON via a temp file.
+    /// Rust `CommitIndex::write` — atomically writes pretty JSON via a temp file.
     core::Expected<core::Unit, std::string> Write(const std::string& path) const;
 
     /// Serialize to the camelCase pretty JSON that `write` persists.
@@ -103,11 +103,11 @@ core::Expected<std::string, std::string> SeedCommitFileTrustedDescriptor(
 
 /// Rust `index_path` — index_dir/<source_slug>/sha256-<ctx_hex>.json.
 std::string IndexPath(const std::string& index_dir,
-       const std::string& source_digest,
-        const std::string& converter,
-    uint64_t virtual_size_gib,
-        bool mkfs,
-   const core::Optional<std::string>& parent_commit_digest);
+                      const std::string& source_digest,
+                      const std::string& converter,
+                      uint64_t virtual_size_gib,
+                      bool mkfs,
+                      const core::Optional<std::string>& parent_commit_digest);
 
 /// Rust `sanitize_filename_component` — keep [A-Za-z0-9-_.], map the rest to '-',
 /// truncate to `max_len`.

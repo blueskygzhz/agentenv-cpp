@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: MIT
-// Tests for sandbox::EnvdInstance::WaitForReady + custom_extension::HookGuard.
+// Tests for sandbox::EnvdInstance::WaitForReady + HttpHealthProbe.
+// (The custom extension hooks have their own file: test_custom_extension.cc.)
 #include "microtest.h"
 
 #include <ctime>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cstring>
+#include <string>
+#include <thread>
+
 #include "agentenv/sandbox/envd.h"
-#include "agentenv/sandbox/custom_extension.h"
 
 using namespace agentenv::sandbox;
 
@@ -61,78 +70,84 @@ MT_TEST(envd_null_probe_times_out) {
     MT_EXPECT_TRUE(!r.ok());
 }
 
-// ---- custom_extension ----
+// ---- HttpHealthProbe ----
+
 namespace {
-class RecordingClient : public custom_extension::Client {
+
+/// Serves one canned HTTP response per connection on a loopback port and
+/// records the request line of each.
+class OneShotHttpServer {
  public:
-    int stop_calls = 0;
-    std::string last_event;
-    agentenv::core::Expected<agentenv::core::Unit, std::string>
-    Notify(const std::string& event, const custom_extension::Params&) override {
-        last_event = event;
-        if (event == custom_extension::hook::kStop) ++stop_calls;
-        return agentenv::core::Unit{};
+    explicit OneShotHttpServer(const std::string& status_line) : status_(status_line) {
+        fd_ = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        struct sockaddr_in a;
+        std::memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET;
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ::bind(fd_, reinterpret_cast<struct sockaddr*>(&a), sizeof(a));
+        ::listen(fd_, 4);
+        socklen_t len = sizeof(a);
+        ::getsockname(fd_, reinterpret_cast<struct sockaddr*>(&a), &len);
+        port_ = ntohs(a.sin_port);
+        thread_ = std::thread([this]() {
+            const int c = ::accept(fd_, NULL, NULL);
+            if (c < 0) return;
+            char buf[1024];
+            const ssize_t n = ::recv(c, buf, sizeof(buf), 0);
+            if (n > 0) request_.assign(buf, static_cast<size_t>(n));
+            const std::string resp = status_ + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            (void)::send(c, resp.data(), resp.size(), MSG_NOSIGNAL);
+            ::close(c);
+        });
     }
-    agentenv::core::Expected<agentenv::core::Optional<custom_extension::Params>,
-                              agentenv::core::AnyError>
-    HookPatchParams(const agentenv::core::SandboxId&,
-                    const custom_extension::Params&) override {
-        return agentenv::core::Optional<custom_extension::Params>();
+    ~OneShotHttpServer() {
+        ::shutdown(fd_, SHUT_RDWR);
+        if (thread_.joinable()) thread_.join();
+        ::close(fd_);
     }
+    uint16_t port() const { return port_; }
+    std::string Base() const { return "http://127.0.0.1:" + std::to_string(port_); }
+    void Join() {
+        if (thread_.joinable()) thread_.join();
+    }
+    const std::string& request() const { return request_; }
+
+ private:
+    std::string status_;
+    int fd_;
+    uint16_t port_;
+    std::thread thread_;
+    std::string request_;
 };
+
 }  // namespace
 
-MT_TEST(params_is_empty) {
-    custom_extension::Params p;
-    MT_EXPECT_TRUE(custom_extension::ParamsIsEmpty(p));
-    p.json_bytes = "{}";
-    MT_EXPECT_TRUE(custom_extension::ParamsIsEmpty(p));
-    p.json_bytes = "null";
-    MT_EXPECT_TRUE(custom_extension::ParamsIsEmpty(p));
-    p.json_bytes = "{\"a\":1}";
-    MT_EXPECT_TRUE(!custom_extension::ParamsIsEmpty(p));
+MT_TEST(http_health_probe_gets_health_and_accepts_success) {
+    OneShotHttpServer server("HTTP/1.1 204 No Content");
+    EnvdInstance envd(server.Base(), agentenv::core::Optional<EnvdAccessToken>());
+    MT_EXPECT_TRUE(envd.HttpHealthProbe()(1000));
+    server.Join();
+    MT_EXPECT_TRUE(server.request().compare(0, 16, "GET /health HTTP") == 0);
 }
 
-MT_TEST(instance_id_unique) {
-    custom_extension::SandboxInstanceId a = custom_extension::SandboxInstanceId::New();
-    custom_extension::SandboxInstanceId b = custom_extension::SandboxInstanceId::New();
-    MT_EXPECT_TRUE(a.ToString() != b.ToString());
-    MT_EXPECT_TRUE(a.ToString().size() > 0);
+MT_TEST(http_health_probe_rejects_a_server_error) {
+    OneShotHttpServer server("HTTP/1.1 503 Service Unavailable");
+    EnvdInstance envd(server.Base(), agentenv::core::Optional<EnvdAccessToken>());
+    MT_EXPECT_TRUE(!envd.HttpHealthProbe()(1000));
 }
 
-MT_TEST(hook_guard_fires_stop_on_destruction) {
-    RecordingClient client;
-    agentenv::core::SandboxId sid = agentenv::core::SandboxId::Fresh();
-    {
-        custom_extension::HookGuard guard(&client, sid,
-                                          custom_extension::SandboxInstanceId::New());
-        MT_EXPECT_EQ(client.stop_calls, 0);
-    }
-    MT_EXPECT_EQ(client.stop_calls, 1);
-    MT_EXPECT_TRUE(client.last_event == custom_extension::hook::kStop);
+MT_TEST(http_health_probe_rejects_an_unreachable_or_malformed_base) {
+    MT_EXPECT_TRUE(!EnvdInstance("http://127.0.0.1:1").HttpHealthProbe()(200));
+    MT_EXPECT_TRUE(!EnvdInstance("unix:///tmp/x").HttpHealthProbe()(200));
+    MT_EXPECT_TRUE(!EnvdInstance("http://:80").HttpHealthProbe()(200));
 }
 
-MT_TEST(hook_guard_disarm_suppresses_stop) {
-    RecordingClient client;
-    agentenv::core::SandboxId sid = agentenv::core::SandboxId::Fresh();
-    {
-        custom_extension::HookGuard guard(&client, sid,
-                                          custom_extension::SandboxInstanceId::New());
-        guard.Disarm();
-    }
-    MT_EXPECT_EQ(client.stop_calls, 0);
-}
-
-MT_TEST(hook_guard_move_transfers_obligation) {
-    RecordingClient client;
-    agentenv::core::SandboxId sid = agentenv::core::SandboxId::Fresh();
-    {
-        custom_extension::HookGuard g1(&client, sid,
-                                       custom_extension::SandboxInstanceId::New());
-        custom_extension::HookGuard g2(std::move(g1));
-        // moved-from g1 must not fire; g2 fires once.
-    }
-    MT_EXPECT_EQ(client.stop_calls, 1);
+MT_TEST(wait_for_ready_uses_the_http_probe) {
+    OneShotHttpServer server("HTTP/1.1 200 OK");
+    EnvdInstance envd(server.Base(), agentenv::core::Optional<EnvdAccessToken>(
+                                         EnvdAccessToken("secret")));
+    MT_EXPECT_TRUE(envd.WaitForReady(2000, 10).ok());
+    MT_EXPECT_EQ(envd.AccessToken()->Expose(), std::string("secret"));
 }
 
 MT_MAIN

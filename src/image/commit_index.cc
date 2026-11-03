@@ -2,19 +2,23 @@
 // Rust: src/image/commit_index.rs
 #include "agentenv/image/commit_index.h"
 
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cerrno>
-#include <fstream>
+#include <limits>
 #include <sstream>
 #include <vector>
 
 #include "agentenv/core/digest.h"
+#include "agentenv/core/json.h"
+#include "agentenv/core/logging.h"
 
 namespace agentenv {
 namespace image {
@@ -27,38 +31,41 @@ const std::size_t kMaxDigestSlugLen = 160;
 
 // ---- small filesystem helpers (POSIX) ----
 
-bool FileMetadata(const std::string& path, bool* is_file, uint64_t* len) {
+/// Rust `fs::metadata` (follows symlinks). Returns the errno on failure.
+int FileMetadata(const std::string& path, bool* is_file, uint64_t* len) {
     struct stat st;
-    if (::stat(path.c_str(), &st) != 0) return false;
+    if (::stat(path.c_str(), &st) != 0) return errno;
     *is_file = S_ISREG(st.st_mode);
     *len = static_cast<uint64_t>(st.st_size);
-    return true;
+    return 0;
 }
 
 std::string ParentDir(const std::string& path) {
     std::string::size_type slash = path.find_last_of('/');
     if (slash == std::string::npos) return ".";
     if (slash == 0) return "/";
- return path.substr(0, slash);
+    return path.substr(0, slash);
 }
 
-// Rust `tokio::fs::create_dir_all` — mkdir -p.
+// Rust `fs::create_dir_all` — mkdir -p.
 core::Expected<core::Unit, std::string> CreateDirAll(const std::string& dir) {
- if (dir.empty() || dir == "." || dir == "/") return core::Unit{};
+    if (dir.empty() || dir == "." || dir == "/") return core::Unit{};
     std::string acc;
     std::string::size_type i = 0;
-  if (dir[0] == '/') { acc = "/"; ++i; }
+    if (dir[0] == '/') {
+        acc = "/";
+        ++i;
+    }
     while (i < dir.size()) {
         std::string::size_type slash = dir.find('/', i);
-   std::string::size_type end =
-(slash == std::string::npos) ? dir.size() : slash;
+        std::string::size_type end = (slash == std::string::npos) ? dir.size() : slash;
         std::string segment = dir.substr(i, end - i);
-      if (!segment.empty()) {
+        if (!segment.empty()) {
             if (!acc.empty() && acc != "/") acc += "/";
-  acc += segment;
-      if (::mkdir(acc.c_str(), 0755) != 0 && errno != EEXIST) {
-    return core::make_unexpected<std::string>(
-"create dir " + acc + ": " + std::strerror(errno));
+            acc += segment;
+            if (::mkdir(acc.c_str(), 0755) != 0 && errno != EEXIST) {
+                return core::make_unexpected<std::string>("create dir " + acc + ": " +
+                                                          std::strerror(errno));
             }
         }
         i = (slash == std::string::npos) ? dir.size() : slash + 1;
@@ -66,74 +73,56 @@ core::Expected<core::Unit, std::string> CreateDirAll(const std::string& dir) {
     return core::Unit{};
 }
 
-std::string JsonEscape(const std::string& s) {
-  std::string out;
-    out.reserve(s.size() + 2);
-    for (char c : s) {
-        switch (c) {
-       case '"':  out += "\\\""; break;
-      case '\\': out += "\\\\"; break;
-         case '\n': out += "\\n";  break;
-      case '\r': out += "\\r";  break;
- case '\t': out += "\\t";  break;
-  default:   out += c;    break;
+// ---- serde field readers for `CommitIndex` ----
+//
+// `CommitIndex` derives `Deserialize` with no `#[serde(default)]`: every field
+// but the `Option` is required, and each must have the right JSON type. A
+// substring scan for `"key":` would accept a document serde rejects (and pick
+// up a key nested anywhere in the text), so the parse goes through a real
+// JSON value.
+
+core::Expected<const core::Json*, std::string> Required(const core::Json& object,
+                                                       const char* key) {
+    const core::JsonObject& map = object.as_object();
+    const core::JsonObject::const_iterator found = map.find(key);
+    if (found == map.end()) {
+        return core::make_unexpected(std::string("missing field `") + key + "`");
     }
-    }
-    return out;
+    return &found->second;
 }
 
-// Extract a JSON string value for `"key"`. Returns false if the key is absent.
-bool JsonFindString(const std::string& json, const std::string& key,
-             std::string* out) {
-    std::string needle = "\"" + key + "\"";
-    std::string::size_type k = json.find(needle);
-    if (k == std::string::npos) return false;
-    std::string::size_type colon = json.find(':', k + needle.size());
-    if (colon == std::string::npos) return false;
-    std::string::size_type q = json.find('"', colon + 1);
-    if (q == std::string::npos) return false;
-    std::string val;
-    for (std::string::size_type i = q + 1; i < json.size(); ++i) {
-        char c = json[i];
-        if (c == '\\' && i + 1 < json.size()) {
-            char n = json[++i];
-      switch (n) {
-        case 'n': val += '\n'; break;
-      case 'r': val += '\r'; break;
-  case 't': val += '\t'; break;
-             default:  val += n; break;
-            }
-        } else if (c == '"') {
-  *out = val;
-            return true;
-        } else {
-    val += c;
-        }
+core::Expected<std::string, std::string> RequiredString(const core::Json& object,
+                                                        const char* key) {
+    const core::Expected<const core::Json*, std::string> field = Required(object, key);
+    if (!field.ok()) return core::make_unexpected(field.error());
+    if (field.value()->kind() != core::Json::Kind::String) {
+        return core::make_unexpected(std::string("invalid type for `") + key +
+                                     "`: expected a string");
     }
-    return false;
+    return field.value()->as_string();
 }
 
-// Extract a numeric/boolean scalar for `"key"` as raw token text.
-bool JsonFindScalar(const std::string& json, const std::string& key,
-          std::string* out) {
-    std::string needle = "\"" + key + "\"";
-    std::string::size_type k = json.find(needle);
- if (k == std::string::npos) return false;
-    std::string::size_type colon = json.find(':', k + needle.size());
-  if (colon == std::string::npos) return false;
- std::string::size_type i = colon + 1;
-    while (i < json.size() && (json[i] == ' ' || json[i] == '\t' ||
-           json[i] == '\n' || json[i] == '\r')) {
-  ++i;
+core::Expected<uint64_t, std::string> RequiredUnsigned(const core::Json& object, const char* key,
+                                                       uint64_t max) {
+    const core::Expected<const core::Json*, std::string> field = Required(object, key);
+    if (!field.ok()) return core::make_unexpected(field.error());
+    const core::Json& value = *field.value();
+    if (value.kind() != core::Json::Kind::Int || value.as_int() < 0 ||
+        static_cast<uint64_t>(value.as_int()) > max) {
+        return core::make_unexpected(std::string("invalid value for `") + key +
+                                     "`: expected an unsigned integer");
     }
-    std::string tok;
-    while (i < json.size() && json[i] != ',' && json[i] != '}' &&
-      json[i] != '\n' && json[i] != ' ') {
-     tok += json[i++];
+    return static_cast<uint64_t>(value.as_int());
+}
+
+core::Expected<bool, std::string> RequiredBool(const core::Json& object, const char* key) {
+    const core::Expected<const core::Json*, std::string> field = Required(object, key);
+    if (!field.ok()) return core::make_unexpected(field.error());
+    if (field.value()->kind() != core::Json::Kind::Bool) {
+        return core::make_unexpected(std::string("invalid type for `") + key +
+                                     "`: expected a boolean");
     }
-    if (tok.empty()) return false;
-    *out = tok;
-    return true;
+    return field.value()->as_bool();
 }
 
 }  // namespace
@@ -142,16 +131,13 @@ const char* const kOverlaybdCommitFile = "overlaybd.commit";
 
 // ---- CommitIndex ----
 
-CommitIndex CommitIndex::OciLayer(std::string source_digest,
-     std::string commit_digest,
-uint64_t size,
-  std::string converter,
-     uint64_t virtual_size_gib,
-        bool mkfs,
-    core::Optional<std::string> parent_commit_digest) {
+CommitIndex CommitIndex::OciLayer(std::string source_digest, std::string commit_digest,
+                                  uint64_t size, std::string converter,
+                                  uint64_t virtual_size_gib, bool mkfs,
+                                  core::Optional<std::string> parent_commit_digest) {
     CommitIndex idx;
     idx.schema = kIndexSchemaVersion;
- idx.source_kind = kOciSourceKind;
+    idx.source_kind = kOciSourceKind;
     idx.source_digest = std::move(source_digest);
     idx.commit_digest = std::move(commit_digest);
     idx.size = size;
@@ -163,153 +149,259 @@ uint64_t size,
 }
 
 bool CommitIndex::MatchesOciContext(
-    const std::string& source_digest, const std::string& converter,
- uint64_t virtual_size_gib, bool mkfs,
-    const core::Optional<std::string>& parent_commit_digest) const {
-    bool parents_equal =
-     (parent_commit_digest.has_value() == this->parent_commit_digest.has_value()) &&
- (!parent_commit_digest.has_value() ||
+    const std::string& source_digest, const std::string& converter, uint64_t virtual_size_gib,
+    bool mkfs, const core::Optional<std::string>& parent_commit_digest) const {
+    const bool parents_equal =
+        (parent_commit_digest.has_value() == this->parent_commit_digest.has_value()) &&
+        (!parent_commit_digest.has_value() ||
          *parent_commit_digest == *this->parent_commit_digest);
-    return schema == kIndexSchemaVersion &&
-  source_kind == kOciSourceKind &&
-           this->source_digest == source_digest &&
-  this->converter == converter &&
-     this->virtual_size_gib == virtual_size_gib &&
-  this->mkfs == mkfs &&
- parents_equal;
+    return schema == kIndexSchemaVersion && source_kind == kOciSourceKind &&
+           this->source_digest == source_digest && this->converter == converter &&
+           this->virtual_size_gib == virtual_size_gib && this->mkfs == mkfs && parents_equal;
 }
 
 std::string CommitIndex::ToJsonPretty() const {
+    // `serde_json::to_vec_pretty`: struct fields in declaration order (which
+    // `core::JsonObject`, a sorted map, cannot keep), `"key": value`, two-space
+    // indent, and `parentCommitDigest` skipped when `None`.
     std::ostringstream os;
     os << "{\n";
     os << "  \"schema\": " << schema << ",\n";
-    os << "  \"sourceKind\": \"" << JsonEscape(source_kind) << "\",\n";
-    os << "  \"sourceDigest\": \"" << JsonEscape(source_digest) << "\",\n";
-    os << "  \"commitDigest\": \"" << JsonEscape(commit_digest) << "\",\n";
+    os << "  \"sourceKind\": " << core::JsonQuote(source_kind) << ",\n";
+    os << "  \"sourceDigest\": " << core::JsonQuote(source_digest) << ",\n";
+    os << "  \"commitDigest\": " << core::JsonQuote(commit_digest) << ",\n";
     os << "  \"size\": " << size << ",\n";
-    os << "  \"converter\": \"" << JsonEscape(converter) << "\",\n";
+    os << "  \"converter\": " << core::JsonQuote(converter) << ",\n";
     os << "  \"virtualSizeGib\": " << virtual_size_gib << ",\n";
     os << "  \"mkfs\": " << (mkfs ? "true" : "false");
     if (parent_commit_digest.has_value()) {
-        os << ",\n  \"parentCommitDigest\": \""
-           << JsonEscape(*parent_commit_digest) << "\"";
+        os << ",\n  \"parentCommitDigest\": " << core::JsonQuote(*parent_commit_digest);
     }
     os << "\n}";
     return os.str();
 }
 
-core::Expected<CommitIndex, std::string> CommitIndex::FromJson(
-    const std::string& json) {
+core::Expected<CommitIndex, std::string> CommitIndex::FromJson(const std::string& json) {
+    const core::Expected<core::Json, core::AnyError> parsed = core::Json::Parse(json);
+    if (!parsed.ok()) return core::make_unexpected(parsed.error().chain());
+    const core::Json& value = parsed.value();
+    if (value.kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(std::string("invalid type: expected struct CommitIndex"));
+    }
+
     CommitIndex idx;
-    std::string tok;
-    if (!JsonFindScalar(json, "schema", &tok)) {
-        return core::make_unexpected<std::string>("missing schema");
+    const core::Expected<uint64_t, std::string> schema =
+        RequiredUnsigned(value, "schema", std::numeric_limits<uint32_t>::max());
+    if (!schema.ok()) return core::make_unexpected(schema.error());
+    idx.schema = static_cast<uint32_t>(schema.value());
+
+    const char* const kStringKeys[] = {"sourceKind", "sourceDigest", "commitDigest",
+                                       "converter"};
+    std::string* const string_fields[] = {&idx.source_kind, &idx.source_digest,
+                                          &idx.commit_digest, &idx.converter};
+    for (std::size_t i = 0; i < 4; ++i) {
+        const core::Expected<std::string, std::string> field =
+            RequiredString(value, kStringKeys[i]);
+        if (!field.ok()) return core::make_unexpected(field.error());
+        *string_fields[i] = field.value();
     }
-    idx.schema = static_cast<uint32_t>(std::strtoul(tok.c_str(), nullptr, 10));
-    if (!JsonFindString(json, "sourceKind", &idx.source_kind) ||
-        !JsonFindString(json, "sourceDigest", &idx.source_digest) ||
-        !JsonFindString(json, "commitDigest", &idx.commit_digest) ||
-        !JsonFindString(json, "converter", &idx.converter)) {
-        return core::make_unexpected<std::string>("missing string field");
-    }
-    if (!JsonFindScalar(json, "size", &tok)) {
-        return core::make_unexpected<std::string>("missing size");
-    }
-    idx.size = std::strtoull(tok.c_str(), nullptr, 10);
-    if (!JsonFindScalar(json, "virtualSizeGib", &tok)) {
-     return core::make_unexpected<std::string>("missing virtualSizeGib");
-    }
-    idx.virtual_size_gib = std::strtoull(tok.c_str(), nullptr, 10);
-    if (!JsonFindScalar(json, "mkfs", &tok)) {
-      return core::make_unexpected<std::string>("missing mkfs");
-    }
-    idx.mkfs = (tok == "true");
-    std::string parent;
-    if (JsonFindString(json, "parentCommitDigest", &parent)) {
-        idx.parent_commit_digest = parent;
+
+    const uint64_t kU64Max = std::numeric_limits<uint64_t>::max();
+    const core::Expected<uint64_t, std::string> size = RequiredUnsigned(value, "size", kU64Max);
+    if (!size.ok()) return core::make_unexpected(size.error());
+    idx.size = size.value();
+    const core::Expected<uint64_t, std::string> virtual_size =
+        RequiredUnsigned(value, "virtualSizeGib", kU64Max);
+    if (!virtual_size.ok()) return core::make_unexpected(virtual_size.error());
+    idx.virtual_size_gib = virtual_size.value();
+    const core::Expected<bool, std::string> mkfs = RequiredBool(value, "mkfs");
+    if (!mkfs.ok()) return core::make_unexpected(mkfs.error());
+    idx.mkfs = mkfs.value();
+
+    // `Option<String>`: absent and `null` are both `None`.
+    const core::JsonObject& map = value.as_object();
+    const core::JsonObject::const_iterator parent = map.find("parentCommitDigest");
+    if (parent != map.end() && parent->second.kind() != core::Json::Kind::Null) {
+        if (parent->second.kind() != core::Json::Kind::String) {
+            return core::make_unexpected(
+                std::string("invalid type for `parentCommitDigest`: expected a string"));
+        }
+        idx.parent_commit_digest = parent->second.as_string();
     }
     return idx;
 }
 
 core::Expected<core::Optional<CommitIndex>, std::string> CommitIndex::Read(
     const std::string& path) {
-    std::ifstream in(path.c_str(), std::ios::binary);
-    if (!in) {
-   // Absent file -> Ok(None); any other open failure would also land here,
-  // but the caller treats a missing index as "recompute", matching Rust's
-        // NotFound handling.
-        return core::Optional<CommitIndex>();
+    // Only NotFound means "no index"; any other read failure (EACCES, EISDIR,
+    // EIO) is an error, as in Rust. Folding those into `None` would make the
+    // caller reconvert a layer whose index it merely could not read.
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT) return core::Optional<CommitIndex>();
+        return core::make_unexpected<std::string>("read commit index " + path + ": " +
+                                                  std::strerror(errno));
     }
-    std::ostringstream ss;
-  ss << in.rdbuf();
-    auto parsed = FromJson(ss.str());
+    std::string bytes;
+    char buf[8192];
+    for (;;) {
+        const ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            const std::string why = std::strerror(errno);
+            ::close(fd);
+            return core::make_unexpected<std::string>("read commit index " + path + ": " + why);
+        }
+        if (n == 0) break;
+        bytes.append(buf, static_cast<std::size_t>(n));
+    }
+    ::close(fd);
+    core::Expected<CommitIndex, std::string> parsed = FromJson(bytes);
     if (!parsed.ok()) {
-        return core::make_unexpected<std::string>(
-   "parse commit index " + path + ": " + parsed.error());
+        return core::make_unexpected<std::string>("parse commit index " + path + ": " +
+                                                  parsed.error());
     }
     return core::Optional<CommitIndex>(parsed.take_value());
 }
 
-core::Expected<core::Unit, std::string> CommitIndex::Write(
-  const std::string& path) const {
-    std::string parent = ParentDir(path);
-    auto mk = CreateDirAll(parent);
-    if (!mk.ok()) {
-        return core::make_unexpected<std::string>(
- "create commit index dir " + parent + ": " + mk.error());
+namespace {
+
+bool WriteAll(int fd, const char* data, std::size_t len) {
+    while (len > 0) {
+        const ssize_t n = ::write(fd, data, len);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        data += n;
+        len -= static_cast<std::size_t>(n);
     }
-    std::string tmp = parent + "/.commit_index.tmp.XXXXXX";
-    std::vector<char> buf(tmp.begin(), tmp.end());
-    buf.push_back('\0');
-    int fd = ::mkstemp(buf.data());
-    if (fd < 0) {
-        return core::make_unexpected<std::string>(
-            "create temp commit index in " + parent + ": " +
-        std::strerror(errno));
+    return true;
+}
+
+/// Rust `tempfile::NamedTempFile::new_in` — an open temp file in `parent`
+/// (mode 0600, `.tmp` + random suffix) that is unlinked on drop unless
+/// persisted.
+class SeedTempFile {
+ public:
+    SeedTempFile() : fd_(-1) {}
+    ~SeedTempFile() {
+        if (fd_ >= 0) ::close(fd_);
+        if (!path_.empty()) ::unlink(path_.c_str());
     }
-    std::string tmp_path(buf.data());
-    ::close(fd);
-    {
- std::ofstream out(tmp_path.c_str(), std::ios::binary | std::ios::trunc);
-        std::string json = ToJsonPretty();
-        out.write(json.data(), static_cast<std::streamsize>(json.size()));
-        if (!out) {
-            ::unlink(tmp_path.c_str());
- return core::make_unexpected<std::string>(
-                "write temp commit index " + tmp_path);
+    SeedTempFile(const SeedTempFile&) = delete;
+    SeedTempFile& operator=(const SeedTempFile&) = delete;
+
+    /// Returns the errno on failure.
+    int Create(const std::string& parent) {
+        std::string tmpl = parent + "/.tmpXXXXXX";
+        std::vector<char> buf(tmpl.begin(), tmpl.end());
+        buf.push_back('\0');
+        const int fd = ::mkostemp(buf.data(), O_CLOEXEC);
+        if (fd < 0) return errno;
+        fd_ = fd;
+        path_ = std::string(buf.data());
+        return 0;
+    }
+
+    int fd() const { return fd_; }
+    const std::string& path() const { return path_; }
+
+    /// Rust `NamedTempFile::persist` — `rename(2)`, replacing the target.
+    int Persist(const std::string& destination) {
+        CloseFd();
+        if (::rename(path_.c_str(), destination.c_str()) != 0) return errno;
+        path_.clear();
+        return 0;
+    }
+
+    /// Rust `NamedTempFile::persist_noclobber` (tempfile's unix `persist`
+    /// with `overwrite = false`): `renameat2(RENAME_NOREPLACE)`, falling back
+    /// to `link` + `unlink` only where renameat2 is unsupported. Never a plain
+    /// `rename`, which would clobber a concurrently persisted destination.
+    /// Returns the errno of the failure; EEXIST means "already there".
+    int PersistNoClobber(const std::string& destination) {
+        CloseFd();
+#ifdef SYS_renameat2
+        const long rc = ::syscall(SYS_renameat2, AT_FDCWD, path_.c_str(), AT_FDCWD,
+                                  destination.c_str(), 1 /* RENAME_NOREPLACE */);
+        if (rc == 0) {
+            path_.clear();
+            return 0;
+        }
+        if (errno != EINVAL && errno != ENOSYS) return errno;
+#endif
+        if (::link(path_.c_str(), destination.c_str()) != 0) return errno;
+        ::unlink(path_.c_str());
+        path_.clear();
+        return 0;
+    }
+
+ private:
+    void CloseFd() {
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
         }
     }
-    if (::rename(tmp_path.c_str(), path.c_str()) != 0) {
-  ::unlink(tmp_path.c_str());
- return core::make_unexpected<std::string>(
-            "move commit index " + tmp_path + " to " + path + ": " +
-      std::strerror(errno));
+
+    int fd_;
+    std::string path_;
+};
+
+}  // namespace
+
+core::Expected<core::Unit, std::string> CommitIndex::Write(const std::string& path) const {
+    const std::string parent = ParentDir(path);
+    const core::Expected<core::Unit, std::string> mk = CreateDirAll(parent);
+    if (!mk.ok()) {
+        return core::make_unexpected<std::string>("create commit index dir " + parent + ": " +
+                                                  mk.error());
     }
- return core::Unit{};
+    SeedTempFile tmp;
+    const int created = tmp.Create(parent);
+    if (created != 0) {
+        return core::make_unexpected<std::string>("create temp commit index in " + parent + ": " +
+                                                  std::strerror(created));
+    }
+    const std::string json = ToJsonPretty();
+    if (!WriteAll(tmp.fd(), json.data(), json.size())) {
+        return core::make_unexpected<std::string>("write temp commit index " + tmp.path() + ": " +
+                                                  std::strerror(errno));
+    }
+    const std::string tmp_path = tmp.path();
+    const int persisted = tmp.Persist(path);
+    if (persisted != 0) {
+        return core::make_unexpected<std::string>("move commit index " + tmp_path + " to " +
+                                                  path + ": " + std::strerror(persisted));
+    }
+    return core::Unit{};
 }
 
 bool CommitIndex::operator==(const CommitIndex& o) const {
-    bool parents_equal =
-      (parent_commit_digest.has_value() == o.parent_commit_digest.has_value()) &&
-   (!parent_commit_digest.has_value() ||
-         *parent_commit_digest == *o.parent_commit_digest);
+    const bool parents_equal =
+        (parent_commit_digest.has_value() == o.parent_commit_digest.has_value()) &&
+        (!parent_commit_digest.has_value() || *parent_commit_digest == *o.parent_commit_digest);
     return schema == o.schema && source_kind == o.source_kind &&
-      source_digest == o.source_digest && commit_digest == o.commit_digest &&
-  size == o.size && converter == o.converter &&
-    virtual_size_gib == o.virtual_size_gib && mkfs == o.mkfs &&
-     parents_equal;
+           source_digest == o.source_digest && commit_digest == o.commit_digest &&
+           size == o.size && converter == o.converter &&
+           virtual_size_gib == o.virtual_size_gib && mkfs == o.mkfs && parents_equal;
 }
 
 // ---- free functions ----
 
-std::string SanitizeFilenameComponent(const std::string& value,
-   std::size_t max_len) {
+std::string SanitizeFilenameComponent(const std::string& value, std::size_t max_len) {
+    // Rust maps per `char`, so one multi-byte UTF-8 character becomes a single
+    // '-', not one per byte. Continuation bytes (10xxxxxx) are therefore
+    // folded into the '-' already emitted for their lead byte.
     std::string component;
     component.reserve(value.size());
-    for (char c : value) {
-     bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-   (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
-        component += ok ? c : '-';
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(value[i]);
+        if ((c & 0xC0) == 0x80) continue;
+        const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+        component += ok ? static_cast<char>(c) : '-';
     }
     if (component.size() > max_len) component.resize(max_len);
     return component;
@@ -317,7 +409,7 @@ std::string SanitizeFilenameComponent(const std::string& value,
 
 std::string DigestSlug(const std::string& digest) {
     std::string slug;
-    std::string::size_type colon = digest.find(':');
+    const std::string::size_type colon = digest.find(':');
     if (colon != std::string::npos && colon > 0 && colon + 1 < digest.size()) {
         slug = digest.substr(0, colon) + "-" + digest.substr(colon + 1);
     } else {
@@ -327,41 +419,40 @@ std::string DigestSlug(const std::string& digest) {
 }
 
 std::string CommitDir(const std::string& commit_store, const std::string& digest) {
-  return commit_store + "/" + DigestSlug(digest);
+    return commit_store + "/" + DigestSlug(digest);
 }
 
 std::string CommitFile(const std::string& commit_store, const std::string& digest) {
     return CommitDir(commit_store, digest) + "/" + kOverlaybdCommitFile;
 }
 
-core::Optional<std::string> CachedCommitFileIfUsable(
-    const std::string& commit_store, const std::string& digest, uint64_t size) {
-    std::string path = CommitFile(commit_store, digest);
+core::Optional<std::string> CachedCommitFileIfUsable(const std::string& commit_store,
+                                                     const std::string& digest, uint64_t size) {
+    const std::string path = CommitFile(commit_store, digest);
     bool is_file = false;
     uint64_t len = 0;
-    if (FileMetadata(path, &is_file, &len) && is_file && len == size) {
-        return path;
-    }
+    if (FileMetadata(path, &is_file, &len) == 0 && is_file && len == size) return path;
     return core::nullopt;
 }
 
-core::Expected<std::string, std::string> AcceptExistingCommitFile(
-    const std::string& destination, const std::string& digest, uint64_t size) {
+core::Expected<std::string, std::string> AcceptExistingCommitFile(const std::string& destination,
+                                                                  const std::string& digest,
+                                                                  uint64_t size) {
     bool is_file = false;
     uint64_t len = 0;
- if (!FileMetadata(destination, &is_file, &len)) {
-     return core::make_unexpected<std::string>(
-            "stat existing commit cache file " + destination);
+    const int err = FileMetadata(destination, &is_file, &len);
+    if (err != 0) {
+        return core::make_unexpected<std::string>("stat existing commit cache file " +
+                                                  destination + ": " + std::strerror(err));
     }
     if (!is_file) {
-    return core::make_unexpected<std::string>(
-            "commit cache file " + destination + " for " + digest +
-            " is not a regular file");
+        return core::make_unexpected<std::string>("commit cache file " + destination + " for " +
+                                                  digest + " is not a regular file");
     }
     if (len != size) {
-      std::ostringstream os;
-    os << "commit cache file " << destination << " size mismatch for "
-           << digest << ": expected " << size << ", found " << len;
+        std::ostringstream os;
+        os << "commit cache file " << destination << " size mismatch for " << digest
+           << ": expected " << size << ", found " << len;
         return core::make_unexpected<std::string>(os.str());
     }
     return destination;
@@ -369,205 +460,221 @@ core::Expected<std::string, std::string> AcceptExistingCommitFile(
 
 namespace {
 
-// Shared tail for both seed paths: verify size then persist a temp file into the
-// destination without clobbering an existing (concurrently written) file.
-core::Expected<std::string, std::string> PersistNoClobber(
-    const std::string& tmp_path, const std::string& destination,
-    const std::string& digest, uint64_t size) {
-    if (::link(tmp_path.c_str(), destination.c_str()) == 0) {
-        ::unlink(tmp_path.c_str());
-        return destination;
-    }
-    if (errno == EEXIST) {
-     ::unlink(tmp_path.c_str());
-        return AcceptExistingCommitFile(destination, digest, size);
-    }
-    // rename() clobbers, so we used link()+unlink() for the noclobber semantics;
-    // fall back to rename only when the destination genuinely does not exist.
-    if (::rename(tmp_path.c_str(), destination.c_str()) == 0) {
-        return destination;
-}
-    std::string err = std::strerror(errno);
-    ::unlink(tmp_path.c_str());
-    return core::make_unexpected<std::string>(
-        "persist temp commit cache file " + tmp_path + " to " + destination +
-        ": " + err);
+core::Expected<std::string, std::string> FinishPersist(SeedTempFile* temp,
+                                                       const std::string& destination,
+                                                       const std::string& digest,
+                                                       uint64_t size) {
+    const std::string temp_path = temp->path();
+    const int err = temp->PersistNoClobber(destination);
+    if (err == 0) return destination;
+    if (err == EEXIST) return AcceptExistingCommitFile(destination, digest, size);
+    return core::make_unexpected<std::string>("persist temp commit cache file " + temp_path +
+                                              " to " + destination + ": " +
+                                              std::strerror(err));
 }
 
-core::Expected<std::string, std::string> MakeTempIn(const std::string& parent,
-           std::string* out_path) {
-    std::string tmpl = parent + "/.commit_cache.tmp.XXXXXX";
-    std::vector<char> buf(tmpl.begin(), tmpl.end());
-    buf.push_back('\0');
-    int fd = ::mkstemp(buf.data());
-if (fd < 0) {
-        return core::make_unexpected<std::string>(
-            "create temp commit cache file in " + parent + ": " +
-      std::strerror(errno));
+/// The shared prologue of both seed paths: create the commit dir, then check
+/// the source length against the descriptor.
+core::Expected<std::string, std::string> PrepareSeed(const std::string& destination,
+                                                     const std::string& source, uint64_t size,
+                                                     const char* mismatch_prefix) {
+    const std::string parent = ParentDir(destination);
+    const core::Expected<core::Unit, std::string> mk = CreateDirAll(parent);
+    if (!mk.ok()) {
+        return core::make_unexpected<std::string>("create commit cache dir " + parent + ": " +
+                                                  mk.error());
     }
-    ::close(fd);
-  *out_path = std::string(buf.data());
-    return *out_path;
+    bool is_file = false;
+    uint64_t source_len = 0;
+    const int err = FileMetadata(source, &is_file, &source_len);
+    if (err != 0) {
+        return core::make_unexpected<std::string>("stat source commit " + source + ": " +
+                                                  std::strerror(err));
+    }
+    if (source_len != size) {
+        std::ostringstream os;
+        os << mismatch_prefix << " size mismatch for " << source << ": descriptor says " << size
+           << ", file has " << source_len;
+        return core::make_unexpected<std::string>(os.str());
+    }
+    return parent;
 }
 
 }  // namespace
 
-core::Expected<std::string, std::string> SeedCommitFile(
-    const std::string& commit_store, const std::string& source,
-  const std::string& digest, uint64_t size) {
-    std::string destination = CommitFile(commit_store, digest);
-    auto existing = CachedCommitFileIfUsable(commit_store, digest, size);
+core::Expected<std::string, std::string> SeedCommitFile(const std::string& commit_store,
+                                                        const std::string& source,
+                                                        const std::string& digest,
+                                                        uint64_t size) {
+    const std::string destination = CommitFile(commit_store, digest);
+    const core::Optional<std::string> existing =
+        CachedCommitFileIfUsable(commit_store, digest, size);
     if (existing.has_value()) return *existing;
 
-    std::string parent = ParentDir(destination);
-    auto mk = CreateDirAll(parent);
-    if (!mk.ok()) {
-        return core::make_unexpected<std::string>(
-   "create commit cache dir " + parent + ": " + mk.error());
+    const core::Expected<std::string, std::string> prepared =
+        PrepareSeed(destination, source, size, "commit cache seed");
+    if (!prepared.ok()) return core::make_unexpected(prepared.error());
+    const std::string& parent = prepared.value();
+
+    const int in = ::open(source.c_str(), O_RDONLY | O_CLOEXEC);
+    if (in < 0) {
+        return core::make_unexpected<std::string>("open source commit " + source + ": " +
+                                                  std::strerror(errno));
+    }
+    SeedTempFile temp;
+    const int created = temp.Create(parent);
+    if (created != 0) {
+        ::close(in);
+        return core::make_unexpected<std::string>("create temp commit cache file in " + parent +
+                                                  ": " + std::strerror(created));
     }
 
-    bool is_file = false;
-    uint64_t source_len = 0;
-    if (!FileMetadata(source, &is_file, &source_len)) {
-return core::make_unexpected<std::string>("stat source commit " + source);
+    // Rust `digest::copy_with_sha256_hex`: stream the copy and hash the same
+    // bytes, so neither side has to hold the whole layer in memory.
+    core::Sha256Stream hasher;
+    uint64_t copied = 0;
+    std::vector<char> buf(128 * 1024);
+    for (;;) {
+        const ssize_t n = ::read(in, buf.data(), buf.size());
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            const std::string why = std::strerror(errno);
+            ::close(in);
+            return core::make_unexpected<std::string>("copy source commit " + source +
+                                                      " to temp commit cache file " +
+                                                      temp.path() + ": " + why);
+        }
+        if (n == 0) break;
+        if (!WriteAll(temp.fd(), buf.data(), static_cast<std::size_t>(n))) {
+            const std::string why = std::strerror(errno);
+            ::close(in);
+            return core::make_unexpected<std::string>("copy source commit " + source +
+                                                      " to temp commit cache file " +
+                                                      temp.path() + ": " + why);
+        }
+        hasher.Update(buf.data(), static_cast<std::size_t>(n));
+        copied += static_cast<uint64_t>(n);
     }
-    if (source_len != size) {
-   std::ostringstream os;
-        os << "commit cache seed size mismatch for " << source
-           << ": descriptor says " << size << ", file has " << source_len;
-        return core::make_unexpected<std::string>(os.str());
-  }
-
-    // Copy source into a temp file while hashing (mirrors copy_with_sha256_hex).
-    std::string tmp_path;
-    auto mkt = MakeTempIn(parent, &tmp_path);
-    if (!mkt.ok()) return core::make_unexpected(mkt.take_error());
-
-std::ifstream in(source.c_str(), std::ios::binary);
-    if (!in) {
-      ::unlink(tmp_path.c_str());
-        return core::make_unexpected<std::string>("open source commit " + source);
-}
- std::ofstream out(tmp_path.c_str(), std::ios::binary | std::ios::trunc);
-    std::string all((std::istreambuf_iterator<char>(in)),
-      std::istreambuf_iterator<char>());
-    out.write(all.data(), static_cast<std::streamsize>(all.size()));
-    out.flush();
-    if (!out) {
-        ::unlink(tmp_path.c_str());
- return core::make_unexpected<std::string>(
-            "copy source commit " + source + " to temp commit cache file " +
-            tmp_path);
+    ::close(in);
+    if (::fsync(temp.fd()) != 0) {
+        return core::make_unexpected<std::string>("sync temp commit cache file " +
+                                                  temp.path() + ": " + std::strerror(errno));
     }
-    uint64_t copied = all.size();
-    std::string actual_digest = core::Sha256Digest(all);
+    const std::string actual_digest = hasher.PeekHex();
 
     if (copied != size) {
-        ::unlink(tmp_path.c_str());
         std::ostringstream os;
-        os << "short commit cache seed copy for " << source << ": expected "
-           << size << " bytes, copied " << copied;
+        os << "short commit cache seed copy for " << source << ": expected " << size
+           << " bytes, copied " << copied;
         return core::make_unexpected<std::string>(os.str());
     }
     if (actual_digest != digest) {
-  ::unlink(tmp_path.c_str());
-        return core::make_unexpected<std::string>(
-            "commit cache seed digest mismatch for " + source + ": expected " +
-            digest + ", got " + actual_digest);
+        return core::make_unexpected<std::string>("commit cache seed digest mismatch for " +
+                                                  source + ": expected " + digest + ", got " +
+                                                  actual_digest);
     }
-    return PersistNoClobber(tmp_path, destination, digest, size);
+    return FinishPersist(&temp, destination, digest, size);
 }
 
 core::Expected<std::string, std::string> SeedCommitFileTrustedDescriptor(
-    const std::string& commit_store, const std::string& source,
-    const std::string& digest, uint64_t size) {
-    std::string destination = CommitFile(commit_store, digest);
-    auto existing = CachedCommitFileIfUsable(commit_store, digest, size);
+    const std::string& commit_store, const std::string& source, const std::string& digest,
+    uint64_t size) {
+    const std::string destination = CommitFile(commit_store, digest);
+    const core::Optional<std::string> existing =
+        CachedCommitFileIfUsable(commit_store, digest, size);
     if (existing.has_value()) return *existing;
 
-    std::string parent = ParentDir(destination);
-    auto mk = CreateDirAll(parent);
-    if (!mk.ok()) {
- return core::make_unexpected<std::string>(
-     "create commit cache dir " + parent + ": " + mk.error());
+    const core::Expected<std::string, std::string> prepared =
+        PrepareSeed(destination, source, size, "trusted commit cache seed");
+    if (!prepared.ok()) return core::make_unexpected(prepared.error());
+    const std::string& parent = prepared.value();
+
+    if (::link(source.c_str(), destination.c_str()) == 0) return destination;
+    if (errno == EEXIST) return AcceptExistingCommitFile(destination, digest, size);
+    AGENTENV_DEBUG("hard-link overlaybd commit cache seed failed; falling back to copy: source="
+                   << source << " destination=" << destination
+                   << " error=" << std::strerror(errno));
+
+    SeedTempFile temp;
+    const int created = temp.Create(parent);
+    if (created != 0) {
+        return core::make_unexpected<std::string>("create temp commit cache file in " + parent +
+                                                  ": " + std::strerror(created));
     }
 
-    bool is_file = false;
-    uint64_t source_len = 0;
-    if (!FileMetadata(source, &is_file, &source_len)) {
-        return core::make_unexpected<std::string>("stat source commit " + source);
+    // Rust `fs::copy(source, temp.path())`: contents *and* permission bits.
+    // std's copy reopens the destination and `fchmod`s it to the source mode,
+    // so the cached commit ends up with the source's permissions rather than
+    // the temp file's 0600.
+    const std::string copy_error_prefix =
+        "copy trusted source commit " + source + " to temp " + temp.path() + ": ";
+    const int in = ::open(source.c_str(), O_RDONLY | O_CLOEXEC);
+    if (in < 0) return core::make_unexpected(copy_error_prefix + std::strerror(errno));
+    struct stat source_st;
+    if (::fstat(in, &source_st) != 0) {
+        const std::string why = std::strerror(errno);
+        ::close(in);
+        return core::make_unexpected(copy_error_prefix + why);
     }
-    if (source_len != size) {
+    std::vector<char> buf(128 * 1024);
+    for (;;) {
+        const ssize_t n = ::read(in, buf.data(), buf.size());
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            const std::string why = std::strerror(errno);
+            ::close(in);
+            return core::make_unexpected(copy_error_prefix + why);
+        }
+        if (n == 0) break;
+        if (!WriteAll(temp.fd(), buf.data(), static_cast<std::size_t>(n))) {
+            const std::string why = std::strerror(errno);
+            ::close(in);
+            return core::make_unexpected(copy_error_prefix + why);
+        }
+    }
+    ::close(in);
+    if (::fchmod(temp.fd(), source_st.st_mode & 07777) != 0) {
+        return core::make_unexpected(copy_error_prefix + std::strerror(errno));
+    }
+
+    struct stat st;
+    if (::fstat(temp.fd(), &st) != 0) {
+        return core::make_unexpected<std::string>("stat temp commit cache file " +
+                                                  temp.path() + ": " + std::strerror(errno));
+    }
+    if (static_cast<uint64_t>(st.st_size) != size) {
         std::ostringstream os;
-        os << "trusted commit cache seed size mismatch for " << source
-           << ": descriptor says " << size << ", file has " << source_len;
+        os << "trusted commit cache seed temp size mismatch for " << source << ": expected "
+           << size;
         return core::make_unexpected<std::string>(os.str());
     }
-
-    // Fast path: hard-link the trusted source directly into the cache.
-    if (::link(source.c_str(), destination.c_str()) == 0) {
-     return destination;
+    if (::fsync(temp.fd()) != 0) {
+        return core::make_unexpected<std::string>("sync temp commit cache file " +
+                                                  temp.path() + ": " + std::strerror(errno));
     }
-    if (errno == EEXIST) {
-        return AcceptExistingCommitFile(destination, digest, size);
-    }
-    // Fall back to a verified copy (mirrors the debug-logged fallback in Rust).
-
-    std::string tmp_path;
-    auto mkt = MakeTempIn(parent, &tmp_path);
-    if (!mkt.ok()) return core::make_unexpected(mkt.take_error());
-
-    std::ifstream in(source.c_str(), std::ios::binary);
-    if (!in) {
-      ::unlink(tmp_path.c_str());
-        return core::make_unexpected<std::string>(
-        "copy trusted source commit " + source + " to temp " + tmp_path);
-    }
-    std::ofstream out(tmp_path.c_str(), std::ios::binary | std::ios::trunc);
-    std::string all((std::istreambuf_iterator<char>(in)),
-   std::istreambuf_iterator<char>());
-    out.write(all.data(), static_cast<std::streamsize>(all.size()));
-    out.flush();
-    if (!out) {
- ::unlink(tmp_path.c_str());
-        return core::make_unexpected<std::string>(
-    "copy trusted source commit " + source + " to temp " + tmp_path);
-    }
-    if (all.size() != size) {
-        ::unlink(tmp_path.c_str());
-        std::ostringstream os;
-        os << "trusted commit cache seed temp size mismatch for " << source
-       << ": expected " << size;
-        return core::make_unexpected<std::string>(os.str());
-    }
-    return PersistNoClobber(tmp_path, destination, digest, size);
+    return FinishPersist(&temp, destination, digest, size);
 }
 
-std::string IndexPath(const std::string& index_dir,
-     const std::string& source_digest,
-     const std::string& converter,
-  uint64_t virtual_size_gib,
-       bool mkfs,
-          const core::Optional<std::string>& parent_commit_digest) {
-    // Compact JSON identical to serde_json::to_vec(IndexPathContext), key order
-    // = declaration order, parentCommitDigest omitted only when None is a real
-    // absence — serde serializes Option<None> as `null` here (no skip attr), so
-    // we must emit `null` to keep the digest stable.
+std::string IndexPath(const std::string& index_dir, const std::string& source_digest,
+                      const std::string& converter, uint64_t virtual_size_gib, bool mkfs,
+                      const core::Optional<std::string>& parent_commit_digest) {
+    // Compact JSON identical to `serde_json::to_vec(IndexPathContext)`: key
+    // order is declaration order, and `parentCommitDigest` has no
+    // `skip_serializing_if`, so `None` is written as `null`. Any byte of
+    // difference changes the digest and orphans every existing index.
     std::ostringstream ctx;
-    ctx << "{\"converter\":\"" << JsonEscape(converter) << "\","
+    ctx << "{\"converter\":" << core::JsonQuote(converter) << ","
         << "\"virtualSizeGib\":" << virtual_size_gib << ","
-    << "\"mkfs\":" << (mkfs ? "true" : "false") << ","
-      << "\"parentCommitDigest\":";
+        << "\"mkfs\":" << (mkfs ? "true" : "false") << ","
+        << "\"parentCommitDigest\":";
     if (parent_commit_digest.has_value()) {
-        ctx << "\"" << JsonEscape(*parent_commit_digest) << "\"";
+        ctx << core::JsonQuote(*parent_commit_digest);
     } else {
-    ctx << "null";
+        ctx << "null";
     }
     ctx << "}";
-    std::string ctx_str = ctx.str();
-    std::string ctx_hex = core::Sha256Hex(ctx_str);
-    return index_dir + "/" + DigestSlug(source_digest) + "/sha256-" + ctx_hex +
-    ".json";
+    return index_dir + "/" + DigestSlug(source_digest) + "/sha256-" +
+           core::Sha256Hex(ctx.str()) + ".json";
 }
 
 }  // namespace image

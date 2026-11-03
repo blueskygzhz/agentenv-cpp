@@ -75,12 +75,25 @@ struct ParsedHardCommitRef {
         : digest(std::move(d)), file(std::move(f)), size(s) {}
 };
 
-/// Rust `load_cache_owned_hard_commit_refs`.
-///
-/// In a cache-owned config, `file=` lowers are hard commits. `dir=` lowers are
-/// remote-recoverable and deliberately not pinned, so they are skipped.
-core::Expected<std::vector<ParsedHardCommitRef>, std::string>
-    LoadCacheOwnedHardCommitRefs(const std::string& image_config_path);
+/// Rust `struct CacheOwnedLocalFileLower` — one `file=` lower of an image
+/// config, with the digest and size every cache-owned local lower must carry.
+struct CacheOwnedLocalFileLower {
+    std::string digest;
+    std::string file;
+    uint64_t    size = 0;
+};
+
+/// Rust `struct CacheOwnedImageConfigFacts`.
+struct CacheOwnedImageConfigFacts {
+    std::vector<CacheOwnedLocalFileLower> local_file_lowers;
+    /// The upper's data file, when the config names one.
+    core::Optional<std::string>           upper_file;
+};
+
+/// Rust `load_cache_owned_image_config_facts` — every `file=` lower (failing
+/// closed when one lacks a digest or size) plus the upper data file.
+core::Expected<CacheOwnedImageConfigFacts, std::string>
+    LoadCacheOwnedImageConfigFacts(const std::string& image_config_path);
 
 /// Rust `load_commit_store_owned_hard_commit_refs` — the subset of `file=`
 /// lowers that live inside `commit_store`. Fails closed when such a lower is
@@ -89,8 +102,15 @@ core::Expected<std::vector<ParsedHardCommitRef>, std::string>
     LoadCommitStoreOwnedHardCommitRefs(const std::string& image_config_path,
                                        const std::string& commit_store);
 
-/// Rust `path_is_inside`.
-bool PathIsInside(const std::string& path, const std::string& ancestor);
+/// Rust `stable_path_identity` — absolute, lexically normalized, and with
+/// the nearest existing ancestor canonicalized (symlinks resolved), so a path
+/// whose leaf does not exist yet still has a stable identity.
+std::string StablePathIdentity(const std::string& path);
+
+/// Rust `path_is_inside` — `path` is `parent` or lives under it, compared
+/// component-wise on stable identities (robust to `..`, symlinks and
+/// not-yet-existing leaves).
+bool PathIsInside(const std::string& path, const std::string& parent);
 
 /// Rust `struct ImageCacheMetadataStore`.
 class ImageCacheMetadataStore {
@@ -134,7 +154,8 @@ class ImageCacheMetadataStore {
     /// Replaces the config's edge set from the config file on disk and, since
     /// this runs on every resolve, doubles as the LRU touch.
     core::Expected<core::Unit, std::string>
-        RecordConfigRefsFromConfigPath(const std::string& config_path);
+        RecordConfigRefsFromConfigPath(const std::string& config_path,
+                                       const std::string& commit_store);
 
     /// Rust `commit_store_hard_commit_digests_from_config_path`.
     static core::Expected<std::vector<HardCommitId>, std::string>
@@ -156,7 +177,7 @@ class ImageCacheMetadataStore {
     /// Rust `rebuild_from_configs` — reconciles the whole graph against a
     /// config directory, preserving recency for configs that already had it.
     core::Expected<core::Unit, std::string>
-        RebuildFromConfigs(const std::string& configs_dir);
+        RebuildFromConfigs(const std::string& configs_dir, const std::string& commit_store);
 
     // ---- holds --------------------------------------------------------------
 

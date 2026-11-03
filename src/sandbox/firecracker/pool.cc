@@ -8,13 +8,70 @@
 // `SetSpawnForTesting` exists for the cases that cannot allocate a slot.
 #include "agentenv/sandbox/firecracker/pool.h"
 
+#include <chrono>
+#include <cstdlib>
+#include <mutex>
+#include <thread>
+
+#include "agentenv/cfg.h"
 #include "agentenv/core/fs.h"
+#include "agentenv/core/logging.h"
 #include "agentenv/sandbox/firecracker/lifecycle.h"
+#include "agentenv/sandbox/firecracker/socket.h"
 #include "agentenv/sandbox/network/manager.h"
 
 namespace agentenv {
 namespace sandbox {
 namespace firecracker {
+
+namespace {
+
+/// Rust `static POOL: OnceLock<Option<FirecrackerPool>>` — `g_pool_initialized`
+/// is the `OnceLock`, `g_pool` the `Option`.
+std::mutex g_pool_mu;
+bool g_pool_initialized = false;
+FirecrackerPool* g_pool = NULL;
+
+/// Rust `firecracker_pool_exit_hook`.
+void FirecrackerPoolExitHook() {
+    FirecrackerPool* pool = NULL;
+    {
+        std::lock_guard<std::mutex> lg(g_pool_mu);
+        pool = g_pool;
+    }
+    if (pool == NULL) return;
+    const core::Expected<core::Unit, std::string> done = pool->Shutdown(true);
+    if (!done.ok()) {
+        AGENTENV_WARN("firecracker pool shutdown on process exit failed: " << done.error());
+    }
+}
+
+/// Rust `try_init`.
+core::Expected<FirecrackerPool*, std::string> TryInit() {
+    const cfg::AppConfig* cfg = cfg::ConfigManager::GlobalConfig();
+    if (cfg == NULL) return static_cast<FirecrackerPool*>(NULL);
+    const core::Optional<cfg::ResolvedFirecrackerPoolConfig> pool_config =
+        cfg->FirecrackerPoolConfig();
+    if (!pool_config.has_value()) return static_cast<FirecrackerPool*>(NULL);
+
+    // Rust `FirecrackerPool::new`.
+    FirecrackerPool::Options options;
+    options.pool = pool_config->pool;
+    options.fill_concurrency = pool_config->fill_concurrency;
+    options.work_base_dir = cfg->firecracker.work_dir;
+    options.capture_output = LoggingEnabled(cfg->firecracker.log_level);
+    options.firecracker_bin = cfg->ResolvedFirecrackerBinaryPath();
+    options.socket_timeout_ms = static_cast<int64_t>(cfg->firecracker.socket_timeout_secs) * 1000;
+    options.socket_poll_interval_ms = static_cast<int64_t>(cfg->firecracker.socket_poll_ms);
+
+    if (std::atexit(FirecrackerPoolExitHook) != 0) {
+        AGENTENV_WARN("failed to register firecracker pool process-exit hook");
+    }
+    return new FirecrackerPool(options, &network::SlotNetworkManager::Global(),
+                               []() { return MakeUnixConnector(); });
+}
+
+}  // namespace
 
 FirecrackerPool::FirecrackerPool(const Options& options,
                                  network::SlotNetworkManager* network,
@@ -22,13 +79,51 @@ FirecrackerPool::FirecrackerPool(const Options& options,
     : options_(options),
       network_(network),
       connector_factory_(connector_factory),
-      pool_(options.pool) {}
+      pool_(options.pool) {
+    // Rust's `join_all` over a batch of zero would make no progress.
+    if (options_.fill_concurrency == 0) options_.fill_concurrency = 1;
+}
 
 FirecrackerPool::~FirecrackerPool() {
     // Rust's process-exit hook. Without this the warm processes outlive the
     // pool and keep their slots and work directories, which no later run can
     // identify as abandoned.
     Shutdown(true);
+}
+
+FirecrackerPool* FirecrackerPool::Global() {
+    FirecrackerPool* pool = NULL;
+    {
+        std::lock_guard<std::mutex> lg(g_pool_mu);
+        if (!g_pool_initialized) {
+            g_pool_initialized = true;
+            const core::Expected<FirecrackerPool*, std::string> made = TryInit();
+            if (made.ok()) {
+                g_pool = made.value();
+            } else {
+                AGENTENV_WARN("firecracker pool init failed; falling back to cold spawn: "
+                              << made.error());
+            }
+        }
+        pool = g_pool;
+    }
+    if (pool == NULL) return NULL;
+    pool->EnsureWorkerStarted();
+    return pool;
+}
+
+void FirecrackerPool::EnsureWorkerStarted() {
+    pool_.StartMaintenanceWorker([this]() { (void)RunMaintenanceCycle(); });
+}
+
+core::Expected<core::Unit, std::string> FirecrackerPool::PrimeGlobal(int64_t timeout_ms) {
+    FirecrackerPool* pool = Global();
+    if (pool == NULL) {
+        AGENTENV_DEBUG("firecracker pool disabled; skipping prime");
+        return core::Unit();
+    }
+    pool->PrimeFor(timeout_ms);
+    return core::Unit();
 }
 
 void FirecrackerPool::SetSpawnForTesting(SpawnFn spawn, CleanupFn cleanup) {
@@ -68,77 +163,143 @@ std::size_t FirecrackerPool::WarmLen() const {
     return pool_.Len();
 }
 
+core::Expected<core::Unit, std::string> FirecrackerPool::CleanupWarm(
+    const std::shared_ptr<WarmFirecracker>& warm, bool sync_network_cleanup) {
+    return cleanup_ ? cleanup_(warm, sync_network_cleanup)
+                    : RealCleanup(warm, sync_network_cleanup);
+}
+
+std::size_t FirecrackerPool::FillWarmEntries(std::size_t to_fill, std::string* error) {
+    std::size_t created = 0;
+    std::size_t remaining = to_fill;
+    std::vector<std::string> cleanup_failures;
+    while (remaining > 0 && !pool_.IsShuttingDown()) {
+        // `remaining` tracks refill attempts left in this maintenance action.
+        // On any create failure the current batch is finished, then no further
+        // batch is launched -- a failing spawn is almost always a resource
+        // that will not appear within this cycle (no free slot, no KVM).
+        const std::size_t batch_size =
+            remaining < options_.fill_concurrency ? remaining : options_.fill_concurrency;
+
+        // Rust `join_all` over `create_warm_async`: the batch is created
+        // concurrently, one thread per entry.
+        typedef core::Expected<std::shared_ptr<WarmFirecracker>, std::string> Made;
+        std::vector<Made> results(
+            batch_size, core::make_unexpected(std::string("warm entry was not created")));
+        std::vector<std::thread> workers;
+        for (std::size_t i = 0; i < batch_size; ++i) {
+            Made* slot = &results[i];
+            try {
+                workers.push_back(
+                    std::thread([this, slot]() { *slot = spawn_ ? spawn_() : RealSpawn(); }));
+            } catch (const std::system_error& err) {
+                *slot = core::make_unexpected(std::string("spawn refill thread: ") + err.what());
+            }
+        }
+        for (std::size_t i = 0; i < workers.size(); ++i) workers[i].join();
+
+        bool saw_failure = false;
+        for (std::size_t i = 0; i < results.size(); ++i) {
+            if (!results[i].ok()) {
+                saw_failure = true;
+                AGENTENV_DEBUG("skipping firecracker pool refill attempt: " << results[i].error());
+                continue;
+            }
+            if (pool_.TryPushBounded(results[i].value())) {
+                ++created;
+                continue;
+            }
+            // Hit the high watermark (or shutdown) while this batch was in
+            // flight. The entry is destroyed rather than dropped: its slot and
+            // work dir are live state nothing else holds a handle to.
+            const core::Expected<core::Unit, std::string> gone =
+                CleanupWarm(results[i].value(), false);
+            if (!gone.ok()) {
+                AGENTENV_WARN("firecracker pool: cleanup of unqueued warm entry failed: "
+                              << gone.error());
+                cleanup_failures.push_back(gone.error());
+            }
+        }
+
+        if (saw_failure) break;
+        remaining -= batch_size;
+    }
+
+    const core::Expected<core::Unit, std::string> result =
+        FirecrackerPoolCleanupResult(cleanup_failures);
+    if (!result.ok() && error != NULL) *error = result.error();
+    return created;
+}
+
 std::size_t FirecrackerPool::RunMaintenanceCycle() {
     const warmpool::PoolMaintenanceAction action =
         pool_.ComputeMaintenanceAction(pool_.Len());
+    std::string error;
+    std::size_t count = 0;
     switch (action.kind) {
-   case warmpool::PoolMaintenanceKind::Fill: {
-     std::size_t created = 0;
-            // Rust fills in batches of `fill_concurrency` and stops launching
-            // further batches once one entry fails: a failing spawn is almost
-            // always a resource that will not appear within this cycle (no
-            // free slot, no KVM), and retrying it immediately only multiplies
-            // the cost.
-            std::size_t remaining = action.count;
-            while (remaining > 0) {
-                const std::size_t batch =
-                    remaining < options_.fill_concurrency ? remaining : options_.fill_concurrency;
-                bool saw_failure = false;
-                for (std::size_t i = 0; i < batch; ++i) {
-                    const core::Expected<std::shared_ptr<WarmFirecracker>, std::string> made =
-                        spawn_ ? spawn_() : RealSpawn();
-                    if (!made.ok()) {
-                        saw_failure = true;
-                        continue;
-                    }
-                    if (!pool_.TryPushBounded(made.value())) {
-                        // Hit the high watermark while this batch was in
-                        // flight. The entry is destroyed rather than dropped:
-                        // its slot and work dir are live kernel and filesystem
-                        // state that nothing else holds a handle to.
-                        const core::Expected<core::Unit, std::string> gone =
-                            cleanup_ ? cleanup_(made.value(), false)
-                                     : RealCleanup(made.value(), false);
-                        (void)gone;
-                        continue;
-                    }
-                    ++created;
+        case warmpool::PoolMaintenanceKind::Fill:
+            count = FillWarmEntries(action.count, &error);
+            break;
+        case warmpool::PoolMaintenanceKind::Drain:
+            for (std::size_t i = 0; i < action.count; ++i) {
+                std::shared_ptr<WarmFirecracker> victim;
+                if (!pool_.TryDrainOne(&victim)) break;
+                // Rust `cleanup_warm_blocking(warm, false)?`: the first
+                // failure ends the cycle.
+                const core::Expected<core::Unit, std::string> gone = CleanupWarm(victim, false);
+                if (!gone.ok()) {
+                    error = gone.error();
+                    break;
                 }
-                remaining -= batch;
-                if (saw_failure) break;
+                ++count;
             }
-     return created;
- }
- case warmpool::PoolMaintenanceKind::Drain: {
-     std::size_t drained = 0;
-            // Reachable only when two maintenance cycles overlap: the fill
-            // target is clamped to the high watermark and acquire only
-            // removes, so a single-threaded pool never rises above it. Kept
-            // because `ComputeMaintenanceAction` is shared with the network
-            // manager, which *does* return slots to its pool and can exceed
-            // the watermark -- and because a pool that silently ignored a
-            // Drain would hold VMM processes nothing asked it to keep.
-      for (std::size_t i = 0; i < action.count; ++i) {
-  std::shared_ptr<WarmFirecracker> victim;
-          if (!pool_.TryDrainOne(&victim)) break;
-                // Explicit, not destructor-driven: the entry owns a raw `Slot*`
-                // whose teardown goes through the network manager, which the
-                // entry has no reference to.
-                const core::Expected<core::Unit, std::string> gone =
-                    cleanup_ ? cleanup_(victim, false) : RealCleanup(victim, false);
-                (void)gone;
-        ++drained;
-      }
-            return drained;
-        }
+            break;
         case warmpool::PoolMaintenanceKind::Idle:
         default:
-            return 0;
+            break;
+    }
+    if (!error.empty()) {
+        AGENTENV_WARN("firecracker pool maintenance cycle failed: " << error);
+    }
+    return count;
+}
+
+void FirecrackerPool::PrimeFor(int64_t timeout_ms) {
+    const warmpool::PoolConfig& config = pool_.Config();
+    if (!config.maintenance_enabled) {
+        AGENTENV_DEBUG("firecracker pool maintenance disabled; skipping prime");
+        return;
+    }
+    if (!config.startup_prewarm) {
+        AGENTENV_DEBUG("firecracker pool startup prewarm disabled; skipping prime");
+        return;
+    }
+    const std::size_t target = config.low_watermark;
+    if (target == 0 || WarmLen() >= target) return;
+
+    AGENTENV_INFO("priming firecracker pool low_watermark=" << target << " current="
+                                                            << WarmLen()
+                                                            << " timeout_ms=" << timeout_ms);
+    const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    for (;;) {
+        const int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                       std::chrono::steady_clock::now() - started)
+                                       .count();
+        if (WarmLen() >= target) {
+            AGENTENV_INFO("firecracker pool primed warm=" << WarmLen()
+                                                          << " elapsed_ms=" << elapsed_ms);
+            return;
+        }
+        if (elapsed_ms >= timeout_ms) {
+            AGENTENV_WARN("firecracker pool prime timed out; continuing with partial warm-up warm="
+                          << WarmLen() << " target=" << target);
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(kPoolPrimePollIntervalMs));
     }
 }
 
 void FirecrackerPool::Prime() {
-    // Fill until we reach the low watermark (best-effort, like Rust prime()).
     while (pool_.Len() < pool_.Config().low_watermark) {
         if (RunMaintenanceCycle() == 0) break;
     }
@@ -150,8 +311,7 @@ FirecrackerPool::Shutdown(bool sync_network_cleanup) {
     std::vector<std::string> failures;
     for (std::size_t i = 0; i < drained.size(); ++i) {
         const core::Expected<core::Unit, std::string> gone =
-            cleanup_ ? cleanup_(drained[i], sync_network_cleanup)
-                     : RealCleanup(drained[i], sync_network_cleanup);
+            CleanupWarm(drained[i], sync_network_cleanup);
         if (!gone.ok()) failures.push_back(gone.error());
     }
     // Rust `firecracker_pool_cleanup_result`: every failure, joined.
@@ -165,7 +325,7 @@ FirecrackerPool::RealSpawn() {
             std::string("firecracker pool: no network manager"));
     }
 
-    // ① The slot first, because the namespace it creates is what the process
+    // (1) The slot first, because the namespace it creates is what the process
     // must be spawned into -- it cannot be applied afterwards.
     const core::Expected<network::Slot*, std::string> slot = network_->AllocateAny();
     if (!slot.ok()) {
@@ -173,99 +333,94 @@ FirecrackerPool::RealSpawn() {
             std::string("firecracker pool: allocate network slot: ") + slot.error());
     }
 
-    // ② The work dir, which is where the API socket will be created.
+    // (2) The work dir, which is where the API socket will be created. Rust
+    // `release`s the untouched slot back to the network pool on failure.
     const core::Expected<std::string, std::string> work_dir =
         CreateFirecrackerWorkDir(options_.work_base_dir);
     if (!work_dir.ok()) {
-        network_->CleanupAllocatedSlot(slot.value(), false);
+        (void)network_->Release(slot.value());
         return core::make_unexpected(
             std::string("firecracker pool: create work dir: ") + work_dir.error());
     }
 
-    std::shared_ptr<FirecrackerInstance> instance(new FirecrackerInstance(
+    std::unique_ptr<FirecrackerInstance> instance(new FirecrackerInstance(
         work_dir.value(), connector_factory_ ? connector_factory_() : NULL));
 
     core::Optional<std::string> stdout_path;
     core::Optional<std::string> stderr_path;
     WarmStdioPaths(work_dir.value(), options_.capture_output, &stdout_path, &stderr_path);
 
-    // ③ Spawn into the slot's namespace.
-    const core::Expected<core::Unit, std::string> spawned = instance->SpawnWithNetns(
+    // (3) Spawn into the slot's namespace, then (4) wait for the socket. Until
+    // the wait returns the entry is not warm: handing it out earlier only
+    // moves the wait into the request that receives it.
+    core::Expected<core::Unit, std::string> spawn_result = instance->SpawnWithNetns(
         options_.firecracker_bin,
         stdout_path.has_value() ? *stdout_path : std::string(),
         stderr_path.has_value() ? *stderr_path : std::string(),
         slot.value()->NamespacePath());
-    if (!spawned.ok()) {
+    if (!spawn_result.ok()) {
+        spawn_result = core::make_unexpected("spawn warm firecracker process: " +
+                                             spawn_result.error());
+    } else {
+        spawn_result =
+            instance->WaitForReady(options_.socket_timeout_ms, options_.socket_poll_interval_ms);
+        if (!spawn_result.ok()) {
+            spawn_result = core::make_unexpected("wait for warm firecracker api socket: " +
+                                                 spawn_result.error());
+        }
+    }
+    if (!spawn_result.ok()) {
         // Unwound in reverse, and the process stopped first: `Stop` removes the
         // API socket, which lives inside the work dir being deleted next.
-        instance->Stop(kPoolFirecrackerStopTimeoutMs);
-        core::fs::RemoveDirAll(work_dir.value());
-        network_->CleanupAllocatedSlot(slot.value(), false);
-        return core::make_unexpected(
-            std::string("spawn warm firecracker process: ") + spawned.error());
+        (void)instance->Stop(kPoolFirecrackerStopTimeoutMs);
+        (void)network_->Release(slot.value());
+        (void)core::fs::RemoveDirAll(work_dir.value());
+        return core::make_unexpected(spawn_result.error());
     }
 
-    // ④ Wait for the socket. Until this returns the entry is not warm: handing
-    // it out earlier only moves the wait into the request that receives it,
-    // which is the cost the pool exists to remove.
-    const core::Expected<core::Unit, std::string> ready =
-        instance->WaitForReady(options_.socket_timeout_ms, options_.socket_poll_interval_ms);
-    if (!ready.ok()) {
-        instance->Stop(kPoolFirecrackerStopTimeoutMs);
-        core::fs::RemoveDirAll(work_dir.value());
-        network_->CleanupAllocatedSlot(slot.value(), false);
-        return core::make_unexpected(
-            std::string("wait for warm firecracker api socket: ") + ready.error());
-    }
-
+    AGENTENV_DEBUG("firecracker pool warm entry ready slot=" << slot.value()->Idx()
+                                                             << " work_dir=" << work_dir.value());
     return std::shared_ptr<WarmFirecracker>(
-        new WarmFirecracker(slot.value(), instance, work_dir.value()));
+        new WarmFirecracker(slot.value(), std::move(instance), work_dir.value()));
 }
 
 core::Expected<core::Unit, std::string>
 FirecrackerPool::RealCleanup(const std::shared_ptr<WarmFirecracker>& warm,
                              bool sync_network_cleanup) {
     if (!warm) return core::Unit();
+    const uint32_t slot_idx = warm->GetSlot() != NULL ? warm->GetSlot()->Idx() : 0;
 
     // Rust's order, and it is load-bearing: the socket lives in the work dir
     // and the tap device lives in the slot's namespace, so each step removes
     // something the next one is about to delete the container of.
-    //
-    // A failure in one step does not skip the others. Rust logs a failed stop
-    // and carries on for the same reason: the work dir and the slot leak
-    // permanently if skipped, while a surviving process is at least visible.
-    std::vector<std::string> failures;
-
-    if (!sync_network_cleanup) {
+    std::unique_ptr<FirecrackerInstance> instance = warm->TakeInstance();
+    if (sync_network_cleanup) {
+        // Process-exit path: Rust drops the instance rather than awaiting a
+        // graceful stop; the destructor kills and reaps the child.
+        instance.reset();
+    } else if (instance) {
         const core::Expected<core::Unit, std::string> stopped =
-            warm->GetInstance()->Stop(kPoolFirecrackerStopTimeoutMs);
+            instance->Stop(kPoolFirecrackerStopTimeoutMs);
         if (!stopped.ok()) {
-            failures.push_back(std::string("stop warm process: ") + stopped.error());
+            AGENTENV_WARN("firecracker pool: stop warm process failed slot="
+                          << slot_idx << ": " << stopped.error());
         }
-    }
-    // With `sync_network_cleanup` the caller is a process-exit path: Rust drops
-    // the child there rather than awaiting a graceful stop, because the runtime
-    // it would need is already being torn down. The destructor signals the
-    // child, which is all that is available at that point.
-
-    const core::Expected<core::Unit, std::string> removed =
-        core::fs::RemoveDirAll(warm->WorkDir());
-    if (!removed.ok()) {
-        failures.push_back(std::string("remove warm work dir: ") + removed.error());
+        instance.reset();
     }
 
-    if (network_ != NULL) {
-        // `CleanupAllocatedSlot`, not `Release`: a warm entry taken out of the
-        // pool is being destroyed, so its slot must go back to the free bitmap
-        // rather than into the slot pool holding a namespace whose VMM is gone.
-        const core::Expected<core::Unit, std::string> torn =
-            network_->CleanupAllocatedSlot(warm->GetSlot(), sync_network_cleanup);
-        if (!torn.ok()) {
-            failures.push_back(std::string("cleanup warm network slot: ") + torn.error());
-        }
-    }
+    // Rust `drop(work_dir)`: a `TempDir` drop, which ignores removal errors.
+    (void)core::fs::RemoveDirAll(warm->WorkDir());
 
-    return FirecrackerPoolCleanupResult(failures);
+    if (network_ == NULL || warm->GetSlot() == NULL) return core::Unit();
+    // `CleanupAllocatedSlot`, not `Release`: a warm entry being destroyed must
+    // not return a namespace whose VMM just died to the slot pool.
+    const core::Expected<core::Unit, std::string> torn =
+        network_->CleanupAllocatedSlot(warm->GetSlot(), sync_network_cleanup);
+    if (!torn.ok()) {
+        return core::make_unexpected("firecracker pool: cleanup warm network slot: " +
+                                     torn.error());
+    }
+    return core::Unit();
 }
 
 }  // namespace firecracker

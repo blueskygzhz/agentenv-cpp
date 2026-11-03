@@ -256,6 +256,19 @@ std::string Sha256Digest(const std::string& data) {
     return Sha256Digest(data.data(), data.size());
 }
 
+bool IsSha256Digest(const std::string& value) {
+    static const char kPrefix[] = "sha256:";
+    const std::size_t prefix_len = sizeof(kPrefix) - 1;
+    if (value.size() != prefix_len + 64 || value.compare(0, prefix_len, kPrefix) != 0) {
+        return false;
+    }
+    for (std::size_t i = prefix_len; i < value.size(); ++i) {
+        const char c = value[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+
 // ---- HMAC-SHA256 ----------------------------------------------------------
 
 std::array<uint8_t, 32> HmacSha256(const void* key, std::size_t key_len, const void* data,

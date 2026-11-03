@@ -98,6 +98,11 @@ std::string Sha256Hex(const std::string& data);
 std::string Sha256Digest(const void* data, std::size_t len);
 std::string Sha256Digest(const std::string& data);
 
+/// Rust `is_sha256_digest` — `sha256:` followed by exactly 64 *lowercase* hex
+/// digits. Uppercase is rejected: digests are compared as strings, so two
+/// spellings of one hash would name two different objects.
+bool IsSha256Digest(const std::string& value);
+
 // ---- HMAC-SHA256 (Rust: the `hmac` crate over `sha2::Sha256`) -------------
 
 /// Rust `Hmac::<Sha256>::new_from_slice(key).chain_update(data).finalize()`.

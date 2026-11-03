@@ -171,8 +171,59 @@ MT_TEST(commit_index_json_roundtrip) {
 
     // Absent file -> Ok(None).
     auto missing = image::CommitIndex::Read(dir + "/does-not-exist.json");
-  MT_EXPECT_TRUE(missing.ok());
+    MT_EXPECT_TRUE(missing.ok());
     MT_EXPECT_TRUE(!missing.value().has_value());
+
+    // Any other read failure is an error, not "no index".
+    auto is_dir = image::CommitIndex::Read(dir);
+    MT_EXPECT_TRUE(!is_dir.ok());
+}
+
+// `CommitIndex` derives `Deserialize` without `#[serde(default)]`: every
+// non-Option field is required and type-checked.
+MT_TEST(commit_index_parse_is_strict_like_serde) {
+    const std::string valid =
+        "{\"schema\":1,\"sourceKind\":\"oci-layer\",\"sourceDigest\":\"sha256:a\","
+        "\"commitDigest\":\"sha256:b\",\"size\":3,\"converter\":\"c\","
+        "\"virtualSizeGib\":64,\"mkfs\":false,\"parentCommitDigest\":null,\"extra\":1}";
+    auto ok = image::CommitIndex::FromJson(valid);
+    MT_EXPECT_TRUE(ok.ok());
+    MT_EXPECT_TRUE(!ok.value().parent_commit_digest.has_value());
+
+    MT_EXPECT_TRUE(!image::CommitIndex::FromJson(
+                        "{\"schema\":1,\"sourceKind\":\"oci-layer\",\"sourceDigest\":\"a\","
+                        "\"commitDigest\":\"b\",\"size\":3,\"converter\":\"c\","
+                        "\"virtualSizeGib\":64}")
+                        .ok());
+    MT_EXPECT_TRUE(!image::CommitIndex::FromJson(
+                        "{\"schema\":1,\"sourceKind\":\"oci-layer\",\"sourceDigest\":\"a\","
+                        "\"commitDigest\":\"b\",\"size\":\"3\",\"converter\":\"c\","
+                        "\"virtualSizeGib\":64,\"mkfs\":false}")
+                        .ok());
+    MT_EXPECT_TRUE(!image::CommitIndex::FromJson(
+                        "{\"schema\":-1,\"sourceKind\":\"oci-layer\",\"sourceDigest\":\"a\","
+                        "\"commitDigest\":\"b\",\"size\":3,\"converter\":\"c\","
+                        "\"virtualSizeGib\":64,\"mkfs\":false}")
+                        .ok());
+    // A nested key with the same name must not satisfy a top-level field.
+    MT_EXPECT_TRUE(!image::CommitIndex::FromJson("{\"nested\":{\"schema\":1}}").ok());
+}
+
+// `IndexPath` hashes serde_json's compact form, so control characters must use
+// serde's escapes (`\u0001`), or the digest diverges from Rust.
+MT_TEST(index_path_hashes_serde_json_escaping) {
+    const std::string expected_context =
+        "{\"converter\":\"a\\u0001b\",\"virtualSizeGib\":64,\"mkfs\":true,"
+        "\"parentCommitDigest\":null}";
+    const std::string path = image::IndexPath("/idx", "sha256:oci", std::string("a\x01" "b"), 64,
+                                              true, core::Optional<std::string>());
+    MT_EXPECT_EQ(path, "/idx/sha256-oci/sha256-" + core::Sha256Hex(expected_context) + ".json");
+}
+
+// Rust maps per `char`: one multi-byte character becomes a single '-'.
+MT_TEST(sanitize_filename_component_maps_chars_not_bytes) {
+    MT_EXPECT_EQ(image::SanitizeFilenameComponent("a\xc3\xa9" "b:c", 160), std::string("a-b-c"));
+    MT_EXPECT_EQ(image::SanitizeFilenameComponent("abcdef", 3), std::string("abc"));
 }
 
 MT_MAIN

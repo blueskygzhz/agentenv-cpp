@@ -2,12 +2,15 @@
 // Rust: src/image/cache/service.rs — the deleting-GC engine.
 #include "agentenv/image/cache_gc.h"
 
+#include <cerrno>
 #include <sstream>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "agentenv/core/fs.h"
 #include "agentenv/core/logging.h"
+#include "agentenv/image/cache_hold.h"
+#include "agentenv/image/commit_index.h"
 
 namespace agentenv {
 namespace image {
@@ -189,7 +192,14 @@ ImageCacheGc::DeleteCollectableHardCommit(const HardCommitId& digest,
 }
 
 core::Expected<ImageCacheGcReport, std::string>
-ImageCacheGc::RunGc(const ImageCacheLiveRuntimeRefs& live_refs) {
+ImageCacheGc::RunGc(const ImageCacheLiveRuntimeRefs& live_refs, bool rebuild_metadata) {
+    if (rebuild_metadata) {
+        // Rust `rebuild_metadata_from_configs`.
+        const core::Expected<core::Unit, std::string> rebuilt =
+            metadata_->RebuildFromConfigs(config_dir_, commit_store_);
+        if (!rebuilt.ok()) return core::make_unexpected(rebuilt.error());
+    }
+
     core::Expected<std::map<HardCommitId, std::vector<ImageCacheConfigId> >, std::string>
         config_referrers = metadata_->HardCommitConfigReferrerMap();
     if (!config_referrers.ok()) return core::make_unexpected(config_referrers.error());
@@ -216,81 +226,124 @@ ImageCacheGc::RunGc(const ImageCacheLiveRuntimeRefs& live_refs) {
             continue;
         }
 
-        // Take an operation hold so a concurrent resume cannot start using the
-        // commit while it is being deleted.
-        core::Expected<ImageCacheHoldOwner, std::string> owner =
-            ImageCacheHoldOwner::New(kOperationHoldNamespace,
-                                     std::string("gc/") + record.digest.AsStr());
-        if (!owner.ok()) return core::make_unexpected(owner.error());
-
-        std::set<HardCommitId> held;
-        held.insert(record.digest);
-        core::Expected<core::Unit, std::string> hold =
-            metadata_->CreateOrReplaceHold(owner.value(), held);
+        // Rust `acquire_operation_hold_for_hard_commits(self, "gc", [digest])`:
+        // a uniquely-owned operation hold, so two passes never share a lease.
+        const HardCommitId digest = record.digest;
+        std::set<std::string> held;
+        held.insert(digest.AsStr());
+        core::Expected<std::shared_ptr<ImageCacheOperationHold>, std::string> hold =
+            ImageCacheOperationHold::AcquireForHardCommits(metadata_, "gc", held);
         if (!hold.ok()) return core::make_unexpected(hold.error());
 
-        // Re-read the record: it may have been re-recorded or removed between
-        // the scan and the hold.
-        core::Expected<core::Optional<HardCommitObjectRecord>, std::string> fresh =
-            metadata_->GetHardCommitObject(record.digest);
-        if (!fresh.ok()) {
-            (void)metadata_->ReleaseHold(owner.value());
-            return core::make_unexpected(fresh.error());
-        }
+        const core::Expected<core::Unit, std::string> result =
+            CollectUnderHold(digest, live_refs, hold.value()->owner(), &report);
 
-        if (!fresh.value().has_value()) {
-            report.blocked.push_back(BlockedWith(
-                record.digest,
-                Unverifiable("hard commit object record disappeared before delete")));
-            (void)metadata_->ReleaseHold(owner.value());
-            continue;
-        }
+        // Rust `hold.release_best_effort("gc")` -- the outcome is ignored.
+        (void)hold.value()->Release("gc");
+        if (!result.ok()) return core::make_unexpected(result.error());
+    }
 
-        // Source-config publish is not serialised by the operation hold, so
-        // the roots are read fresh here.
-        core::Expected<std::vector<ImageCacheConfigId>, std::string> fresh_referrers =
-            metadata_->HardCommitConfigReferrers(record.digest);
-        if (!fresh_referrers.ok()) {
-            (void)metadata_->ReleaseHold(owner.value());
-            return core::make_unexpected(fresh_referrers.error());
+    const core::Expected<std::size_t, std::string> stale = ReclaimStaleIndexes();
+    if (stale.ok()) {
+        if (stale.value() > 0) {
+            AGENTENV_INFO("image cache reclaimed stale conversion indexes: stale_indexes="
+                          << stale.value());
         }
-
-        core::Expected<HardCommitGcDecision, std::string> second =
-            CheckCollectableHardCommit(*fresh.value(), fresh_referrers.value(), live_refs,
-                                       &owner.value());
-        if (!second.ok()) {
-            (void)metadata_->ReleaseHold(owner.value());
-            return core::make_unexpected(second.error());
-        }
-
-        if (second.value().kind == HardCommitGcDecision::Kind::Blocked) {
-            report.blocked.push_back(*second.value().blocked);
-            (void)metadata_->ReleaseHold(owner.value());
-            continue;
-        }
-
-        const HardCommitGcDecision& collectable = second.value();
-        core::Expected<core::Unit, std::string> deleted = DeleteCollectableHardCommit(
-            *collectable.digest, collectable.file, collectable.p2p_keys);
-        if (deleted.ok()) {
-            ++report.collected;
-            report.freed_bytes += collectable.size.has_value() ? *collectable.size : 0;
-        } else {
-            // A failed delete is reported, not fatal: the next pass retries.
-            AGENTENV_WARN("failed to delete collectable image cache commit " +
-                          collectable.digest->AsStr() + ": " + deleted.error());
-            ImageCacheGcBlockedReason reason;
-            reason.kind   = ImageCacheGcBlockedReason::DeleteFailed;
-            reason.detail = deleted.error();
-            report.blocked.push_back(BlockedWith(*collectable.digest, reason));
-        }
-
-        // Release even on the delete path: the record is already gone, so the
-        // hold would otherwise be a permanent dangling reference.
-        (void)metadata_->ReleaseHold(owner.value());
+    } else {
+        AGENTENV_WARN("image cache stale-index reclaim failed: " << stale.error());
     }
 
     return report;
+}
+
+core::Expected<core::Unit, std::string> ImageCacheGc::CollectUnderHold(
+    const HardCommitId& digest, const ImageCacheLiveRuntimeRefs& live_refs,
+    const ImageCacheHoldOwner& hold_owner, ImageCacheGcReport* report) {
+    core::Expected<core::Optional<HardCommitObjectRecord>, std::string> fresh =
+        metadata_->GetHardCommitObject(digest);
+    if (!fresh.ok()) return core::make_unexpected(fresh.error());
+
+    if (!fresh.value().has_value()) {
+        report->blocked.push_back(BlockedWith(
+            digest, Unverifiable("hard commit object record disappeared before delete")));
+        return core::Unit();
+    }
+
+    // Source-config publish is not serialized by the GC operation hold, so
+    // refresh roots after taking the hold and before deleting the commit.
+    core::Expected<std::vector<ImageCacheConfigId>, std::string> fresh_referrers =
+        metadata_->HardCommitConfigReferrers(digest);
+    if (!fresh_referrers.ok()) return core::make_unexpected(fresh_referrers.error());
+
+    core::Expected<HardCommitGcDecision, std::string> second = CheckCollectableHardCommit(
+        *fresh.value(), fresh_referrers.value(), live_refs, &hold_owner);
+    if (!second.ok()) return core::make_unexpected(second.error());
+
+    if (second.value().kind == HardCommitGcDecision::Kind::Blocked) {
+        report->blocked.push_back(*second.value().blocked);
+        return core::Unit();
+    }
+
+    const HardCommitGcDecision& collectable = second.value();
+    core::Expected<core::Unit, std::string> deleted = DeleteCollectableHardCommit(
+        *collectable.digest, collectable.file, collectable.p2p_keys);
+    if (deleted.ok()) {
+        ++report->collected;
+        report->freed_bytes += collectable.size.has_value() ? *collectable.size : 0;
+    } else {
+        AGENTENV_WARN("failed to delete collectable image cache commit: digest="
+                      << collectable.digest->AsStr() << " error=" << deleted.error());
+        ImageCacheGcBlockedReason reason;
+        reason.kind   = ImageCacheGcBlockedReason::DeleteFailed;
+        reason.detail = deleted.error();
+        report->blocked.push_back(BlockedWith(*collectable.digest, reason));
+    }
+    return core::Unit();
+}
+
+core::Expected<std::size_t, std::string> ImageCacheGc::ReclaimStaleIndexes() const {
+    std::size_t removed = 0;
+    if (!core::fs::Exists(index_dir_)) return removed;
+    core::Expected<std::vector<std::string>, std::string> digest_dirs =
+        core::fs::ReadDir(index_dir_);
+    if (!digest_dirs.ok()) {
+        return core::make_unexpected("read image cache index dir: " + digest_dirs.error());
+    }
+    for (std::size_t i = 0; i < digest_dirs.value().size(); ++i) {
+        const std::string digest_dir_path = index_dir_ + "/" + digest_dirs.value()[i];
+        struct stat st;
+        // `DirEntry::file_type` does not follow symlinks.
+        if (::lstat(digest_dir_path.c_str(), &st) != 0) {
+            return core::make_unexpected("stat " + digest_dir_path);
+        }
+        if (!S_ISDIR(st.st_mode)) continue;
+        core::Expected<std::vector<std::string>, std::string> index_files =
+            core::fs::ReadDir(digest_dir_path);
+        if (!index_files.ok()) return core::make_unexpected(index_files.error());
+        std::size_t remaining = 0;
+        for (std::size_t j = 0; j < index_files.value().size(); ++j) {
+            const std::string index_path = digest_dir_path + "/" + index_files.value()[j];
+            bool stale = false;
+            const core::Expected<core::Optional<CommitIndex>, std::string> index =
+                CommitIndex::Read(index_path);
+            if (!index.ok()) {
+                AGENTENV_WARN("failed to read image cache index; keeping it: index="
+                              << index_path << " error=" << index.error());
+            } else if (!index.value().has_value()) {
+                stale = true;
+            } else {
+                stale = !core::fs::Exists(
+                    CommitFile(commit_store_, index.value()->commit_digest));
+            }
+            if (stale && ::unlink(index_path.c_str()) == 0) {
+                ++removed;
+            } else if (!stale) {
+                ++remaining;
+            }
+        }
+        if (remaining == 0) (void)::rmdir(digest_dir_path.c_str());
+    }
+    return removed;
 }
 
 }  // namespace cache

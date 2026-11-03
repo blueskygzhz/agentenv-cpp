@@ -41,17 +41,21 @@ namespace firecracker {
 /// next tenant. `Cleanup` destroys all three.
 class WarmFirecracker {
  public:
-    WarmFirecracker(network::Slot* slot, std::shared_ptr<FirecrackerInstance> instance,
+    WarmFirecracker(network::Slot* slot, std::unique_ptr<FirecrackerInstance> instance,
                     const std::string& work_dir)
-        : slot_(slot), instance_(instance), work_dir_(work_dir) {}
+        : slot_(slot), instance_(std::move(instance)), work_dir_(work_dir) {}
 
     network::Slot* GetSlot() const { return slot_; }
-    const std::shared_ptr<FirecrackerInstance>& GetInstance() const { return instance_; }
+    FirecrackerInstance* GetInstance() const { return instance_.get(); }
     const std::string& WorkDir() const { return work_dir_; }
+
+    /// Rust's destructuring move out of the entry, as `adopt_warm_firecracker`
+    /// does: the sandbox takes the process, and the entry is left empty.
+    std::unique_ptr<FirecrackerInstance> TakeInstance() { return std::move(instance_); }
 
  private:
     network::Slot* slot_;
-    std::shared_ptr<FirecrackerInstance> instance_;
+    std::unique_ptr<FirecrackerInstance> instance_;
     std::string work_dir_;
 };
 
@@ -107,6 +111,25 @@ class FirecrackerPool : public Pool {
                     std::function<std::shared_ptr<Connector>()> connector_factory);
     ~FirecrackerPool();
 
+    /// Rust `FirecrackerPool::global` — the process-wide pool when
+    /// `[pool.firecracker].enabled = true`, NULL otherwise. Built on first use
+    /// from `ConfigManager::GlobalConfig()` and `SlotNetworkManager::Global()`,
+    /// with a process-exit hook; every call ensures the maintenance worker.
+    static FirecrackerPool* Global();
+
+    /// Rust `FirecrackerPool::prime` — eagerly initialize the global pool and
+    /// wait until `low_watermark` warm entries exist, or until `timeout_ms`
+    /// elapses. Best-effort: a timeout is not an error, the cold path stays
+    /// available.
+    static core::Expected<core::Unit, std::string> PrimeGlobal(int64_t timeout_ms);
+
+    /// Rust `ensure_worker_started`.
+    void EnsureWorkerStarted();
+
+    /// The manager this pool's slots come from; an adopted entry's slot is
+    /// released back to it.
+    network::SlotNetworkManager* NetworkManager() const { return network_; }
+
     /// Overrides the spawn/cleanup pair. Both or neither: a test spawner whose
     /// entries are destroyed by the real cleanup would try to tear down
     /// kernel state it never created.
@@ -131,10 +154,17 @@ class FirecrackerPool : public Pool {
     std::size_t WarmLen() const;
 
     /// Rust `run_maintenance_cycle` — one Fill/Drain/Idle decision.
-    /// Returns entries created (Fill) or destroyed (Drain).
+    /// Returns entries created (Fill) or destroyed (Drain); cleanup failures
+    /// are logged as the Rust worker logs the cycle's error.
     std::size_t RunMaintenanceCycle();
 
-    /// Rust `prime` (synchronous form): fill up to the low watermark.
+    /// Rust `prime`'s loop for this pool: waits (polling every
+    /// `kPoolPrimePollIntervalMs`) for the maintenance worker to reach the low
+    /// watermark. Skipped when maintenance or startup prewarm is disabled.
+    void PrimeFor(int64_t timeout_ms);
+
+    /// Synchronous fill up to the low watermark without a worker. Test helper:
+    /// production primes through the worker (`PrimeFor`).
     void Prime();
 
     /// Rust `shutdown` — drain and destroy every entry, reporting *all*
@@ -147,12 +177,21 @@ class FirecrackerPool : public Pool {
 
  private:
     /// Rust `create_warm_async`: allocate slot, make work dir, spawn into the
-    /// namespace, wait for the API socket. Unwinds in reverse on any failure.
+    /// namespace, wait for the API socket. Unwinds in reverse on any failure,
+    /// releasing the slot back to the network pool.
     core::Expected<std::shared_ptr<WarmFirecracker>, std::string> RealSpawn();
 
     /// Rust `cleanup_warm_*`: stop the process, drop the work dir, tear the
-    /// slot down. All three run even if an earlier one fails.
+    /// slot down. All three run even if an earlier one fails; as in Rust only
+    /// the slot teardown's failure is reported (a failed stop is logged, the
+    /// work-dir removal is a `TempDir` drop).
     core::Expected<core::Unit, std::string> RealCleanup(
+        const std::shared_ptr<WarmFirecracker>& warm, bool sync_network_cleanup);
+
+    /// Rust `fill_warm_entries` — returns entries queued, and the joined
+    /// cleanup failures through `*error`.
+    std::size_t FillWarmEntries(std::size_t to_fill, std::string* error);
+    core::Expected<core::Unit, std::string> CleanupWarm(
         const std::shared_ptr<WarmFirecracker>& warm, bool sync_network_cleanup);
 
     Options options_;

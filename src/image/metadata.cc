@@ -7,17 +7,23 @@ namespace image {
 
 namespace {
 
-const core::Json* Field(const core::Json& object, const std::string& key) {
+/// The raw member, null included. serde's `#[serde(default)]` only covers a
+/// *missing* key: an explicit `null` deserializes to `None` for an `Option`
+/// field but is an "invalid type: null" error for a `Vec`, `HashMap` or
+/// nested struct. Callers pick which of the two rules applies.
+const core::Json* RawField(const core::Json& object, const std::string& key) {
     if (object.kind() != core::Json::Kind::Object) return 0;
     const core::JsonObject& map = object.as_object();
     const core::JsonObject::const_iterator found = map.find(key);
     if (found == map.end()) return 0;
-    // Null is reported as absent, matching serde's `#[serde(default)]` on an
-    // `Option`: a producer that writes an explicit null means "unset", and
-    // treating it as a present value of the wrong kind would reject a document
-    // serde accepts.
-    if (found->second.kind() == core::Json::Kind::Null) return 0;
     return &found->second;
+}
+
+/// An `Option<_>` member: null and missing are both `None`.
+const core::Json* OptionField(const core::Json& object, const std::string& key) {
+    const core::Json* raw = RawField(object, key);
+    if (raw == 0 || raw->kind() == core::Json::Kind::Null) return 0;
+    return raw;
 }
 
 core::Json StringsToJson(const std::vector<std::string>& values) {
@@ -99,17 +105,13 @@ bool ImageResolutionMetadata::operator==(const ImageResolutionMetadata& other) c
 core::Optional<std::string> NormalizeOptionalString(const core::Optional<std::string>& value) {
     if (!value.has_value()) return core::Optional<std::string>();
     const std::string& raw = *value;
-    std::size_t begin = 0;
-    std::size_t end = raw.size();
-    while (begin < end && (raw[begin] == ' ' || raw[begin] == '\t' || raw[begin] == '\n' ||
-                           raw[begin] == '\r')) {
-        ++begin;
-    }
-    while (end > begin && (raw[end - 1] == ' ' || raw[end - 1] == '\t' || raw[end - 1] == '\n' ||
-                           raw[end - 1] == '\r')) {
-        --end;
-    }
-    const std::string trimmed = raw.substr(begin, end - begin);
+    // Rust `str::trim` over the ASCII range (`char::is_whitespace` includes
+    // vertical tab and form feed).
+    const char* const kSpace = " \t\n\r\v\f";
+    const std::size_t begin = raw.find_first_not_of(kSpace);
+    if (begin == std::string::npos) return core::Optional<std::string>();
+    const std::size_t end = raw.find_last_not_of(kSpace);
+    const std::string trimmed = raw.substr(begin, end - begin + 1);
     if (trimmed.empty()) return core::Optional<std::string>();
     return core::Optional<std::string>(trimmed);
 }
@@ -152,15 +154,22 @@ std::map<std::string, std::string> EnvVarsFromEntries(const std::vector<std::str
     return out;
 }
 
+// Neither struct carries `#[serde(rename_all = ...)]`, so the wire names are
+// the Rust field names verbatim (snake_case). The sidecar written by
+// `ImageCacheStore::write_metadata` is read back by both implementations, so a
+// camelCase key here would be silently ignored by `#[serde(default)]` on the
+// Rust side and the image would lose its env/workdir/user.
 core::Json ImageBaseContextToJson(const ImageBaseContext& context) {
     core::JsonObject object;
     core::Json out(object);
     // `env_vars` has no `skip_serializing_if`, so it is always present --
     // including as `{}`.
-    out["envVars"] = MapToJson(context.env_vars);
+    out["env_vars"] = MapToJson(context.env_vars);
     if (context.workdir.has_value()) out["workdir"] = core::Json(*context.workdir);
     if (context.user.has_value()) out["user"] = core::Json(*context.user);
-    if (!context.exposed_ports.empty()) out["exposedPorts"] = StringsToJson(context.exposed_ports);
+    if (!context.exposed_ports.empty()) {
+        out["exposed_ports"] = StringsToJson(context.exposed_ports);
+    }
     if (context.entrypoint.has_value()) out["entrypoint"] = StringsToJson(*context.entrypoint);
     if (context.cmd.has_value()) out["cmd"] = StringsToJson(*context.cmd);
     if (!context.volumes.empty()) out["volumes"] = StringsToJson(context.volumes);
@@ -171,89 +180,107 @@ core::Json ImageBaseContextToJson(const ImageBaseContext& context) {
 core::Json ImageResolutionMetadataToJson(const ImageResolutionMetadata& metadata) {
     core::JsonObject object;
     core::Json out(object);
-    out["baseContext"] = ImageBaseContextToJson(metadata.base_context);
-    if (metadata.raw_config.has_value()) out["rawConfig"] = *metadata.raw_config;
+    out["base_context"] = ImageBaseContextToJson(metadata.base_context);
+    if (metadata.raw_config.has_value()) out["raw_config"] = *metadata.raw_config;
     return out;
 }
 
+namespace {
+
+/// A defaulted non-`Option` member (`#[serde(default)] Vec<String>`): missing
+/// keeps the default, null is a type error.
+core::Expected<core::Unit, std::string> ReadStrings(const core::Json& object,
+                                                    const std::string& key,
+                                                    std::vector<std::string>* out) {
+    const core::Json* raw = RawField(object, key);
+    if (raw == 0) return core::Unit();
+    const core::Expected<std::vector<std::string>, std::string> parsed = ParseStrings(*raw, key);
+    if (!parsed.ok()) return core::make_unexpected(parsed.error());
+    *out = parsed.value();
+    return core::Unit();
+}
+
+core::Expected<core::Unit, std::string> ReadMap(const core::Json& object, const std::string& key,
+                                                std::map<std::string, std::string>* out) {
+    const core::Json* raw = RawField(object, key);
+    if (raw == 0) return core::Unit();
+    const core::Expected<std::map<std::string, std::string>, std::string> parsed =
+        ParseMap(*raw, key);
+    if (!parsed.ok()) return core::make_unexpected(parsed.error());
+    *out = parsed.value();
+    return core::Unit();
+}
+
+core::Expected<core::Unit, std::string> ReadOptionalString(const core::Json& object,
+                                                           const std::string& key,
+                                                           core::Optional<std::string>* out) {
+    const core::Json* field = OptionField(object, key);
+    if (field == 0) return core::Unit();
+    if (field->kind() != core::Json::Kind::String) {
+        return core::make_unexpected("field '" + key + "' must be a string");
+    }
+    *out = core::Optional<std::string>(field->as_string());
+    return core::Unit();
+}
+
+core::Expected<core::Unit, std::string> ReadOptionalStrings(
+    const core::Json& object, const std::string& key,
+    core::Optional<std::vector<std::string> >* out) {
+    const core::Json* field = OptionField(object, key);
+    if (field == 0) return core::Unit();
+    const core::Expected<std::vector<std::string>, std::string> parsed = ParseStrings(*field, key);
+    if (!parsed.ok()) return core::make_unexpected(parsed.error());
+    *out = core::Optional<std::vector<std::string> >(parsed.value());
+    return core::Unit();
+}
+
+}  // namespace
+
+#define AGENTENV_METADATA_TRY(expr)                                     \
+    do {                                                                \
+        const core::Expected<core::Unit, std::string> step_ = (expr);   \
+        if (!step_.ok()) return core::make_unexpected(step_.error());   \
+    } while (0)
+
 core::Expected<ImageBaseContext, std::string> ParseImageBaseContext(const core::Json& value) {
     ImageBaseContext context;
-    // An absent object is the default context, matching `#[serde(default)]` on
-    // the containing field rather than being an error.
-    if (value.kind() == core::Json::Kind::Null) return context;
+    // A struct deserializes only from an object; serde rejects `null` here
+    // even when the containing field is `#[serde(default)]`.
     if (value.kind() != core::Json::Kind::Object) {
         return core::make_unexpected(std::string("image base context must be an object"));
     }
-
-    if (const core::Json* env_vars = Field(value, "envVars")) {
-        const core::Expected<std::map<std::string, std::string>, std::string> parsed =
-            ParseMap(*env_vars, "envVars");
-        if (!parsed.ok()) return core::make_unexpected(parsed.error());
-        context.env_vars = parsed.value();
-    }
-    if (const core::Json* workdir = Field(value, "workdir")) {
-        if (workdir->kind() != core::Json::Kind::String) {
-            return core::make_unexpected(std::string("field 'workdir' must be a string"));
-        }
-        context.workdir = core::Optional<std::string>(workdir->as_string());
-    }
-    if (const core::Json* user = Field(value, "user")) {
-        if (user->kind() != core::Json::Kind::String) {
-            return core::make_unexpected(std::string("field 'user' must be a string"));
-        }
-        context.user = core::Optional<std::string>(user->as_string());
-    }
-    if (const core::Json* ports = Field(value, "exposedPorts")) {
-        const core::Expected<std::vector<std::string>, std::string> parsed =
-            ParseStrings(*ports, "exposedPorts");
-        if (!parsed.ok()) return core::make_unexpected(parsed.error());
-        context.exposed_ports = parsed.value();
-    }
-    if (const core::Json* entrypoint = Field(value, "entrypoint")) {
-        const core::Expected<std::vector<std::string>, std::string> parsed =
-            ParseStrings(*entrypoint, "entrypoint");
-        if (!parsed.ok()) return core::make_unexpected(parsed.error());
-        context.entrypoint = core::Optional<std::vector<std::string> >(parsed.value());
-    }
-    if (const core::Json* cmd = Field(value, "cmd")) {
-        const core::Expected<std::vector<std::string>, std::string> parsed =
-            ParseStrings(*cmd, "cmd");
-        if (!parsed.ok()) return core::make_unexpected(parsed.error());
-        context.cmd = core::Optional<std::vector<std::string> >(parsed.value());
-    }
-    if (const core::Json* volumes = Field(value, "volumes")) {
-        const core::Expected<std::vector<std::string>, std::string> parsed =
-            ParseStrings(*volumes, "volumes");
-        if (!parsed.ok()) return core::make_unexpected(parsed.error());
-        context.volumes = parsed.value();
-    }
-    if (const core::Json* labels = Field(value, "labels")) {
-        const core::Expected<std::map<std::string, std::string>, std::string> parsed =
-            ParseMap(*labels, "labels");
-        if (!parsed.ok()) return core::make_unexpected(parsed.error());
-        context.labels = parsed.value();
-    }
+    AGENTENV_METADATA_TRY(ReadMap(value, "env_vars", &context.env_vars));
+    AGENTENV_METADATA_TRY(ReadOptionalString(value, "workdir", &context.workdir));
+    AGENTENV_METADATA_TRY(ReadOptionalString(value, "user", &context.user));
+    AGENTENV_METADATA_TRY(ReadStrings(value, "exposed_ports", &context.exposed_ports));
+    AGENTENV_METADATA_TRY(ReadOptionalStrings(value, "entrypoint", &context.entrypoint));
+    AGENTENV_METADATA_TRY(ReadOptionalStrings(value, "cmd", &context.cmd));
+    AGENTENV_METADATA_TRY(ReadStrings(value, "volumes", &context.volumes));
+    AGENTENV_METADATA_TRY(ReadMap(value, "labels", &context.labels));
     return context;
 }
+
+#undef AGENTENV_METADATA_TRY
 
 core::Expected<ImageResolutionMetadata, std::string> ParseImageResolutionMetadata(
     const core::Json& value) {
     ImageResolutionMetadata metadata;
-    if (value.kind() == core::Json::Kind::Null) return metadata;
     if (value.kind() != core::Json::Kind::Object) {
         return core::make_unexpected(std::string("image resolution metadata must be an object"));
     }
 
-    const core::Json* base = Field(value, "baseContext");
-    const core::Expected<ImageBaseContext, std::string> parsed =
-        ParseImageBaseContext(base != 0 ? *base : core::Json());
-    if (!parsed.ok()) return core::make_unexpected(parsed.error());
-    metadata.base_context = parsed.value();
+    // `#[serde(default)] base_context`: a missing key is the default context;
+    // a present one (null included) must parse as an object.
+    if (const core::Json* base = RawField(value, "base_context")) {
+        const core::Expected<ImageBaseContext, std::string> parsed = ParseImageBaseContext(*base);
+        if (!parsed.ok()) return core::make_unexpected(parsed.error());
+        metadata.base_context = parsed.value();
+    }
 
     // Stored without inspection: this is the pass-through document, and
     // validating its shape here would reject configs the consumer understands
-    // and this port does not.
-    if (const core::Json* raw_config = Field(value, "rawConfig")) {
+    // and this port does not. `Option<Value>` maps null to `None`.
+    if (const core::Json* raw_config = OptionField(value, "raw_config")) {
         metadata.raw_config = core::Optional<core::Json>(*raw_config);
     }
     return metadata;

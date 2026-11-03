@@ -2,6 +2,11 @@
 // Rust: src/image/cache/graph.rs — `ImageCacheMetadataStore`.
 #include "agentenv/image/cache_metadata_store.h"
 
+#include <limits.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <ctime>
 #include <sstream>
@@ -244,27 +249,66 @@ local_store::BatchOp SchemaVersionPutOp() {
 
 // ---- config parsing ---------------------------------------------------------
 
-bool PathIsInside(const std::string& path, const std::string& ancestor) {
-    if (ancestor.empty()) return false;
-    // Compare on a trailing-slash-normalised ancestor so "/a/bc" is not
-    // treated as living inside "/a/b".
-    std::string prefix = ancestor;
-    if (prefix[prefix.size() - 1] != '/') prefix += '/';
-    return path.size() > prefix.size() && path.compare(0, prefix.size(), prefix) == 0;
+namespace {
+
+/// Rust `canonicalize_nearest_existing_parent` — canonicalize the deepest
+/// existing ancestor and re-append the not-yet-existing tail, so a path whose
+/// leaf has not been created still resolves through symlinked parents.
+std::string CanonicalizeNearestExistingParent(const std::string& path) {
+    std::vector<std::string> suffix;
+    std::string cursor = path;
+    for (;;) {
+        char* resolved = ::realpath(cursor.c_str(), NULL);
+        if (resolved != NULL) {
+            std::string base(resolved);
+            ::free(resolved);
+            for (std::vector<std::string>::reverse_iterator it = suffix.rbegin();
+                 it != suffix.rend(); ++it) {
+                if (base.empty() || base[base.size() - 1] != '/') base += '/';
+                base += *it;
+            }
+            return base;
+        }
+        const std::string::size_type slash = cursor.rfind('/');
+        if (slash == std::string::npos) return path;
+        const std::string name = cursor.substr(slash + 1);
+        if (!name.empty()) suffix.push_back(name);
+        const std::string parent = slash == 0 ? std::string("/") : cursor.substr(0, slash);
+        if (parent == cursor) return path;
+        cursor = parent;
+    }
+}
+
+}  // namespace
+
+std::string StablePathIdentity(const std::string& path) {
+    std::string absolute = path;
+    if (absolute.empty() || absolute[0] != '/') {
+        char buf[PATH_MAX];
+        const std::string cwd = ::getcwd(buf, sizeof(buf)) != NULL ? std::string(buf) : ".";
+        absolute = cwd + "/" + path;
+    }
+    return CanonicalizeNearestExistingParent(storage::overlaybd::LexicallyNormalizePath(absolute));
+}
+
+bool PathIsInside(const std::string& path, const std::string& parent) {
+    // Rust `Path::starts_with` on stable identities: component-wise, so
+    // "/a/bc" is not inside "/a/b", and a path is inside itself.
+    const std::string p = StablePathIdentity(path);
+    std::string base = StablePathIdentity(parent);
+    while (base.size() > 1 && base[base.size() - 1] == '/') base.erase(base.size() - 1);
+    if (p == base) return true;
+    if (base == "/") return !p.empty() && p[0] == '/';
+    return p.size() > base.size() && p.compare(0, base.size(), base) == 0 &&
+           p[base.size()] == '/';
 }
 
 namespace {
 
 core::Expected<storage::overlaybd::ImageConfig, std::string> LoadImageConfig(
     const std::string& image_config_path) {
-    core::Expected<std::string, std::string> text =
-        core::fs::ReadToString(image_config_path);
-    if (!text.ok()) {
-        return core::make_unexpected(std::string("load image config ") + image_config_path +
-                                     ": " + text.error());
-    }
     core::Expected<storage::overlaybd::ImageConfig, std::string> config =
-        storage::overlaybd::ParseImageConfig(text.value());
+        storage::overlaybd::LoadImageConfig(image_config_path);
     if (!config.ok()) {
         return core::make_unexpected(std::string("load image config ") + image_config_path +
                                      ": " + config.error());
@@ -274,27 +318,34 @@ core::Expected<storage::overlaybd::ImageConfig, std::string> LoadImageConfig(
 
 }  // namespace
 
-core::Expected<std::vector<ParsedHardCommitRef>, std::string>
-LoadCacheOwnedHardCommitRefs(const std::string& image_config_path) {
+core::Expected<CacheOwnedImageConfigFacts, std::string> LoadCacheOwnedImageConfigFacts(
+    const std::string& image_config_path) {
     core::Expected<storage::overlaybd::ImageConfig, std::string> config =
         LoadImageConfig(image_config_path);
     if (!config.ok()) return core::make_unexpected(config.error());
 
-    std::vector<ParsedHardCommitRef> refs;
-    std::set<HardCommitId>           seen;
+    CacheOwnedImageConfigFacts facts;
     const std::vector<storage::overlaybd::LayerConfig>& lowers = config.value().lowers;
     for (std::size_t i = 0; i < lowers.size(); ++i) {
-        // `dir=` lowers are remote-recoverable, so they are never pinned.
         if (lowers[i].file.empty()) continue;
-        core::Expected<HardCommitId, std::string> digest =
-            HardCommitId::New(lowers[i].digest);
-        if (!digest.ok()) return core::make_unexpected(digest.error());
-        if (seen.insert(digest.value()).second) {
-            refs.push_back(
-                ParsedHardCommitRef(digest.value(), lowers[i].file, lowers[i].size));
+        std::ostringstream where;
+        where << "image config " << image_config_path << " lower " << i;
+        if (lowers[i].digest.empty()) {
+            return core::make_unexpected(where.str() + " has local file but no digest");
         }
+        if (lowers[i].size == 0) {
+            return core::make_unexpected(where.str() + " has local file but no size");
+        }
+        CacheOwnedLocalFileLower lower;
+        lower.digest = lowers[i].digest;
+        lower.file = lowers[i].file;
+        lower.size = lowers[i].size;
+        facts.local_file_lowers.push_back(lower);
     }
-    return refs;
+    if (!config.value().upper.data.empty()) {
+        facts.upper_file = core::Optional<std::string>(config.value().upper.data);
+    }
+    return facts;
 }
 
 core::Expected<std::vector<ParsedHardCommitRef>, std::string>
@@ -622,13 +673,14 @@ ImageCacheMetadataStore::ConfigLastUsed(const ImageCacheConfigId& config_id) con
 }
 
 core::Expected<core::Unit, std::string>
-ImageCacheMetadataStore::RecordConfigRefsFromConfigPath(const std::string& config_path) {
+ImageCacheMetadataStore::RecordConfigRefsFromConfigPath(const std::string& config_path,
+                                                        const std::string& commit_store) {
     core::Expected<ImageCacheConfigId, std::string> config_id =
         ImageCacheConfigId::FromConfigPath(config_path);
     if (!config_id.ok()) return core::make_unexpected(config_id.error());
 
     core::Expected<std::vector<ParsedHardCommitRef>, std::string> hard_refs =
-        LoadCacheOwnedHardCommitRefs(config_path);
+        LoadCommitStoreOwnedHardCommitRefs(config_path, commit_store);
     if (!hard_refs.ok()) return core::make_unexpected(hard_refs.error());
 
     std::set<HardCommitId> new_refs;
@@ -742,26 +794,38 @@ ImageCacheMetadataStore::HardCommitConfigReferrerMap() const {
 }
 
 core::Expected<core::Unit, std::string>
-ImageCacheMetadataStore::RebuildFromConfigs(const std::string& configs_dir) {
-    // Rust returns an empty map when the directory is absent.
+ImageCacheMetadataStore::RebuildFromConfigs(const std::string& configs_dir,
+                                            const std::string& commit_store) {
+    // Rust `parse_configs_dir`: an absent directory is an empty map; paths are
+    // processed sorted; only regular files count.
     std::map<ImageCacheConfigId, std::vector<ParsedHardCommitRef> > parsed;
     if (core::fs::Exists(configs_dir)) {
         core::Expected<std::vector<std::string>, std::string> names =
             core::fs::ReadDir(configs_dir);
         if (!names.ok()) {
             return core::make_unexpected(std::string("rebuild image cache metadata from ") +
-                                         configs_dir + ": " + names.error());
+                                         configs_dir + ": read configs dir " + configs_dir +
+                                         ": " + names.error());
         }
-        for (std::size_t i = 0; i < names.value().size(); ++i) {
-            const std::string& name = names.value()[i];
+        std::vector<std::string> sorted = names.value();
+        std::sort(sorted.begin(), sorted.end());
+        for (std::size_t i = 0; i < sorted.size(); ++i) {
+            const std::string& name = sorted[i];
             if (!IsRegularConfigFilename(name)) continue;
+            const std::string path = configs_dir + "/" + name;
+            struct stat st;
+            if (::stat(path.c_str(), &st) != 0) {
+                return core::make_unexpected(std::string("rebuild image cache metadata from ") +
+                                             configs_dir + ": stat image config " + path);
+            }
+            if (!S_ISREG(st.st_mode)) continue;
 
             core::Expected<ImageCacheConfigId, std::string> config_id =
                 ImageCacheConfigId::FromFilename(name);
             if (!config_id.ok()) return core::make_unexpected(config_id.error());
 
             core::Expected<std::vector<ParsedHardCommitRef>, std::string> refs =
-                LoadCacheOwnedHardCommitRefs(configs_dir + "/" + name);
+                LoadCommitStoreOwnedHardCommitRefs(path, commit_store);
             // Rust fails closed on a malformed config so a partial graph never
             // becomes the basis for GC decisions.
             if (!refs.ok()) {

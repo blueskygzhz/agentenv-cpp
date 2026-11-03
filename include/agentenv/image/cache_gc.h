@@ -85,13 +85,18 @@ struct HardCommitGcDecision {
 class ImageCacheGc {
  public:
     /// `commit_store` bounds what GC is willing to delete: a recorded file
-    /// outside it is never touched. `transport` may be null, in which case a
-    /// commit carrying P2P keys cannot be unpublished and is therefore not
-    /// collected.
-    ImageCacheGc(const std::string& commit_store,
+    /// outside it is never touched. `config_dir` is where the source configs
+    /// that root commits live (rebuilt from when `RunGc(.., true)`), and
+    /// `index_dir` holds the conversion indexes stale-index reclaim sweeps.
+    /// `transport` may be null, in which case a commit carrying P2P keys
+    /// cannot be unpublished and is therefore not collected.
+    ImageCacheGc(const std::string& commit_store, const std::string& config_dir,
+                 const std::string& index_dir,
                  std::shared_ptr<ImageCacheMetadataStore> metadata,
                  std::shared_ptr<p2p::P2pTransport> transport)
         : commit_store_(commit_store),
+          config_dir_(config_dir),
+          index_dir_(index_dir),
           metadata_(std::move(metadata)),
           transport_(std::move(transport)) {}
 
@@ -118,12 +123,27 @@ class ImageCacheGc {
         DeleteCollectableHardCommit(const HardCommitId& digest, const std::string& file,
                                     const std::set<p2p::P2pArtifactKey>& p2p_keys);
 
-    /// Rust `run_gc` (without the metadata rebuild, which the caller does).
+    /// Rust `run_gc` — fail-closed deleting GC. With `rebuild_metadata` the
+    /// config-derived roots are rebuilt from `config_dir` first (skipped when
+    /// capacity eviction already reconciled them this pass). Each candidate
+    /// is re-checked under a uniquely-owned `gc` operation hold; the pass
+    /// ends with a best-effort stale-index reclaim.
     core::Expected<ImageCacheGcReport, std::string>
-        RunGc(const ImageCacheLiveRuntimeRefs& live_refs);
+        RunGc(const ImageCacheLiveRuntimeRefs& live_refs, bool rebuild_metadata);
+
+    /// Rust `reclaim_stale_indexes` — remove conversion indexes whose commit
+    /// file is gone (or that are empty), and index directories left empty.
+    /// An unreadable index is kept.
+    core::Expected<std::size_t, std::string> ReclaimStaleIndexes() const;
 
  private:
+    core::Expected<core::Unit, std::string>
+        CollectUnderHold(const HardCommitId& digest, const ImageCacheLiveRuntimeRefs& live_refs,
+                         const ImageCacheHoldOwner& hold_owner, ImageCacheGcReport* report);
+
     std::string                              commit_store_;
+    std::string                              config_dir_;
+    std::string                              index_dir_;
     std::shared_ptr<ImageCacheMetadataStore> metadata_;
     std::shared_ptr<p2p::P2pTransport>       transport_;
 };

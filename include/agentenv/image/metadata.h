@@ -99,7 +99,8 @@ struct ImageResolutionMetadata {
 };
 
 /// Serializes to the shape serde produces for `ImageBaseContext`, honouring
-/// every `skip_serializing_if`.
+/// every `skip_serializing_if`. Keys are the snake_case Rust field names: the
+/// structs have no `rename_all`.
 ///
 /// The omissions are load-bearing: a serialized `"entrypoint": null` is not
 /// the same document as one with no `entrypoint` key, and the sidecar is read
@@ -108,7 +109,8 @@ core::Json ImageBaseContextToJson(const ImageBaseContext& context);
 core::Json ImageResolutionMetadataToJson(const ImageResolutionMetadata& metadata);
 
 /// Parses the same shapes back. A missing key keeps the default, matching
-/// `#[serde(default)]`.
+/// `#[serde(default)]`; an explicit null is `None` for `Option` members and a
+/// type error for every other member, as serde does.
 core::Expected<ImageBaseContext, std::string> ParseImageBaseContext(const core::Json& value);
 core::Expected<ImageResolutionMetadata, std::string> ParseImageResolutionMetadata(
     const core::Json& value);

@@ -4,8 +4,17 @@
 //   - the rtnetlink/iptables side-effects remain TODOs (need root + netlink).
 #include "agentenv/sandbox/network.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <sstream>
+
+#include <sys/mount.h>
+#include <unistd.h>
+
+#include "agentenv/core/fs.h"
+#include "agentenv/sandbox/network/slot.h"
 
 namespace agentenv {
 namespace sandbox {
@@ -159,9 +168,37 @@ std::vector<std::string> NetworkAddressPlan::InternalEgressDeniedCidrs() const {
     return out;
 }
 
-// ---------------- side-effecting runtime (TODO: root + netlink) ----------------
-core::Expected<core::Unit, std::string> PrepareRuntime() {
-    // TODO: create bridge, tap pool, ip_forward, iptables NAT.
+// ---------------- runtime directory ----------------
+// Rust `prepare_runtime`: namespaces from a previous run are bind-mounted
+// files under `<runtime>/netns`; nothing references them any more, so every
+// stacked mount is detached and the file removed. Entries without the AENV
+// prefix are left alone.
+core::Expected<core::Unit, std::string> PrepareRuntime(const std::string& runtime_path) {
+    const std::string directory = core::fs::Join(runtime_path, "netns");
+    core::Expected<core::Unit, std::string> created = core::fs::CreateDirAll(directory);
+    if (!created.ok()) return core::make_unexpected(created.error());
+
+    core::Expected<std::vector<std::string>, std::string> entries = core::fs::ReadDir(directory);
+    if (!entries.ok()) return core::make_unexpected(entries.error());
+
+    const std::string prefix(kNetnsPrefix);
+    for (std::size_t i = 0; i < entries.value().size(); ++i) {
+        const std::string& name = entries.value()[i];
+        if (name.compare(0, prefix.size(), prefix) != 0) continue;
+        const std::string path = core::fs::Join(directory, name);
+
+        // Remove every stacked bind mount before deleting the namespace file.
+        for (;;) {
+            if (::umount2(path.c_str(), MNT_DETACH) == 0) continue;
+            const int err = errno;
+            if (err == EINVAL || err == ENOENT) break;
+            return core::make_unexpected("unmount stale AENV network namespace " + path + ": " +
+                                         std::strerror(err));
+        }
+        if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
+            return core::make_unexpected(std::string(std::strerror(errno)));
+        }
+    }
     return core::Unit{};
 }
 

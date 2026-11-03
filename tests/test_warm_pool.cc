@@ -2,6 +2,10 @@
 // Ported from crates/warm-pool/src/lib.rs `mod tests`.
 #include "agentenv/warm-pool/pool.h"
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+
 #include "microtest.h"
 
 using agentenv::warmpool::PoolConfig;
@@ -121,6 +125,73 @@ MT_TEST(release_rejects_after_shutdown) {
     WarmPool<int> pool(Cfg(0, 10, false));
     pool.DrainAll();
     MT_EXPECT_TRUE(!pool.Release(42));
+}
+
+// ---- start_maintenance_worker ----
+
+namespace {
+
+/// Polls `done` for up to two seconds.
+template <typename Pred>
+bool WaitUntil(Pred done) {
+    for (int i = 0; i < 400; ++i) {
+        if (done()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return done();
+}
+
+}  // namespace
+
+MT_TEST(maintenance_worker_refills_to_the_low_watermark) {
+    WarmPool<int> pool(Cfg(3, 6, true));
+    std::atomic<int> cycles(0);
+    pool.StartMaintenanceWorker([&pool, &cycles]() {
+        ++cycles;
+        const PoolMaintenanceAction action = pool.ComputeMaintenanceAction(pool.Len());
+        if (action.kind != agentenv::warmpool::PoolMaintenanceKind::Fill) return;
+        for (std::size_t i = 0; i < action.count; ++i) pool.TryPushBounded(1);
+    });
+    // Started with a maintenance request, so it fills without being asked.
+    MT_EXPECT_TRUE(WaitUntil([&pool]() { return pool.Len() >= 3; }));
+    MT_EXPECT_EQ(pool.Len(), static_cast<std::size_t>(3));
+
+    // An acquisition below the low watermark wakes it again.
+    int out = 0;
+    MT_EXPECT_TRUE(pool.TryAcquire(&out));
+    pool.RequestMaintenance();
+    MT_EXPECT_TRUE(WaitUntil([&pool]() { return pool.Len() >= 3; }));
+
+    // `DrainAll` joins the worker before returning the entries.
+    const std::vector<int> drained = pool.DrainAll();
+    MT_EXPECT_TRUE(drained.size() >= 3);
+    const int after = cycles.load();
+    pool.RequestMaintenance();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    MT_EXPECT_EQ(cycles.load(), after);
+}
+
+MT_TEST(maintenance_worker_is_not_started_when_disabled) {
+    WarmPool<int> pool(Cfg(3, 6, false));
+    std::atomic<int> cycles(0);
+    pool.StartMaintenanceWorker([&cycles]() { ++cycles; });
+    pool.RequestMaintenance();
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    MT_EXPECT_EQ(cycles.load(), 0);
+}
+
+MT_TEST(maintenance_worker_starts_once) {
+    WarmPool<int> pool(Cfg(1, 2, true));
+    std::atomic<int> first(0);
+    std::atomic<int> second(0);
+    pool.StartMaintenanceWorker([&pool, &first]() {
+        ++first;
+        pool.TryPushBounded(1);
+    });
+    pool.StartMaintenanceWorker([&second]() { ++second; });
+    MT_EXPECT_TRUE(WaitUntil([&first]() { return first.load() > 0; }));
+    MT_EXPECT_EQ(second.load(), 0);
+    pool.DrainAll();
 }
 
 MT_MAIN

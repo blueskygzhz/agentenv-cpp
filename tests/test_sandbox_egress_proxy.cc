@@ -6,10 +6,19 @@
 // a guest could otherwise reach a destination its policy forbids.
 #include "agentenv/sandbox/network/egress_proxy.h"
 
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "agentenv/sandbox/network.h"
+#include "agentenv/sandbox/network/slot.h"
 #include "microtest.h"
 
 using namespace agentenv;                    // NOLINT
@@ -562,6 +571,148 @@ MT_TEST(original_destination_rejects_a_non_redirected_fd) {
     uint16_t port = 0;
     auto r = OriginalDestination(-1, &ip, &port);
     MT_EXPECT_TRUE(!r.ok());
+}
+
+// ---- live sockets ----
+
+namespace {
+
+/// A loopback listener on an ephemeral port.
+int LocalListener(uint16_t* port) {
+    const int fd = ::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_in address;
+    std::memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    if (fd < 0 || ::bind(fd, reinterpret_cast<struct sockaddr*>(&address), sizeof(address)) != 0 ||
+        ::listen(fd, 8) != 0) {
+        return -1;
+    }
+    socklen_t len = sizeof(address);
+    ::getsockname(fd, reinterpret_cast<struct sockaddr*>(&address), &len);
+    *port = ntohs(address.sin_port);
+    return fd;
+}
+
+std::string RecvSome(int fd) {
+    char buffer[64];
+    const ssize_t n = ::recv(fd, buffer, sizeof(buffer), 0);
+    return n > 0 ? std::string(buffer, static_cast<size_t>(n)) : std::string();
+}
+
+bool SendString(int fd, const std::string& s) {
+    return ::send(fd, s.data(), s.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(s.size());
+}
+
+}  // namespace
+
+MT_TEST(connect_timeout_reaches_a_local_listener) {
+    uint16_t port = 0;
+    const int listener = LocalListener(&port);
+    MT_EXPECT_TRUE(listener >= 0);
+
+    std::string error;
+    const int fd = ConnectTimeout(Ip("127.0.0.1"), port, kUpstreamTimeoutMs, &error);
+    MT_EXPECT_TRUE(fd >= 0);
+    // Handed back blocking, as `TcpStream::connect_timeout` does.
+    MT_EXPECT_EQ(::fcntl(fd, F_GETFL, 0) & O_NONBLOCK, 0);
+    ::close(fd);
+    ::close(listener);
+}
+
+MT_TEST(connect_timeout_reports_a_refused_connection) {
+    uint16_t port = 0;
+    const int listener = LocalListener(&port);
+    MT_EXPECT_TRUE(listener >= 0);
+    ::close(listener);  // nothing listens on this port any more
+
+    std::string error;
+    MT_EXPECT_EQ(ConnectTimeout(Ip("127.0.0.1"), port, 1000, &error), -1);
+    MT_EXPECT_TRUE(!error.empty());
+}
+
+MT_TEST(relay_copies_both_directions_and_closes_only_the_finished_one) {
+    int client[2];
+    int upstream[2];
+    MT_EXPECT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, client), 0);
+    MT_EXPECT_EQ(::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, upstream), 0);
+    // [0] is the test's end, [1] the relay's.
+    std::thread relay([&client, &upstream]() { RelayStreams(client[1], upstream[1]); });
+
+    MT_EXPECT_TRUE(SendString(client[0], "ping"));
+    MT_EXPECT_EQ(RecvSome(upstream[0]), std::string("ping"));
+    MT_EXPECT_TRUE(SendString(upstream[0], "pong"));
+    MT_EXPECT_EQ(RecvSome(client[0]), std::string("pong"));
+
+    // The guest finishes sending: upstream sees EOF...
+    ::shutdown(client[0], SHUT_WR);
+    MT_EXPECT_EQ(RecvSome(upstream[0]), std::string());
+    // ...but can still drain its response back to the guest.
+    MT_EXPECT_TRUE(SendString(upstream[0], "late"));
+    MT_EXPECT_EQ(RecvSome(client[0]), std::string("late"));
+
+    ::shutdown(upstream[0], SHUT_WR);
+    relay.join();
+    MT_EXPECT_EQ(RecvSome(client[0]), std::string());
+    for (int i = 0; i < 2; ++i) {
+        ::close(client[i]);
+        ::close(upstream[i]);
+    }
+}
+
+MT_TEST(ensure_listener_reports_a_missing_namespace) {
+    EgressProxy proxy;
+    auto r = proxy.EnsureListener(Ip("10.11.0.9"), "/nonexistent/aenv-netns");
+    MT_EXPECT_TRUE(!r.ok());
+    MT_EXPECT_TRUE(r.error().find("open egress proxy namespace /nonexistent/aenv-netns") == 0);
+    MT_EXPECT_TRUE(!proxy.HasListener(Ip("10.11.0.9")));
+}
+
+MT_TEST(listener_lifecycle_accepts_and_tears_down) {
+    EgressProxy proxy;
+    const uint32_t ip = Ip("10.11.0.10");
+    // Our own namespace stands in for a slot's; entering it still needs
+    // CAP_SYS_ADMIN, and the fixed port must be free.
+    auto started = proxy.EnsureListener(ip, "/proc/self/ns/net");
+    if (!started.ok()) {
+        MT_EXPECT_TRUE(started.error().find("enter egress proxy namespace") == 0 ||
+                       started.error().find("bind egress proxy port") == 0);
+        MT_EXPECT_TRUE(!proxy.HasListener(ip));
+        return;
+    }
+    MT_EXPECT_TRUE(proxy.HasListener(ip));
+    // Idempotent: a second call keeps the running listener.
+    MT_EXPECT_TRUE(proxy.EnsureListener(ip, "/proc/self/ns/net").ok());
+
+    // With no active policy the handler refuses: the connection is closed.
+    std::string error;
+    const int fd = ConnectTimeout(Ip("127.0.0.1"), kEgressProxyPort, 2000, &error);
+    MT_EXPECT_TRUE(fd >= 0);
+    MT_EXPECT_EQ(RecvSome(fd), std::string());
+    ::close(fd);
+
+    proxy.Teardown(ip);
+    MT_EXPECT_TRUE(!proxy.HasListener(ip));
+    MT_EXPECT_EQ(static_cast<int>(proxy.ConnectionCount(ip)), 0);
+}
+
+MT_TEST(slot_without_a_proxy_refuses_a_domain_policy) {
+    core::Expected<Slot*, NetworkError> slot =
+        Slot::New(1, NetworkAddressPlan::Default(), "/tmp/aenv-egress-test");
+    MT_EXPECT_TRUE(slot.ok());
+    std::vector<std::string> allow;
+    allow.push_back("example.com");
+    const core::Optional<SandboxNetworkPolicy> policy(
+        MakePolicy(BaseSandboxNetworkPolicy::Deny, allow));
+    MT_EXPECT_TRUE(policy->RequiresEgressProxy());
+
+    // Refused before any namespace work: a REDIRECT to a port nobody serves
+    // would silently break every allowed domain.
+    auto applied = slot.value()->SetEgressPolicy(policy);
+    MT_EXPECT_TRUE(!applied.ok());
+    MT_EXPECT_TRUE(applied.error().find("egress proxy") != std::string::npos);
+    delete slot.value();
 }
 
 MT_MAIN

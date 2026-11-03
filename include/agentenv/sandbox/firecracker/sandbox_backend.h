@@ -36,6 +36,9 @@ namespace network {
 class Slot;
 class SlotNetworkManager;
 }  // namespace network
+namespace firecracker {
+class FirecrackerPool;
+}  // namespace firecracker
 
 namespace firecracker {
 
@@ -305,6 +308,35 @@ core::Expected<core::Unit, std::string> BindVolumeDriveSlot(const std::string& w
 core::Expected<std::vector<DriveMount>, std::string> PrepareFreshDrives(
     const std::string& work_dir, const FreshDrivePlan& plan, FreshDriveResources* resources);
 
+/// Rust `firecracker_stdout_path` / `firecracker_stderr_path` /
+/// `firecracker_stdio_paths` / `firecracker_log_path`.
+///
+/// Everything lands in the default log directory --
+/// `<serial_output_base_dir>/<sandbox_id>` when configured, else
+/// `<work_dir>/logs` -- except stdout/stderr, whose directory an explicit
+/// `stdout_path`/`stderr_path` overrides. A stdio stream is captured when
+/// logging is enabled or its directory was given explicitly.
+struct FirecrackerLogPaths {
+    std::string default_log_dir;
+    core::Optional<std::string> stdout_path;
+    core::Optional<std::string> stderr_path;
+    /// Target of the VMM logger (used only when logging is enabled).
+    std::string logger_path;
+    /// The stdout/stderr targets regardless of capture, which is where a
+    /// warm entry's logs are relocated to.
+    std::string stdout_target;
+    std::string stderr_target;
+};
+FirecrackerLogPaths ResolveFirecrackerLogPaths(
+    const core::Optional<std::string>& serial_output_base_dir,
+    const core::Optional<std::string>& stdout_dir, const core::Optional<std::string>& stderr_dir,
+    bool capture_output, const core::SandboxId& sandbox_id, const std::string& work_dir);
+
+/// Rust `relocate_warm_log` — moves a warm entry's log to the sandbox's own
+/// path (copy + remove across devices). Absent or identical source is a no-op.
+core::Expected<core::Unit, std::string> RelocateWarmLog(const core::Optional<std::string>& src,
+                                                       const std::string& target);
+
 /// What a fresh start needs. Separate from `ConfigurePlan`, which describes the
 /// API calls: this is the process-level half (which binary, where it works,
 /// how long to wait).
@@ -328,11 +360,23 @@ struct FreshStartSpec {
     /// system temporary directory, as Rust does.
     core::Optional<std::string> firecracker_work_dir;
     bool capture_output = true;
+    /// Rust `common.{serial_output_base_dir, stdout_path, stderr_path}` --
+    /// where the VMM's stdio and logger land (`ResolveFirecrackerLogPaths`).
+    core::Optional<std::string> serial_output_base_dir;
+    core::Optional<std::string> stdout_path;
+    core::Optional<std::string> stderr_path;
+    /// Rust `FirecrackerPool::global()`. A fresh boot never adopts a warm
+    /// entry; this is only what a fork child of this sandbox resumes with.
+    FirecrackerPool* firecracker_pool = NULL;
     int64_t socket_timeout_ms = 10 * 1000;
     int64_t socket_poll_ms = 10;
     /// Rust `RuntimePolicy::{envd_timeout, envd_poll_interval}`.
     int64_t envd_timeout_ms = 60 * 1000;
     int64_t envd_poll_ms = 100;
+    /// Rust `init_envd_instance`: `common.control_plane_port` and
+    /// `common.envd_access_token`, with the slot's host-interaction IP.
+    uint16_t control_plane_port = 49983;
+    core::Optional<EnvdAccessToken> envd_access_token;
 };
 
 /// Host-side drive materialization for a resume (Rust `start_resume`:
@@ -416,6 +460,11 @@ struct ResumeStartSpec {
     /// override finds the tap. NULL means no network (tests). The egress
     /// policy is the capture's own, `snapshot_config.common.network_policy`.
     network::SlotNetworkManager* network_manager = NULL;
+
+    /// Rust `FirecrackerPool::global()`. When set and this launch uses the
+    /// default log paths, a pre-spawned VMM and its slot are adopted
+    /// (`adopt_warm_firecracker`) instead of spawning one. NULL disables it.
+    FirecrackerPool* firecracker_pool = NULL;
 };
 
 /// Rust `FirecrackerSandbox::start_resume` — the ordered API sequence a resume

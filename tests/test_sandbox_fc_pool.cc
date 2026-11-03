@@ -6,6 +6,9 @@
 #include "agentenv/sandbox/firecracker/mmds.h"
 #include "agentenv/sandbox/firecracker/pool.h"
 
+#include <chrono>
+#include <thread>
+
 using namespace agentenv::sandbox::firecracker;
 namespace warmpool = agentenv::warmpool;
 namespace core = agentenv::core;
@@ -170,10 +173,10 @@ namespace {
 /// A warm entry with no live kernel state behind it. Paired with a fake
 /// cleanup, so the null slot is never dereferenced.
 std::shared_ptr<WarmFirecracker> FakeWarm(const std::string& tag) {
-    std::shared_ptr<FirecrackerInstance> inst(
+    std::unique_ptr<FirecrackerInstance> inst(
         new FirecrackerInstance("/tmp/agentenv-fc-test-" + tag, std::shared_ptr<Connector>()));
     return std::shared_ptr<WarmFirecracker>(
-        new WarmFirecracker(NULL, inst, "/tmp/agentenv-fc-test-" + tag));
+        new WarmFirecracker(NULL, std::move(inst), "/tmp/agentenv-fc-test-" + tag));
 }
 
 FirecrackerPool::Options OptionsFor(std::size_t low, std::size_t high) {
@@ -367,6 +370,51 @@ MT_TEST(real_spawn_without_a_network_manager_is_an_error) {
     const std::size_t created = pool.RunMaintenanceCycle();
     MT_EXPECT_EQ(static_cast<int>(created), 0);
     MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 0);
+}
+
+MT_TEST(worker_primes_the_pool_in_the_background) {
+    FirecrackerPool::Options o = OptionsFor(2, 4);
+    o.pool.startup_prewarm = true;
+    FirecrackerPool pool(o, NULL, NULL);
+    std::shared_ptr<SpawnLedger> ledger = InstallLedger(&pool);
+
+    // Rust `prime`: the worker does the filling; prime only waits for it.
+    pool.EnsureWorkerStarted();
+    pool.PrimeFor(2000);
+    MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 2);
+
+    // Acquiring below the low watermark requests a refill -- and, as
+    // acquisition pressure, doubles the fill target up to the high watermark.
+    MT_EXPECT_TRUE(pool.Acquire().ok());
+    for (int i = 0; i < 400 && pool.WarmLen() < 4; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 4);
+    MT_EXPECT_EQ(pool.Shutdown(false).ok(), true);
+    // Everything still queued was destroyed; the acquired entry is the
+    // caller's.
+    MT_EXPECT_EQ(ledger->cleaned, 4);
+    MT_EXPECT_EQ(ledger->spawned, 5);
+}
+
+MT_TEST(prime_is_skipped_without_startup_prewarm) {
+    FirecrackerPool::Options o = OptionsFor(2, 4);
+    o.pool.startup_prewarm = false;
+    FirecrackerPool pool(o, NULL, NULL);
+    std::shared_ptr<SpawnLedger> ledger = InstallLedger(&pool);
+    // No worker started, so a prime that waited would time out; skipping
+    // returns at once.
+    const std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+    pool.PrimeFor(2000);
+    MT_EXPECT_TRUE(std::chrono::steady_clock::now() - started < std::chrono::milliseconds(500));
+    MT_EXPECT_EQ(ledger->spawned, 0);
+}
+
+MT_TEST(global_pool_is_absent_without_a_config) {
+    // No `ConfigManager::InitGlobal*` in this binary: Rust's `try_init` finds
+    // no `[pool.firecracker]` config and the pool stays disabled.
+    MT_EXPECT_TRUE(FirecrackerPool::Global() == NULL);
+    MT_EXPECT_TRUE(FirecrackerPool::PrimeGlobal(10).ok());
 }
 
 MT_MAIN

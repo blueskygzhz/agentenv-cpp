@@ -3,6 +3,8 @@
 // FirecrackerSandboxFactory`.
 #include "agentenv/sandbox/firecracker/factory_impl.h"
 
+#include "agentenv/sandbox/firecracker/lifecycle.h"
+
 #include "agentenv/sandbox/firecracker/factory.h"
 #include "agentenv/sandbox/firecracker/sandbox_backend.h"
 
@@ -44,6 +46,9 @@ class FirecrackerSandboxFactory::Impl {
 
     /// Rust `NetworkManager::global()`; NULL means no network.
     network::SlotNetworkManager* network_manager = NULL;
+
+    /// Rust `FirecrackerPool::global()`; NULL means resumes always cold-spawn.
+    FirecrackerPool* firecracker_pool = NULL;
 
     /// The node half of Rust `start_resume`'s drive preparation. Absent
     /// without a device manager -- the configuration the resume tests use,
@@ -114,6 +119,10 @@ void FirecrackerSandboxFactory::SetNetworkManager(network::SlotNetworkManager* m
     impl_->network_manager = manager;
 }
 
+void FirecrackerSandboxFactory::SetFirecrackerPool(FirecrackerPool* pool) {
+    impl_->firecracker_pool = pool;
+}
+
 core::Expected<std::unique_ptr<SandboxBackend>, core::AnyError>
 FirecrackerSandboxFactory::Build(const FreshSandboxBuildSpec& spec,
                                  const SandboxLaunchConfig& config) {
@@ -151,10 +160,13 @@ FirecrackerSandboxFactory::Build(const FreshSandboxBuildSpec& spec,
                                 : std::string();
     start.sandbox_id = config.sandbox_id;
     start.firecracker_work_dir = sandbox_config.common.firecracker_work_base_dir;
-    // Rust `capture_output` follows the log level: both or neither, per
-    // `WarmStdioPaths`. Half the diagnostics is worse than none, because it
-    // looks complete.
-    start.capture_output = sandbox_config.common.firecracker_log_level.has_value();
+    // Rust `capture_output = logging_enabled(firecracker_log_level)`: a
+    // blank level counts as unset.
+    start.capture_output = LoggingEnabled(sandbox_config.common.firecracker_log_level);
+    start.serial_output_base_dir = sandbox_config.common.serial_output_base_dir;
+    start.stdout_path = sandbox_config.common.stdout_path;
+    start.stderr_path = sandbox_config.common.stderr_path;
+    start.firecracker_pool = impl_->firecracker_pool;
     start.socket_timeout_ms =
         static_cast<int64_t>(sandbox_config.common.runtime_policy.socket_timeout_ms);
     start.socket_poll_ms =
@@ -163,15 +175,18 @@ FirecrackerSandboxFactory::Build(const FreshSandboxBuildSpec& spec,
         static_cast<int64_t>(sandbox_config.common.runtime_policy.envd_timeout_ms);
     start.envd_poll_ms =
         static_cast<int64_t>(sandbox_config.common.runtime_policy.envd_poll_interval_ms);
+    start.control_plane_port = sandbox_config.common.control_plane_port;
+    start.envd_access_token = sandbox_config.common.envd_access_token;
 
     ConfigurePlan& plan = start.configure;
     plan.mem_size_mib = sandbox_config.mem_size_mib;
     plan.vcpu_count = sandbox_config.vcpu_count;
     plan.track_dirty_pages = sandbox_config.common.track_dirty_pages;
-    if (sandbox_config.common.firecracker_log_level.has_value()) {
+    // Rust `configure_logger` returns early for a blank level.
+    if (LoggingEnabled(sandbox_config.common.firecracker_log_level)) {
         plan.log_level = *sandbox_config.common.firecracker_log_level;
-        // Resolved against the work directory by StartFreshInstance, which is
-        // the only thing that knows where it ended up.
+        // Replaced by StartFreshInstance with `firecracker_log_path()`, which
+        // depends on the work directory only it knows.
         plan.log_path = "firecracker.log";
     }
     if (sandbox_config.common.cpu_config_json.has_value()) {
@@ -289,7 +304,7 @@ FirecrackerSandboxFactory::BuildFromSnapshot(const RunnableSnapshotView& snapsho
     spec.chroot_base_dir = impl_->cfg.chroot_base_dir;
     spec.sandbox_id = config.sandbox_id;
     spec.firecracker_work_dir = snapshot_config.common.firecracker_work_base_dir;
-    spec.capture_output = snapshot_config.common.firecracker_log_level.has_value();
+    spec.capture_output = LoggingEnabled(snapshot_config.common.firecracker_log_level);
     spec.socket_timeout_ms =
         static_cast<int64_t>(snapshot_config.common.runtime_policy.socket_timeout_ms);
     spec.socket_poll_ms =
@@ -314,6 +329,7 @@ FirecrackerSandboxFactory::BuildFromSnapshot(const RunnableSnapshotView& snapsho
     }
     spec.drives = drives.value();
     spec.network_manager = impl_->network_manager;
+    spec.firecracker_pool = impl_->firecracker_pool;
 
     std::unique_ptr<SandboxBackend> backend(
         FirecrackerSandboxBackend::NewResuming(spec, impl_->connector_for_testing));
@@ -351,7 +367,7 @@ FirecrackerSandboxFactory::BuildFromPausedState(
     spec.chroot_base_dir = impl_->cfg.chroot_base_dir;
     spec.sandbox_id = id;
     spec.firecracker_work_dir = snapshot_config.common.firecracker_work_base_dir;
-    spec.capture_output = snapshot_config.common.firecracker_log_level.has_value();
+    spec.capture_output = LoggingEnabled(snapshot_config.common.firecracker_log_level);
     spec.socket_timeout_ms =
         static_cast<int64_t>(snapshot_config.common.runtime_policy.socket_timeout_ms);
     spec.socket_poll_ms =
@@ -375,6 +391,7 @@ FirecrackerSandboxFactory::BuildFromPausedState(
     }
     spec.drives = drives.value();
     spec.network_manager = impl_->network_manager;
+    spec.firecracker_pool = impl_->firecracker_pool;
 
     std::unique_ptr<SandboxBackend> backend(
         FirecrackerSandboxBackend::NewResuming(spec, impl_->connector_for_testing));

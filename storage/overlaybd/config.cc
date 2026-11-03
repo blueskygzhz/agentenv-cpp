@@ -371,9 +371,18 @@ core::Expected<ImageConfig, std::string> ParseImageConfig(const std::string& tex
 }
 
 core::Expected<ImageConfig, std::string> LoadImageConfig(const std::string& path) {
+    // Rust `load_image_config`: read, parse, rebase local paths against the
+    // config's directory, then validate. Callers rely on the rebasing -- an
+    // image.json names its files relative to itself.
     const core::Expected<std::string, std::string> text = core::fs::ReadToString(path);
-    if (!text.ok()) return core::make_unexpected(text.error());
-    return ParseImageConfig(text.value());
+    if (!text.ok()) return core::make_unexpected("reading image config file: " + text.error());
+    core::Expected<ImageConfig, std::string> cfg = ParseImageConfig(text.value());
+    if (!cfg.ok()) return core::make_unexpected("parse image config json failed: " + cfg.error());
+    ImageConfig resolved = cfg.value();
+    ResolveImageConfigLocalPaths(path, &resolved);
+    const core::Expected<core::Unit, std::string> valid = ValidateImageConfig(resolved);
+    if (!valid.ok()) return core::make_unexpected(valid.error());
+    return resolved;
 }
 
 

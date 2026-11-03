@@ -97,6 +97,8 @@ MT_TEST(external_layer_inherits_image_repo_blob_url) {
 }
 
 // Rust's digest fallback chain: digest -> target_digest -> "external:{index}".
+// `load_image_config` validates that every lower names a file/dir/digest, so
+// the fallback is only reachable for a `dir` lower without a digest.
 MT_TEST(external_layer_digest_fallback_chain) {
     TempRoot root;
     PosixFsArtifactStore store(root.path);
@@ -104,8 +106,8 @@ MT_TEST(external_layer_digest_fallback_chain) {
     WriteFile(image,
               "{\"repoBlobUrl\":\"https://r/x\","
               "\"lowers\":["
-              "{\"targetDigest\":\"sha256:target-only\",\"size\":2},"
-              "{\"size\":3}"
+              "{\"dir\":\"layer0\",\"targetDigest\":\"sha256:target-only\",\"size\":2},"
+              "{\"dir\":\"layer1\",\"size\":3}"
               "],\"upper\":{},\"resultFile\":\"\"}");
 
     auto layers = store.DeriveRootfsLayers(image, false);
@@ -120,8 +122,10 @@ MT_TEST(layer_without_file_or_repo_blob_url_is_unsupported) {
     TempRoot root;
     PosixFsArtifactStore store(root.path);
     const std::string image = core::fs::Join(root.path, "image.json");
+    // A digest-only lower without repoBlobUrl is already rejected by
+    // `load_image_config`; Rust reaches `Unsupported` only for a `dir` lower.
     WriteFile(image,
-              "{\"repoBlobUrl\":\"\",\"lowers\":[{\"digest\":\"sha256:x\",\"size\":1}],"
+              "{\"repoBlobUrl\":\"\",\"lowers\":[{\"dir\":\"layer0\",\"size\":1}],"
               "\"upper\":{},\"resultFile\":\"\"}");
 
     auto layers = store.DeriveRootfsLayers(image, false);

@@ -279,29 +279,56 @@ SlotNetworkManager::~SlotNetworkManager() {
 }
 
 SlotNetworkManager& SlotNetworkManager::Global() {
-    std::lock_guard<std::mutex> lg(g_manager_mu);
-    if (g_manager == NULL) {
-        NetworkManagerConfig config;
-        config.address_plan = NetworkAddressPlan::Default();
+    SlotNetworkManager* manager = NULL;
+    {
+        std::lock_guard<std::mutex> lg(g_manager_mu);
+        if (g_manager == NULL) {
+            NetworkManagerConfig config;
+            config.address_plan = NetworkAddressPlan::Default();
 
-        // Rust reads `ConfigManager::global_config()`; fall back to defaults
-        // when the process never loaded a config (tests, tools).
-        const cfg::AppConfig* app = cfg::ConfigManager::GlobalConfig();
-        if (app != NULL) {
-            config.pool      = app->NetworkPoolConfig();
-            config.netns_dir = app->runtime_path + "/netns";
-        } else {
-            config.netns_dir = "/run/aenv/netns";
-        }
-        g_manager = new SlotNetworkManager(config);
+            // Rust reads `ConfigManager::global_config()`; fall back to
+            // defaults when the process never loaded a config (tests, tools).
+            const cfg::AppConfig* app = cfg::ConfigManager::GlobalConfig();
+            if (app != NULL) {
+                config.pool      = app->NetworkPoolConfig();
+                config.netns_dir = app->runtime_path + "/netns";
+                // Rust `.expect(..)`: config loading already validated
+                // `network.internal`, so a failure here is a broken invariant.
+                core::Expected<NetworkAddressPlan, std::string> plan =
+                    cfg::NetworkAddressPlanFromConfig(app->network);
+                if (!plan.ok()) {
+                    AGENTENV_ERROR("validated network.internal config should produce an "
+                                   "address plan: " << plan.error());
+                    std::abort();
+                }
+                config.address_plan = plan.value();
+            } else {
+                config.netns_dir = "/run/aenv/netns";
+            }
+            g_manager = new SlotNetworkManager(config);
 
-        // Registered after construction so the hook never observes a
-        // half-built manager.
-        if (std::atexit(NetworkManagerExitHook) != 0) {
-            AGENTENV_WARN("failed to register network manager process-exit hook");
+            // Registered after construction so the hook never observes a
+            // half-built manager.
+            if (std::atexit(NetworkManagerExitHook) != 0) {
+                AGENTENV_WARN("failed to register network manager process-exit hook");
+            }
         }
+        manager = g_manager;
     }
-    return *g_manager;
+    // Rust `ensure_pool_maintenance_worker_started` — idempotent, and outside
+    // the singleton lock because the first cycle may itself call `Global()`.
+    manager->EnsurePoolMaintenanceWorkerStarted();
+    return *manager;
+}
+
+// Rust `ensure_pool_maintenance_worker_started`.
+void SlotNetworkManager::EnsurePoolMaintenanceWorkerStarted() {
+    pool_.StartMaintenanceWorker([this]() {
+        core::Expected<core::Unit, std::string> cycle = RunPoolMaintenanceCycle();
+        if (!cycle.ok()) {
+            AGENTENV_WARN("network pool maintenance cycle failed: " << cycle.error());
+        }
+    });
 }
 
 SlotNetworkManager* SlotNetworkManager::GlobalIfInitialized() {
@@ -346,7 +373,7 @@ core::Expected<Slot*, std::string> SlotNetworkManager::AllocateSlot(uint32_t idx
     }
 
     core::Expected<Slot*, NetworkError> slot =
-        Slot::New(idx, address_plan_, netns_dir_);
+        Slot::New(idx, address_plan_, netns_dir_, &egress_proxy_);
     if (!slot.ok()) {
         // The index was just validated, so this should not happen; give the
         // bit back rather than leaking it.
@@ -469,7 +496,7 @@ core::Expected<Slot*, std::string> SlotNetworkManager::AllocateFreshSlot() {
     }
 
     core::Expected<Slot*, NetworkError> slot =
-        Slot::New(idx, address_plan_, netns_dir_);
+        Slot::New(idx, address_plan_, netns_dir_, &egress_proxy_);
     if (!slot.ok()) {
         ReleaseSlotBit(idx);
         return core::make_unexpected(slot.error().Message());
@@ -584,6 +611,7 @@ core::Expected<core::Unit, std::string> SlotNetworkManager::Shutdown() {
         }
     }
 
+    egress_proxy_.Shutdown();
     CleanupGlobalHostIptables();
 
     if (failures.empty()) return core::Unit();

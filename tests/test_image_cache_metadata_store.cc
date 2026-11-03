@@ -2,6 +2,10 @@
 // Rust: src/image/cache/graph.rs `mod tests`.
 #include "agentenv/image/cache_metadata_store.h"
 
+#include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>
+
 #include <set>
 #include <string>
 #include <vector>
@@ -92,7 +96,7 @@ MT_TEST(image_cache_meta_p2p_keys_survive_config_reconcile) {
     lowers.push_back(std::make_pair(std::string("sha256:aaa"), static_cast<uint64_t>(11)));
     WriteConfig(config_path, lowers, root.path);
 
-    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(config_path).ok());
+    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(config_path, root.path).ok());
 
     auto record = store->GetHardCommitObject(digest);
     MT_EXPECT_TRUE(record.ok());
@@ -217,7 +221,7 @@ MT_TEST(image_cache_meta_rebuild_from_configs) {
     lowers.push_back(std::make_pair(std::string("sha256:b"), static_cast<uint64_t>(20)));
     WriteConfig(configs + "/app-image.json", lowers, root.path);
 
-    MT_EXPECT_TRUE(store->RebuildFromConfigs(configs).ok());
+    MT_EXPECT_TRUE(store->RebuildFromConfigs(configs, root.path).ok());
 
     auto referrers = store->HardCommitConfigReferrers(Hard("sha256:a"));
     MT_EXPECT_TRUE(referrers.ok());
@@ -233,7 +237,7 @@ MT_TEST(image_cache_meta_rebuild_from_configs) {
 
     // A config that disappears from disk loses its edges on the next rebuild.
     MT_EXPECT_TRUE(core::fs::RemoveFile(configs + "/app-image.json").ok());
-    MT_EXPECT_TRUE(store->RebuildFromConfigs(configs).ok());
+    MT_EXPECT_TRUE(store->RebuildFromConfigs(configs, root.path).ok());
 
     auto gone = store->HardCommitConfigReferrers(Hard("sha256:a"));
     MT_EXPECT_TRUE(gone.ok());
@@ -251,13 +255,13 @@ MT_TEST(image_cache_meta_rebuild_fails_closed_on_malformed_config) {
 
     // Failing closed matters: a partially-built graph would let GC delete a
     // commit that is actually still referenced.
-    MT_EXPECT_TRUE(!store->RebuildFromConfigs(configs).ok());
+    MT_EXPECT_TRUE(!store->RebuildFromConfigs(configs, root.path).ok());
 }
 
 MT_TEST(image_cache_meta_rebuild_on_missing_dir_is_noop) {
     TempRoot root;
     auto store = TestStore(root.path);
-    MT_EXPECT_TRUE(store->RebuildFromConfigs(root.path + "/absent").ok());
+    MT_EXPECT_TRUE(store->RebuildFromConfigs(root.path + "/absent", root.path).ok());
 }
 
 // Rust `plan_capacity_eviction_frees_shared_commit_only_when_all_referrers_evicted`.
@@ -279,8 +283,8 @@ MT_TEST(image_cache_meta_capacity_eviction_shared_commit) {
     second.push_back(std::make_pair(std::string("sha256:two"), static_cast<uint64_t>(20)));
     WriteConfig(configs + "/two-image.json", second, root.path);
 
-    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(configs + "/one-image.json").ok());
-    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(configs + "/two-image.json").ok());
+    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(configs + "/one-image.json", root.path).ok());
+    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(configs + "/two-image.json", root.path).ok());
 
     // Total is 130. Under the high watermark, nothing is planned.
     auto idle = store->PlanCapacityEvictionFromStore(1000, 500, UnixNowSecs() + 60);
@@ -305,7 +309,7 @@ MT_TEST(image_cache_meta_capacity_eviction_respects_evictable_before) {
     std::vector<std::pair<std::string, uint64_t> > lowers;
     lowers.push_back(std::make_pair(std::string("sha256:a"), static_cast<uint64_t>(100)));
     WriteConfig(configs + "/app-image.json", lowers, root.path);
-    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(configs + "/app-image.json").ok());
+    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(configs + "/app-image.json", root.path).ok());
 
     // The config was just touched, so a cutoff in the past excludes it even
     // though the cache is over its watermark.
@@ -329,7 +333,7 @@ MT_TEST(image_cache_meta_config_last_used_is_touched_on_record) {
     MT_EXPECT_TRUE(before.ok());
     MT_EXPECT_TRUE(!before.value().has_value());
 
-    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(configs + "/app-image.json").ok());
+    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(configs + "/app-image.json", root.path).ok());
 
     auto after = store->ConfigLastUsed(id);
     MT_EXPECT_TRUE(after.ok());
@@ -345,7 +349,7 @@ MT_TEST(image_cache_meta_remove_config_refs_clears_edges_and_recency) {
     std::vector<std::pair<std::string, uint64_t> > lowers;
     lowers.push_back(std::make_pair(std::string("sha256:a"), static_cast<uint64_t>(10)));
     WriteConfig(configs + "/app-image.json", lowers, root.path);
-    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(configs + "/app-image.json").ok());
+    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(configs + "/app-image.json", root.path).ok());
 
     const ImageCacheConfigId id = ConfigId("app-image.json");
     MT_EXPECT_TRUE(store->RemoveConfigRefs(id).ok());
@@ -371,8 +375,8 @@ MT_TEST(image_cache_meta_referrer_map_dedups_and_sorts) {
     WriteConfig(configs + "/b-image.json", lowers, root.path);
     WriteConfig(configs + "/a-image.json", lowers, root.path);
 
-    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(configs + "/b-image.json").ok());
-    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(configs + "/a-image.json").ok());
+    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(configs + "/b-image.json", root.path).ok());
+    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(configs + "/a-image.json", root.path).ok());
 
     auto map = store->HardCommitConfigReferrerMap();
     MT_EXPECT_TRUE(map.ok());
@@ -439,7 +443,7 @@ MT_TEST(image_cache_meta_path_is_inside_rejects_sibling_prefix) {
     MT_EXPECT_TRUE(PathIsInside("/a/b/c", "/a/b"));
     MT_EXPECT_TRUE(PathIsInside("/a/b/c", "/a/b/"));
     MT_EXPECT_TRUE(!PathIsInside("/a/bc", "/a/b"));
-    MT_EXPECT_TRUE(!PathIsInside("/a/b", "/a/b"));
+    MT_EXPECT_TRUE(PathIsInside("/a/b", "/a/b"));
     MT_EXPECT_TRUE(!PathIsInside("/a/b/c", ""));
 }
 
@@ -456,6 +460,121 @@ MT_TEST(image_cache_meta_remove_hard_commit_object) {
     auto record = store->GetHardCommitObject(digest);
     MT_EXPECT_TRUE(record.ok());
     MT_EXPECT_TRUE(!record.value().has_value());
+}
+
+// Rust `config_refs_filter_ownership_before_deduplicating_digests`.
+MT_TEST(image_cache_meta_config_refs_filter_ownership_before_dedup) {
+    TempRoot root;
+    auto store = TestStore(root.path);
+    const std::string commits    = root.path + "/custom-commits";
+    const std::string configs    = root.path + "/configs";
+    const std::string repository = root.path + "/repository";
+    const std::string config     = configs + "/mixed-image.json";
+    const std::string local      = commits + "/shared.commit";
+    MT_EXPECT_TRUE(core::fs::CreateDirAll(commits).ok());
+    MT_EXPECT_TRUE(core::fs::CreateDirAll(configs).ok());
+    MT_EXPECT_TRUE(core::fs::CreateDirAll(repository).ok());
+    MT_EXPECT_EQ(::symlink(repository.c_str(), (commits + "/outside").c_str()), 0);
+
+    storage::overlaybd::ImageConfig cfg;
+    const char* const files[]   = {"../repository/shared",
+                                   "../custom-commits/../repository/other", NULL,
+                                   "../custom-commits/outside/other"};
+    const char* const digests[] = {"sha256:shared", "sha256:other", "sha256:shared",
+                                   "sha256:symlink"};
+    const uint64_t    sizes[]   = {7, 9, 7, 9};
+    for (int i = 0; i < 4; ++i) {
+        storage::overlaybd::LayerConfig layer;
+        layer.file   = files[i] != NULL ? std::string(files[i]) : local;
+        layer.digest = digests[i];
+        layer.size   = sizes[i];
+        cfg.lowers.push_back(layer);
+    }
+    MT_EXPECT_TRUE(core::fs::Write(config, storage::overlaybd::ImageConfigToJson(cfg)).ok());
+
+    // The repository copy of `sha256:shared` comes first; filtering by
+    // ownership before deduplication is what keeps the commit-store copy.
+    MT_EXPECT_TRUE(store->RecordConfigRefsFromConfigPath(config, commits).ok());
+    MT_EXPECT_TRUE(store->RebuildFromConfigs(configs, commits).ok());
+
+    auto records = store->ListHardCommitObjects();
+    MT_EXPECT_TRUE(records.ok());
+    MT_EXPECT_EQ(records.value().size(), static_cast<std::size_t>(1));
+    MT_EXPECT_TRUE(records.value()[0].file.has_value());
+    // Rust compares `Path`s component-wise, so "a//b" equals "a/b".
+    MT_EXPECT_EQ(*records.value()[0].file, storage::overlaybd::LexicallyNormalizePath(local));
+
+    auto plan = store->PlanCapacityEvictionFromStore(0, 0, UINT64_MAX);
+    MT_EXPECT_TRUE(plan.ok());
+    MT_EXPECT_EQ(plan.value().total_bytes, static_cast<uint64_t>(7));
+}
+
+// Rust `load_cache_owned_image_config_facts`: relative paths are rebased onto
+// the config's directory, and a local file lower must carry digest + size.
+MT_TEST(image_cache_meta_cache_owned_facts_rebase_and_fail_closed) {
+    TempRoot root;
+    const std::string configs = root.path + "/configs";
+    MT_EXPECT_TRUE(core::fs::CreateDirAll(configs).ok());
+
+    storage::overlaybd::ImageConfig cfg;
+    storage::overlaybd::LayerConfig local;
+    local.file   = "../commits/a/overlaybd.commit";
+    local.digest = "sha256:a";
+    local.size   = 3;
+    cfg.lowers.push_back(local);
+    storage::overlaybd::LayerConfig remote;
+    remote.digest = "sha256:remote";
+    remote.size   = 5;
+    cfg.lowers.push_back(remote);
+    cfg.repo_blob_url = "https://registry.example/v2/app/blobs";
+    cfg.upper.data    = "upper.data";
+    cfg.upper.index   = "upper.index";
+    const std::string path = configs + "/app-image.json";
+    MT_EXPECT_TRUE(core::fs::Write(path, storage::overlaybd::ImageConfigToJson(cfg)).ok());
+
+    auto facts = LoadCacheOwnedImageConfigFacts(path);
+    MT_EXPECT_TRUE(facts.ok());
+    MT_EXPECT_EQ(facts.value().local_file_lowers.size(), static_cast<std::size_t>(1));
+    MT_EXPECT_EQ(storage::overlaybd::LexicallyNormalizePath(
+                     facts.value().local_file_lowers[0].file),
+                 storage::overlaybd::LexicallyNormalizePath(
+                     root.path + "/commits/a/overlaybd.commit"));
+    MT_EXPECT_EQ(facts.value().local_file_lowers[0].size, static_cast<uint64_t>(3));
+    MT_EXPECT_TRUE(facts.value().upper_file.has_value());
+    MT_EXPECT_EQ(storage::overlaybd::LexicallyNormalizePath(*facts.value().upper_file),
+                 storage::overlaybd::LexicallyNormalizePath(configs + "/upper.data"));
+
+    storage::overlaybd::ImageConfig sizeless;
+    storage::overlaybd::LayerConfig no_size;
+    no_size.file   = "blob";
+    no_size.digest = "sha256:x";
+    sizeless.lowers.push_back(no_size);
+    const std::string bad = configs + "/bad-image.json";
+    MT_EXPECT_TRUE(core::fs::Write(bad, storage::overlaybd::ImageConfigToJson(sizeless)).ok());
+    auto rejected = LoadCacheOwnedImageConfigFacts(bad);
+    MT_EXPECT_TRUE(!rejected.ok());
+    MT_EXPECT_TRUE(rejected.error().find("no size") != std::string::npos);
+}
+
+// Rust `stable_path_identity` / `path_is_inside`.
+MT_TEST(image_cache_meta_stable_path_identity_resolves_symlinked_parent) {
+    TempRoot root;
+    const std::string real = root.path + "/real";
+    const std::string link = root.path + "/link";
+    MT_EXPECT_TRUE(core::fs::CreateDirAll(real).ok());
+    MT_EXPECT_EQ(::symlink(real.c_str(), link.c_str()), 0);
+
+    char* canonical_root = ::realpath(root.path.c_str(), NULL);
+    MT_EXPECT_TRUE(canonical_root != NULL);
+    const std::string base(canonical_root != NULL ? canonical_root : "");
+    ::free(canonical_root);
+
+    // The leaf does not exist yet; the nearest existing parent is resolved
+    // through the symlink and the missing tail re-appended.
+    MT_EXPECT_EQ(StablePathIdentity(link + "/x/../missing/leaf"), base + "/real/missing/leaf");
+    MT_EXPECT_TRUE(PathIsInside(link + "/missing", real));
+    // `..` cannot be used to smuggle a sibling inside.
+    MT_EXPECT_TRUE(!PathIsInside(real + "/../sibling", real));
 }
 
 int main() { return microtest::RunAll(); }

@@ -30,6 +30,10 @@
 #include "agentenv/sandbox/firecracker/factory_impl.h"
 #include "agentenv/sandbox/firecracker/paused_state.h"
 #include "agentenv/sandbox/firecracker/sandbox_backend.h"
+#include "agentenv/core/fs.h"
+#include "agentenv/sandbox/firecracker/pool.h"
+#include "agentenv/sandbox/network.h"
+#include "agentenv/sandbox/network/slot.h"
 
 using namespace agentenv;
 using namespace agentenv::sandbox;
@@ -954,6 +958,208 @@ MT_TEST(build_from_snapshot_without_an_app_config_says_so) {
     MT_EXPECT_TRUE(!r.ok());
     if (r.ok()) return;
     MT_EXPECT_TRUE(r.error().chain().find("AppConfig") != std::string::npos);
+}
+
+// ---- adopt_warm_firecracker ----
+
+namespace {
+
+/// A warm entry the way `RealSpawn` builds one -- a running stand-in VMM
+/// answering on its socket in its own work dir -- with a slot that has no
+/// kernel state behind it. `conn` is the connector the warm VMM answers on.
+std::shared_ptr<WarmFirecracker> SpawnWarmEntry(const std::string& dir,
+                                                std::shared_ptr<Connector> conn) {
+    const std::string work = dir + "/warm";
+    if (!core::fs::CreateDirAll(work).ok()) return std::shared_ptr<WarmFirecracker>();
+    std::unique_ptr<FirecrackerInstance> instance(new FirecrackerInstance(work, conn));
+    if (!instance->Spawn(AGENTENV_FAKE_FIRECRACKER, std::string(), std::string()).ok()) {
+        return std::shared_ptr<WarmFirecracker>();
+    }
+    if (!instance->WaitForReady(300, 5).ok()) return std::shared_ptr<WarmFirecracker>();
+    core::Expected<network::Slot*, network::NetworkError> slot =
+        network::Slot::New(7, network::NetworkAddressPlan::Default(), dir + "/netns");
+    if (!slot.ok()) return std::shared_ptr<WarmFirecracker>();
+    return std::shared_ptr<WarmFirecracker>(
+        new WarmFirecracker(slot.value(), std::move(instance), work));
+}
+
+FirecrackerPool::Options OneEntryPool() {
+    FirecrackerPool::Options o;
+    o.pool.low_watermark = 1;
+    o.pool.high_watermark = 1;
+    o.pool.maintenance_enabled = false;
+    o.capture_output = false;
+    return o;
+}
+
+/// Installs a one-shot spawner and fills the pool with its entry.
+void FillWith(FirecrackerPool* pool, const std::shared_ptr<WarmFirecracker>& warm) {
+    pool->SetSpawnForTesting(
+        [warm]() -> core::Expected<std::shared_ptr<WarmFirecracker>, std::string> {
+            if (!warm) return core::make_unexpected(std::string("no warm entry"));
+            return warm;
+        },
+        [](const std::shared_ptr<WarmFirecracker>& entry, bool)
+            -> core::Expected<core::Unit, std::string> {
+            delete entry->GetSlot();
+            return core::Unit();
+        });
+    pool->Prime();
+}
+
+}  // namespace
+
+MT_TEST(a_resume_adopts_a_warm_firecracker_instead_of_spawning) {
+    const std::string dir = MakeTempDir();
+    if (dir.empty()) return;
+
+    std::shared_ptr<ResumeConnector> warm_conn(new ResumeConnector());
+    std::shared_ptr<WarmFirecracker> warm = SpawnWarmEntry(dir, warm_conn);
+    MT_EXPECT_TRUE(warm != NULL);
+    if (!warm) return;
+    network::Slot* warm_slot = warm->GetSlot();
+    const std::string warm_dir = warm->WorkDir();
+
+    FirecrackerPool pool(OneEntryPool(), NULL, NULL);
+    FillWith(&pool, warm);
+    MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 1);
+
+    ResumeStartSpec spec = RunnableSpecIn(dir);
+    spec.firecracker_pool = &pool;
+    std::shared_ptr<ResumeConnector> cold_conn(new ResumeConnector());
+    FreshDriveResources resources;
+    std::unique_ptr<FirecrackerInstance> instance;
+    const core::Expected<core::Unit, std::string> r =
+        StartResumeInstance(spec, cold_conn, &instance, &resources);
+    MT_EXPECT_TRUE(r.ok());
+    if (!r.ok()) {
+        MT_EXPECT_EQ(r.error(), std::string(""));
+        delete resources.network_slot();
+        return;
+    }
+
+    // The warm VMM ran the whole sequence; nothing was cold-spawned.
+    MT_EXPECT_EQ(warm_conn->calls.size(), static_cast<std::size_t>(4));
+    MT_EXPECT_EQ(cold_conn->calls.size(), static_cast<std::size_t>(0));
+    MT_EXPECT_EQ(instance->WorkDir(), warm_dir);
+    MT_EXPECT_TRUE(!core::fs::Exists(spec.chroot_base_dir));
+    // The entry's slot is now this sandbox's, released with its resources.
+    MT_EXPECT_TRUE(resources.network_slot() == warm_slot);
+    MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 0);
+
+    instance.reset();
+    delete resources.network_slot();
+}
+
+MT_TEST(explicit_log_paths_keep_a_resume_on_the_cold_path) {
+    const std::string dir = MakeTempDir();
+    if (dir.empty()) return;
+
+    std::shared_ptr<ResumeConnector> warm_conn(new ResumeConnector());
+    FirecrackerPool pool(OneEntryPool(), NULL, NULL);
+    FillWith(&pool, SpawnWarmEntry(dir, warm_conn));
+    MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 1);
+
+    ResumeStartSpec spec = RunnableSpecIn(dir);
+    spec.firecracker_pool = &pool;
+    // The warm VMM's stdio was fixed at its spawn; a launch that names its
+    // own stdout cannot use it.
+    spec.snapshot_config.common.stdout_path = dir + "/stdout";
+    std::shared_ptr<ResumeConnector> cold_conn(new ResumeConnector());
+    FreshDriveResources resources;
+    std::unique_ptr<FirecrackerInstance> instance;
+    const core::Expected<core::Unit, std::string> r =
+        StartResumeInstance(spec, cold_conn, &instance, &resources);
+    MT_EXPECT_TRUE(r.ok());
+    MT_EXPECT_EQ(cold_conn->calls.size(), static_cast<std::size_t>(4));
+    MT_EXPECT_EQ(warm_conn->calls.size(), static_cast<std::size_t>(0));
+    MT_EXPECT_EQ(static_cast<int>(pool.WarmLen()), 1);
+    // Rust `firecracker_stdio_paths`: an explicit directory is captured even
+    // with logging off.
+    MT_EXPECT_TRUE(core::fs::Exists(dir + "/stdout/firecracker-stdout.log"));
+}
+
+MT_TEST(a_failed_warm_resume_removes_the_adopted_work_dir) {
+    const std::string dir = MakeTempDir();
+    if (dir.empty()) return;
+
+    // The warm VMM refuses the MMDS write, past the load.
+    std::shared_ptr<ResumeConnector> warm_conn(new ResumeConnector("/mmds"));
+    std::shared_ptr<WarmFirecracker> warm = SpawnWarmEntry(dir, warm_conn);
+    MT_EXPECT_TRUE(warm != NULL);
+    if (!warm) return;
+    network::Slot* warm_slot = warm->GetSlot();
+    const std::string warm_dir = warm->WorkDir();
+    FirecrackerPool pool(OneEntryPool(), NULL, NULL);
+    FillWith(&pool, warm);
+
+    ResumeStartSpec spec = RunnableSpecIn(dir);
+    spec.firecracker_pool = &pool;
+    FreshDriveResources resources;
+    std::unique_ptr<FirecrackerInstance> instance;
+    const core::Expected<core::Unit, std::string> r = StartResumeInstance(
+        spec, std::shared_ptr<Connector>(new ResumeConnector()), &instance, &resources);
+    MT_EXPECT_TRUE(!r.ok());
+    MT_EXPECT_TRUE(!instance);
+    // Rust's `TempDir` goes with the failed sandbox; the adopted directory is
+    // its work dir now.
+    MT_EXPECT_TRUE(!core::fs::Exists(warm_dir));
+    // No manager in this test, so the slot was handed back to nobody.
+    MT_EXPECT_TRUE(resources.network_slot() == NULL);
+    delete warm_slot;
+}
+
+// ---- firecracker_*_path ----
+
+MT_TEST(log_paths_default_under_the_work_dir) {
+    const core::SandboxId id = ResumedId();
+    const FirecrackerLogPaths p = ResolveFirecrackerLogPaths(
+        core::Optional<std::string>(), core::Optional<std::string>(),
+        core::Optional<std::string>(), false, id, "/w");
+    MT_EXPECT_EQ(p.default_log_dir, std::string("/w/logs"));
+    MT_EXPECT_EQ(p.logger_path, std::string("/w/logs/firecracker.log"));
+    MT_EXPECT_TRUE(!p.stdout_path.has_value());
+    MT_EXPECT_TRUE(!p.stderr_path.has_value());
+    MT_EXPECT_EQ(p.stdout_target, std::string("/w/logs/firecracker-stdout.log"));
+
+    const FirecrackerLogPaths c = ResolveFirecrackerLogPaths(
+        core::Optional<std::string>(), core::Optional<std::string>(),
+        core::Optional<std::string>(), true, id, "/w");
+    MT_EXPECT_EQ(*c.stdout_path, std::string("/w/logs/firecracker-stdout.log"));
+    MT_EXPECT_EQ(*c.stderr_path, std::string("/w/logs/firecracker-stderr.log"));
+}
+
+MT_TEST(log_paths_follow_the_serial_dir_and_explicit_stdio) {
+    const core::SandboxId id = ResumedId();
+    const FirecrackerLogPaths p = ResolveFirecrackerLogPaths(
+        core::Optional<std::string>("/serial"), core::Optional<std::string>("/out"),
+        core::Optional<std::string>(), false, id, "/w");
+    MT_EXPECT_EQ(p.default_log_dir, "/serial/" + id.ToString());
+    MT_EXPECT_EQ(p.logger_path, "/serial/" + id.ToString() + "/firecracker.log");
+    // Only the explicitly-directed stream is captured with logging off.
+    MT_EXPECT_EQ(*p.stdout_path, std::string("/out/firecracker-stdout.log"));
+    MT_EXPECT_TRUE(!p.stderr_path.has_value());
+}
+
+MT_TEST(relocate_warm_log_moves_and_replaces) {
+    const std::string dir = MakeTempDir();
+    if (dir.empty()) return;
+    const std::string src = dir + "/warm.log";
+    const std::string target = dir + "/logs/firecracker-stdout.log";
+    MT_EXPECT_TRUE(core::fs::Write(src, "warm").ok());
+
+    MT_EXPECT_TRUE(RelocateWarmLog(core::Optional<std::string>(src), target).ok());
+    MT_EXPECT_TRUE(!core::fs::Exists(src));
+    MT_EXPECT_EQ(core::fs::ReadToString(target).value(), std::string("warm"));
+
+    // An existing target is replaced; an absent or identical source is a no-op.
+    MT_EXPECT_TRUE(core::fs::Write(src, "again").ok());
+    MT_EXPECT_TRUE(RelocateWarmLog(core::Optional<std::string>(src), target).ok());
+    MT_EXPECT_EQ(core::fs::ReadToString(target).value(), std::string("again"));
+    MT_EXPECT_TRUE(RelocateWarmLog(core::Optional<std::string>(), target).ok());
+    MT_EXPECT_TRUE(RelocateWarmLog(core::Optional<std::string>(target), target).ok());
+    MT_EXPECT_TRUE(RelocateWarmLog(core::Optional<std::string>(dir + "/none"), target).ok());
+    (void)core::fs::RemoveDirAll(dir);
 }
 
 MT_MAIN

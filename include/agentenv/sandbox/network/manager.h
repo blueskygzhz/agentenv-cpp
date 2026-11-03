@@ -13,6 +13,7 @@
 
 #include "agentenv/core/expected.h"
 #include "agentenv/sandbox/network.h"
+#include "agentenv/sandbox/network/egress_proxy.h"
 #include "agentenv/sandbox/network/slot.h"
 #include "agentenv/warm-pool/pool.h"
 
@@ -108,6 +109,11 @@ class SlotNetworkManager {
     /// configured watermarks.
     core::Expected<core::Unit, std::string> RunPoolMaintenanceCycle();
 
+    /// Rust `ensure_pool_maintenance_worker_started` — starts the background
+    /// refill/drain worker once (no-op when maintenance is disabled).
+    /// `Global()` calls it; `Shutdown` joins the worker.
+    void EnsurePoolMaintenanceWorkerStarted();
+
     /// Rust `compute_maintenance_action`.
     warmpool::PoolMaintenanceAction
         ComputeMaintenanceAction(std::size_t pool_len) const;
@@ -157,6 +163,10 @@ class SlotNetworkManager {
     /// Rust `cleanup_global_host_iptables`.
     void CleanupGlobalHostIptables();
 
+    /// Rust `egress_proxy: Arc<EgressProxy>` — shared by every slot this
+    /// manager builds. Declared first so it is destroyed last, after the
+    /// pooled slots that point at it.
+    EgressProxy          egress_proxy_;
     mutable std::mutex   mu_;
     /// Rust `allocated: AtomicBitSet<..>`; a bitmap over slot indices.
     std::vector<uint64_t> allocated_;

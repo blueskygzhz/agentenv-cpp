@@ -13,12 +13,36 @@
 namespace agentenv {
 namespace core {
 
+/// A typed error carried inside an `AnyError` chain — the counterpart of the
+/// concrete `std::error::Error` an `anyhow::Error` wraps. Recovered with
+/// [`AnyError::Find`], Rust's `chain().find_map(downcast_ref::<T>)`.
+class ErrorPayload {
+ public:
+    virtual ~ErrorPayload() {}
+};
+
 /// Erased error with a message chain. Move-only-ish: shared_ptr internals let
 /// it be freely copied (like `anyhow::Error` cloning by Arc).
 class AnyError {
  public:
     AnyError() = default;
     explicit AnyError(std::string what) : node_(std::make_shared<Node>(std::move(what))) {}
+
+    /// Rust `anyhow::Error::new(typed_error)`: the message plus the typed
+    /// value, which survives any `context` layered on top.
+    AnyError(std::string what, std::shared_ptr<const ErrorPayload> payload)
+        : node_(std::make_shared<Node>(std::move(what))) {
+        node_->payload = std::move(payload);
+    }
+
+    /// Rust `err.chain().find_map(|cause| cause.downcast_ref::<T>())`.
+    template <typename T>
+    const T* Find() const {
+        for (const Node* cur = node_.get(); cur != NULL; cur = cur->source.get()) {
+            if (const T* found = dynamic_cast<const T*>(cur->payload.get())) return found;
+        }
+        return NULL;
+    }
 
     /// Chain a message on top of the current error.
     AnyError context(std::string msg) const {
@@ -54,6 +78,7 @@ class AnyError {
     struct Node {
         std::string what;
         std::shared_ptr<Node> source;
+        std::shared_ptr<const ErrorPayload> payload;
         explicit Node(std::string w) : what(std::move(w)) {}
     };
     std::shared_ptr<Node> node_;

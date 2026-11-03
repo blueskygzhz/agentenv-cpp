@@ -154,7 +154,8 @@ std::string ImageConfigToJson(const ImageConfig& config);
 /// Rust `overlaybd::config::load_image_config` — parses an `image.json`.
 core::Expected<ImageConfig, std::string> ParseImageConfig(const std::string& text);
 
-/// Reads and parses the file at `path`.
+/// Rust `load_image_config` — read, parse, rebase local paths against the
+/// config's directory (`ResolveImageConfigLocalPaths`), then validate.
 core::Expected<ImageConfig, std::string> LoadImageConfig(const std::string& path);
 
 /// Rust `lexically_normalize_path` — collapse `.` and `..` without touching

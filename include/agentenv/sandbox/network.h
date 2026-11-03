@@ -43,8 +43,10 @@ class NetworkManager {
                                                            const SandboxNetworkPolicy& policy) = 0;
 };
 
-/// Rust `prepare_runtime`.
-core::Expected<core::Unit, std::string> PrepareRuntime();
+/// Rust `prepare_runtime` — creates `<runtime_path>/netns` and reclaims
+/// namespace files (prefix `kNetnsPrefix`) left by a previous run: every
+/// stacked bind mount is lazily detached, then the file is removed.
+core::Expected<core::Unit, std::string> PrepareRuntime(const std::string& runtime_path);
 
 // ==== Rust: src/sandbox/network/address_plan.rs ====
 

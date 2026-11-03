@@ -15,6 +15,7 @@
 #include "agentenv/api/server.h"
 #include "agentenv/api_key.h"
 #include "agentenv/core/config.h"
+#include "agentenv/core/fs.h"
 #include "agentenv/core/identity.h"
 #include "agentenv/core/logging.h"
 #include "agentenv/orchestrator/persistence.h"
@@ -26,6 +27,8 @@
 #include "agentenv/privileges.h"
 #include "agentenv/sandbox/backend.h"
 #include "agentenv/sandbox/firecracker/factory_impl.h"
+#include "agentenv/sandbox/firecracker/pool.h"
+#include "agentenv/sandbox/network.h"
 #include "agentenv/sandbox/network/manager.h"
 #include "agentenv/setup.h"
 
@@ -295,11 +298,16 @@ int main(int argc, char** argv) {
     // sandbox from the previous run would be invisible while its artifacts
     // stayed on disk, so nothing could resume them and nothing would collect
     // them either.
+    //
+    // Rust `ConfigManager::init_global_from_path`: installed as the global so
+    // the process-wide singletons that read `global_config()` --
+    // `SlotNetworkManager::Global()` takes `runtime_path` and the network pool
+    // from it -- see the same config the factory does.
     ae::cfg::AppConfig app_cfg;
     {
-        auto mgr = ae::cfg::ConfigManager::NewFromPath(cfg_path);
+        auto mgr = ae::cfg::ConfigManager::InitGlobalFromPath(cfg_path);
         if (mgr.ok()) {
-            app_cfg = mgr.value().config();
+            app_cfg = mgr.value()->config();
         } else {
             AGENTENV_WARN("app config defaults: " << mgr.error());
         }
@@ -333,6 +341,31 @@ int main(int argc, char** argv) {
             AGENTENV_ERROR(cleared.error());
             return 1;
         }
+    }
+
+    // Rust `setup::ensure_environment` (`server.rs:94`), its networking steps:
+    // the runtime directory, reclaiming namespaces a previous run left
+    // mounted, the IPv4-forwarding precondition, and the capacity report.
+    // All run before the network manager exists, so no live slot can be
+    // mistaken for a stale one.
+    {
+        auto runtime_dir = ae::core::fs::CreateDirAll(app_cfg.runtime_path);
+        if (!runtime_dir.ok()) {
+            AGENTENV_ERROR("create AENV runtime directory " << app_cfg.runtime_path << ": "
+                                                            << runtime_dir.error());
+            return 1;
+        }
+        auto netns = ae::sandbox::network::PrepareRuntime(app_cfg.runtime_path);
+        if (!netns.ok()) {
+            AGENTENV_ERROR("prepare AENV network namespace runtime directory: " << netns.error());
+            return 1;
+        }
+        auto forwarding = ae::setup::CheckIpForwarding();
+        if (!forwarding.ok()) {
+            AGENTENV_ERROR(forwarding.error());
+            return 1;
+        }
+        ae::setup::network_capacity::Check();
     }
 
     auto store = std::shared_ptr<ae::orchestrator::MetadataStore>(
@@ -382,6 +415,17 @@ int main(int argc, char** argv) {
     // here rather than on first allocation so a missing CAP_NET_ADMIN is
     // reported at startup (construction only warns, as Rust does).
     fc_factory->SetNetworkManager(&ae::sandbox::network::SlotNetworkManager::Global());
+    // Rust `FirecrackerPool::prime(10s)` (`server.rs:103`): pre-spawn VMMs in
+    // their own slots so resumes skip the spawn and socket wait. Best-effort;
+    // a disabled or failing pool leaves resumes on the cold path.
+    {
+        auto primed = ae::sandbox::firecracker::FirecrackerPool::PrimeGlobal(10 * 1000);
+        if (!primed.ok()) {
+            AGENTENV_WARN("firecracker pool prime failed; continuing startup: "
+                          << primed.error());
+        }
+        fc_factory->SetFirecrackerPool(ae::sandbox::firecracker::FirecrackerPool::Global());
+    }
     auto factory = std::shared_ptr<ae::sandbox::SandboxBackendFactory>(fc_factory);
 
     auto built = ae::orchestrator::Orchestrator::New(store, factory, persister, app_cfg);
@@ -510,9 +554,9 @@ int main(int argc, char** argv) {
     // 6) Graceful shutdown.
     //
     // Rust `server.rs:191-230` tears down in a fixed order. Of that sequence,
-    // only the orchestrator and the p2p transport exist in this port; the
-    // startup-manifest drain, image-build cleanup, observability reporter,
-    // firecracker pool, ublk daemon and overlaybd p2p runtime are either
+    // the orchestrator, the firecracker pool and the p2p transport exist in
+    // this port; the startup-manifest drain, image-build cleanup,
+    // observability reporter, ublk daemon and overlaybd p2p runtime are either
     // unported or have no global handle to stop. Their absence is a known gap,
     // not something this function can paper over.
     if (g_shutdown_signal != 0) {
@@ -525,6 +569,16 @@ int main(int argc, char** argv) {
     if (!orch_stopped.ok()) {
         AGENTENV_WARN("error occurred while shutting down orchestrator: "
                       << orch_stopped.error().Message());
+    }
+
+    if (ae::sandbox::firecracker::FirecrackerPool* pool =
+            ae::sandbox::firecracker::FirecrackerPool::Global()) {
+        AGENTENV_INFO("shutting down firecracker pool");
+        auto pool_stopped = pool->Shutdown(false);
+        if (!pool_stopped.ok()) {
+            AGENTENV_WARN("error occurred while shutting down firecracker pool: "
+                          << pool_stopped.error());
+        }
     }
 
     AGENTENV_INFO("shutting down p2p transport");

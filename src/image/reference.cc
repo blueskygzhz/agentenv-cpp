@@ -16,17 +16,17 @@ core::Expected<T, ImageError> InvalidRef(const std::string& message) {
     return core::make_unexpected(InvalidReference(message));
 }
 
+/// Rust `str::trim` over the ASCII range: `char::is_whitespace` also accepts
+/// vertical tab and form feed, so both are stripped here too.
+bool IsTrimSpace(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
+}
+
 std::string Trim(const std::string& text) {
     std::size_t begin = 0;
     std::size_t end = text.size();
-    while (begin < end && (text[begin] == ' ' || text[begin] == '\t' || text[begin] == '\n' ||
-                           text[begin] == '\r')) {
-        ++begin;
-    }
-    while (end > begin && (text[end - 1] == ' ' || text[end - 1] == '\t' ||
-                           text[end - 1] == '\n' || text[end - 1] == '\r')) {
-        --end;
-    }
+    while (begin < end && IsTrimSpace(text[begin])) ++begin;
+    while (end > begin && IsTrimSpace(text[end - 1])) --end;
     return text.substr(begin, end - begin);
 }
 
