@@ -619,6 +619,24 @@ std::string OssClient::ObjectUrl(const std::string& key) const {
     return "s3://" + config_.bucket + "/" + FullKey(key);
 }
 
+RepositoryResult<core::Unit> OssClient::DeletePrefix(const std::string& prefix) {
+    // `ListKeysRecursive` yields repository-relative keys with the configured
+    // backend prefix already stripped, and `Delete` re-applies it. Passing
+    // full keys through would prefix them twice and delete nothing while
+    // reporting success.
+    const RepositoryResult<std::vector<std::string> > keys = ListKeysRecursive(prefix);
+    if (!keys.ok()) return core::make_unexpected(keys.error());
+
+    for (std::size_t i = 0; i < keys.value().size(); ++i) {
+        const RepositoryResult<core::Unit> deleted = Delete(keys.value()[i]);
+        // Stops at the first failure rather than continuing: the caller
+        // deletes the owning record next, and doing that after a partial
+        // removal would strand whatever is left.
+        if (!deleted.ok()) return core::make_unexpected(deleted.error());
+    }
+    return core::Unit();
+}
+
 RepositoryResult<uint64_t> OssClient::GetToFile(const std::string& key,
                                                 const std::string& destination) const {
     const std::string full = FullKey(key);

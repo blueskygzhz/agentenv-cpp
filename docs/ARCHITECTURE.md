@@ -168,12 +168,30 @@ earlier revision of this section listed `LocalRepository` / `S3Repository` /
   `PosixFsArtifactStore`, rooted at
   `{backend.posix_fs.snapshot_store}/repository`) and
   `InMemorySnapshotRepository` (tests).
+- **The posix-fs record layer now comes from the shared catalog.** Upstream's
+  `backends/posixfs/catalog.rs` has *only* document methods; records come from
+  the shared document-backed catalog (ported as `record_catalog.h`, see
+  section 7). `PosixFsCatalogStore` used to carry a second record
+  implementation of its own — record paths, alias bindings, `flock` — over the
+  very same files; those methods are gone and
+  `PosixFsSnapshotRepository` forwards to `record_catalog` as the OSS backend
+  does. No migration was needed: `DocumentKey::SnapshotRecord(id).PosixPath()`
+  resolves to `catalog/records/<id>.json` and its lock to
+  `catalog/records/<id>.lock`, which is byte for byte what the removed code
+  used, and an alias is still `catalog/aliases/<name>` holding the owner's
+  uuid. (An earlier revision of this document claimed the two layouts did not
+  share a key space and that records written here were invisible to a Rust
+  node. That was wrong — the paths were always identical.) What the move did
+  fix is four behavioural divergences the local copy had: the `deleting`
+  marker did not gate reads, a failed alias claim left the record behind,
+  records were written compact rather than pretty, and `delete` only unlinked
+  files instead of running upstream's full sequence.
 - `main.cc` constructs the posix-fs pair directly. `MakePosixFsRepository`
   still returns the in-memory stub (it has no `OverlaybdLayerStore` or
   `LocalArtifactCache` to build the real one with), while
   `MakeOssRepository(const cfg::OssBackendConfig&)` now builds a real
-  `OssSnapshotRepository`. So **`[backend.oss]` is reachable for documents and
-  blobs, but not for snapshot records** — see the OSS section below.
+  `OssSnapshotRepository`. So **`[backend.oss]` is reachable for documents,
+  blobs and snapshot records** — see the OSS section below.
 - The OSS document layer (`repository/oss/documents.{h,cc}`) is ported: shared
   catalog documents are serialised across nodes with an **ETag
   compare-and-swap** (read with a version token, write `If-Match`, create with
@@ -187,10 +205,13 @@ earlier revision of this section listed `LocalRepository` / `S3Repository` /
     create-only, which can never succeed while the object exists — a hot
     document would stop being updatable.
   - An **append-only** store (Alibaba's native OSS) cannot write
-    conditionally; upstream serialises writes there with a document lease.
-    That lease is not ported, so such a store is *refused* rather than run
-    through the CAS: a precondition the store ignores is no guarantee at all,
-    and the lost update would leave no symptom.
+    conditionally, so such a store is *refused* rather than run through the
+    CAS: a precondition the store ignores is no guarantee at all, and the lost
+    update would leave no symptom. Upstream serialises writes there with a
+    document lease, and **that lease is now ported**
+    (`repository/oss/lease.{h,cc}`, section 7a); what is still missing is the
+    one store operation it stands on — see that section — so the refusal
+    stays in the document layer rather than surfacing from inside an acquire.
 - `OssClient` (`repository/oss/client.{h,cc}`) is the S3/MinIO `ObjectStore`
   over HTTP: SigV4-signed GET / PUT / DELETE / ListObjectsV2 on the existing
   `http::Transport` and `S3SigningContext`, with the transport injected so
@@ -222,20 +243,8 @@ earlier revision of this section listed `LocalRepository` / `S3Repository` /
     first does.
 - `OssSnapshotRepository` (`repository/oss/repository.{h,cc}`) assembles the
   two halves behind `SnapshotRepository`, and `MakeOssRepository` returns it.
-  - **The record half is refused, not answered.** Upstream's `Repository`
-    trait has no record methods at all: `create` / `get` / `list` / `delete` /
-    `resolve_alias` / `try_start_build` / `mark_build_error` come from the
-    backend-agnostic `impl<R: Repository> SnapshotCatalog for R`
-    (`src/snapshot/catalog.rs`), which stores each record as an ordinary
-    *document*. That layer is not ported — this tree's posix-fs backend
-    answers the record methods from its own on-disk layout instead — so there
-    is nothing to reuse here, and inventing a second record layout would put
-    records under a key space the Rust server does not read. Each of the seven
-    reports `Unsupported`, and the refusals are deliberately not
-    interchangeable with a benign answer: `Get` returning `None` would make a
-    published snapshot look deleted, `List` returning empty would make a whole
-    catalog look empty, and `Delete` reporting success would strand what it
-    cannot see.
+  Its record methods forward to the shared catalog below; only `Delete` is
+  still refused.
   - The document half being complete is what makes the volume catalog
     (`volume/catalog.h`, built on documents exactly as upstream) usable over
     object storage today.
@@ -256,6 +265,111 @@ earlier revision of this section listed `LocalRepository` / `S3Repository` /
     exists because that code signs through the global libcurl transport and
     cannot be driven by the client's injected one: routing stays testable
     without a server, and the protocol stays one implementation.
+- `record_catalog.{h,cc}` is the record layer **every** backend shares (Rust
+  `impl<R: Repository + ?Sized> SnapshotCatalog for R`, `src/snapshot/catalog.rs`).
+  Upstream's `Repository` trait has no record methods: a snapshot record is an
+  ordinary *document*, and `create` / `get` / `list` / `resolve_alias` /
+  `try_start_build` / `mark_build_error` come from one blanket impl over the
+  document methods. A free-function set here, since C++11 has no blanket impl;
+  a backend forwards its record methods to it, and the forwarding cannot
+  recurse because these functions call only the document methods.
+  - Why it matters that this is shared and not per-backend: every backend then
+    keeps records under the *same* key space, which is the only reason a node
+    on one backend can read a catalog written by a node on another.
+  - `UpdateRecord` runs its decision function **twice** — once inside the
+    atomic update to choose what to write, once on the state the write was
+    actually applied to, to produce the answer. That is what makes the
+    reported outcome describe the state the write landed on rather than the
+    state first read, which on a contended record are different; it is also
+    why the function must be pure.
+  - `deleting` gates everything: `get`, `resolve_alias`, `list`,
+    `try_start_build` and `mark_build_error` all treat a marked record as
+    absent, because its artifacts may already be gone and a caller that
+    resumed from them would fail as if they were corrupt. The record itself
+    stays readable by id so a retried delete can finish.
+  - `create` claims the alias *after* writing the record and rolls the record
+    back if the claim is lost, since a record holding an alias it does not own
+    is findable by id, invisible by name, and reconciled by nothing.
+  - `claim_alias` yields to a *live* owner only. An alias whose snapshot is
+    gone is cleaned up on sight (`alias_owner`), or a name left behind by a
+    half-finished delete would be blocked forever.
+  - `list` fails on a record that will not parse rather than skipping it: a
+    quietly short catalog is indistinguishable from a smaller one.
+  - `delete` runs upstream's full sequence: mark `deleting` → release the
+    alias → remove the artifacts (`Repository::delete_snapshot_blobs`) →
+    delete the build log → delete the record. The order *is* the recovery
+    story: every step is idempotent, the record is the only thing that names
+    those files, so it must outlive them, and a marked record is already
+    invisible to readers while it waits for the retry. Reversing the last two
+    would leave an unreferenced directory nothing could find again.
+    - Deleting by an id whose record is already gone still removes the build
+      log, which is how an attempt that died right after the record was
+      removed gets finished.
+    - A snapshot with a **disk-image publication** is refused, from *inside*
+      the atomic update so the record is not even marked: rolling a
+      publication back needs Rust's `AcrDiskImageExporter`, which is not
+      ported, and marking-then-stopping would hide the snapshot from every
+      read while its image stayed live in the registry.
+  - `delete_snapshot_blobs` is the backend's own half. `posixfs` removes the
+    snapshot directory and `fsync`s its parent (without that, a crash could
+    leave the record durably deleted and the files resurrected as garbage);
+    `oss` lists and deletes the snapshot's key prefix **with a trailing
+    slash**, without which the prefix of one id also matches any id that
+    starts with it. A missing file or object is success, because this runs
+    before the record is deleted and has to be retryable. Content-addressed
+    **managed layers stay** in both: they live outside the snapshot and may
+    belong to other snapshots.
+  - Also not ported from that file: `publish` / `publish_with_local_layers` /
+    `commit` / `attach_startup_manifest`, which need `publish.rs` and
+    `store.rs`.
+  - Both backends answer their record methods from here. `posixfs` used to
+    keep a second implementation over the same files; it is gone — see
+    section 5.
+
+### 7a. The OSS document lease
+
+- `repository/oss/lease.{h,cc}` (Rust `backends/oss/lease.rs`) is what
+  upstream uses where there is no conditional write: Alibaba's native OSS.
+  A document's lock is an **appendable object of JSON lines** under `locks/`,
+  a prefix older nodes never list. OSS appends only at an object's current
+  length, so of two appends at one length exactly one lands.
+  - Each line is a frame naming the offset it must land at and the holder it
+    replaces. A frame counts only if *both* match, which is what makes a claim
+    appended from an outdated view inert — including the case where the lock
+    was deleted and grew back to the same length under someone else. The last
+    frame that counts holds the lock.
+  - A line that does not parse is **skipped but still counted** towards the
+    offsets: another version may append lines this build cannot read, and both
+    views must still agree on where the next append lands.
+  - An append that reports no offset may still have landed, so a claim is
+    confirmed by **reading the object back**, never by the reply alone — the
+    one exception being an append that landed at offset 0 of an object that
+    did not exist, which cannot be anyone else's.
+  - A holder that died never releases, so a contender that has seen the *same*
+    holder for 30 s takes the lock over. A merely slow holder cannot be
+    stopped, so holders bound themselves: `Lease::deadline_ms` is 10 s before
+    any contender may take over, dated from when the claiming append was
+    **sent** (not confirmed), and every write made under the lease must start
+    before it. `static_assert` keeps that margin larger than two write
+    attempts, because a write may take a second one after refreshing
+    credentials.
+  - `Release` deletes the lock object, and reports nothing: a release that
+    could not be made durable is logged and the lock left to expire, because
+    failing here would make a write that *did* land look like it had not.
+  - Upstream bounds an acquire with `tokio::time::timeout`, which cancels the
+    request in flight. Nothing here can cancel a blocking call, so the budget
+    is checked between attempts and the bound becomes 75 s plus the one
+    request already in flight.
+  - **What is still missing**: `LockStore::AppendLock`. Appending is Alibaba's
+    own `AppendObject`, signed with `OSS4-HMAC-SHA256` against an
+    `oss-<region>.aliyuncs.com` endpoint — a different service from the S3
+    REST API `OssClient` speaks, which is why upstream builds a second
+    opendal operator (`native_oss`) for it. Until that transport exists the
+    document layer keeps refusing an append-only store.
+  - Tests (`tests/test_oss_lease.cc`) split the two halves the way the port
+    does: the timing rules run on an injected virtual clock (a 30 s lease
+    cannot be waited out for real), and mutual exclusion runs on 16 real
+    threads, because two appends actually racing is the whole point.
 - Cross-node sharing therefore means *one shared POSIX filesystem*. Durable
   state (catalog documents, managed layers) lives in the repository and is
   serialised with `flock` + `mkstemp`/`rename` + read-modify-write CAS;

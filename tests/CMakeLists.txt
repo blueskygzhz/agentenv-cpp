@@ -110,6 +110,8 @@ agentenv_add_test(test_oss_client       test_oss_client.cc       agentenv-snapsh
 agentenv_add_test(test_oss_repository   test_oss_repository.cc   agentenv-snapshot agentenv-volume-record agentenv-cfg)
 # Rust: src/snapshot/catalog.rs — the record layer every backend shares.
 agentenv_add_test(test_record_catalog   test_record_catalog.cc   agentenv-snapshot agentenv-volume-record agentenv-cfg)
+# Rust: src/repository/backends/oss/lease.rs — the append-only lease.
+agentenv_add_test(test_oss_lease        test_oss_lease.cc        agentenv-snapshot agentenv-volume-record agentenv-cfg)
 # Rust: src/image/local_layer.rs
 agentenv_add_test(test_image_local_layer   test_image_local_layer.cc   agentenv-image)
 agentenv_add_test(test_image_commit_index  test_image_commit_index.cc  agentenv-image)

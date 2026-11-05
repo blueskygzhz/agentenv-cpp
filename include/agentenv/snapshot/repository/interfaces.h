@@ -159,8 +159,7 @@ class SnapshotRepository {
     // --- blobs (Rust src/repository/interfaces.rs; default bodies returning
     // `unsupported("blob storage")`, `None` for the URL) -----------------------
     //
-    // Rust's `delete_snapshot_blobs` and `staging_file` are not ported yet;
-    // nothing in this tree calls them.
+    // Rust's `staging_file` is not ported; nothing in this tree calls it.
 
     /// Rust `managed_layers_repo_blob_url` — set when readers address managed
     /// layers by URL.
@@ -191,6 +190,17 @@ class SnapshotRepository {
     /// published yet" from a transport failure.
     virtual RepositoryResult<uint64_t> FetchBlob(const BlobKey& key,
                                                  const std::string& destination);
+
+    /// Rust `delete_snapshot_blobs` — removes every file of one snapshot.
+    ///
+    /// Shared managed layers **stay**: they are content-addressed and may
+    /// belong to other snapshots, so removing them here would break a
+    /// snapshot nobody deleted. Only the per-snapshot directory goes.
+    ///
+    /// A missing file is success, because this runs before the record is
+    /// deleted and must be retryable: a delete that failed partway is
+    /// finished by running it again.
+    virtual RepositoryResult<core::Unit> DeleteSnapshotBlobs(const core::SnapshotId& id);
 };
 
 /// Rust `repository::materialize_volume_backing` (layer_config.rs) — writes a

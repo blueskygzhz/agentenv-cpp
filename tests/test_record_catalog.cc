@@ -495,4 +495,180 @@ MT_TEST(releasing_a_missing_alias_is_success) {
     MT_EXPECT_TRUE(record_catalog::ReleaseAlias(f.Repo(), Alias("base"), Id(kIdA)).ok());
 }
 
+// ---- delete --------------------------------------------------------------
+
+MT_TEST(delete_marks_frees_the_alias_and_then_removes_the_record) {
+    Fixture f;
+    SnapshotRecord record = WaitingTemplate(kIdA, core::Optional<std::string>("base"));
+    MT_EXPECT_TRUE(record_catalog::Create(f.Repo(), record).ok());
+    f.server.Seed(DocumentKey::BuildLog(Id(kIdA)).Path(), "build output");
+
+    MT_EXPECT_TRUE(record_catalog::Delete(f.Repo(), kIdA).ok());
+
+    MT_EXPECT_TRUE(!f.Stored(kIdA).has_value());
+    MT_EXPECT_TRUE(!f.HasAlias("base"));
+    // The log goes with the record: it is addressed by the same id, so
+    // leaving it would make the next snapshot reusing that id inherit it.
+    MT_EXPECT_TRUE(f.server.bodies.count(DocumentKey::BuildLog(Id(kIdA)).Path()) == 0);
+}
+
+// Deleting by alias must reach the same record, otherwise a caller holding
+// only the name could not delete anything.
+MT_TEST(delete_accepts_an_alias) {
+    Fixture f;
+    MT_EXPECT_TRUE(
+        record_catalog::Create(f.Repo(), WaitingTemplate(kIdA, core::Optional<std::string>("base")))
+            .ok());
+    MT_EXPECT_TRUE(record_catalog::Delete(f.Repo(), "base").ok());
+    MT_EXPECT_TRUE(!f.Stored(kIdA).has_value());
+}
+
+// Already gone is success, and the by-id retry still removes the build log:
+// a previous attempt that died right after the record was removed left the
+// log behind, and nothing else would ever address it.
+MT_TEST(delete_finishes_a_previous_attempt_that_only_lost_its_record) {
+    Fixture f;
+    f.server.Seed(DocumentKey::BuildLog(Id(kIdA)).Path(), "build output");
+
+    MT_EXPECT_TRUE(record_catalog::Delete(f.Repo(), kIdA).ok());
+    MT_EXPECT_TRUE(f.server.bodies.count(DocumentKey::BuildLog(Id(kIdA)).Path()) == 0);
+}
+
+// A record already marked is resumed rather than skipped: the mark means an
+// earlier attempt stopped partway, and the cleanup after it still has to run.
+MT_TEST(delete_resumes_from_a_record_already_marked) {
+    Fixture f;
+    SnapshotRecord marked = WaitingTemplate(kIdA, core::Optional<std::string>("base"));
+    marked.deleting = true;
+    f.SeedRecord(marked);
+    f.SeedAlias("base", kIdA);
+
+    MT_EXPECT_TRUE(record_catalog::Delete(f.Repo(), kIdA).ok());
+    MT_EXPECT_TRUE(!f.Stored(kIdA).has_value());
+    MT_EXPECT_TRUE(!f.HasAlias("base"));
+}
+
+MT_TEST(delete_leaves_an_alias_that_now_belongs_to_another_snapshot) {
+    Fixture f;
+    SnapshotRecord stale = WaitingTemplate(kIdA, core::Optional<std::string>("base"));
+    f.SeedRecord(stale);
+    // The name was rebound to another snapshot since this record named it.
+    f.SeedAlias("base", kIdB);
+
+    MT_EXPECT_TRUE(record_catalog::Delete(f.Repo(), kIdA).ok());
+    MT_EXPECT_TRUE(!f.Stored(kIdA).has_value());
+    MT_EXPECT_TRUE(f.HasAlias("base"));
+}
+
+// Refused from inside the atomic update, so the record is not even marked.
+// Upstream rolls each publication back through `AcrDiskImageExporter`, which
+// is not ported; marking and then stopping would hide the snapshot from every
+// read while its image stayed live in the registry.
+MT_TEST(delete_refuses_a_snapshot_with_a_published_disk_image_without_marking_it) {
+    Fixture f;
+    SnapshotRecord record = WaitingTemplate(kIdA, core::nullopt);
+    CommittedSnapshot committed;
+    PersistedDiskImagePublication publication;
+    publication.image_ref = "registry.example.com/env";
+    publication.tag = "1";
+    publication.manifest_digest = "sha256:" + std::string(64, 'a');
+    publication.repo_blob_url = "https://registry.example.com/v2/env/blobs/";
+    committed.disk_publications.push_back(publication);
+    record.committed = core::Optional<CommittedSnapshot>(committed);
+    f.SeedRecord(record);
+
+    const RepositoryResult<core::Unit> refused = record_catalog::Delete(f.Repo(), kIdA);
+    MT_EXPECT_TRUE(!refused.ok());
+    MT_EXPECT_TRUE(!refused.ok() && refused.error().kind == RepositoryErrorKind::Unsupported);
+    MT_EXPECT_TRUE(f.Stored(kIdA).has_value());
+    MT_EXPECT_TRUE(f.Stored(kIdA).has_value() && !f.Stored(kIdA)->deleting);
+}
+
+namespace {
+
+/// A repository whose blob removal always fails, over a real one.
+///
+/// Only the methods the record layer actually reaches are forwarded. The rest
+/// keep the base class's "unsupported" answers, so a call this decorator did
+/// not anticipate surfaces as a failure instead of passing silently.
+struct BlobRemovalFails : public SnapshotRepository {
+    SnapshotRepository& inner;
+
+    explicit BlobRemovalFails(SnapshotRepository& inner) : inner(inner) {}
+
+    RepositoryResult<core::Unit> DeleteSnapshotBlobs(const core::SnapshotId&) {
+        return core::make_unexpected(RepositoryError::Backend("remove snapshot files", "EIO"));
+    }
+
+    RepositoryResult<core::Optional<std::string> > GetDocument(const DocumentKey& key) {
+        return inner.GetDocument(key);
+    }
+    RepositoryResult<core::Unit> PutDocument(const DocumentKey& key, const std::string& bytes) {
+        return inner.PutDocument(key, bytes);
+    }
+    RepositoryResult<core::Optional<std::string> > UpdateDocument(const DocumentKey& key,
+                                                                  const DocumentUpdate& update) {
+        return inner.UpdateDocument(key, update);
+    }
+    RepositoryResult<core::Unit> DeleteDocument(const DocumentKey& key) {
+        return inner.DeleteDocument(key);
+    }
+    RepositoryResult<std::vector<std::pair<std::string, std::string> > > ReadDocuments(
+        DocumentCollection collection) {
+        return inner.ReadDocuments(collection);
+    }
+
+    // The record methods are what a backend contributes, and they are what is
+    // under test, so they go through the shared layer exactly as a backend's
+    // do.
+    RepositoryResult<SnapshotRecord> Create(const SnapshotRecord& record) {
+        return record_catalog::Create(*this, record);
+    }
+    RepositoryResult<core::Optional<SnapshotRecord> > Get(const std::string& id_or_alias) {
+        return record_catalog::Get(*this, id_or_alias);
+    }
+    RepositoryResult<std::vector<SnapshotRecord> > List(const SnapshotListFilter& filter) {
+        return record_catalog::List(*this, filter);
+    }
+    RepositoryResult<core::Unit> Delete(const std::string& id_or_alias) {
+        return record_catalog::Delete(*this, id_or_alias);
+    }
+    RepositoryResult<core::Optional<core::SnapshotId> > ResolveAlias(const std::string& alias) {
+        return record_catalog::ResolveAlias(*this, alias);
+    }
+    RepositoryResult<SnapshotRecord> TryStartBuild(const core::SnapshotId& id) {
+        return record_catalog::TryStartBuild(*this, id);
+    }
+    RepositoryResult<core::Unit> MarkBuildError(const core::SnapshotId& id,
+                                                const TemplateBuildErrorReason& reason) {
+        return record_catalog::MarkBuildError(*this, id, reason);
+    }
+};
+
+}  // namespace
+
+// The files go before the record, so a failure there must leave the record
+// behind. The record is the only thing that names those files: removing it
+// first and failing here would leave them unreferenced, with nothing able to
+// find them again.
+MT_TEST(delete_keeps_the_record_when_the_files_cannot_be_removed) {
+    Fixture f;
+    BlobRemovalFails repository(f.Repo());
+    MT_EXPECT_TRUE(
+        record_catalog::Create(repository, WaitingTemplate(kIdA, core::Optional<std::string>("base")))
+            .ok());
+
+    const RepositoryResult<core::Unit> failed = record_catalog::Delete(repository, kIdA);
+    MT_EXPECT_TRUE(!failed.ok());
+
+    // Still there -- but marked, so it is already invisible to readers while
+    // it waits for the retry.
+    MT_EXPECT_TRUE(f.Stored(kIdA).has_value());
+    MT_EXPECT_TRUE(f.Stored(kIdA).has_value() && f.Stored(kIdA)->deleting);
+    MT_EXPECT_TRUE(!record_catalog::Get(repository, kIdA).value().has_value());
+    // The alias was released before the files, so the name is reusable even
+    // though the delete is unfinished.
+    MT_EXPECT_TRUE(!f.HasAlias("base"));
+}
+
 MT_MAIN

@@ -3,6 +3,7 @@
 #include "agentenv/snapshot/repository/posixfs/backend.h"
 
 #include "agentenv/core/fs.h"
+#include "agentenv/snapshot/repository/record_catalog.h"
 
 namespace agentenv {
 namespace snapshot {
@@ -44,52 +45,65 @@ std::shared_ptr<SnapshotRepository> PosixFsBackend::repository() {
 // ---------------------------------------------------------------------------
 // Rust `impl SnapshotRepository for PosixFsSnapshotRepository`
 //
-// Each method is the `*_sync` body upstream: a forward to the catalog store.
-// Now that the boundary types are the real ones, the forwards are direct --
-// there is nothing left to convert.
+// The record methods forward to the **shared** catalog (`record_catalog.h`),
+// which is where they live upstream: `backends/posixfs/catalog.rs` has only
+// document methods, and records come from the backend-agnostic
+// `impl<R: Repository> SnapshotCatalog for R`. This backend used to carry its
+// own second implementation of them.
+//
+// Nothing about the on-disk layout changes. The shared layer writes a record
+// through `PutDocument`/`UpdateDocument`, which resolve
+// `DocumentKey::SnapshotRecord(id).PosixPath()` to `catalog/records/<id>.json`
+// and lock `catalog/records/<id>.lock` -- byte for byte the paths the removed
+// code used, including `catalog/aliases/<name>` for an alias binding and its
+// `"<uuid>"` JSON body.
+//
+// What *does* change is behaviour, and every difference was a divergence from
+// upstream: a record marked `deleting` is now hidden from `Get`, `List`,
+// `ResolveAlias` and both build transitions (it used to be handed out and
+// could be started as a build while its files were being removed); a failed
+// alias claim in `Create` now rolls the record back; a record is encoded
+// pretty, as `encode_record` does; and `Delete` now performs upstream's full
+// sequence instead of just dropping the record.
+//
+// The forwarding cannot recurse: `record_catalog` calls only the document and
+// blob methods below.
 // ---------------------------------------------------------------------------
 
 RepositoryResult<SnapshotRecord>
 PosixFsSnapshotRepository::Create(const SnapshotRecord& record) {
-    return catalog_store_->Create(record);
+    return record_catalog::Create(*this, record);
 }
 
 RepositoryResult<core::Optional<SnapshotRecord> >
 PosixFsSnapshotRepository::Get(const std::string& id_or_alias) {
-    return catalog_store_->Get(id_or_alias);
+    return record_catalog::Get(*this, id_or_alias);
 }
 
 RepositoryResult<std::vector<SnapshotRecord> >
 PosixFsSnapshotRepository::List(const SnapshotListFilter& filter) {
-    return catalog_store_->List(filter);
+    return record_catalog::List(*this, filter);
 }
 
 RepositoryResult<core::Unit>
 PosixFsSnapshotRepository::Delete(const std::string& id_or_alias) {
-    // Rust `delete_sync`: resolve first, because the store deletes by id while
-    // the trait accepts an alias too. A missing record is success -- delete is
-    // idempotent, so a retry after a partial failure must not start failing.
-    const RepositoryResult<core::Optional<SnapshotRecord> > found =
-        catalog_store_->Get(id_or_alias);
-    if (!found.ok()) return core::make_unexpected(found.error());
-    if (!found.value().has_value()) return core::Unit{};
-    return catalog_store_->DeleteRecord(found.value()->id);
+    return record_catalog::Delete(*this, id_or_alias);
 }
 
 RepositoryResult<core::Optional<core::SnapshotId> >
 PosixFsSnapshotRepository::ResolveAlias(const std::string& alias) {
-    return catalog_store_->ResolveAlias(alias);
+    return record_catalog::ResolveAlias(*this, alias);
 }
 
 RepositoryResult<SnapshotRecord>
 PosixFsSnapshotRepository::TryStartBuild(const core::SnapshotId& id) {
-    return catalog_store_->TryStart(id);
+    return record_catalog::TryStartBuild(*this, id);
 }
 
 RepositoryResult<core::Unit>
 PosixFsSnapshotRepository::MarkBuildError(const core::SnapshotId& id,
                                           const TemplateBuildErrorReason& reason) {
-    return catalog_store_->MarkError(id, reason);
+    return record_catalog::MarkBuildError(*this, id, reason);
 }
 
 RepositoryResult<core::Optional<std::string> > PosixFsSnapshotRepository::GetDocument(
@@ -162,6 +176,12 @@ RepositoryResult<uint64_t> PosixFsSnapshotRepository::FetchBlob(const BlobKey& k
                                                                 const std::string& destination) {
     if (!artifact_store_) return SnapshotRepository::FetchBlob(key, destination);
     return artifact_store_->FetchBlob(key, destination);
+}
+
+RepositoryResult<core::Unit> PosixFsSnapshotRepository::DeleteSnapshotBlobs(
+    const core::SnapshotId& id) {
+    if (!artifact_store_) return SnapshotRepository::DeleteSnapshotBlobs(id);
+    return artifact_store_->DeleteSnapshotFiles(id);
 }
 
 }  // namespace posixfs

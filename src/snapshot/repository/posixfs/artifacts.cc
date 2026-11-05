@@ -309,6 +309,40 @@ RepositoryResult<uint64_t> PosixFsArtifactStore::FetchBlob(const BlobKey& key,
     return fetched_size.value();
 }
 
+RepositoryResult<core::Unit> PosixFsArtifactStore::DeleteSnapshotFiles(
+    const core::SnapshotId& snapshot_id) {
+    const std::string snapshot_dir =
+        PosixFsSnapshotArtifactLayout(root_, snapshot_id).SnapshotDir();
+
+    // Absence is success *before* removing, not just after: this is retried
+    // after a partial delete, and the second run must finish rather than
+    // report the work it no longer has to do.
+    const core::Expected<bool, std::string> exists = core::fs::TryExists(snapshot_dir);
+    if (!exists.ok()) {
+        return core::make_unexpected(
+            RepositoryError::Backend("stat '" + snapshot_dir + "'", exists.error()));
+    }
+    if (!exists.value()) return core::Unit();
+
+    const core::Expected<core::Unit, std::string> removed = core::fs::RemoveDirAll(snapshot_dir);
+    if (!removed.ok()) {
+        return core::make_unexpected(
+            RepositoryError::Backend("remove '" + snapshot_dir + "'", removed.error()));
+    }
+
+    // Rust `snapshot_dir.parent().map_or(Ok(()), sync_dir)`: the unlink must
+    // be durable before the record that referenced these files is deleted, or
+    // a crash could resurrect artifacts nothing points at.
+    const core::Optional<std::string> parent = core::fs::Parent(snapshot_dir);
+    if (!parent.has_value()) return core::Unit();
+    const core::Expected<core::Unit, std::string> synced = core::fs::SyncDirectory(*parent);
+    if (!synced.ok()) {
+        return core::make_unexpected(
+            RepositoryError::Backend("sync '" + *parent + "'", synced.error()));
+    }
+    return core::Unit();
+}
+
 RepositoryResult<core::Unit> PosixFsArtifactStore::PutLayer(const std::string& digest,
                                                             const std::string& destination,
                                                             const std::string& source) {

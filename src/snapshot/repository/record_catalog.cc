@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <sstream>
 #include <utility>
 
 #include "agentenv/core/json.h"
@@ -16,6 +17,13 @@ namespace repository {
 namespace record_catalog {
 
 namespace {
+
+/// A count for an error message.
+std::string ToDecimal(std::size_t value) {
+    std::ostringstream out;
+    out << value;
+    return out.str();
+}
 
 /// Rust `decode_record`.
 RepositoryResult<SnapshotRecord> DecodeRecord(const std::string& id, const std::string& bytes) {
@@ -399,6 +407,85 @@ RepositoryResult<std::vector<SnapshotRecord> > List(SnapshotRepository& reposito
     }
     std::sort(records.begin(), records.end(), NewestFirst);
     return records;
+}
+
+RepositoryResult<core::Unit> Delete(SnapshotRepository& repository,
+                                    const std::string& id_or_alias) {
+    const RepositoryResult<core::Optional<SnapshotRecord> > found =
+        FindRecord(repository, id_or_alias);
+    if (!found.ok()) return core::make_unexpected(found.error());
+
+    if (!found.value().has_value()) {
+        // No record, but a build log may still be there: a delete that got
+        // as far as removing the record left it behind, and retrying by id
+        // is what finishes the job.
+        const core::Expected<core::SnapshotId, std::string> id =
+            core::SnapshotId::Parse(id_or_alias);
+        if (!id.ok()) return core::Unit();
+        return repository.DeleteDocument(DocumentKey::BuildLog(id.value()));
+    }
+    const core::SnapshotId id = found.value()->id;
+
+    // Marks the record, or reports what is already there. Note the two
+    // outcomes that are *not* interchangeable: an absent record means another
+    // delete finished first (stop), while an already-marked one means a
+    // previous attempt stopped partway (continue the cleanup).
+    const std::function<RepositoryResult<Decision<core::Optional<SnapshotRecord> > >(
+        const core::SnapshotId&, const core::Optional<SnapshotRecord>&)>
+        mark = [](const core::SnapshotId&, const core::Optional<SnapshotRecord>& current)
+            -> RepositoryResult<Decision<core::Optional<SnapshotRecord> > > {
+        Decision<core::Optional<SnapshotRecord> > decision;
+        if (!current.has_value()) return decision;
+
+        if (current->committed.has_value() &&
+            !current->committed->disk_publications.empty()) {
+            // Refused from inside the update, so the record is left exactly
+            // as it was. Upstream rolls each publication back (best effort)
+            // before removing anything; without that, a "deleted" snapshot
+            // would stay published in the registry, which is the one failure
+            // the caller cannot see.
+            return core::make_unexpected(RepositoryError::Unsupported(
+                "deleting snapshot '" + current->id.ToString() +
+                "' with " + ToDecimal(current->committed->disk_publications.size()) +
+                " disk image publication(s); rolling those back needs Rust "
+                "AcrDiskImageExporter::rollback_publication, which is not ported"));
+        }
+
+        if (current->deleting) {
+            // Already marked: nothing to write, but the cleanup continues
+            // from the record as it stands.
+            decision.value = current;
+            return decision;
+        }
+        SnapshotRecord record = *current;
+        record.deleting = true;
+        decision.write = core::Optional<SnapshotRecord>(record);
+        decision.value = core::Optional<SnapshotRecord>(record);
+        return decision;
+    };
+
+    const RepositoryResult<core::Optional<SnapshotRecord> > marked =
+        UpdateRecord<core::Optional<SnapshotRecord> >(repository, id, mark);
+    if (!marked.ok()) return core::make_unexpected(marked.error());
+    // Another delete finished first.
+    if (!marked.value().has_value()) return core::Unit();
+
+    if (marked.value()->alias.has_value()) {
+        const RepositoryResult<core::Unit> released =
+            ReleaseAlias(repository, *marked.value()->alias, id);
+        if (!released.ok()) return core::make_unexpected(released.error());
+    }
+
+    // Files before the record, so a failure here leaves the record that still
+    // names them and the delete can be retried.
+    const RepositoryResult<core::Unit> blobs = repository.DeleteSnapshotBlobs(id);
+    if (!blobs.ok()) return core::make_unexpected(blobs.error());
+
+    const RepositoryResult<core::Unit> log =
+        repository.DeleteDocument(DocumentKey::BuildLog(id));
+    if (!log.ok()) return core::make_unexpected(log.error());
+
+    return repository.DeleteDocument(DocumentKey::SnapshotRecord(id));
 }
 
 RepositoryResult<core::Optional<core::SnapshotId> > ResolveAlias(SnapshotRepository& repository,

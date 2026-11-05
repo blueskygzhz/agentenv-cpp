@@ -60,15 +60,24 @@ RepositoryResult<core::Optional<std::string> > ReadDocument(const ObjectStore& s
 ///
 /// An append-only store is Alibaba's native OSS, which ignores a write
 /// precondition. Running the CAS against it would report success while
-/// overwriting a concurrent update, so the operation is refused until the
-/// lease path is ported.
+/// overwriting a concurrent update, so the operation is refused.
+///
+/// What upstream does instead is take a lease, and that part is ported --
+/// `oss/lease.h`. What is missing is the one store operation a lease stands
+/// on: `lease::LockStore::AppendLock`. Appending is Alibaba's own
+/// `AppendObject`, signed with `OSS4-HMAC-SHA256` against an
+/// `oss-<region>.aliyuncs.com` endpoint -- a different service from the S3
+/// REST API this client speaks, which is why upstream builds a second opendal
+/// operator (`native_oss`) for it rather than reusing its S3 one. Until that
+/// transport exists the lease has nothing to append to, so the refusal stays
+/// here rather than surfacing from inside an acquire.
 RepositoryResult<core::Unit> RefuseAppendOnlyStore(const ObjectStore& store,
                                                    const std::string& path) {
     if (!store.CanAppend()) return core::Unit();
     return core::make_unexpected(RepositoryError::Unsupported(
         "writing '" + path +
-        "' on an append-only object store requires the document lease, which is not "
-        "available in this build"));
+        "' on an append-only object store requires the document lease, whose append "
+        "transport (Alibaba OSS AppendObject) is not available in this build"));
 }
 
 }  // namespace

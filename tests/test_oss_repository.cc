@@ -437,13 +437,11 @@ MT_TEST(the_record_methods_are_served_through_the_shared_document_catalog) {
     MT_EXPECT_TRUE(server.bodies.count("catalog/records/" + TestId().ToString() + ".json") == 1);
 }
 
-// `Delete` is the one still refused, and refused *before* mutating anything.
-// Upstream marks the record, frees the alias and then removes the artifacts
-// (`store::delete_snapshot`, which needs `delete_snapshot_blobs` and the ACR
-// publication rollback -- neither ported). Doing the first two and skipping
-// the third would leave the bucket holding files nothing references while
-// reporting the snapshot deleted, which is worse than refusing.
-MT_TEST(delete_is_refused_without_touching_the_record) {
+// `Delete` removes the record *and* the snapshot's objects. The second half
+// is this backend's own (`delete_snapshot_blobs` -> list the snapshot prefix,
+// delete each key); the ordering and the marking are the shared layer's and
+// are tested there.
+MT_TEST(delete_removes_the_record_and_the_snapshots_own_objects) {
     StubObjectServer server;
     OssSnapshotRepository repository(ClientOf(server.Fn(), GoodConfig()),
                                      std::shared_ptr<ObjectUploader>());
@@ -452,18 +450,93 @@ MT_TEST(delete_is_refused_without_touching_the_record) {
     record.id = TestId();
     record.source = SnapshotSource::Template(TemplateBuildInfo());
     MT_EXPECT_TRUE(repository.Create(record).ok());
-    const std::size_t requests_after_create = server.requests.size();
 
-    const RepositoryResult<core::Unit> deleted = repository.Delete(TestId().ToString());
-    MT_EXPECT_TRUE(!deleted.ok());
-    MT_EXPECT_TRUE(!deleted.ok() && deleted.error().kind == RepositoryErrorKind::Unsupported);
-    // Not even read: nothing is marked, so a later retry starts from a clean
-    // record once the artifact removal lands.
-    MT_EXPECT_EQ(static_cast<int>(server.requests.size()),
-                 static_cast<int>(requests_after_create));
+    const std::string vm_state = BlobKey::Snapshot(TestId(), SnapshotFile::VmState).Path();
+    server.Seed(vm_state, "state-bytes");
+    // A managed layer is content-addressed and lives outside the snapshot's
+    // own prefix, so it must survive: another snapshot may share it.
+    const std::string layer = BlobKey::Layer("sha256:abc", LayerRole::Rootfs).Path();
+    server.Seed(layer, "layer-bytes");
+    // A sibling snapshot whose id merely *starts with* the same text. Without
+    // the trailing slash on the delete prefix this one would go too.
+    const std::string sibling = vm_state;
+    server.Seed(BlobKey::SnapshotDir(TestId()) + "-other/vm_state.bin", "other-bytes");
+
+    MT_EXPECT_TRUE(repository.Delete(TestId().ToString()).ok());
+
+    MT_EXPECT_TRUE(server.bodies.count("catalog/records/" + TestId().ToString() + ".json") == 0);
+    MT_EXPECT_TRUE(server.bodies.count(sibling) == 0);
+    MT_EXPECT_TRUE(server.bodies.count(layer) == 1);
+    MT_EXPECT_TRUE(
+        server.bodies.count(BlobKey::SnapshotDir(TestId()) + "-other/vm_state.bin") == 1);
+
+    // Idempotent: a delete that was interrupted must be retryable.
+    MT_EXPECT_TRUE(repository.Delete(TestId().ToString()).ok());
+}
+
+// The same delete under a configured prefix. `ListKeysRecursive` hands back
+// repository-relative keys and `Delete` re-applies the prefix, so a key that
+// goes through unchanged -- or gets prefixed twice -- addresses nothing and
+// the delete reports success having removed nothing. With no prefix set that
+// mistake is invisible, which is why this case is asserted on its own.
+MT_TEST(delete_removes_the_snapshots_objects_under_a_configured_prefix) {
+    cfg::OssBackendConfig config = GoodConfig();
+    config.prefix = core::Optional<std::string>("repo");
+
+    StubObjectServer server;
+    OssSnapshotRepository repository(ClientOf(server.Fn(), config),
+                                     std::shared_ptr<ObjectUploader>());
+
+    SnapshotRecord record;
+    record.id = TestId();
+    record.source = SnapshotSource::Template(TemplateBuildInfo());
+    MT_EXPECT_TRUE(repository.Create(record).ok());
+
+    const std::string record_key = "repo/catalog/records/" + TestId().ToString() + ".json";
+    const std::string vm_state =
+        "repo/" + BlobKey::Snapshot(TestId(), SnapshotFile::VmState).Path();
+    server.Seed(vm_state, "state-bytes");
+    MT_EXPECT_TRUE(server.bodies.count(record_key) == 1);
+
+    MT_EXPECT_TRUE(repository.Delete(TestId().ToString()).ok());
+    MT_EXPECT_TRUE(server.bodies.count(vm_state) == 0);
+    MT_EXPECT_TRUE(server.bodies.count(record_key) == 0);
+}
+
+// Refused rather than half-done: upstream rolls each publication back through
+// `AcrDiskImageExporter`, which is not ported. Removing the snapshot anyway
+// would leave the image live in the registry with nothing pointing at it --
+// and the record must not even be marked, or the snapshot would vanish from
+// every read while still being published.
+MT_TEST(delete_is_refused_for_a_published_disk_image_without_marking_the_record) {
+    StubObjectServer server;
+    OssSnapshotRepository repository(ClientOf(server.Fn(), GoodConfig()),
+                                     std::shared_ptr<ObjectUploader>());
+
+    SnapshotRecord record;
+    record.id = TestId();
+    record.source = SnapshotSource::Template(TemplateBuildInfo());
+    CommittedSnapshot committed;
+    PersistedDiskImagePublication publication;
+    publication.image_ref = "registry.example.com/env";
+    publication.tag = "1";
+    publication.manifest_digest = "sha256:" + std::string(64, 'a');
+    publication.repo_blob_url = "https://registry.example.com/v2/env/blobs/";
+    committed.disk_publications.push_back(publication);
+    record.committed = core::Optional<CommittedSnapshot>(committed);
+    // Written directly: `Create` refuses an already-committed record.
+    server.Seed("catalog/records/" + TestId().ToString() + ".json",
+                record.ToJson().ToStringPretty());
+
+    const RepositoryResult<core::Unit> refused = repository.Delete(TestId().ToString());
+    MT_EXPECT_TRUE(!refused.ok());
+    MT_EXPECT_TRUE(!refused.ok() && refused.error().kind == RepositoryErrorKind::Unsupported);
+
     const RepositoryResult<core::Optional<SnapshotRecord> > still_there =
         repository.Get(TestId().ToString());
     MT_EXPECT_TRUE(still_there.ok() && still_there.value().has_value());
+    MT_EXPECT_TRUE(still_there.ok() && still_there.value().has_value() &&
+                   !still_there.value()->deleting);
 }
 
 // ---- the factory ---------------------------------------------------------

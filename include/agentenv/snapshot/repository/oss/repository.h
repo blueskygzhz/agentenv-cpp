@@ -107,6 +107,7 @@ class OssSnapshotRepository : public SnapshotRepository {
     RepositoryResult<bool> HasBlob(const BlobKey& key);
     RepositoryResult<std::string> ReadBlob(const BlobKey& key);
     RepositoryResult<uint64_t> FetchBlob(const BlobKey& key, const std::string& destination);
+    RepositoryResult<core::Unit> DeleteSnapshotBlobs(const core::SnapshotId& id);
 
  private:
     std::shared_ptr<OssClient> client_;

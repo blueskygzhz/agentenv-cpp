@@ -147,6 +147,10 @@ RepositoryResult<uint64_t> SnapshotRepository::FetchBlob(const BlobKey&, const s
     return core::make_unexpected(RepositoryError::Unsupported("blob storage"));
 }
 
+RepositoryResult<core::Unit> SnapshotRepository::DeleteSnapshotBlobs(const core::SnapshotId&) {
+    return core::make_unexpected(RepositoryError::Unsupported("blob storage"));
+}
+
 namespace {
 
 /// Rust `managed_layer_config` (layer_config.rs) — a managed layer read in

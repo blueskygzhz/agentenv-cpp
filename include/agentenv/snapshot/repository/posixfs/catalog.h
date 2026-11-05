@@ -96,29 +96,21 @@ class PosixFsCatalogStore {
     RepositoryResult<core::Unit> AbortPublish(const PublishSession& session);
 
     // ---- snapshot records ------------------------------------------------
-
-    /// Rust `create` — pre-creates a waiting template record.
-    RepositoryResult<SnapshotRecord> Create(const SnapshotRecord& record);
-
-    /// Rust `get` — accepts an id or an alias, and drops a dangling alias on
-    /// the way.
-    RepositoryResult<core::Optional<SnapshotRecord> > Get(const std::string& id_or_alias);
-
-    /// Rust `list` — newest first, ties broken by id so the order is total.
-    RepositoryResult<std::vector<SnapshotRecord> > List(const SnapshotListFilter& filter);
-
-    /// Rust `delete_record` — idempotent.
-    RepositoryResult<core::Unit> DeleteRecord(const core::SnapshotId& id);
-
-    /// Rust `resolve_alias`.
-    RepositoryResult<core::Optional<core::SnapshotId> > ResolveAlias(const std::string& alias);
-
-    /// Rust `try_start` — Waiting -> Building.
-    RepositoryResult<SnapshotRecord> TryStart(const core::SnapshotId& id);
-
-    /// Rust `mark_error`.
-    RepositoryResult<core::Unit> MarkError(const core::SnapshotId& id,
-                                           const TemplateBuildErrorReason& reason);
+    //
+    // There are none. `create`, `get`, `list`, `delete`, `resolve_alias`,
+    // `try_start` and `mark_error` used to be implemented here, a second time,
+    // over the same files the document methods below already address. Upstream
+    // has them exactly once, in the backend-agnostic
+    // `impl<R: Repository> SnapshotCatalog for R`; this port now does too, in
+    // `repository/record_catalog.h`, reached through
+    // `PosixFsSnapshotRepository`.
+    //
+    // The paths are unchanged -- `DocumentKey::SnapshotRecord(id).PosixPath()`
+    // is `catalog/records/<id>.json`, which is what `RecordPath` returned --
+    // so an existing repository root needs no migration. The copy that lived
+    // here had drifted: it ignored the `deleting` marker, left a record behind
+    // when an alias claim failed, and its `delete` only unlinked files instead
+    // of running the full marked-then-cleaned sequence.
 
     // ---- build cache ------------------------------------------------------
 
@@ -131,10 +123,6 @@ class PosixFsCatalogStore {
 
     /// Rust `forget_retired_build_cache`.
     RepositoryResult<core::Unit> ForgetRetiredBuildCache(const std::string& volume_id);
-
-    /// Rust `matches_record_filter`. Exposed for tests.
-    static bool MatchesRecordFilter(const SnapshotRecord& record,
-                                    const SnapshotListFilter& filter);
 
     // ---- shared documents (Rust src/repository/backends/posixfs/catalog.rs)
 
@@ -182,7 +170,6 @@ class PosixFsCatalogStore {
     RepositoryResult<core::FileLockGuard> AcquireCatalogLock(const std::string& lock_path,
                                                              const std::string& label) const;
     RepositoryResult<core::FileLockGuard> AcquireAliasLock(const SnapshotAlias& alias) const;
-    RepositoryResult<core::FileLockGuard> AcquireRecordLock(const core::SnapshotId& id) const;
     RepositoryResult<core::FileLockGuard> AcquireVolumeAliasLock(
         const std::string& alias) const;
 
@@ -191,8 +178,6 @@ class PosixFsCatalogStore {
     RepositoryResult<core::Optional<core::SnapshotId> > LoadAliasTarget(
         const SnapshotAlias& alias) const;
     RepositoryResult<core::Unit> WriteRecordUnlocked(const SnapshotRecord& record) const;
-    RepositoryResult<core::Unit> EnsureAliasAvailable(const SnapshotAlias& alias,
-                                                      const core::SnapshotId& new_id) const;
     RepositoryResult<SnapshotRecord> CommittedRecordUnlocked(
         const SnapshotPublishMetadata& metadata, const CommittedSnapshot& committed,
         int64_t now_unix_ms) const;

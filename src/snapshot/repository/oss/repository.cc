@@ -22,15 +22,6 @@ namespace {
 const size_t kUploadPartSize = 64u * 1024u * 1024u;
 const size_t kUploadConcurrency = 4;
 
-/// The one record operation that still cannot be served.
-RepositoryError NoSnapshotDeletion(const std::string& lookup) {
-    return RepositoryError::Unsupported(
-        "deleting snapshot '" + lookup +
-        "'; removing its artifacts needs Rust snapshot::store::delete_snapshot "
-        "(Repository::delete_snapshot_blobs plus the ACR publication rollback), "
-        "which is not ported");
-}
-
 /// Multipart upload through the overlaybd OSS backend.
 class OssBackendUploader : public ObjectUploader {
  public:
@@ -86,7 +77,7 @@ RepositoryResult<std::shared_ptr<ObjectUploader> > MakeOssBackendUploader(
 // Forwarded to the shared catalog, which keeps them in the same document key
 // space every backend uses -- the only reason a record written here is
 // readable by a node on another backend. The forwarding cannot recurse:
-// `record_catalog` calls only the *document* methods below.
+// `record_catalog` calls only the *document* and blob methods below.
 
 RepositoryResult<SnapshotRecord> OssSnapshotRepository::Create(const SnapshotRecord& record) {
     return record_catalog::Create(*this, record);
@@ -103,12 +94,7 @@ RepositoryResult<std::vector<SnapshotRecord> > OssSnapshotRepository::List(
 }
 
 RepositoryResult<core::Unit> OssSnapshotRepository::Delete(const std::string& id_or_alias) {
-    // The only record method still refused, and refused *before* mutating
-    // anything: upstream marks the record, frees the alias and then removes
-    // the artifacts. Doing the first two and skipping the third would leave
-    // the bucket holding files nothing references, while reporting that the
-    // snapshot was deleted.
-    return core::make_unexpected(NoSnapshotDeletion(id_or_alias));
+    return record_catalog::Delete(*this, id_or_alias);
 }
 
 RepositoryResult<core::Optional<core::SnapshotId> > OssSnapshotRepository::ResolveAlias(
@@ -235,6 +221,14 @@ RepositoryResult<std::string> OssSnapshotRepository::ReadBlob(const BlobKey& key
 RepositoryResult<uint64_t> OssSnapshotRepository::FetchBlob(const BlobKey& key,
                                                             const std::string& destination) {
     return client_->GetToFile(key.Path(), destination);
+}
+
+RepositoryResult<core::Unit> OssSnapshotRepository::DeleteSnapshotBlobs(
+    const core::SnapshotId& id) {
+    // The trailing slash is what keeps this from deleting a *different*
+    // snapshot: without it the prefix of one id also matches any id that
+    // starts with it.
+    return client_->DeletePrefix(BlobKey::SnapshotDir(id) + "/");
 }
 
 }  // namespace oss

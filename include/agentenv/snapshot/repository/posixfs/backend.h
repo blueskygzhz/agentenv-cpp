@@ -92,6 +92,7 @@ class PosixFsSnapshotRepository : public SnapshotRepository {
         std::size_t limit) override;
     RepositoryResult<std::vector<std::pair<std::string, std::string> > > ReadDocuments(
         DocumentCollection collection) override;
+    RepositoryResult<core::Unit> DeleteSnapshotBlobs(const core::SnapshotId& id) override;
 
     // ---- blobs (Rust posixfs `backend.rs` -> artifact store). Without an
     // artifact store these keep the base class's "unsupported" answers. -----

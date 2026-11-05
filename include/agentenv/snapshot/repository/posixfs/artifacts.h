@@ -56,6 +56,18 @@ class PosixFsArtifactStore {
     /// byte count. `ArtifactNotFound` when the blob is absent.
     RepositoryResult<uint64_t> FetchBlob(const BlobKey& key, const std::string& destination);
 
+    /// Rust `delete_snapshot_files` — removes one snapshot's directory.
+    ///
+    /// Managed layers live outside it and stay: they are content-addressed
+    /// and shared, so deleting them with the snapshot would break another
+    /// snapshot that references the same digest.
+    ///
+    /// The parent directory is fsynced after a successful removal, so the
+    /// unlink survives a crash. Without it, the record could be deleted
+    /// durably while the files it referenced come back — artifacts nothing
+    /// points at any more.
+    RepositoryResult<core::Unit> DeleteSnapshotFiles(const core::SnapshotId& snapshot_id);
+
     /// Rust `import_built_artifacts`.
     ///
     /// 1. copy committed fixed-layout runtime files (`vm_state.bin`)

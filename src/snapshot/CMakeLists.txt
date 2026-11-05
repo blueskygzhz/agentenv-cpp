@@ -35,6 +35,9 @@ add_library(agentenv-snapshot STATIC
     # Rust: src/repository/backends/oss/documents.rs — the ETag
     # compare-and-swap that serialises catalog writes across nodes.
     repository/oss/documents.cc
+    # Rust: src/repository/backends/oss/lease.rs — the append-only lease that
+    # serialises catalog writes on a store with no conditional write.
+    repository/oss/lease.cc
     # Rust: src/repository/backends/oss/client.rs — the S3 REST calls the
     # document layer issues, over the overlaybd SigV4 signer and transport.
     repository/oss/client.cc

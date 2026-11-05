@@ -53,15 +53,27 @@ RepositoryResult<core::Optional<SnapshotRecord> > Get(SnapshotRepository& reposi
 RepositoryResult<std::vector<SnapshotRecord> > List(SnapshotRepository& repository,
                                                     const SnapshotListFilter& filter);
 
-// `SnapshotCatalog::delete` is deliberately absent. Upstream's sequence is
-// mark-deleting -> release alias -> **remove the artifacts** -> delete build
-// log -> delete record, and that middle step is `store::delete_snapshot`,
-// which needs `Repository::delete_snapshot_blobs` (not on this interface) and
-// a best-effort rollback of any ACR disk publication (`AcrDiskImageExporter`,
-// not ported). Deleting the record without it would drop the only reference
-// to artifacts that stay in the bucket forever, and reporting success for
-// that is worse than refusing: the caller believes the storage was reclaimed.
-// A backend's `Delete` therefore reports `unsupported` naming the gap.
+/// Rust `SnapshotCatalog::delete` — one snapshot by id or alias.
+///
+/// Order is the whole design, and it is upstream's: mark the record
+/// `deleting`, release the alias, remove the artifacts, delete the build log,
+/// delete the record. Every step is retryable and each one is safe to be
+/// interrupted after:
+///   - marking first makes the snapshot invisible before its files go, so
+///     nothing starts resuming from a snapshot that is being dismantled;
+///   - the alias is freed early, so a delete that stops partway does not keep
+///     the name reserved;
+///   - the files go *before* the record, because the record is the only thing
+///     that names them — dropping it first would leak them permanently.
+/// A missing snapshot is success, so a retry finishes rather than failing.
+///
+/// Refused for a record with ACR disk publications: rolling those back is
+/// `AcrDiskImageExporter::rollback_publication`, which is not ported, and
+/// skipping it would leave an image published in a registry that this call
+/// claims to have deleted. The refusal happens inside the compare-and-swap,
+/// so nothing is mutated.
+RepositoryResult<core::Unit> Delete(SnapshotRepository& repository,
+                                    const std::string& id_or_alias);
 
 /// Rust `SnapshotCatalog::resolve_alias`.
 RepositoryResult<core::Optional<core::SnapshotId> > ResolveAlias(SnapshotRepository& repository,

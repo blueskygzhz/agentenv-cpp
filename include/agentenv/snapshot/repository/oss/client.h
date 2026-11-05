@@ -159,6 +159,17 @@ class OssClient : public ObjectStore {
     RepositoryResult<uint64_t> GetToFile(const std::string& key,
                                          const std::string& destination) const;
 
+    /// Rust `delete_prefix` — deletes every object under `prefix`.
+    ///
+    /// Lists recursively, then deletes one key at a time. Upstream runs 16
+    /// deletes concurrently; these are serial, which costs latency on a
+    /// snapshot with many files but removes the same set.
+    ///
+    /// Not a bulk `DeleteObjects` request: that returns per-key errors inside
+    /// a 200 response, so treating the status as the outcome would report a
+    /// partial delete as a complete one.
+    RepositoryResult<core::Unit> DeletePrefix(const std::string& prefix);
+
     /// Rust `object_url` — `s3://<bucket>/<prefix>/<key>`.
     ///
     /// The same spelling the overlaybd OSS backend parses, so a located blob
