@@ -17,9 +17,11 @@
 //   `snapshot::StoreVolumeLayers` and materialized with
 //   `snapshot::repository::MaterializeVolumeBacking` — the same three entry
 //   points Rust uses, none of them backend-specific.
-// * The two backing-creation paths shell out (`mkfs.ext4`,
-//   `package_raw_as_overlaybd`). Without those tools the call returns a
-//   `Storage` error, as upstream does. See `CreateEmptyBacking`.
+// * `CreateEmptyBacking` shells out to `mkfs.ext4` exactly as upstream does;
+//   without that tool the call returns a `Storage` error. The overlaybd
+//   packaging step is *not* a subprocess on either side -- Rust calls
+//   `overlaybd::tools::package_raw_as_overlaybd` and the port calls
+//   `storage::overlaybd::tools::PackageRawAsOverlaybd`, both in-process.
 #ifndef AGENTENV_VOLUME_H_
 #define AGENTENV_VOLUME_H_
 

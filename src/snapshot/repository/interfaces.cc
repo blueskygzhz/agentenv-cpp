@@ -193,7 +193,8 @@ RepositoryResult<std::string> MaterializeVolumeBacking(
         return core::make_unexpected(RepositoryError::Backend(
             "create volume image config dir '" + *parent + "'", created.error()));
     }
-    const std::string bytes = storage::overlaybd::ImageConfigToJson(image_config);
+    // Rust `serde_json::to_vec_pretty(&image_config)`.
+    const std::string bytes = storage::overlaybd::ImageConfigToJsonPretty(image_config);
     // Rust `destination.with_extension(format!("tmp-{}", Uuid::now_v7().simple()))`.
     std::string stem = destination;
     const std::size_t slash = destination.rfind('/');

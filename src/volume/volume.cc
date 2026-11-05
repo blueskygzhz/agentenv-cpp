@@ -27,6 +27,12 @@ using snapshot::OverlaybdLayerRef;
 namespace obd = storage::overlaybd;
 namespace repo = snapshot::repository;
 
+// Upstream reads `crate::cfg::MAX_VOLUME_MOUNTS` directly; the port keeps a
+// copy in `volume/record.h` to break a header dependency, so pin them here --
+// this is the one translation unit that sees both.
+static_assert(kMaxVolumeMounts == cfg::kMaxVolumeMounts,
+              "volume::kMaxVolumeMounts must mirror cfg::kMaxVolumeMounts");
+
 /// Rust `format!("vol_{}", Uuid::now_v7().simple())` — the dash-free hex
 /// form, which also keeps the id inside `is_valid_volume_component`.
 std::string FreshVolumeId() { return "vol_" + core::Uuid::GenV7().ToSimpleString(); }
@@ -819,8 +825,20 @@ VolumeResult<std::string> VolumeManager::CreateChildBacking(const std::string& v
 
     Optional<VolumeError> failure;
     do {
+        // Rust `fs::read` + `serde_json::from_slice`: a plain parse. Not
+        // `LoadImageConfig`, which would additionally rebase local paths
+        // against the parent's directory and run `ValidateImageConfig` --
+        // upstream does neither here, and the lowers it clones below are
+        // already absolute (both writers of a volume `image.json` emit
+        // absolute `file` entries).
+        const core::Expected<std::string, std::string> text =
+            core::fs::ReadToString(parent_config);
+        if (!text.ok()) {
+            failure = VolumeError::Storage(text.error());
+            break;
+        }
         const core::Expected<obd::ImageConfig, std::string> loaded =
-            obd::LoadImageConfig(parent_config);
+            obd::ParseImageConfig(text.value());
         if (!loaded.ok()) {
             failure = VolumeError::Storage(loaded.error());
             break;

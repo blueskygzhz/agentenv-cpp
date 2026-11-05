@@ -3,6 +3,7 @@
 #include "agentenv/snapshot/runtime_support.h"
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <sstream>
 
@@ -62,23 +63,42 @@ static std::string TrimTrailingSlash(const std::string& s) {
 }
 
 // ---- write_image_config (Rust async fn, synchronous here) -------------------
+// Rust writes `<file_name>.tmp` beside the destination and renames over it, so
+// a concurrent reader (overlaybd-tcmu, or the image cache scanning runtime
+// configs) never observes a half-written file. The parent directory is created
+// by the caller, which is where upstream does it too.
 static repository::RepositoryResult<std::string>
 WriteImageConfig(const std::string& destination, const std::string& label,
                  const storage::overlaybd::ImageConfig& cfg) {
-    core::Optional<std::string> parent = core::fs::Parent(destination);
-    if (parent.has_value()) {
-        core::Expected<core::Unit, std::string> mk = core::fs::CreateDirAll(*parent);
-        if (!mk.ok()) {
-            return core::make_unexpected(repository::RepositoryError::Backend(
-                std::string("create runtime image config dir '") + *parent + "'", mk.error()));
-        }
-    }
+    // Rust `serde_json::to_vec_pretty`. Its error arm carries `label`; building
+    // the value cannot fail here, so the parameter is only kept for signature
+    // parity with upstream.
+    (void)label;
+    const std::string serialized = storage::overlaybd::ImageConfigToJsonPretty(cfg);
 
-    std::string serialized = storage::overlaybd::ImageConfigToJson(cfg);
-    core::Expected<core::Unit, std::string> w = core::fs::Write(destination, serialized);
-    if (!w.ok()) {
+    // Rust `tmp_name = destination.file_name().unwrap_or("image.json") + ".tmp"`,
+    // then `tmp_path.set_file_name(tmp_name)` -- same directory, new leaf.
+    const core::Optional<std::string> parent = core::fs::Parent(destination);
+    const core::Optional<std::string> name = core::fs::FileName(destination);
+    const std::string tmp_name =
+        (name.has_value() ? *name : std::string("image.json")) + ".tmp";
+    const std::string tmp_path = parent.has_value() && !parent->empty()
+                                     ? core::fs::Join(*parent, tmp_name)
+                                     : tmp_name;
+
+    const core::Expected<core::Unit, std::string> written =
+        core::fs::Write(tmp_path, serialized);
+    if (!written.ok()) {
         return core::make_unexpected(repository::RepositoryError::Backend(
-            std::string("write runtime image config '") + destination + "'", w.error()));
+            std::string("write temp runtime image config '") + tmp_path + "'", written.error()));
+    }
+    // Rust leaves the temporary in place when the rename fails (unlike
+    // `materialize_volume_backing`, which unlinks it); keep that asymmetry.
+    if (std::rename(tmp_path.c_str(), destination.c_str()) != 0) {
+        const std::string error = std::strerror(errno);
+        return core::make_unexpected(repository::RepositoryError::Backend(
+            std::string("move runtime image config '") + tmp_path + "' to '" + destination + "'",
+            error));
     }
     return destination;
 }
@@ -91,6 +111,19 @@ RuntimeImageMaterializer::MaterializeImageConfig(
     const std::string& managed_repo_blob_url,
     ResolveManagedFn resolve_managed,
     void* resolve_ctx) {
+
+    // Rust creates the parent before resolving any layer, so a bad destination
+    // fails before the (possibly expensive) managed-layer resolution runs.
+    const core::Optional<std::string> destination_parent = core::fs::Parent(destination);
+    if (destination_parent.has_value()) {
+        const core::Expected<core::Unit, std::string> mk =
+            core::fs::CreateDirAll(*destination_parent);
+        if (!mk.ok()) {
+            return core::make_unexpected(repository::RepositoryError::Backend(
+                std::string("create runtime image config dir '") + *destination_parent + "'",
+                mk.error()));
+        }
+    }
 
     struct MaterializedLower {
         storage::overlaybd::LayerConfig config;
@@ -144,7 +177,10 @@ RuntimeImageMaterializer::MaterializeImageConfig(
 
     storage::overlaybd::ImageConfig image_cfg;
     if (!mixed && has_any_remote) {
-        image_cfg.repo_blob_url = TrimTrailingSlash(first_url);
+        // Rust stores `first_repo_blob_url.unwrap_or("")` verbatim: the trailing
+        // slash is trimmed only for the mixed-backend *comparison* above, never
+        // in the value that lands in `image.json`.
+        image_cfg.repo_blob_url = first_url;
     }
 
     for (size_t i = 0; i < materialized.size(); ++i) {

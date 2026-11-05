@@ -993,6 +993,8 @@ core::Expected<Unit, std::string> InstallToolsImage(const std::string& source,
         fs::CreateTempFileIn(*parent, ".image-");
     if (!temporary.ok()) return core::make_unexpected(temporary.error());
 
+    // Compact on purpose: this is the one image config upstream writes with
+    // `serde_json::to_writer` rather than `to_vec_pretty`.
     const core::Expected<Unit, std::string> written = fs::WriteFd(
         temporary.value().fd.get(), storage::overlaybd::ImageConfigToJson(image));
     if (!written.ok()) {

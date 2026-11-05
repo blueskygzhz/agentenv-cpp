@@ -148,8 +148,21 @@ struct ImageConfig {
 
 /// Serializes to the exact JSON shape serde produces, honouring the
 /// `skip_serializing_if` attributes (`repoBlobUrl` when empty, `mode` when
-/// unset). Mirrors `serde_json::to_vec_pretty(&config)`.
+/// unset).
+///
+/// Compact, mirroring `serde_json::to_vec` / `to_writer`. Upstream writes an
+/// image config compactly in exactly one place (`deps::cache_tools_image`,
+/// `serde_json::to_writer`); every other writer uses the pretty form, so new
+/// call sites almost certainly want `ImageConfigToJsonPretty`.
 std::string ImageConfigToJson(const ImageConfig& config);
+
+/// Same shape as `ImageConfigToJson`, rendered the way
+/// `serde_json::to_vec_pretty` / `to_string_pretty` does (two-space indent).
+///
+/// This is the form upstream writes for volume backings, runtime image
+/// configs, and snapshot materialization, and the on-disk files are read by
+/// humans and by `overlaybd-tcmu`, so the difference is observable.
+std::string ImageConfigToJsonPretty(const ImageConfig& config);
 
 /// Rust `overlaybd::config::load_image_config` — parses an `image.json`.
 core::Expected<ImageConfig, std::string> ParseImageConfig(const std::string& text);

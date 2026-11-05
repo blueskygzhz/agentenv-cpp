@@ -54,8 +54,11 @@ const char* VolumeModeToString(VolumeMode mode) {
 core::Expected<VolumeMode, std::string> VolumeModeParse(const std::string& raw) {
     if (raw == "ReadOnly") return VolumeMode::ReadOnly;
     if (raw == "Exclusive") return VolumeMode::Exclusive;
-    return core::make_unexpected(std::string("unsupported volume mode \"") + raw +
-                                 "\"; expected \"ReadOnly\" or \"Exclusive\"");
+    // `VolumeMode` is a plain `#[derive(Deserialize)]` unit enum upstream, so
+    // this stands in for serde's own rejection; word it the way serde does, as
+    // the other hand-written variant parsers in the port do.
+    return core::make_unexpected("unknown variant `" + raw +
+                                 "`, expected `ReadOnly` or `Exclusive`");
 }
 
 const char* VolumeStatusToString(VolumeStatus status) {

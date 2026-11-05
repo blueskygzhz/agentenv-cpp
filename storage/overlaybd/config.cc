@@ -261,7 +261,10 @@ bool ImageConfig::operator==(const ImageConfig& other) const {
     return true;
 }
 
-std::string ImageConfigToJson(const ImageConfig& config) {
+// Shared builder. The two public entry points differ only in how the value is
+// rendered, exactly as serde's `to_vec` and `to_vec_pretty` share one
+// `Serialize` impl.
+static core::Json ImageConfigToJsonValue(const ImageConfig& config) {
     core::JsonObject root;
     // `repoBlobUrl` has no `skip_serializing_if` on ImageConfig, but `lowers[].`
     // does; see below.
@@ -307,7 +310,15 @@ std::string ImageConfigToJson(const ImageConfig& config) {
     root["accelerationLayer"] = core::Json(config.acceleration_layer);
     root["recordTracePath"] = core::Json(config.record_trace_path);
 
-    return core::Json(root).ToString();
+    return core::Json(root);
+}
+
+std::string ImageConfigToJson(const ImageConfig& config) {
+    return ImageConfigToJsonValue(config).ToString();
+}
+
+std::string ImageConfigToJsonPretty(const ImageConfig& config) {
+    return ImageConfigToJsonValue(config).ToStringPretty();
 }
 
 core::Expected<ImageConfig, std::string> ParseImageConfig(const std::string& text) {
@@ -548,8 +559,10 @@ core::Expected<bool, std::string> SaveImageConfig(const std::string& path,
         const core::Expected<core::Unit, std::string> created = core::fs::CreateDirAll(*parent);
         if (!created.ok()) return core::make_unexpected(created.error());
     }
+    // Pretty, matching the `serde_json::to_vec_pretty` the volume backing
+    // writers use (`volume::create_empty_backing` / `create_child_backing`).
     const core::Expected<core::Unit, std::string> written =
-        core::fs::Write(path, ImageConfigToJson(config));
+        core::fs::Write(path, ImageConfigToJsonPretty(config));
     if (!written.ok()) return core::make_unexpected(written.error());
     return true;
 }

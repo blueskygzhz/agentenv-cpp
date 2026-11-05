@@ -47,9 +47,15 @@ extern const char* const kTestAccessTokenHashSeed;
 /// Rust `HOME_PATH_PLACEHOLDER` / `RUNTIME_PATH_PLACEHOLDER`.
 extern const char* const kHomePathPlaceholder;     // "$AENV_HOME"
 extern const char* const kRuntimePathPlaceholder;  // "$AENV_RUNTIME"
-/// Rust `crate::volume::MAX_VOLUME_MOUNTS`. Declared here (rather than pulled
-/// from a volume header) because the volume module is not ported yet; keep the
-/// two in sync when it lands.
+/// Rust `cfg::MAX_VOLUME_MOUNTS` — Firecracker exposes /dev/vdc through
+/// /dev/vdz for extra drives, so 24 is a hardware ceiling, not a policy knob.
+///
+/// Upstream has one definition and the volume module reads it as
+/// `crate::cfg::MAX_VOLUME_MOUNTS`. The port repeats it as
+/// `volume::kMaxVolumeMounts` (`agentenv/volume/record.h`) so the
+/// `agentenv-volume-record` library does not have to pull in this header's
+/// whole config surface; `src/volume/volume.cc` static-asserts the two equal,
+/// so they cannot drift.
 const std::size_t kMaxVolumeMounts = 24;
 
 // ---------------------------------------------------------------------------
