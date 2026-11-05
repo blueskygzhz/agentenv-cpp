@@ -10,9 +10,13 @@
 // accepts, frames, dispatches, and rolls back a device handoff the client
 // never received.
 //
-// What is still missing is the *device plane* -- the io_uring control ring and
-// a real overlaybd ublk target (`storage/ublk/impls.cc` is a skeleton). So
-// this binary installs a handler that refuses every device request by name.
+// What is still missing is the device plane's *orchestration* -- the device
+// table, the warm pool, the refcounted shared-access mode and the pack
+// recording that `server.rs` builds on top of a target. The target itself is
+// no longer missing: `ublk::OverlaybdTarget` serves an overlaybd image
+// through `UblkTarget`, and `UblkDevBuilder` / `RunStartSequence` bring a
+// device up. So this binary installs a handler that refuses every device
+// request by name.
 //
 // That is deliberately different from the previous version, which refused to
 // start at all. A daemon that does not listen makes every client block on a
@@ -67,11 +71,12 @@ class UnportedDeviceHandler : public ud::DeviceHandler {
             return ok;
         }
         return core::make_unexpected(ud::HandlerError::Internal(
-            "ublk device plane is not ported in this build: it needs an io_uring "
-            "control ring and a real overlaybd ublk target (storage/ublk/impls.cc "
-            "is a skeleton that serves zeroes and refuses writes). The daemon "
-            "protocol, client, device control commands and runtime materialization "
-            "are ported; only the data plane is not."));
+            "ublk device orchestration is not ported in this build: it needs the "
+            "device table, the warm pool, refcounted shared access and pack "
+            "recording from server.rs. The daemon protocol, client, device control "
+            "commands, runtime materialization, device start sequence and the "
+            "overlaybd target itself (ublk::OverlaybdTarget) are ported; what is "
+            "missing is the layer that owns devices across requests."));
     }
 
     /// Reported truthfully even though no device can be created, so the

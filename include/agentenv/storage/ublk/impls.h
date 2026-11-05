@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: MIT
-// Rust: storage/ublk/src/impls/{mod,cow,overlaybd_target}.rs — concrete Targets.
+// Placeholders against the superseded `Target` interface in `target.h`.
+//
+// Rust's `impls/` has no `cow.rs`; `BasicCowTarget` has no upstream
+// counterpart at all. Its `overlaybd_target.rs` is ported in
+// `overlaybd_target.h`, not here.
 #ifndef AGENTENV_STORAGE_UBLK_IMPLS_H_
 #define AGENTENV_STORAGE_UBLK_IMPLS_H_
 
@@ -29,7 +33,13 @@ struct OverlaybdTargetConfig {
     int64_t   disk_bytes = 0;
 };
 
-/// Rust struct `OverlaybdTarget` — serves reads from an overlaybd LSMT stack.
+/// A placeholder against the superseded `Target` interface. Serves zeroes and
+/// refuses writes.
+///
+/// **Not** the port of Rust's `OverlaybdTarget` — that is
+/// `ublk::OverlaybdTarget` in `overlaybd_target.h`, which implements
+/// `UblkTarget` (Rust `UVMUblkTarget`) and reads and writes a real image.
+/// Nothing constructs this; new code wants the other one.
 std::shared_ptr<Target> MakeOverlaybdTarget(const OverlaybdTargetConfig& cfg);
 
 }  // namespace ublk

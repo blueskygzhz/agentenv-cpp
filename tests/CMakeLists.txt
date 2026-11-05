@@ -137,6 +137,8 @@ agentenv_add_test(test_ublk_queue          test_ublk_queue.cc          agentenv-
 agentenv_add_test(test_ublk_dev            test_ublk_dev.cc            agentenv-ublk)
 # Rust: storage/ublk/src/dev.rs — queue_work/slot_task
 agentenv_add_test(test_ublk_queue_worker   test_ublk_queue_worker.cc   agentenv-ublk)
+# Rust: storage/ublk/src/impls/overlaybd_target.rs — the data plane
+agentenv_add_test(test_ublk_overlaybd_target test_ublk_overlaybd_target.cc agentenv-ublk)
 # Rust: storage/ublk-daemon/src/main.rs — flag > env > TOML, per field
 agentenv_add_test(test_ublk_daemon_config  test_ublk_daemon_config.cc  agentenv-ublk-daemon-config)
 # Rust: storage/ublk-daemon/src/runtime.rs — claim, upper, resize, rollback
