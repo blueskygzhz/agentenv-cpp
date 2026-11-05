@@ -26,6 +26,16 @@ core::Json CreateSandboxReq::ToJson() const {
     for (const auto& e : env_vars) arr.emplace_back(core::Json(e));
     j["env_vars"] = core::Json(std::move(arr));
     if (secure) j["secure"] = core::Json(true);
+    if (volume_mounts.has_value()) {
+        core::JsonArray mounts;
+        for (std::size_t i = 0; i < volume_mounts->size(); ++i) {
+            core::Json m;
+            m["name"] = core::Json((*volume_mounts)[i].name);
+            m["path"] = core::Json((*volume_mounts)[i].path);
+            mounts.emplace_back(std::move(m));
+        }
+        j["volumeMounts"] = core::Json(std::move(mounts));
+    }
     return j;
 }
 
@@ -49,6 +59,41 @@ CreateSandboxReq::FromJson(const core::Json& j) {
         r.secure = secure.as_bool();
     } else if (secure.kind() != core::Json::Kind::Null) {
         return core::make_unexpected(core::err("invalid field: secure must be a boolean"));
+    }
+    // Rust `volume_mounts: Option<Vec<models::SandboxVolumeMount>>`. Absent is
+    // distinct from `[]` (see the field comment), so the vector is only
+    // constructed when the key is actually present.
+    const auto& mounts = j["volumeMounts"];
+    if (mounts.kind() == core::Json::Kind::Array) {
+        std::vector<SandboxVolumeMountModel> parsed;
+        for (const auto& e : mounts.as_array()) {
+            if (e.kind() != core::Json::Kind::Object) {
+                return core::make_unexpected(
+                    core::err("invalid field: volumeMounts entries must be objects"));
+            }
+            // Both halves are non-optional `String` upstream, so a mount
+            // missing either is a body that fails to deserialize -- not a
+            // mount at the empty path, which would then be normalized into
+            // something the caller never asked for.
+            auto name = GetString(e, "name");
+            if (!name.ok()) {
+                return core::make_unexpected(
+                    core::err("invalid field: volumeMounts entry missing name"));
+            }
+            auto path = GetString(e, "path");
+            if (!path.ok()) {
+                return core::make_unexpected(
+                    core::err("invalid field: volumeMounts entry missing path"));
+            }
+            SandboxVolumeMountModel mount;
+            mount.name = name.value();
+            mount.path = path.value();
+            parsed.push_back(mount);
+        }
+        r.volume_mounts = core::Optional<std::vector<SandboxVolumeMountModel> >(parsed);
+    } else if (mounts.kind() != core::Json::Kind::Null) {
+        return core::make_unexpected(
+            core::err("invalid field: volumeMounts must be an array"));
     }
     return r;
 }

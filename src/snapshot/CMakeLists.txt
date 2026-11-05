@@ -32,6 +32,12 @@ add_library(agentenv-snapshot STATIC
     repository/posixfs/runtime.cc
     # Rust: src/snapshot/repository/backends/posixfs/backend.rs
     repository/posixfs/backend.cc
+    # Rust: src/repository/backends/oss/documents.rs — the ETag
+    # compare-and-swap that serialises catalog writes across nodes.
+    repository/oss/documents.cc
+    # Rust: src/repository/backends/oss/client.rs — the S3 REST calls the
+    # document layer issues, over the overlaybd SigV4 signer and transport.
+    repository/oss/client.cc
 )
 target_include_directories(agentenv-snapshot PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # `CommandContext::EffectiveStartCmd` shell-quotes each argument before it

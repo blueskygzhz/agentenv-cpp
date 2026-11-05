@@ -33,11 +33,8 @@
 namespace agentenv {
 namespace api {
 
-/// Rust generated `models::SandboxVolumeMount`.
-struct SandboxVolumeMountModel {
-    std::string name;
-    std::string path;
-};
+// `SandboxVolumeMountModel` (Rust `models::SandboxVolumeMount`) is declared in
+// `dto.h`, which `CreateSandboxReq` needs it from.
 
 /// Rust generated `models::NewColdSandbox`, restricted to the resource fields.
 struct NewColdSandboxResources {

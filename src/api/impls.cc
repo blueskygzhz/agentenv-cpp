@@ -3,7 +3,9 @@
 #include "agentenv/api/impls.h"
 #include <unordered_map>
 
+#include "agentenv/api/sandbox_params.h"
 #include "agentenv/api/volumes.h"
+#include "agentenv/core/identity.h"
 
 namespace agentenv {
 namespace api {
@@ -27,6 +29,58 @@ GetSandboxResp ToGetSandboxResp(const orchestrator::SandboxMetadata& m) {
 /// Rust `ApiImpl::internal_error` — 500 with the source message.
 ApiError InternalError(const std::string& message) {
     return ApiError::Make(500, message);
+}
+
+/// Rust struct `PreparedVolumeMounts`.
+struct PreparedVolumeMounts {
+    /// The temporary lease owner, empty when there was nothing to reserve.
+    /// Upstream's `Option<String>`: an empty owner means `finish_volume_
+    /// reservation` has nothing to re-point and returns immediately.
+    std::string owner;
+    std::vector<sandbox::ExtraDrive> drives;
+    std::map<std::string, std::string> mounts;
+    std::vector<std::string> volume_ids;
+};
+
+/// Rust `prepare_volume_mounts`.
+///
+/// The lease has to be taken before the sandbox exists, because resolving a
+/// mount is what proves the volume is free -- but there is no sandbox id yet
+/// to lease it to. A synthetic `pending-<uuid>` owner holds it for the
+/// duration of the launch and is swapped for the real id afterwards by
+/// `FinishVolumeReservation`. Without the placeholder, two concurrent creates
+/// naming one exclusive volume would both resolve successfully.
+core::Expected<PreparedVolumeMounts, ApiError> PrepareVolumeMounts(
+    volume::VolumeManager* manager, const std::map<std::string, std::string>& mounts) {
+    PreparedVolumeMounts prepared;
+    if (mounts.empty()) return prepared;
+
+    const std::string owner = "pending-" + core::Uuid::GenV7().ToSimpleString();
+    const core::Expected<ResolvedVolumeMounts, VolumeApiError> resolved =
+        ResolveVolumeMounts(manager, mounts, owner);
+    if (!resolved.ok()) return core::make_unexpected(resolved.error());
+
+    prepared.owner  = owner;
+    prepared.drives = resolved.value().drives;
+    prepared.mounts = resolved.value().normalized_mounts;
+    for (std::map<std::string, std::string>::const_iterator it =
+             prepared.mounts.begin();
+         it != prepared.mounts.end(); ++it) {
+        prepared.volume_ids.push_back(it->second);
+    }
+    return prepared;
+}
+
+/// Rust `finish_volume_reservation` — re-points the placeholder lease at the
+/// real sandbox id, or releases it when `new_owner` is absent.
+core::Expected<core::Unit, volume::VolumeError> FinishVolumeReservation(
+    volume::VolumeManager* manager, const std::string& owner,
+    const core::Optional<std::string>& new_owner,
+    const std::vector<std::string>& volume_ids) {
+    // No placeholder was taken, so there is nothing to hand over. Checked
+    // first because `manager` is legitimately null on that path.
+    if (owner.empty()) return core::Unit();
+    return manager->ReplaceOwnerFor(owner, new_owner, volume_ids);
 }
 
 }  // namespace
@@ -92,11 +146,73 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
     // sandbox whose envd port accepts any caller.
     request.secure = req.secure;
 
+    // Rust `sandboxes_post`, volume section. Three of its checks have no
+    // counterpart here and are deliberately absent rather than approximated:
+    //
+    //  * `check_snapshot_volume_replacement` and the free-drive-slot check
+    //    both read the source snapshot's manifest, and this port has no
+    //    snapshot repository (see `CreateSnapshot`, which reports 501).
+    //  * `check_attached_drive_overlap` compares volume mounts against the
+    //    request's `attachedDrives`, a field `CreateSandboxReq` does not
+    //    carry, so there is nothing to overlap with.
+    //
+    // `extra_drives_in_snapshot` stays false for the same reason: upstream
+    // sets it only when the request omits `volumeMounts` *and* the snapshot
+    // captured volumes, which is the restore path this port cannot take.
+    const core::Expected<core::Optional<std::map<std::string, std::string> >, ApiError>
+        requested = VolumeMountsFromModel(
+            req.volume_mounts.has_value() ? *req.volume_mounts
+                                          : std::vector<SandboxVolumeMountModel>());
+    if (!requested.ok()) return core::make_unexpected(requested.error());
+
+    const core::Expected<PreparedVolumeMounts, ApiError> prepared = PrepareVolumeMounts(
+        volumes_.get(),
+        requested.value().has_value() ? *requested.value()
+                                      : std::map<std::string, std::string>());
+    // Returned unchanged: the error already carries the status upstream maps
+    // it to (409 for a volume already leased, 400 for a bad mount path, 500
+    // for a storage fault), so there is nothing left to classify.
+    if (!prepared.ok()) return core::make_unexpected(prepared.error());
+
+    request.extra_drives = prepared.value().drives;
+    for (std::map<std::string, std::string>::const_iterator it =
+             prepared.value().mounts.begin();
+         it != prepared.value().mounts.end(); ++it) {
+        request.volume_mounts[it->first] = it->second;
+    }
+
     const orchestrator::OrchestratorResult<orchestrator::SandboxMetadata> r =
         svc_->CreateSandbox(request);
-    if (!r.ok()) return core::make_unexpected(ToApiError(r.error()));
+    if (!r.ok()) {
+        // The launch never happened, so the placeholder lease has to go --
+        // these volumes already existed and belong to the caller, so they are
+        // released, not deleted.
+        FinishVolumeReservation(volumes_.get(), prepared.value().owner,
+                                core::Optional<std::string>(),
+                                prepared.value().volume_ids);
+        return core::make_unexpected(ToApiError(r.error()));
+    }
 
     const orchestrator::SandboxMetadata& meta = r.value();
+
+    // Handing the lease to the sandbox that now holds the volumes. If this
+    // fails the sandbox is running with volumes still leased to a placeholder
+    // nothing will ever release, so the sandbox is torn down and the lease
+    // dropped rather than left in that state.
+    const core::Expected<core::Unit, volume::VolumeError> handover =
+        FinishVolumeReservation(volumes_.get(), prepared.value().owner,
+                                core::Optional<std::string>(meta.id.ToString()),
+                                prepared.value().volume_ids);
+    if (!handover.ok()) {
+        const std::string message =
+            "failed to finalize volume reservation: " + handover.error().ToString();
+        svc_->DeleteSandbox(meta.id);
+        FinishVolumeReservation(volumes_.get(), prepared.value().owner,
+                                core::Optional<std::string>(),
+                                prepared.value().volume_ids);
+        return core::make_unexpected(ApiError::Make(500, message));
+    }
+
     CreateSandboxResp resp;
     resp.sandbox_id    = meta.id.ToString();
     resp.template_id   = meta.template_id;

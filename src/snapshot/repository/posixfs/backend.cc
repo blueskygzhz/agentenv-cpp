@@ -153,6 +153,12 @@ RepositoryResult<std::string> PosixFsSnapshotRepository::ReadBlob(const BlobKey&
     return bytes.value();
 }
 
+RepositoryResult<uint64_t> PosixFsSnapshotRepository::FetchBlob(const BlobKey& key,
+                                                                const std::string& destination) {
+    if (!artifact_store_) return SnapshotRepository::FetchBlob(key, destination);
+    return artifact_store_->FetchBlob(key, destination);
+}
+
 }  // namespace posixfs
 }  // namespace repository
 }  // namespace snapshot

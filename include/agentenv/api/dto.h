@@ -15,6 +15,17 @@
 namespace agentenv {
 namespace api {
 
+/// Rust generated `models::SandboxVolumeMount`. Both fields are required
+/// there (plain `String`, not `Option`), so a mount missing either one is a
+/// body that does not deserialize.
+///
+/// Lives here rather than in `sandbox_params.h` because `CreateSandboxReq`
+/// carries a list of these, and `sandbox_params.h` includes *this* header.
+struct SandboxVolumeMountModel {
+    std::string name;
+    std::string path;
+};
+
 /// POST /sandboxes  request body.
 struct CreateSandboxReq {
     std::string template_id;
@@ -23,6 +34,16 @@ struct CreateSandboxReq {
     /// Rust `secure: body.secure == Some(true)` — only a JSON `true` turns on
     /// envd access-token enforcement.
     bool        secure = false;
+    /// Rust `volume_mounts: Option<Vec<models::SandboxVolumeMount>>`, JSON key
+    /// `volumeMounts`.
+    ///
+    /// Optional rather than a plain vector because upstream's
+    /// `sandboxes_post` branches on `is_some()`, not on emptiness: an absent
+    /// list means "restore whatever volumes the snapshot captured", while a
+    /// present empty list means "this sandbox has no volumes". Collapsing the
+    /// two would make a restore indistinguishable from an explicit refusal of
+    /// every volume.
+    core::Optional<std::vector<SandboxVolumeMountModel> > volume_mounts;
 
     core::Json ToJson() const;
     static core::Expected<CreateSandboxReq, core::AnyError> FromJson(const core::Json& j);

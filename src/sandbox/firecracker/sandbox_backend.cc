@@ -40,10 +40,6 @@ SandboxCaptureError ClassifyCaptureError(const std::string& message) {
     return SandboxCaptureError::Recoverable(message);
 }
 
-core::AnyError NotAvailable(const char* what) {
-    return core::err(std::string(what) + ": not available in this build");
-}
-
 }  // namespace
 
 std::string ManagedSnapshotBase(const core::Optional<std::string>& work_dir) {
@@ -1087,6 +1083,42 @@ class FirecrackerSandboxBackend::Impl {
     /// Test override for the guest-memory layer write.
     MemoryLayerWriter memory_layer_writer;
 
+    /// Rust `self.launch.common().extra_drives`.
+    ///
+    /// The three construction forms keep their drives in different places, so
+    /// a single accessor is what lets the volume predicates below be written
+    /// once:
+    ///   * resume   -> the snapshot config being restored;
+    ///   * fresh    -> the host-side drive plan, which is what actually gets
+    ///                 attached;
+    ///   * handed-in instance -> no plan ran here, so the capture descriptor
+    ///                 it was constructed with is the only record of them.
+    ///
+    /// The fallback matters: a backend built from an already-booted instance
+    /// is what `Pause` hands back, and reporting "no drives" for it would say
+    /// a sandbox holding writable volumes has none to flush.
+    const std::vector<ExtraDrive>& ExtraDrives() const {
+        if (launch.kind == LaunchMode::Kind::Resume) {
+            return resume_spec.snapshot_config.common.extra_drives;
+        }
+        if (spec.drives.has_value()) return spec.drives->extra_drives;
+        return snapshot_config.common.extra_drives;
+    }
+
+    /// Rust `has_writable_persistent_volumes` — a drive that is writable
+    /// *and* has a snapshot output dir.
+    ///
+    /// Both halves are required: a read-only volume has nothing to flush or
+    /// seal, and a writable drive with no output dir is an ordinary attached
+    /// drive whose contents live in the snapshot rather than in a volume.
+    bool HasWritablePersistentVolumes() const {
+        const std::vector<ExtraDrive>& drives = ExtraDrives();
+        for (std::size_t i = 0; i < drives.size(); ++i) {
+            if (!drives[i].read_only && drives[i].snapshot_output_dir.has_value()) return true;
+        }
+        return false;
+    }
+
     /// Rust `live_snapshot_root` — resolved once, then reused.
     ///
     /// The caching is not an optimisation: Rust holds the root in a guard for
@@ -1327,10 +1359,13 @@ SandboxCaptureResult<std::string> FirecrackerSandboxBackend::Snapshot() {
     // write into each other.
     spec.snapshot_dir = root.value() + "/" + core::Uuid::GenV7().ToString();
     // Rust reads `has_writable_persistent_volumes()` off the sandbox's own
-    // drives. This backend attaches none and has no envd client to flush
-    // through, so the flag is false by construction rather than by choice --
-    // once volumes are wired up, this is where the flush hooks in.
-    spec.has_writable_persistent_volumes = false;
+    // drives, and so does this now. Hard-coding false was safe only while no
+    // drive could reach this backend; with volumes wired up it would skip the
+    // pre-pause flush for a sandbox that has writable volumes, capturing them
+    // with dirty guest page cache. PauseToDir refuses that rather than
+    // flushing nothing, because this build has no envd client to flush
+    // through -- a stale filesystem is worse than a refused snapshot.
+    spec.has_writable_persistent_volumes = impl_->HasWritablePersistentVolumes();
     spec.write_memory_layer = impl_->memory_layer_writer;
 
     const SandboxCaptureResult<PauseToDirResult> captured = PauseToDir(spec);
@@ -1423,16 +1458,51 @@ core::Expected<core::Unit, core::AnyError> FirecrackerSandboxBackend::Start() {
     if (!started.ok()) return started;
     return WaitForReady();
 }
+// Rust `snapshot_volumes` / `freeze_and_snapshot_volumes` / `thaw_volumes`.
+//
+// Each of these begins by selecting the *writable persistent volumes*, and
+// every step that follows is driven by that selection. When it is empty they
+// are no-ops upstream, so reporting "not available" for a sandbox that has no
+// such volume refused a capture Rust completes — which is every sandbox in
+// this build that attaches no volume, i.e. the common case.
+//
+// The sealing half is what is genuinely missing, and it stays an error:
+// `snapshot_persistent_volume_drives` restacks each volume's overlaybd device
+// into a new commit layer (`restack_snapshot_overlaybd_device`), and this port
+// has the LSMT index types but no layer writer. Reporting success without it
+// would publish a volume whose snapshot layer was never written, and the
+// damage would surface on another node, at a later resume, as a volume that
+// silently lost every write since its last good capture.
 SandboxCaptureResult<core::Unit> FirecrackerSandboxBackend::SnapshotVolumes() {
-    return core::make_unexpected(
-        SandboxCaptureError::Recoverable("snapshot_volumes: not available in this build"));
-}
-SandboxCaptureResult<core::Unit> FirecrackerSandboxBackend::FreezeAndSnapshotVolumes() {
+    // Rust: `if !self.has_writable_persistent_volumes() { return Ok(()) }`.
+    if (!impl_->HasWritablePersistentVolumes()) return core::Unit();
     return core::make_unexpected(SandboxCaptureError::Recoverable(
-        "freeze_and_snapshot_volumes: not available in this build"));
+        "snapshot_volumes: sealing a writable persistent volume needs the overlaybd layer "
+        "writer and an envd client to flush through, neither of which is available in this "
+        "build"));
 }
+
+SandboxCaptureResult<core::Unit> FirecrackerSandboxBackend::FreezeAndSnapshotVolumes() {
+    // Rust freezes each writable persistent volume's mount, then seals them.
+    // With no such mount the loop body never runs and the seal is a no-op, so
+    // the whole operation succeeds without reaching the guest.
+    if (!impl_->HasWritablePersistentVolumes()) return core::Unit();
+    return core::make_unexpected(SandboxCaptureError::Recoverable(
+        "freeze_and_snapshot_volumes: freezing a volume filesystem needs an envd client to "
+        "run the fsfreeze ioctl in the guest, which is not available in this build"));
+}
+
 core::Expected<core::Unit, core::AnyError> FirecrackerSandboxBackend::ThawVolumes() {
-    return core::make_unexpected(NotAvailable("thaw_volumes"));
+    // Rust drains `frozen_volume_mounts`, thawing each. This backend never
+    // freezes anything -- `FreezeAndSnapshotVolumes` fails before it reaches
+    // the guest and records no mount -- so there is never a thaw obligation
+    // outstanding and the drain is empty.
+    //
+    // Reporting an error here instead would be actively harmful: thaw is the
+    // cleanup half of a failed capture, and a caller that is told the thaw
+    // failed must treat the sandbox as unusable. That would condemn a sandbox
+    // over cleanup work that was never needed.
+    return core::Unit{};
 }
 // Rust `fork`.
 //

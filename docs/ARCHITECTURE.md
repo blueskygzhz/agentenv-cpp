@@ -157,12 +157,85 @@ C++11 port strategy:
 Rust: `src/snapshot/` uses `iroh-blobs` for P2P, `opendal` for object store,
 `overlaybd` for the local block format.
 
-C++11: kept modular but simpler:
-- `snapshot::Manager` owns a `snapshot::Repository*` (interface).
-- Repositories: `LocalRepository` (files under a dir), `S3Repository` (via
-  libcurl), `MockRepository` (in-memory).
+C++11: kept modular but simpler. The names below are the real ones — an
+earlier revision of this section listed `LocalRepository` / `S3Repository` /
+`MockRepository`, none of which exist:
+
+- `snapshot::repository::SnapshotRepository` is the interface, split into a
+  **catalog store** (documents: snapshot records, volume records, aliases) and
+  an **artifact store** (content-addressed blobs / overlaybd layers).
+- Implementations: `PosixFsSnapshotRepository` (`PosixFsCatalogStore` +
+  `PosixFsArtifactStore`, rooted at
+  `{backend.posix_fs.snapshot_store}/repository`) and
+  `InMemorySnapshotRepository` (tests).
+- `main.cc` constructs the posix-fs pair directly. The factories
+  `MakePosixFsRepository` / `MakeOssRepository` in
+  `src/snapshot/repository/backends.cc` still return the in-memory stub, so
+  **`[backend.oss]` is not yet reachable as a repository**: the document layer
+  and the network `ObjectStore` both exist (below), but nothing assembles them
+  into a `SnapshotRepository` yet.
+- The OSS document layer (`repository/oss/documents.{h,cc}`) is ported: shared
+  catalog documents are serialised across nodes with an **ETag
+  compare-and-swap** (read with a version token, write `If-Match`, create with
+  `If-None-Match`, retry with jittered backoff up to 32 attempts). It talks to
+  an `ObjectStore` interface rather than to HTTP, which is what makes the race
+  behaviour testable without a server — see `tests/test_oss_documents.cc`,
+  whose fake injects a competing writer between the read and the write.
+  - Three read states stay distinct and must not be merged: `Found`,
+    `NotFound`, and `Changed` (the object was replaced between its stat and
+    its read). Folding `Changed` into `NotFound` makes the update write
+    create-only, which can never succeed while the object exists — a hot
+    document would stop being updatable.
+  - An **append-only** store (Alibaba's native OSS) cannot write
+    conditionally; upstream serialises writes there with a document lease.
+    That lease is not ported, so such a store is *refused* rather than run
+    through the CAS: a precondition the store ignores is no guarantee at all,
+    and the lost update would leave no symptom.
+- `OssClient` (`repository/oss/client.{h,cc}`) is the S3/MinIO `ObjectStore`
+  over HTTP: SigV4-signed GET / PUT / DELETE / ListObjectsV2 on the existing
+  `http::Transport` and `S3SigningContext`, with the transport injected so
+  `tests/test_oss_client.cc` exercises it without a server. It is *not* the
+  `storage/overlaybd/oss.h` `OssBackend`, which is a read path tuned for
+  ranged layer reads and has no conditional write, list, or delete.
+  - `OssClientConfig::FromBackendConfig` rejects a `[backend.oss]` section that
+    is missing bucket / endpoint / region / credentials (blank counts as
+    missing), and reports `credential_process` as unsupported rather than
+    signing with nothing.
+  - `CanAppend` is true exactly for Alibaba's own hosts (`.aliyuncs.com`,
+    `.aliyun-inc.com`), matched on the host suffix so
+    `aliyuncs.com.evil.example` does not qualify. Such a client is therefore
+    refused by the document layer (above) before it issues a request.
+  - `GetWithEtag` is a single GET, so this client never answers `Changed`:
+    bytes and ETag come from one response and cannot disagree. The state stays
+    in the interface because upstream's stat-then-read backend can produce it.
+  - 412 and 409 are a *lost race* (`false`), not an error; 404 on DELETE is
+    success; 5xx and transport failures are retried, 4xx is returned as-is;
+    a 403 is re-signed once in case the clock skewed, then surfaces.
+  - The ListObjectsV2 query is built in sorted order because SigV4 hashes the
+    canonical query string; a page is capped at the server's 1000, and a key
+    outside the configured prefix is rejected rather than relativised into a
+    document that does not exist.
+  - Only the *paged* listing is ported. Upstream also has `read_all` /
+    `list_keys_recursive`, which walk a whole collection with 16 reads in
+    flight and skip a document deleted since the listing; nothing here needs
+    them yet, and a serial stand-in would quietly change the cost of whatever
+    first does.
+- Cross-node sharing therefore means *one shared POSIX filesystem*. Durable
+  state (catalog documents, managed layers) lives in the repository and is
+  serialised with `flock` + `mkstemp`/`rename` + read-modify-write CAS;
+  node-local state (`image.json`, ublk devices) is rebuilt per node by
+  `MaterializeVolumeBacking` and never persisted.
+- `ArtifactStore::FetchBlob` copies a blob out of the repository into a
+  caller-owned destination, which is what lets a node that does *not* share
+  the filesystem still obtain a layer. `PosixFsArtifactStore` implements it as
+  a size-verified `fs::copy`, as upstream does — the destination is
+  caller-owned, so staging it atomically is the caller's concern. A repository
+  with no artifact store (`InMemorySnapshotRepository` included) keeps the base
+  class's `unsupported("blob storage")` answer.
 - P2P layer (`p2p::Node`) is a **stubbed interface**; you can plug a real
-  transport later.
+  transport later. `src/p2p/iroh.cc` is a compile-time `#error` unless
+  `AGENTENV_WITH_IROH`, and every operation reports
+  `P2pError::MakeDisabled()`.
 
 ## 6. Storage stack
 

@@ -142,6 +142,10 @@ class FakeVolumeRepository : public repo::SnapshotRepository {
     repo::RepositoryResult<std::string> ReadBlob(const repo::BlobKey& key) override {
         return inner_.ReadBlob(key);
     }
+    repo::RepositoryResult<uint64_t> FetchBlob(const repo::BlobKey& key,
+                                               const std::string& destination) override {
+        return inner_.FetchBlob(key, destination);
+    }
 
     /// Durable volume records, deleting ones included.
     std::size_t volume_count() {

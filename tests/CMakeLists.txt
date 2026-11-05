@@ -102,6 +102,10 @@ agentenv_add_test(test_image_catalog     test_image_catalog.cc     agentenv-imag
 agentenv_add_test(test_image_resolver    test_image_resolver.cc    agentenv-image)
 # Rust: src/types/image_tag.rs, src/repository/layout.rs, posixfs documents
 agentenv_add_test(test_repository_documents test_repository_documents.cc agentenv-snapshot agentenv-volume-record)
+# Rust: src/repository/backends/oss/documents.rs — the ETag compare-and-swap.
+agentenv_add_test(test_oss_documents    test_oss_documents.cc    agentenv-snapshot agentenv-volume-record)
+# Rust: src/repository/backends/oss/client.rs — the S3 REST calls.
+agentenv_add_test(test_oss_client       test_oss_client.cc       agentenv-snapshot agentenv-volume-record agentenv-cfg)
 # Rust: src/image/local_layer.rs
 agentenv_add_test(test_image_local_layer   test_image_local_layer.cc   agentenv-image)
 agentenv_add_test(test_image_commit_index  test_image_commit_index.cc  agentenv-image)
@@ -171,6 +175,9 @@ agentenv_add_test(test_api_admin          test_api_admin.cc           agentenv-a
 agentenv_add_test(test_api_sandbox_fork   test_api_sandbox_fork.cc   agentenv-api agentenv-orchestrator)
 # Rust: src/api/impls/sandbox.rs :: prepare_volume_fork_specs
 agentenv_add_test(test_api_volume_fork    test_api_volume_fork.cc    agentenv-api agentenv-volume)
+# Rust: src/api/impls/sandbox.rs :: sandboxes_post (volume mount section)
+agentenv_add_test(test_api_sandbox_volume_mounts test_api_sandbox_volume_mounts.cc
+                  agentenv-api agentenv-orchestrator agentenv-volume)
 # Rust: src/api/impls/volumes.rs
 agentenv_add_test(test_api_volumes        test_api_volumes.cc         agentenv-api agentenv-volume)
 # Rust: src/api/impls/template_helpers.rs

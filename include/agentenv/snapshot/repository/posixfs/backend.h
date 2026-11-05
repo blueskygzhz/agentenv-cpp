@@ -99,6 +99,8 @@ class PosixFsSnapshotRepository : public SnapshotRepository {
     RepositoryResult<BlobLocation> LocateBlob(const BlobKey& key) const override;
     RepositoryResult<bool> HasBlob(const BlobKey& key) override;
     RepositoryResult<std::string> ReadBlob(const BlobKey& key) override;
+    RepositoryResult<uint64_t> FetchBlob(const BlobKey& key,
+                                         const std::string& destination) override;
 
  private:
     std::shared_ptr<PosixFsCatalogStore> catalog_store_;

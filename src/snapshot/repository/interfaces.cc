@@ -138,6 +138,10 @@ RepositoryResult<std::string> SnapshotRepository::ReadBlob(const BlobKey&) {
     return core::make_unexpected(RepositoryError::Unsupported("blob storage"));
 }
 
+RepositoryResult<uint64_t> SnapshotRepository::FetchBlob(const BlobKey&, const std::string&) {
+    return core::make_unexpected(RepositoryError::Unsupported("blob storage"));
+}
+
 namespace {
 
 /// Rust `managed_layer_config` (layer_config.rs) — a managed layer read in

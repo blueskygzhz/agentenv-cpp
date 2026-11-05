@@ -52,6 +52,9 @@ class PosixFsArtifactStore {
     /// Rust `put_blob` — layers are kept when already stored (a size mismatch
     /// is an error); snapshot files are replaced atomically.
     RepositoryResult<core::Unit> PutBlob(const BlobKey& key, const BlobBody& body);
+    /// Rust `fetch_blob` — `fs::copy` out of the repository, returning the
+    /// byte count. `ArtifactNotFound` when the blob is absent.
+    RepositoryResult<uint64_t> FetchBlob(const BlobKey& key, const std::string& destination);
 
     /// Rust `import_built_artifacts`.
     ///

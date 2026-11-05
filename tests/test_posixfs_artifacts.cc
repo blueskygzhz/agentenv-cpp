@@ -357,4 +357,73 @@ MT_TEST(snapshot_artifact_layout_names_match_rust) {
                    "image.json");
 }
 
+// ---- Rust: fetch_blob ----
+//
+// The operation that makes a repository readable from a node that cannot
+// mount it: LocateBlob can only answer `Local`, so without this a reader off
+// the shared filesystem has no way to obtain a layer.
+MT_TEST(fetch_blob_copies_a_stored_layer_and_returns_its_size) {
+    TempRoot root;
+    PosixFsArtifactStore store(root.path);
+
+    const std::string staged = core::fs::Join(root.path, "staged-layer");
+    const std::string body = "managed-layer-bytes";
+    WriteFile(staged, body);
+
+    const BlobKey key = BlobKey::Layer("sha256:fetchme", LayerRole::Rootfs);
+    MT_EXPECT_TRUE(store.PutBlob(key, BlobBody::File(staged)).ok());
+
+    // A destination whose parent does not exist yet: the blob is fetched into
+    // a node-local cache directory the caller has not created.
+    const std::string destination = core::fs::Join(root.path, "cache/sub/fetched.commit");
+    auto fetched = store.FetchBlob(key, destination);
+    MT_EXPECT_TRUE(fetched.ok());
+    MT_EXPECT_TRUE(fetched.ok() && fetched.value() == body.size());
+
+    auto read_back = core::fs::ReadToString(destination);
+    MT_EXPECT_TRUE(read_back.ok());
+    MT_EXPECT_TRUE(read_back.ok() && read_back.value() == body);
+
+    // A copy, not a link: the caller owns the destination and may truncate or
+    // rewrite it, which must not reach back into the repository's blob.
+    MT_EXPECT_TRUE(!SameInode(store.BlobPath(key), destination));
+}
+
+// An absent blob is `ArtifactNotFound`, not a backend failure — the caller
+// distinguishes "not published yet" (retry) from a transport fault (fatal).
+MT_TEST(fetch_blob_reports_artifact_not_found_for_an_unstored_layer) {
+    TempRoot root;
+    PosixFsArtifactStore store(root.path);
+
+    auto fetched = store.FetchBlob(BlobKey::Layer("sha256:missing", LayerRole::Rootfs),
+                                   core::fs::Join(root.path, "dst"));
+    MT_EXPECT_TRUE(!fetched.ok());
+    MT_EXPECT_TRUE(!fetched.ok() &&
+                   fetched.error().kind == RepositoryErrorKind::ArtifactNotFound);
+    // Nothing is created on the failure path.
+    MT_EXPECT_TRUE(!core::fs::Exists(core::fs::Join(root.path, "dst")));
+}
+
+// Fetching over an existing destination replaces it, so a retry after a
+// partial fetch converges instead of keeping the short file.
+MT_TEST(fetch_blob_overwrites_a_stale_destination) {
+    TempRoot root;
+    PosixFsArtifactStore store(root.path);
+
+    const std::string staged = core::fs::Join(root.path, "staged-layer");
+    const std::string body = "the-correct-and-longer-bytes";
+    WriteFile(staged, body);
+    const BlobKey key = BlobKey::Layer("sha256:overwrite", LayerRole::Rootfs);
+    MT_EXPECT_TRUE(store.PutBlob(key, BlobBody::File(staged)).ok());
+
+    const std::string destination = core::fs::Join(root.path, "fetched");
+    WriteFile(destination, "stale");
+
+    auto fetched = store.FetchBlob(key, destination);
+    MT_EXPECT_TRUE(fetched.ok());
+    MT_EXPECT_TRUE(fetched.ok() && fetched.value() == body.size());
+    auto read_back = core::fs::ReadToString(destination);
+    MT_EXPECT_TRUE(read_back.ok() && read_back.value() == body);
+}
+
 MT_MAIN

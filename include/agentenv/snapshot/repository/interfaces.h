@@ -147,8 +147,8 @@ class SnapshotRepository {
     // --- blobs (Rust src/repository/interfaces.rs; default bodies returning
     // `unsupported("blob storage")`, `None` for the URL) -----------------------
     //
-    // Rust's `fetch_blob`, `delete_snapshot_blobs` and `staging_file` are not
-    // ported yet; nothing in this tree calls them.
+    // Rust's `delete_snapshot_blobs` and `staging_file` are not ported yet;
+    // nothing in this tree calls them.
 
     /// Rust `managed_layers_repo_blob_url` — set when readers address managed
     /// layers by URL.
@@ -162,6 +162,23 @@ class SnapshotRepository {
     virtual RepositoryResult<bool> HasBlob(const BlobKey& key);
     /// Rust `read_blob` — `ArtifactNotFound` when absent.
     virtual RepositoryResult<std::string> ReadBlob(const BlobKey& key);
+
+    /// Rust `fetch_blob(key, destination) -> u64` — copies the blob out of the
+    /// repository into a caller-owned `destination`, returning the byte count.
+    ///
+    /// This is the operation that makes a repository usable from a node that
+    /// does *not* share its filesystem: `LocateBlob` can only answer `Local`
+    /// when the bytes are already reachable by path, so a reader that cannot
+    /// mount the repository has no other way to obtain a layer.
+    ///
+    /// Distinct from `ReadBlob`, which returns the bytes in memory — a volume
+    /// layer is routinely gigabytes, so the destination is a file and the
+    /// return value is a size rather than the contents.
+    ///
+    /// `ArtifactNotFound` when the blob is absent, so a caller can tell "not
+    /// published yet" from a transport failure.
+    virtual RepositoryResult<uint64_t> FetchBlob(const BlobKey& key,
+                                                 const std::string& destination);
 };
 
 /// Rust `repository::materialize_volume_backing` (layer_config.rs) — writes a

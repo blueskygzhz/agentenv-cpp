@@ -442,9 +442,13 @@ MT_TEST(unported_capture_methods_report_failure) {
     // child, so it fails here from having no live microVM rather than from
     // being unported. Asserting it refuses would no longer say anything about
     // whether it is implemented. See `fork_without_a_live_vm_is_terminal`.
-    MT_EXPECT_TRUE(!backend->SnapshotVolumes().ok());
-    MT_EXPECT_TRUE(!backend->FreezeAndSnapshotVolumes().ok());
-    MT_EXPECT_TRUE(!backend->ThawVolumes().ok());
+    //
+    // The three volume methods are no longer on this list either: they are
+    // driven by the set of writable persistent volumes, and this backend
+    // attaches none, so upstream completes them as no-ops. Asserting they
+    // refuse would have pinned the wrong behaviour -- see
+    // `volume_capture_is_a_no_op_without_writable_persistent_volumes` and
+    // `volume_capture_refuses_a_writable_persistent_volume`.
     MT_EXPECT_TRUE(!backend->Start().ok());
     MT_EXPECT_TRUE(!backend->StartNowait().ok());
     MT_EXPECT_TRUE(!backend->WaitForReady().ok());
@@ -453,6 +457,110 @@ MT_TEST(unported_capture_methods_report_failure) {
     MT_EXPECT_TRUE(backend->UpdateNetworkPolicy(core::nullopt).ok());
     // No API call was made by any of them.
     MT_EXPECT_EQ(conn->calls.size(), static_cast<std::size_t>(0));
+}
+
+// ============================================================
+// volume capture is driven by the writable-persistent-volume set
+// ============================================================
+
+namespace {
+
+/// A drive that is writable and carries a snapshot output dir, which is what
+/// makes it a *writable persistent volume* — the pair of properties every
+/// volume-capture step selects on.
+ExtraDrive WritableVolumeDrive(const std::string& id) {
+    ExtraDrive drive;
+    drive.drive_id = id;
+    drive.image_config_path = "/tmp/aenv-vol-" + id + "/image.json";
+    drive.read_only = false;
+    drive.mount_path = "/mnt/" + id;
+    return drive.WithVolumeSnapshotOutputDir(
+        core::Optional<std::string>("/tmp/aenv-vol-" + id));
+}
+
+/// A backend over an already-booted instance whose capture descriptor carries
+/// `drives` — the form `Pause` hands back, and the only one whose drives are
+/// visible without running a host-side drive plan.
+std::unique_ptr<FirecrackerSandboxBackend> MakeBackendWithDrives(
+    ScriptedConnector* conn, const std::vector<ExtraDrive>& drives) {
+    std::unique_ptr<FirecrackerInstance> instance(
+        new FirecrackerInstance("/tmp/aenv-sbx-test", std::shared_ptr<Connector>(conn)));
+    SnapshotConfig cfg;
+    cfg.common.extra_drives = drives;
+    return std::unique_ptr<FirecrackerSandboxBackend>(
+        new FirecrackerSandboxBackend(std::move(instance), cfg));
+}
+
+}  // namespace
+
+// Rust returns `Ok(())` from all three when there is no writable persistent
+// volume: the flush/freeze loops have nothing to iterate and the seal skips
+// every drive. Refusing instead would refuse a capture upstream completes,
+// for every sandbox that attaches no volume.
+MT_TEST(volume_capture_is_a_no_op_without_writable_persistent_volumes) {
+    ScriptedConnector* conn = new ScriptedConnector();
+    std::unique_ptr<FirecrackerSandboxBackend> backend = MakeBackend(conn);
+
+    MT_EXPECT_TRUE(backend->SnapshotVolumes().ok());
+    MT_EXPECT_TRUE(backend->FreezeAndSnapshotVolumes().ok());
+    MT_EXPECT_TRUE(backend->ThawVolumes().ok());
+    // A no-op reaches neither the VMM nor the guest.
+    MT_EXPECT_EQ(conn->calls.size(), static_cast<std::size_t>(0));
+}
+
+// A read-only volume, and a writable drive with no output dir, are both
+// outside the set: the first has nothing to flush, the second is an ordinary
+// attached drive whose contents live in the snapshot. Selecting on only one
+// of the two properties would pull them in and refuse the capture.
+MT_TEST(volume_capture_ignores_read_only_volumes_and_plain_writable_drives) {
+    ScriptedConnector* conn = new ScriptedConnector();
+
+    ExtraDrive read_only = WritableVolumeDrive("ro");
+    read_only.read_only = true;
+
+    ExtraDrive plain;
+    plain.drive_id = "scratch";
+    plain.image_config_path = "/tmp/aenv-scratch/image.json";
+    plain.read_only = false;
+    plain.mount_path = "/mnt/scratch";
+    MT_EXPECT_TRUE(!plain.snapshot_output_dir.has_value());
+
+    std::vector<ExtraDrive> drives;
+    drives.push_back(read_only);
+    drives.push_back(plain);
+    std::unique_ptr<FirecrackerSandboxBackend> backend = MakeBackendWithDrives(conn, drives);
+
+    MT_EXPECT_TRUE(backend->SnapshotVolumes().ok());
+    MT_EXPECT_TRUE(backend->FreezeAndSnapshotVolumes().ok());
+    MT_EXPECT_TRUE(backend->ThawVolumes().ok());
+}
+
+// With a writable persistent volume present the sealing half is reached, and
+// that half is genuinely missing: it needs the overlaybd layer writer and an
+// envd client. Reporting success would publish a volume whose snapshot layer
+// was never written, discovered only at a later resume on another node.
+MT_TEST(volume_capture_refuses_a_writable_persistent_volume) {
+    ScriptedConnector* conn = new ScriptedConnector();
+    std::vector<ExtraDrive> drives;
+    drives.push_back(WritableVolumeDrive("data"));
+    std::unique_ptr<FirecrackerSandboxBackend> backend = MakeBackendWithDrives(conn, drives);
+
+    const SandboxCaptureResult<core::Unit> snapped = backend->SnapshotVolumes();
+    MT_EXPECT_TRUE(!snapped.ok());
+    // Recoverable, not terminal: nothing was touched, so the sandbox is still
+    // runnable and must not be condemned.
+    MT_EXPECT_TRUE(!snapped.ok() &&
+                   snapped.error().kind == SandboxCaptureError::Kind::Recoverable);
+
+    const SandboxCaptureResult<core::Unit> frozen = backend->FreezeAndSnapshotVolumes();
+    MT_EXPECT_TRUE(!frozen.ok());
+    MT_EXPECT_TRUE(!frozen.ok() &&
+                   frozen.error().kind == SandboxCaptureError::Kind::Recoverable);
+
+    // Thaw still succeeds: the freeze failed before reaching the guest, so no
+    // thaw is owed. Failing here would condemn the sandbox over cleanup work
+    // that was never needed.
+    MT_EXPECT_TRUE(backend->ThawVolumes().ok());
 }
 
 MT_TEST(fork_pauses_and_resumes_the_source_around_the_capture) {

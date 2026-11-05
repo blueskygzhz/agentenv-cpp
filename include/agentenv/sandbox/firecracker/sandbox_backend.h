@@ -706,6 +706,25 @@ class FirecrackerSandboxBackend : public SandboxBackend {
     /// fails for a reason that has nothing to do with the sequence under test.
     void SetMemoryLayerWriterForTesting(const MemoryLayerWriter& writer);
 
+    // ---- volume capture: no-op when there is nothing to capture ------------
+    //
+    // Each of these is driven by the set of *writable persistent volumes*
+    // (writable and carrying a snapshot output dir). Upstream they are no-ops
+    // when that set is empty, which this reproduces -- a sandbox with no such
+    // volume is the common case in this build, and refusing it would refuse a
+    // capture Rust completes.
+    //
+    // With such a volume present they report an error instead of succeeding:
+    // sealing one needs the overlaybd layer writer (absent here) and freezing
+    // one needs an envd client to run the ioctl in the guest (also absent).
+    // Claiming success would publish a volume whose snapshot layer was never
+    // written, and that only surfaces at a later resume on another node.
+
+    SandboxCaptureResult<core::Unit> SnapshotVolumes() override;
+    SandboxCaptureResult<core::Unit> FreezeAndSnapshotVolumes() override;
+    /// Always succeeds: nothing here ever freezes, so no thaw is ever owed.
+    core::Expected<core::Unit, core::AnyError> ThawVolumes() override;
+
     // ---- not available in this build --------------------------------------
     //
     // Reported as errors rather than as success. A caller that is told a
@@ -713,9 +732,6 @@ class FirecrackerSandboxBackend : public SandboxBackend {
     // never written, and the failure then appears on a different node, at a
     // different time, as a corrupt record.
 
-    SandboxCaptureResult<core::Unit> SnapshotVolumes() override;
-    SandboxCaptureResult<core::Unit> FreezeAndSnapshotVolumes() override;
-    core::Expected<core::Unit, core::AnyError> ThawVolumes() override;
     SandboxCaptureResult<std::vector<SandboxForkResult> >
         Fork(const std::vector<SandboxForkSpec>& specs) override;
     core::Optional<std::string> HostInteractionIp() const override;

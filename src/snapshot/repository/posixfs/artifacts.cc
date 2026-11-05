@@ -257,6 +257,58 @@ RepositoryResult<core::Unit> PosixFsArtifactStore::PutBlob(const BlobKey& key,
     return PutSnapshotBytes(key.snapshot_id(), SnapshotFileName(key.file()), body.bytes);
 }
 
+RepositoryResult<uint64_t> PosixFsArtifactStore::FetchBlob(const BlobKey& key,
+                                                           const std::string& destination) {
+    const std::string source = BlobPath(key);
+    // TryExists, not Exists: a permission or I/O failure on the repository
+    // must not be reported as "this layer was never published", which is a
+    // caller-visible distinction (one is retried, the other is fatal).
+    const core::Expected<bool, std::string> exists = core::fs::TryExists(source);
+    if (!exists.ok()) {
+        return core::make_unexpected(
+            RepositoryError::Backend("stat blob '" + source + "'", exists.error()));
+    }
+    if (!exists.value()) {
+        return core::make_unexpected(RepositoryError::ArtifactNotFound(key.PosixPath()));
+    }
+
+    const core::Expected<uint64_t, std::string> source_size = core::fs::FileSize(source);
+    if (!source_size.ok()) {
+        return core::make_unexpected(
+            RepositoryError::Backend("read blob metadata '" + source + "'", source_size.error()));
+    }
+
+    // The destination is caller-owned and need not exist yet; its parent must.
+    const core::Optional<std::string> parent = core::fs::Parent(destination);
+    if (parent.has_value()) {
+        const core::Expected<core::Unit, std::string> mk = core::fs::CreateDirAll(*parent);
+        if (!mk.ok()) {
+            return core::make_unexpected(RepositoryError::Backend(
+                "create blob destination dir '" + *parent + "'", mk.error()));
+        }
+    }
+
+    const core::Expected<core::Unit, std::string> copied = core::fs::Copy(source, destination);
+    if (!copied.ok()) {
+        return core::make_unexpected(RepositoryError::Backend(
+            "fetch blob '" + source + "' -> '" + destination + "'", copied.error()));
+    }
+
+    // A short copy is the one failure that stays silent otherwise: overlaybd
+    // would mount a truncated layer and read zeros where data should be.
+    const core::Expected<uint64_t, std::string> fetched_size = core::fs::FileSize(destination);
+    if (!fetched_size.ok()) {
+        return core::make_unexpected(RepositoryError::Backend(
+            "read fetched blob metadata '" + destination + "'", fetched_size.error()));
+    }
+    if (fetched_size.value() != source_size.value()) {
+        return core::make_unexpected(RepositoryError::IntegrityMismatch(
+            key.PosixPath(), ToStr(source_size.value()) + " bytes",
+            ToStr(fetched_size.value()) + " bytes"));
+    }
+    return fetched_size.value();
+}
+
 RepositoryResult<core::Unit> PosixFsArtifactStore::PutLayer(const std::string& digest,
                                                             const std::string& destination,
                                                             const std::string& source) {
