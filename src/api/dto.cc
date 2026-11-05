@@ -257,5 +257,64 @@ core::Json ForkSandboxResp::ToJson() const {
     return core::Json(arr);
 }
 
+// -------- NewVolumeReq --------
+core::Json NewVolumeReq::ToJson() const {
+    core::Json j;
+    j["name"] = core::Json(name);
+    // Omitted when unset: upstream's optional fields carry
+    // `skip_serializing_if = "Option::is_none"`, and a written-out default
+    // would be indistinguishable from a caller that asked for it explicitly.
+    if (mode.has_value()) j["mode"] = core::Json(*mode);
+    if (size_mb.has_value()) j["sizeMb"] = core::Json(static_cast<int64_t>(*size_mb));
+    if (image.has_value()) j["image"] = core::Json(*image);
+    if (from_volume.has_value()) j["fromVolume"] = core::Json(*from_volume);
+    return j;
+}
+
+core::Expected<NewVolumeReq, core::AnyError> NewVolumeReq::FromJson(const core::Json& j) {
+    NewVolumeReq r;
+    // `name` is the one required field; the rest are `Option`s upstream, so a
+    // missing key is not an error. A present key of the wrong type is: silently
+    // dropping a malformed `sizeMb` would create a 64 GiB volume for a caller
+    // who asked for something else entirely.
+    const core::Json& name_field = j["name"];
+    if (name_field.kind() != core::Json::Kind::String) {
+        return core::make_unexpected(core::AnyError(std::string("volume name is required")));
+    }
+    r.name = name_field.as_string();
+
+    const core::Json& mode_field = j["mode"];
+    if (mode_field.kind() == core::Json::Kind::String) {
+        r.mode = core::Optional<std::string>(mode_field.as_string());
+    } else if (mode_field.kind() != core::Json::Kind::Null) {
+        return core::make_unexpected(core::AnyError(std::string("invalid type for `mode`")));
+    }
+
+    const core::Json& size_field = j["sizeMb"];
+    if (size_field.kind() == core::Json::Kind::Int) {
+        if (size_field.as_int() < 0) {
+            return core::make_unexpected(core::AnyError(std::string("`sizeMb` must not be negative")));
+        }
+        r.size_mb = core::Optional<uint64_t>(static_cast<uint64_t>(size_field.as_int()));
+    } else if (size_field.kind() != core::Json::Kind::Null) {
+        return core::make_unexpected(core::AnyError(std::string("invalid type for `sizeMb`")));
+    }
+
+    const core::Json& image_field = j["image"];
+    if (image_field.kind() == core::Json::Kind::String) {
+        r.image = core::Optional<std::string>(image_field.as_string());
+    } else if (image_field.kind() != core::Json::Kind::Null) {
+        return core::make_unexpected(core::AnyError(std::string("invalid type for `image`")));
+    }
+
+    const core::Json& from_field = j["fromVolume"];
+    if (from_field.kind() == core::Json::Kind::String) {
+        r.from_volume = core::Optional<std::string>(from_field.as_string());
+    } else if (from_field.kind() != core::Json::Kind::Null) {
+        return core::make_unexpected(core::AnyError(std::string("invalid type for `fromVolume`")));
+    }
+    return r;
+}
+
 }  // namespace api
 }  // namespace agentenv

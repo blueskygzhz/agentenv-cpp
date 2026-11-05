@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <sstream>
 
+#include "agentenv/api/impls.h"
 #include "agentenv/core/identity.h"
 #include "agentenv/core/logging.h"
 
@@ -352,6 +353,99 @@ core::Expected<PreparedVolumeForkSpecs, VolumeApiError> PrepareVolumeForkSpecs(
     }
 
     return prepared;
+}
+
+// ---------------------------------------------------------------------------
+// Handlers (Rust: `impl Volumes<()> for ApiImpl`)
+// ---------------------------------------------------------------------------
+
+core::Expected<volume::VolumeManager*, ApiError> ApiImpl::RequireVolumes() const {
+    if (!volumes_) {
+        // Upstream's field is non-optional, so there is no upstream message to
+        // copy. The wording matches `ResolveVolumeMounts`, which answers the
+        // same absence on the sandbox path.
+        return core::make_unexpected(ApiError::Make(500, "no volume manager configured"));
+    }
+    return volumes_.get();
+}
+
+core::Expected<VolumePageResp, ApiError> ApiImpl::ListVolumes(
+    const core::Optional<std::string>& next_token,
+    const core::Optional<std::size_t>& limit) {
+    const core::Expected<volume::VolumeManager*, ApiError> manager = RequireVolumes();
+    if (!manager.ok()) return core::make_unexpected(manager.error());
+
+    // Rust `query_params.limit.map(|l| l as usize).unwrap_or(DEFAULT_VOLUME_PAGE_SIZE)`.
+    const std::size_t effective =
+        limit.has_value() ? *limit : volume::kDefaultVolumePageSize;
+    const volume::VolumeResult<volume::VolumePage> page =
+        manager.value()->ListPage(next_token, effective);
+    if (!page.ok()) return core::make_unexpected(VolumeErrorResponse(page.error()));
+
+    VolumePageResp out;
+    core::JsonArray records;
+    for (std::size_t i = 0; i < page.value().records.size(); ++i) {
+        records.push_back(VolumeRecordToJson(page.value().records[i]));
+    }
+    out.records = core::Json(records);
+    out.next_token = page.value().next_token;
+    return out;
+}
+
+core::Expected<core::Json, ApiError> ApiImpl::CreateVolume(const NewVolumeReq& req) {
+    const core::Expected<volume::VolumeManager*, ApiError> manager = RequireVolumes();
+    if (!manager.ok()) return core::make_unexpected(manager.error());
+
+    const core::Expected<volume::VolumeMode, VolumeApiError> mode =
+        ParseVolumeModeParam(req.mode);
+    if (!mode.ok()) return core::make_unexpected(mode.error());
+
+    // Rust resolves `image` only when `from_volume` is absent; naming both is
+    // not an error, the image is simply the unused one. Keeping that shape
+    // matters because `VolumeManager::Create` rejects two *resolved* sources
+    // with `MultipleSources`, which this would otherwise trigger.
+    core::Optional<std::string> source_config;
+    if (!req.from_volume.has_value() && req.image.has_value()) {
+        if (!image_resolver_) {
+            return core::make_unexpected(ApiError::Make(
+                501, "creating a volume from an image requires an image resolver"));
+        }
+        const core::Expected<image::ResolvedBlockImage, image::ImageError> resolved =
+            image_resolver_->Resolve(*req.image);
+        if (!resolved.ok()) {
+            // Rust: `if error.is_user_error() { 400 } else { 500 }`, with the
+            // message prefixed by `resolve volume image`.
+            const int code = resolved.error().IsUserError() ? 400 : 500;
+            return core::make_unexpected(ApiError::Make(
+                code, "resolve volume image: " + resolved.error().reason));
+        }
+        source_config =
+            core::Optional<std::string>(resolved.value().overlaybd_config_path);
+    }
+
+    const volume::VolumeResult<volume::VolumeRecord> created = manager.value()->Create(
+        req.name, mode.value(), req.from_volume, source_config,
+        req.size_mb.has_value() ? *req.size_mb : volume::kDefaultVolumeSizeMb);
+    if (!created.ok()) return core::make_unexpected(VolumeErrorResponse(created.error()));
+    return VolumeRecordToJson(created.value());
+}
+
+core::Expected<core::Json, ApiError> ApiImpl::GetVolume(const std::string& volume_id) {
+    const core::Expected<volume::VolumeManager*, ApiError> manager = RequireVolumes();
+    if (!manager.ok()) return core::make_unexpected(manager.error());
+    const volume::VolumeResult<volume::VolumeRecord> record =
+        manager.value()->Get(volume_id);
+    if (!record.ok()) return core::make_unexpected(VolumeErrorResponse(record.error()));
+    return VolumeRecordToJson(record.value());
+}
+
+core::Expected<core::Unit, ApiError> ApiImpl::DeleteVolume(const std::string& volume_id) {
+    const core::Expected<volume::VolumeManager*, ApiError> manager = RequireVolumes();
+    if (!manager.ok()) return core::make_unexpected(manager.error());
+    const core::Expected<core::Unit, volume::VolumeError> removed =
+        manager.value()->Remove(volume_id);
+    if (!removed.ok()) return core::make_unexpected(VolumeErrorResponse(removed.error()));
+    return core::Unit();
 }
 
 }  // namespace api

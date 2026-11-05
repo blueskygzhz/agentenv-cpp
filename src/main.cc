@@ -18,9 +18,12 @@
 #include "agentenv/core/fs.h"
 #include "agentenv/core/identity.h"
 #include "agentenv/core/logging.h"
+#include "agentenv/image/resolver.h"
 #include "agentenv/orchestrator/persistence.h"
 #include "agentenv/orchestrator/service.h"
 #include "agentenv/cfg.h"
+#include "agentenv/snapshot/repository/posixfs/backend.h"
+#include "agentenv/volume.h"
 #include "agentenv/p2p/http_transport.h"
 #include "agentenv/p2p/node.h"
 #include "agentenv/p2p/scheduler_http.h"
@@ -428,7 +431,63 @@ int main(int argc, char** argv) {
     }
     auto factory = std::shared_ptr<ae::sandbox::SandboxBackendFactory>(fc_factory);
 
-    auto built = ae::orchestrator::Orchestrator::New(store, factory, persister, app_cfg);
+    // 2b) Volume manager.
+    //
+    // Rust `server.rs:106-118`: the snapshot repository first, then
+    // `VolumeManager::open_with_repository_and_limits(home/volumes/catalog,
+    // repository, limits)`. The manager goes to both the orchestrator (which
+    // releases leases on delete and publishes backings on capture) and the API
+    // bundle (which serves `/volumes*`).
+    //
+    // Built from the posix-fs stores directly rather than through
+    // `MakePosixFsRepository`, which still answers with the in-memory stub
+    // whose document methods report "unsupported": a volume catalog on top of
+    // that would fail every call.
+    std::shared_ptr<ae::volume::VolumeManager> volume_manager;
+    std::shared_ptr<ae::image::ImageResolver> image_resolver;
+    if (app_cfg.backend.posix_fs.has_value()) {
+        // Rust `config.backend.posix_fs.snapshot_store.join("repository")`.
+        const std::string repository_root =
+            ae::core::fs::Join(app_cfg.backend.posix_fs->snapshot_store, "repository");
+        auto repository = std::shared_ptr<ae::snapshot::repository::SnapshotRepository>(
+            new ae::snapshot::repository::posixfs::PosixFsSnapshotRepository(
+                std::make_shared<ae::snapshot::repository::posixfs::PosixFsCatalogStore>(
+                    repository_root),
+                std::make_shared<ae::snapshot::repository::posixfs::PosixFsArtifactStore>(
+                    repository_root)));
+
+        ae::volume::VolumeLimits limits;
+        limits.max_size_mb = app_cfg.volume.max_size_mb;
+        limits.max_mounts = app_cfg.volume.max_volume_count;
+
+        auto opened = ae::volume::VolumeManager::OpenWithRepositoryAndLimits(
+            ae::core::fs::Join(app_cfg.home_path, "volumes/catalog"), repository, limits);
+        if (!opened.ok()) {
+            // Fatal, as Rust's `?` is. A node that came up without a volume
+            // manager would answer every `/volumes*` request with a 500 and
+            // silently skip lease release on delete, leaking a reservation per
+            // deleted sandbox.
+            AGENTENV_ERROR("volume manager startup failed: " << opened.error().ToString());
+            return 1;
+        }
+        volume_manager = opened.value();
+        // Rust `ImageResolver::new(config).with_repository(repository)`.
+        // `with_repository` mutates and returns a reference, so the shared_ptr
+        // is built first and configured through it.
+        auto resolver = std::make_shared<ae::image::DefaultImageResolver>(app_cfg);
+        resolver->WithRepository(repository);
+        image_resolver = resolver;
+    } else {
+        // Rust reaches `build_snapshot_backend`'s posix-fs arm whenever the
+        // repository backend is posix-fs, so an absent section is a
+        // configuration gap rather than a mode. Warn instead of failing: the
+        // sandbox control plane does not need volumes to serve.
+        AGENTENV_WARN("no [backend.posix_fs] section;"
+                      << " volumes are disabled and /volumes* will answer 500");
+    }
+
+    auto built = ae::orchestrator::Orchestrator::New(store, factory, persister, app_cfg,
+                                                     volume_manager);
     if (!built.ok()) {
         // Startup restore failing is fatal on purpose. Carrying on with an
         // empty store would present a node with no sandboxes while the
@@ -542,7 +601,8 @@ int main(int argc, char** argv) {
             static_cast<int64_t>(app_cfg.orchestrator.auto_resume_min_sandbox_timeout_secs) *
                 1000)));
 
-    ae::api::RegisterOrchestratorRoutes(server.get(), svc.get());
+    ae::api::RegisterOrchestratorRoutes(server.get(), svc.get(), volume_manager,
+                                        image_resolver);
 
     InstallShutdownHandlers(server.get());
 

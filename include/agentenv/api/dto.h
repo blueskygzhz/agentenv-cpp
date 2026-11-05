@@ -144,6 +144,39 @@ struct ForkSandboxResp {
     core::Json ToJson() const;
 };
 
+/// POST /volumes  request body.
+///
+/// Rust `models::NewVolume`. Only `name` is required; every default is applied
+/// by the handler rather than here, because two of them are not literals --
+/// an absent `sizeMb` means `DEFAULT_VOLUME_SIZE_MB` and an absent `mode`
+/// means exclusive, and both belong with the validation that reads them.
+///
+/// `image` and `from_volume` are alternative sources. Upstream resolves
+/// `image` only when `from_volume` is absent, so the two are not rejected as
+/// a conflict here either.
+struct NewVolumeReq {
+    std::string name;
+    /// Rust `mode: Option<String>` — the API spelling (`"ro"` / `"exclusive"`),
+    /// not the serde spelling of `VolumeMode`.
+    core::Optional<std::string> mode;
+    core::Optional<uint64_t>    size_mb;
+    core::Optional<std::string> image;
+    core::Optional<std::string> from_volume;
+
+    core::Json ToJson() const;
+    static core::Expected<NewVolumeReq, core::AnyError> FromJson(const core::Json& j);
+};
+
+/// GET /volumes  response.
+///
+/// Rust returns the records as the body and the continuation token as the
+/// `x-next-token` *header*, so the two are kept apart here rather than merged
+/// into one object: a client paging by header would never see a body field.
+struct VolumePageResp {
+    /// A JSON array of projected volume records (`VolumeRecordToJson`).
+    core::Json records;
+    core::Optional<std::string> next_token;
+};
 
 }  // namespace api
 }  // namespace agentenv

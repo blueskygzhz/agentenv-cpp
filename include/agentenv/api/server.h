@@ -16,7 +16,12 @@
 #include "agentenv/core/expected.h"
 
 namespace agentenv {
+// Forward-declared rather than included: this header is pulled in by every
+// transport and test, and the volume/image headers drag in the repository and
+// overlaybd surfaces. The routes only need to pass these through.
 namespace orchestrator { class Orchestrator; }
+namespace volume { class VolumeManager; }
+namespace image { class ImageResolver; }
 
 namespace api {
 
@@ -90,7 +95,21 @@ std::unique_ptr<Server> MakeServer();
 
 /// Convenience: register all `/sandboxes*` routes onto the given server,
 /// dispatching to the given orchestrator::Orchestrator.
+///
+/// This overload registers `/volumes*` too, but every one of those routes then
+/// answers 500: the handlers need a volume manager. Prefer the four-argument
+/// form for anything that serves volumes.
 void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc);
+
+/// As above, plus the collaborators the `/volumes*` handlers need.
+///
+/// `volumes` may be null, which is what the two-argument overload passes.
+/// `image_resolver` may be null independently: it is read only by
+/// `POST /volumes` when the request names an `image`, so a deployment that
+/// never creates volumes from images does not need one.
+void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc,
+                                std::shared_ptr<volume::VolumeManager> volumes,
+                                std::shared_ptr<image::ImageResolver> image_resolver);
 
 }  // namespace api
 }  // namespace agentenv

@@ -3,6 +3,7 @@
 // `RegisterOrchestratorRoutes` is the route table itself.
 #include "agentenv/api/server.h"
 
+#include <cstdlib>
 #include <vector>
 
 #include "agentenv/api/http_server.h"
@@ -59,6 +60,13 @@ std::unique_ptr<Server> MakeServer() {
 }
 
 void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc) {
+    RegisterOrchestratorRoutes(server, svc, std::shared_ptr<volume::VolumeManager>(),
+                               std::shared_ptr<image::ImageResolver>());
+}
+
+void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc,
+                                std::shared_ptr<volume::VolumeManager> volumes,
+                                std::shared_ptr<image::ImageResolver> image_resolver) {
     if (server == NULL || svc == NULL) return;
 
     // The handlers share one ApiImpl. It holds a shared_ptr, so the lambdas
@@ -69,7 +77,7 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc)
     // that decides when the orchestrator dies.
     std::shared_ptr<orchestrator::Orchestrator> alias(
         std::shared_ptr<orchestrator::Orchestrator>(), svc);
-    std::shared_ptr<ApiImpl> impl(new ApiImpl(alias));
+    std::shared_ptr<ApiImpl> impl(new ApiImpl(alias, volumes, image_resolver));
 
     // ---- sandboxes --------------------------------------------------------
 
@@ -173,6 +181,74 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc)
                   [impl](const HttpRequest& req, HttpResponse* resp) {
         const core::Expected<core::Unit, ApiError> r =
             impl->CreateSnapshot(Param(req, "sandbox_id"));
+        if (!r.ok()) return WriteError(r.error(), resp);
+        resp->status = 204;
+    });
+
+    // ---- volumes ----------------------------------------------------------
+
+    server->Route("GET", "/volumes", [impl](const HttpRequest& req, HttpResponse* resp) {
+        // Rust's query params are `nextToken` and `limit`. An absent parameter
+        // and an explicitly empty one are treated alike here; upstream's
+        // generated layer would pass `Some("")` through to be rejected as an
+        // invalid cursor, and refusing a paging request because the client sent
+        // `?nextToken=` is not worth preserving.
+        core::Optional<std::string> next_token;
+        const std::string raw_token = Param(req, "nextToken");
+        if (!raw_token.empty()) next_token = core::Optional<std::string>(raw_token);
+
+        core::Optional<std::size_t> limit;
+        const std::string raw_limit = Param(req, "limit");
+        if (!raw_limit.empty()) {
+            // Upstream's `limit` is a `u32` validated to 1..=100 by the
+            // generated layer, so a non-numeric value never reaches the
+            // handler. Rejecting it here keeps that: parsing it loosely would
+            // turn `?limit=abc` into the default page size, silently serving a
+            // different request than the one asked for. The range itself stays
+            // with the manager, which answers `InvalidPageLimit`.
+            char* end = NULL;
+            const unsigned long parsed = std::strtoul(raw_limit.c_str(), &end, 10);
+            if (end == NULL || *end != '\0') {
+                return WriteError(ApiError::Make(400, "invalid `limit`: expected an integer"),
+                                  resp);
+            }
+            limit = core::Optional<std::size_t>(static_cast<std::size_t>(parsed));
+        }
+
+        const core::Expected<VolumePageResp, ApiError> r = impl->ListVolumes(next_token, limit);
+        if (!r.ok()) return WriteError(r.error(), resp);
+        resp->status = 200;
+        resp->body = r.value().records.ToString();
+        // Rust returns the cursor as a header, not in the body, and omits it
+        // entirely on the last page.
+        if (r.value().next_token.has_value()) {
+            resp->headers["x-next-token"] = *r.value().next_token;
+        }
+    });
+
+    server->Route("POST", "/volumes", [impl](const HttpRequest& req, HttpResponse* resp) {
+        core::Json body;
+        if (!ParseBody(req, &body, resp)) return;
+        const core::Expected<NewVolumeReq, core::AnyError> parsed = NewVolumeReq::FromJson(body);
+        if (!parsed.ok()) {
+            return WriteError(ApiError::Make(400, parsed.error().chain()), resp);
+        }
+        const core::Expected<core::Json, ApiError> r = impl->CreateVolume(parsed.value());
+        if (!r.ok()) return WriteError(r.error(), resp);
+        resp->status = 201;
+        resp->body = r.value().ToString();
+    });
+
+    server->Route("GET", "/volumes/{volume_id}",
+                  [impl](const HttpRequest& req, HttpResponse* resp) {
+        const core::Expected<core::Json, ApiError> r = impl->GetVolume(Param(req, "volume_id"));
+        if (!r.ok()) return WriteError(r.error(), resp);
+        WriteJson(r.value(), resp);
+    });
+
+    server->Route("DELETE", "/volumes/{volume_id}",
+                  [impl](const HttpRequest& req, HttpResponse* resp) {
+        const core::Expected<core::Unit, ApiError> r = impl->DeleteVolume(Param(req, "volume_id"));
         if (!r.ok()) return WriteError(r.error(), resp);
         resp->status = 204;
     });

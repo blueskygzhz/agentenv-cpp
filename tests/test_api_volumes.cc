@@ -5,6 +5,7 @@
 #include <map>
 #include <string>
 
+#include "agentenv/api/impls.h"
 #include "microtest.h"
 #include "volume_fakes.h"
 
@@ -376,6 +377,223 @@ MT_TEST(api_volumes_resolution_is_ordered_by_mount_path) {
     MT_EXPECT_EQ(resolved.value().drives.size(), static_cast<std::size_t>(2));
     MT_EXPECT_EQ(resolved.value().drives[0].mount_path, std::string("/mnt/alpha"));
     MT_EXPECT_EQ(resolved.value().drives[1].mount_path, std::string("/mnt/zebra"));
+}
+
+// ---- handlers ---------------------------------------------------------------
+//
+// `ApiImpl`'s volume handlers take no orchestrator path, so these build one
+// with a null service. That is not a shortcut being hidden: if a handler ever
+// starts touching `svc_`, these tests crash rather than quietly passing.
+
+namespace {
+
+ApiImpl MakeVolumeApi(const Fixture& fixture) {
+    return ApiImpl(std::shared_ptr<orchestrator::Orchestrator>(), fixture.manager);
+}
+
+ApiImpl MakeVolumelessApi() {
+    return ApiImpl(std::shared_ptr<orchestrator::Orchestrator>());
+}
+
+NewVolumeReq EmptyVolumeRequest(const std::string& name) {
+    NewVolumeReq req;
+    req.name = name;
+    return req;
+}
+
+}  // namespace
+
+MT_TEST(api_volumes_create_projects_the_public_record) {
+    Fixture fixture;
+    ApiImpl api = MakeVolumeApi(fixture);
+
+    NewVolumeReq req = EmptyVolumeRequest("pgdata");
+    req.size_mb = core::Optional<uint64_t>(1024);
+
+    const core::Expected<core::Json, ApiError> created = api.CreateVolume(req);
+    MT_EXPECT_TRUE(created.ok());
+    MT_EXPECT_EQ(StringField(created.value(), "name"), std::string("pgdata"));
+    MT_EXPECT_EQ(IntField(created.value(), "sizeMB"), static_cast<int64_t>(1024));
+    // Node-internal fields stay out of the projection.
+    MT_EXPECT_TRUE(!HasField(created.value(), "backingLayers"));
+    MT_EXPECT_TRUE(!HasField(created.value(), "backingImageConfig"));
+}
+
+MT_TEST(api_volumes_create_defaults_size_to_the_upstream_constant) {
+    Fixture fixture;
+    ApiImpl api = MakeVolumeApi(fixture);
+
+    // Rust `body.size_mb.unwrap_or(DEFAULT_VOLUME_SIZE_MB)`.
+    const core::Expected<core::Json, ApiError> created =
+        api.CreateVolume(EmptyVolumeRequest("defaulted"));
+    MT_EXPECT_TRUE(created.ok());
+    MT_EXPECT_EQ(IntField(created.value(), "sizeMB"),
+                 static_cast<int64_t>(volume::kDefaultVolumeSizeMb));
+}
+
+MT_TEST(api_volumes_create_rejects_an_unknown_mode) {
+    Fixture fixture;
+    ApiImpl api = MakeVolumeApi(fixture);
+
+    NewVolumeReq req = EmptyVolumeRequest("bad-mode");
+    req.mode = core::Optional<std::string>("read-write");
+
+    const core::Expected<core::Json, ApiError> created = api.CreateVolume(req);
+    MT_EXPECT_TRUE(!created.ok());
+    MT_EXPECT_EQ(created.error().code, 400);
+}
+
+MT_TEST(api_volumes_create_refuses_an_image_without_a_resolver) {
+    Fixture fixture;
+    ApiImpl api = MakeVolumeApi(fixture);
+
+    NewVolumeReq req = EmptyVolumeRequest("from-image");
+    req.image = core::Optional<std::string>("alpine:3.19");
+
+    // Upstream always holds a resolver; this bundle may not, and the request
+    // is refused rather than served as if no image had been named.
+    const core::Expected<core::Json, ApiError> created = api.CreateVolume(req);
+    MT_EXPECT_TRUE(!created.ok());
+    MT_EXPECT_EQ(created.error().code, 501);
+}
+
+MT_TEST(api_volumes_create_ignores_an_image_when_from_volume_is_present) {
+    Fixture fixture;
+    ApiImpl api = MakeVolumeApi(fixture);
+    const VolumeRecord parent = fixture.PublishedVolume();
+
+    NewVolumeReq req = EmptyVolumeRequest("child");
+    req.from_volume = core::Optional<std::string>(parent.id);
+    req.size_mb = core::Optional<uint64_t>(parent.size_mb);
+    // Rust resolves `image` only when `from_volume` is absent, so naming both
+    // is not a conflict -- and critically, not a 501 from the missing
+    // resolver either.
+    req.image = core::Optional<std::string>("alpine:3.19");
+
+    const core::Expected<core::Json, ApiError> created = api.CreateVolume(req);
+    MT_EXPECT_TRUE(created.ok());
+    MT_EXPECT_EQ(StringField(created.value(), "name"), std::string("child"));
+}
+
+MT_TEST(api_volumes_get_and_delete_round_trip) {
+    Fixture fixture;
+    ApiImpl api = MakeVolumeApi(fixture);
+    const VolumeRecord created = fixture.PublishedVolume();
+
+    const core::Expected<core::Json, ApiError> fetched = api.GetVolume(created.id);
+    MT_EXPECT_TRUE(fetched.ok());
+    MT_EXPECT_EQ(StringField(fetched.value(), "volumeID"), created.id);
+
+    const core::Expected<core::Unit, ApiError> deleted = api.DeleteVolume(created.id);
+    MT_EXPECT_TRUE(deleted.ok());
+
+    const core::Expected<core::Json, ApiError> gone = api.GetVolume(created.id);
+    MT_EXPECT_TRUE(!gone.ok());
+    MT_EXPECT_EQ(gone.error().code, 404);
+}
+
+MT_TEST(api_volumes_delete_refuses_a_reserved_volume) {
+    Fixture fixture;
+    ApiImpl api = MakeVolumeApi(fixture);
+    const VolumeRecord created = fixture.PublishedVolume();
+    MT_EXPECT_TRUE(fixture.manager->Reserve(created.id, "sb-1").ok());
+
+    // 409, not 500: the volume exists and is simply busy.
+    const core::Expected<core::Unit, ApiError> deleted = api.DeleteVolume(created.id);
+    MT_EXPECT_TRUE(!deleted.ok());
+    MT_EXPECT_EQ(deleted.error().code, 409);
+}
+
+MT_TEST(api_volumes_list_defaults_the_page_size_and_omits_a_final_token) {
+    Fixture fixture;
+    ApiImpl api = MakeVolumeApi(fixture);
+    MT_EXPECT_TRUE(api.CreateVolume(EmptyVolumeRequest("one")).ok());
+    MT_EXPECT_TRUE(api.CreateVolume(EmptyVolumeRequest("two")).ok());
+
+    const core::Expected<VolumePageResp, ApiError> page =
+        api.ListVolumes(core::Optional<std::string>(), core::Optional<std::size_t>());
+    MT_EXPECT_TRUE(page.ok());
+    MT_EXPECT_EQ(page.value().records.as_array().size(), static_cast<std::size_t>(2));
+    // The whole collection fit, so there is no cursor to continue from.
+    MT_EXPECT_TRUE(!page.value().next_token.has_value());
+}
+
+MT_TEST(api_volumes_list_pages_with_a_continuation_token) {
+    Fixture fixture;
+    ApiImpl api = MakeVolumeApi(fixture);
+    MT_EXPECT_TRUE(api.CreateVolume(EmptyVolumeRequest("one")).ok());
+    MT_EXPECT_TRUE(api.CreateVolume(EmptyVolumeRequest("two")).ok());
+
+    const core::Expected<VolumePageResp, ApiError> first =
+        api.ListVolumes(core::Optional<std::string>(), core::Optional<std::size_t>(1));
+    MT_EXPECT_TRUE(first.ok());
+    MT_EXPECT_EQ(first.value().records.as_array().size(), static_cast<std::size_t>(1));
+    MT_EXPECT_TRUE(first.value().next_token.has_value());
+
+    const core::Expected<VolumePageResp, ApiError> second =
+        api.ListVolumes(first.value().next_token, core::Optional<std::size_t>(1));
+    MT_EXPECT_TRUE(second.ok());
+    MT_EXPECT_EQ(second.value().records.as_array().size(), static_cast<std::size_t>(1));
+    // The two pages must not return the same record.
+    MT_EXPECT_TRUE(StringField(first.value().records.as_array()[0], "volumeID") !=
+                   StringField(second.value().records.as_array()[0], "volumeID"));
+}
+
+MT_TEST(api_volumes_handlers_report_a_missing_manager_as_500) {
+    ApiImpl api = MakeVolumelessApi();
+
+    MT_EXPECT_EQ(api.ListVolumes(core::Optional<std::string>(),
+                                 core::Optional<std::size_t>()).error().code, 500);
+    MT_EXPECT_EQ(api.CreateVolume(EmptyVolumeRequest("x")).error().code, 500);
+    MT_EXPECT_EQ(api.GetVolume("vol_1").error().code, 500);
+    MT_EXPECT_EQ(api.DeleteVolume("vol_1").error().code, 500);
+}
+
+// ---- NewVolumeReq parsing ---------------------------------------------------
+
+MT_TEST(api_volumes_new_volume_request_requires_a_name) {
+    const core::Expected<core::Json, core::AnyError> body = core::Json::Parse("{}");
+    MT_EXPECT_TRUE(body.ok());
+    MT_EXPECT_TRUE(!NewVolumeReq::FromJson(body.value()).ok());
+}
+
+MT_TEST(api_volumes_new_volume_request_rejects_a_malformed_size) {
+    const core::Expected<core::Json, core::AnyError> body =
+        core::Json::Parse("{\"name\":\"v\",\"sizeMb\":\"1024\"}");
+    MT_EXPECT_TRUE(body.ok());
+    // Dropping it would silently create a 64 GiB volume instead.
+    MT_EXPECT_TRUE(!NewVolumeReq::FromJson(body.value()).ok());
+}
+
+MT_TEST(api_volumes_new_volume_request_leaves_absent_fields_unset) {
+    const core::Expected<core::Json, core::AnyError> body =
+        core::Json::Parse("{\"name\":\"v\"}");
+    MT_EXPECT_TRUE(body.ok());
+    const core::Expected<NewVolumeReq, core::AnyError> parsed =
+        NewVolumeReq::FromJson(body.value());
+    MT_EXPECT_TRUE(parsed.ok());
+    MT_EXPECT_EQ(parsed.value().name, std::string("v"));
+    MT_EXPECT_TRUE(!parsed.value().mode.has_value());
+    MT_EXPECT_TRUE(!parsed.value().size_mb.has_value());
+    MT_EXPECT_TRUE(!parsed.value().image.has_value());
+    MT_EXPECT_TRUE(!parsed.value().from_volume.has_value());
+}
+
+MT_TEST(api_volumes_new_volume_request_round_trips) {
+    NewVolumeReq req = EmptyVolumeRequest("v");
+    req.mode = core::Optional<std::string>("ro");
+    req.size_mb = core::Optional<uint64_t>(2048);
+    req.from_volume = core::Optional<std::string>("vol_parent");
+
+    const core::Expected<NewVolumeReq, core::AnyError> parsed =
+        NewVolumeReq::FromJson(req.ToJson());
+    MT_EXPECT_TRUE(parsed.ok());
+    MT_EXPECT_EQ(parsed.value().name, req.name);
+    MT_EXPECT_EQ(*parsed.value().mode, std::string("ro"));
+    MT_EXPECT_EQ(static_cast<int64_t>(*parsed.value().size_mb), static_cast<int64_t>(2048));
+    MT_EXPECT_EQ(*parsed.value().from_volume, std::string("vol_parent"));
+    // Absent stays absent rather than serializing as null.
+    MT_EXPECT_TRUE(!parsed.value().image.has_value());
 }
 
 int main() { return microtest::RunAll(); }
