@@ -2,6 +2,7 @@
 # Never commit compiled artifacts: they are large, do not delta-compress, and
 # are reproducible from source.
 build/
+build-align/
 out/
 cmake-build-*/
 CMakeFiles/
