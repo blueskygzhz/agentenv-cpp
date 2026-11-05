@@ -38,6 +38,13 @@ add_library(agentenv-snapshot STATIC
     # Rust: src/repository/backends/oss/client.rs — the S3 REST calls the
     # document layer issues, over the overlaybd SigV4 signer and transport.
     repository/oss/client.cc
+    # Rust: src/repository/backends/oss/repository.rs — the document and blob
+    # halves assembled into a repository.
+    repository/oss/repository.cc
+    # Rust: src/repository/backends/oss/client.rs `list_keys_recursive`.
+    repository/oss/object_store.cc
+    # Rust: src/snapshot/catalog.rs — the record layer every backend shares.
+    repository/record_catalog.cc
 )
 target_include_directories(agentenv-snapshot PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # `CommandContext::EffectiveStartCmd` shell-quotes each argument before it

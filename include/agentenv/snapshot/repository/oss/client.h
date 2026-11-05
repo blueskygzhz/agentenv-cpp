@@ -70,6 +70,19 @@ struct OssClientConfig {
 /// Rust `is_aliyun_host`.
 bool IsAliyunHost(const std::string& host);
 
+/// A response-body sink that can start over.
+///
+/// What makes a streamed download retryable: an attempt that failed halfway
+/// has already written part of the file, and letting the next attempt append
+/// to it would splice two responses into one object that is the right length
+/// and the wrong bytes.
+class RetryableSink : public storage::overlaybd::http::BodySink {
+ public:
+    /// Discards everything written so far. Called before each attempt, so a
+    /// sink that was never written to must accept it too.
+    virtual core::Expected<core::Unit, std::string> Restart() = 0;
+};
+
 /// An `ObjectStore` over the S3 REST API.
 class OssClient : public ObjectStore {
  public:
@@ -117,15 +130,53 @@ class OssClient : public ObjectStore {
     /// `prefix` applied to a document path. Exposed for assertions.
     std::string FullKey(const std::string& key) const;
 
+    // ---- the blob half (Rust `exists` / `get_to_file` / `object_url`) ----
+    //
+    // Separate from `ObjectStore`, which is the document layer's seam: a
+    // document is small and is read into memory, while these three exist
+    // precisely because a layer is not.
+
+    /// Rust `exists` — a `HEAD`, so probing a multi-gigabyte layer costs one
+    /// round trip rather than its contents.
+    RepositoryResult<bool> Exists(const std::string& key) const;
+
+    /// Rust `get_to_file` — streams one object into `destination`, returning
+    /// the byte count.
+    ///
+    /// Streamed rather than read into memory: `FetchBlob`'s callers fetch
+    /// layers. Three failure modes are handled rather than left to surface as
+    /// a corrupt file: the destination is not created at all unless bytes
+    /// arrive (so a 404 leaves no empty file behind), a retried attempt starts
+    /// the file over instead of appending to the previous one, and a response
+    /// shorter than its own `Content-Length` is refused with the partial file
+    /// removed.
+    ///
+    /// `ArtifactNotFound` when the object is absent. Upstream reports that as
+    /// a backend error; this port follows `SnapshotRepository::FetchBlob`'s
+    /// documented contract instead, which the POSIX backend already honours —
+    /// a caller distinguishing "not published yet" from "transport broken"
+    /// must get the same answer from both backends.
+    RepositoryResult<uint64_t> GetToFile(const std::string& key,
+                                         const std::string& destination) const;
+
+    /// Rust `object_url` — `s3://<bucket>/<prefix>/<key>`.
+    ///
+    /// The same spelling the overlaybd OSS backend parses, so a located blob
+    /// and an uploaded one are named identically.
+    std::string ObjectUrl(const std::string& key) const;
+
  private:
     OssClient() : can_append_(false) {}
 
     /// Signs and sends one request, retrying a transport failure or 5xx and
     /// re-signing a 403 once (a stale timestamp or just-rotated token).
+    ///
+    /// `sink`, when given, receives the body of a successful response instead
+    /// of `Response::body`, and is restarted before every attempt.
     core::Expected<storage::overlaybd::http::Response, std::string> Send(
         const std::string& method, const std::string& key, const std::string& canonical_query,
-        const storage::overlaybd::http::HeaderMap& extra_headers,
-        const std::string& body) const;
+        const storage::overlaybd::http::HeaderMap& extra_headers, const std::string& body,
+        RetryableSink* sink = 0) const;
 
     /// The location of `key` under this client's bucket and style.
     storage::overlaybd::ParsedOssUrl LocationOf(const std::string& key) const;

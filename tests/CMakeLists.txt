@@ -106,6 +106,10 @@ agentenv_add_test(test_repository_documents test_repository_documents.cc agenten
 agentenv_add_test(test_oss_documents    test_oss_documents.cc    agentenv-snapshot agentenv-volume-record)
 # Rust: src/repository/backends/oss/client.rs — the S3 REST calls.
 agentenv_add_test(test_oss_client       test_oss_client.cc       agentenv-snapshot agentenv-volume-record agentenv-cfg)
+# Rust: src/repository/backends/oss/repository.rs — documents + blobs assembled.
+agentenv_add_test(test_oss_repository   test_oss_repository.cc   agentenv-snapshot agentenv-volume-record agentenv-cfg)
+# Rust: src/snapshot/catalog.rs — the record layer every backend shares.
+agentenv_add_test(test_record_catalog   test_record_catalog.cc   agentenv-snapshot agentenv-volume-record agentenv-cfg)
 # Rust: src/image/local_layer.rs
 agentenv_add_test(test_image_local_layer   test_image_local_layer.cc   agentenv-image)
 agentenv_add_test(test_image_commit_index  test_image_commit_index.cc  agentenv-image)

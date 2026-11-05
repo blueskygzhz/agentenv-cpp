@@ -120,6 +120,20 @@ class ObjectStore {
     virtual RepositoryResult<std::vector<std::string> > ListKeysPage(
         const std::string& prefix, const core::Optional<std::string>& start_after,
         std::size_t limit) const = 0;
+
+    /// Rust `list_keys_recursive` — every key under `prefix`, in key order.
+    ///
+    /// Default-implemented by paging `ListKeysPage` with the last key of each
+    /// page as the next cursor, which is what the protocol's own continuation
+    /// amounts to for a flat prefix. Virtual so a store with a cheaper native
+    /// listing can replace it.
+    ///
+    /// The paging is the point: a collection larger than one page read with a
+    /// single `ListKeysPage` would silently return a *prefix* of itself, and a
+    /// catalog listing that is quietly short looks exactly like a catalog with
+    /// fewer records.
+    virtual RepositoryResult<std::vector<std::string> > ListKeysRecursive(
+        const std::string& prefix) const;
 };
 
 }  // namespace oss

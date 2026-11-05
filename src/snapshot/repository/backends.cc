@@ -2,6 +2,8 @@
 // Rust: src/snapshot/repository/backends/common/ — in-memory reference impl.
 #include "agentenv/snapshot/repository/backends.h"
 
+#include "agentenv/snapshot/repository/oss/repository.h"
+
 namespace agentenv {
 namespace snapshot {
 namespace repository {
@@ -141,9 +143,29 @@ std::unique_ptr<SnapshotRepository> MakePosixFsRepository(const std::string& /*r
     // Callers that have them should build `PosixFsBackend` directly.
     return std::unique_ptr<SnapshotRepository>(new InMemorySnapshotRepository());
 }
-std::unique_ptr<SnapshotRepository> MakeOssRepository(const std::string& /*bucket_url*/) {
-    // TODO: object-store backend (needs libcurl / object-store-operator).
-    return std::unique_ptr<SnapshotRepository>(new InMemorySnapshotRepository());
+
+RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeOssRepository(
+    const cfg::OssBackendConfig& config) {
+    // Rust `OssRepository::from_config`: normalise, then connect. Validation
+    // first, so an incomplete section is reported as itself rather than as a
+    // 403 on the first signed request.
+    const RepositoryResult<oss::OssClientConfig> normalized =
+        oss::OssClientConfig::FromBackendConfig(config);
+    if (!normalized.ok()) return core::make_unexpected(normalized.error());
+
+    const RepositoryResult<oss::OssClient*> client = oss::OssClient::New(normalized.value());
+    if (!client.ok()) return core::make_unexpected(client.error());
+    const std::shared_ptr<oss::OssClient> owned(client.value());
+
+    // The multipart uploader is built here rather than lazily: it re-derives
+    // the same endpoint and credentials, and a mistake in that derivation
+    // should surface at startup, not at the first published layer.
+    const RepositoryResult<std::shared_ptr<oss::ObjectUploader> > uploader =
+        oss::MakeOssBackendUploader(normalized.value());
+    if (!uploader.ok()) return core::make_unexpected(uploader.error());
+
+    return std::shared_ptr<SnapshotRepository>(
+        new oss::OssSnapshotRepository(owned, uploader.value()));
 }
 
 }  // namespace repository

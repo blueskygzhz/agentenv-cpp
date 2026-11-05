@@ -117,6 +117,11 @@ RepositoryResult<std::vector<std::string> > PosixFsSnapshotRepository::ListDocum
     return catalog_store_->ListDocuments(collection, after, limit);
 }
 
+RepositoryResult<std::vector<std::pair<std::string, std::string> > >
+PosixFsSnapshotRepository::ReadDocuments(DocumentCollection collection) {
+    return catalog_store_->ReadDocuments(collection);
+}
+
 RepositoryResult<core::Unit> PosixFsSnapshotRepository::PutBlob(const BlobKey& key,
                                                                 const BlobBody& body) {
     if (!artifact_store_) return SnapshotRepository::PutBlob(key, body);

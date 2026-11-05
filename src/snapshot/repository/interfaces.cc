@@ -118,6 +118,11 @@ RepositoryResult<std::vector<std::string> > SnapshotRepository::ListDocuments(
     return core::make_unexpected(RepositoryError::Unsupported("repository documents"));
 }
 
+RepositoryResult<std::vector<std::pair<std::string, std::string> > >
+SnapshotRepository::ReadDocuments(DocumentCollection) {
+    return core::make_unexpected(RepositoryError::Unsupported("repository documents"));
+}
+
 core::Optional<std::string> SnapshotRepository::ManagedLayersRepoBlobUrl() const {
     return core::Optional<std::string>();
 }

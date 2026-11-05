@@ -933,6 +933,33 @@ RepositoryResult<std::vector<std::string> > PosixFsCatalogStore::ListDocuments(
     return ids;
 }
 
+RepositoryResult<std::vector<std::pair<std::string, std::string> > >
+PosixFsCatalogStore::ReadDocuments(DocumentCollection collection) const {
+    // Rust `usize::MAX`: the whole collection, since the caller asked for all
+    // of it and a cap here would silently truncate a catalog listing.
+    const RepositoryResult<std::vector<std::string> > ids =
+        ListDocuments(collection, core::nullopt, static_cast<std::size_t>(-1));
+    if (!ids.ok()) return core::make_unexpected(ids.error());
+
+    std::vector<std::pair<std::string, std::string> > documents;
+    documents.reserve(ids.value().size());
+    for (std::size_t i = 0; i < ids.value().size(); ++i) {
+        const core::Optional<DocumentKey> key =
+            DocumentCollectionKey(collection, ids.value()[i]);
+        if (!key.has_value()) {
+            return core::make_unexpected(
+                RepositoryError::InvalidRequest("invalid document id '" + ids.value()[i] + "'"));
+        }
+        const RepositoryResult<core::Optional<std::string> > bytes = GetDocument(*key);
+        if (!bytes.ok()) return core::make_unexpected(bytes.error());
+        // Removed since the listing, which is normal on a directory other
+        // processes write to.
+        if (!bytes.value().has_value()) continue;
+        documents.push_back(std::make_pair(ids.value()[i], *bytes.value()));
+    }
+    return documents;
+}
+
 }  // namespace posixfs
 }  // namespace repository
 }  // namespace snapshot

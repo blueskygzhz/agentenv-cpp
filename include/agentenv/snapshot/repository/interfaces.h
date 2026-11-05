@@ -23,6 +23,7 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <cstddef>
@@ -143,6 +144,17 @@ class SnapshotRepository {
     virtual RepositoryResult<std::vector<std::string> > ListDocuments(
         DocumentCollection collection, const core::Optional<std::string>& after,
         std::size_t limit);
+
+    /// Rust `read_documents` — every document in `collection`, in id order,
+    /// as `(id, bytes)` pairs.
+    ///
+    /// Not expressible as a loop over `ListDocuments` by a caller: a document
+    /// deleted between the listing and its read must be *skipped*, and only
+    /// the backend can tell that apart from a read failure. The shared catalog
+    /// lists records this way, so a `List` on a backend without it reports
+    /// `unsupported` rather than an empty catalog.
+    virtual RepositoryResult<std::vector<std::pair<std::string, std::string> > > ReadDocuments(
+        DocumentCollection collection);
 
     // --- blobs (Rust src/repository/interfaces.rs; default bodies returning
     // `unsupported("blob storage")`, `None` for the URL) -----------------------

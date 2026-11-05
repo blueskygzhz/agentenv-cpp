@@ -258,6 +258,38 @@ RepositoryResult<std::vector<std::string> > ListDocuments(
     return ids;
 }
 
+RepositoryResult<std::vector<std::pair<std::string, std::string> > > ReadAllDocuments(
+    const ObjectStore& store, DocumentCollection collection) {
+    const std::string prefix = DocumentCollectionPrefix(collection);
+
+    const RepositoryResult<std::vector<std::string> > keys = store.ListKeysRecursive(prefix);
+    if (!keys.ok()) {
+        return core::make_unexpected(
+            RepositoryError::Backend("list '" + prefix + "'", keys.error().message));
+    }
+
+    std::vector<std::pair<std::string, std::string> > documents;
+    documents.reserve(keys.value().size());
+    for (std::size_t i = 0; i < keys.value().size(); ++i) {
+        // The id is resolved before the read, as upstream does: a key that is
+        // not a document is a malformed store, and reading it first would
+        // spend a round trip to then reject it anyway.
+        const RepositoryResult<std::string> id = DocumentIdFromKey(collection, keys.value()[i]);
+        if (!id.ok()) return core::make_unexpected(id.error());
+
+        const RepositoryResult<core::Optional<std::string> > bytes =
+            ReadDocument(store, keys.value()[i]);
+        if (!bytes.ok()) return core::make_unexpected(bytes.error());
+        // Rust's `.map(...)` then `flatten()`: absent means the document was
+        // deleted since the listing, which is a normal outcome on a store
+        // other nodes write to.
+        if (!bytes.value().has_value()) continue;
+
+        documents.push_back(std::make_pair(id.value(), *bytes.value()));
+    }
+    return documents;
+}
+
 }  // namespace oss
 }  // namespace repository
 }  // namespace snapshot

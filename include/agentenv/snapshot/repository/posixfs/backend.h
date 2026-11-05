@@ -90,6 +90,8 @@ class PosixFsSnapshotRepository : public SnapshotRepository {
     RepositoryResult<std::vector<std::string> > ListDocuments(
         DocumentCollection collection, const core::Optional<std::string>& after,
         std::size_t limit) override;
+    RepositoryResult<std::vector<std::pair<std::string, std::string> > > ReadDocuments(
+        DocumentCollection collection) override;
 
     // ---- blobs (Rust posixfs `backend.rs` -> artifact store). Without an
     // artifact store these keep the base class's "unsupported" answers. -----

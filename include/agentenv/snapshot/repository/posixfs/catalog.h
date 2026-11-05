@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "agentenv/core/expected.h"
@@ -153,6 +154,14 @@ class PosixFsCatalogStore {
     RepositoryResult<std::vector<std::string> > ListDocuments(
         DocumentCollection collection, const core::Optional<std::string>& after,
         std::size_t limit) const;
+
+    /// Rust `read_documents` — the whole collection, in id order.
+    ///
+    /// A document removed between the listing and its read is skipped, which
+    /// is the one thing a caller looping over `ListDocuments` could not do
+    /// correctly: it cannot tell a concurrent delete from a read failure.
+    RepositoryResult<std::vector<std::pair<std::string, std::string> > > ReadDocuments(
+        DocumentCollection collection) const;
 
     const std::string& root() const { return root_; }
 

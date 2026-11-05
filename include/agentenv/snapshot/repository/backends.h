@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 
+#include "agentenv/cfg.h"
 #include "agentenv/snapshot/repository/interfaces.h"
 
 namespace agentenv {
@@ -39,8 +40,19 @@ class InMemorySnapshotRepository : public SnapshotRepository {
 /// Rust: backends/posixfs/ — a shared-POSIX filesystem repository.
 std::unique_ptr<SnapshotRepository> MakePosixFsRepository(const std::string& root_dir);
 
-/// Rust: backends/oss/ — an object-storage repository (gated on libcurl).
-std::unique_ptr<SnapshotRepository> MakeOssRepository(const std::string& bucket_url);
+/// Rust `OssRepository::from_config` — an object-storage repository.
+///
+/// Takes the configuration section rather than a URL, as upstream does: a
+/// bucket URL alone cannot carry the endpoint, region and credentials, so the
+/// previous signature could never have constructed one.
+///
+/// Fails rather than degrading: an incomplete `[backend.oss]` section, a
+/// `credential_process`, or a build without libcurl are all reported here
+/// instead of at the first request. The returned repository serves documents
+/// and blobs; its snapshot *record* methods report `Unsupported` (see
+/// `oss/repository.h`).
+RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeOssRepository(
+    const cfg::OssBackendConfig& config);
 
 }  // namespace repository
 }  // namespace snapshot

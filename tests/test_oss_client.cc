@@ -19,80 +19,15 @@
 
 #include "agentenv/snapshot/repository/oss/documents.h"
 #include "microtest.h"
+#include "oss_client_fixture.h"
 
 using namespace agentenv;                                  // NOLINT
 using namespace agentenv::snapshot::repository;            // NOLINT
 using namespace agentenv::snapshot::repository::oss;       // NOLINT
+using namespace agentenv::testing::oss_fixture;            // NOLINT
 
 namespace sov = agentenv::storage::overlaybd;
 namespace shttp = agentenv::storage::overlaybd::http;
-
-namespace {
-
-/// Records every request and replays scripted responses.
-struct RecordingTransport {
-    std::vector<shttp::Request> requests;
-    std::vector<shttp::Response> responses;
-    /// Returned once `responses` runs out.
-    shttp::Response fallback;
-    int transport_failures = 0;
-
-    RecordingTransport() { fallback.status = 200; }
-
-    void Push(long status, const std::string& body = std::string(),
-              const std::string& etag = std::string()) {
-        shttp::Response r;
-        r.status = status;
-        r.body.assign(body.begin(), body.end());
-        if (!etag.empty()) r.headers["ETag"] = etag;
-        responses.push_back(r);
-    }
-
-    OssClient::Transport Fn() {
-        return [this](const shttp::Request& request)
-                   -> core::Expected<shttp::Response, std::string> {
-            requests.push_back(request);
-            if (transport_failures > 0) {
-                --transport_failures;
-                return core::make_unexpected(std::string("injected transport failure"));
-            }
-            if (requests.size() <= responses.size()) return responses[requests.size() - 1];
-            return fallback;
-        };
-    }
-};
-
-cfg::OssBackendConfig GoodConfig() {
-    cfg::OssBackendConfig c;
-    c.endpoint = "https://minio.internal:9000";
-    c.bucket = "agentenv";
-    c.region = core::Optional<std::string>("us-east-1");
-    c.access_key_id = core::Optional<std::string>("AKID");
-    c.access_key_secret = core::Optional<std::string>("SECRET");
-    return c;
-}
-
-OssClientConfig Normalized(const cfg::OssBackendConfig& c) {
-    const RepositoryResult<OssClientConfig> normalized =
-        OssClientConfig::FromBackendConfig(c);
-    MT_EXPECT_TRUE(normalized.ok());
-    return normalized.ok() ? normalized.value() : OssClientConfig();
-}
-
-/// A client over a scripted transport.
-OssClient* Client(RecordingTransport* transport, const cfg::OssBackendConfig& c) {
-    const RepositoryResult<OssClient*> client =
-        OssClient::NewWithTransport(Normalized(c), transport->Fn());
-    MT_EXPECT_TRUE(client.ok());
-    return client.ok() ? client.value() : 0;
-}
-
-std::string HeaderOf(const shttp::Request& request, const std::string& name) {
-    const shttp::HeaderMap::const_iterator it = request.headers.find(name);
-    return it == request.headers.end() ? std::string() : it->second;
-}
-
-}  // namespace
 
 // ---- configuration normalisation ------------------------------------------
 
@@ -474,95 +409,6 @@ MT_TEST(an_aliyun_endpoint_uses_virtual_hosted_addressing) {
 }
 
 // ---- the document layer over the real client -----------------------------
-
-/// An HTTP-level stub with ETag semantics: this is the closest thing to a
-/// MinIO available here, and it is what lets the compare-and-swap be
-/// exercised end to end over the real client rather than over a fake store.
-struct StubObjectServer {
-    std::map<std::string, std::string> bodies;
-    std::map<std::string, std::string> etags;
-    uint64_t next_version = 1;
-    /// Runs before a PUT is evaluated — the seam a competing writer uses.
-    std::function<void()> before_put;
-
-    std::string Etag() {
-        std::ostringstream o;
-        o << "\"v" << next_version++ << "\"";
-        return o.str();
-    }
-
-    void Seed(const std::string& key, const std::string& body) {
-        bodies[key] = body;
-        etags[key] = Etag();
-    }
-
-    OssClient::Transport Fn() {
-        return [this](const shttp::Request& request)
-                   -> core::Expected<shttp::Response, std::string> {
-            // The key is whatever follows the bucket in a path-style URL.
-            const std::string marker = "/agentenv/";
-            const std::size_t at = request.url.find(marker);
-            std::string key = at == std::string::npos
-                                  ? std::string()
-                                  : request.url.substr(at + marker.size());
-            const std::size_t q = key.find('?');
-            if (q != std::string::npos) key = key.substr(0, q);
-
-            shttp::Response r;
-            if (request.method == "GET") {
-                const std::map<std::string, std::string>::const_iterator it = bodies.find(key);
-                if (it == bodies.end()) {
-                    r.status = 404;
-                    return r;
-                }
-                r.status = 200;
-                r.body.assign(it->second.begin(), it->second.end());
-                r.headers["ETag"] = etags[key];
-                return r;
-            }
-            if (request.method == "PUT") {
-                if (before_put) {
-                    const std::function<void()> hook = before_put;
-                    before_put = std::function<void()>();
-                    hook();
-                }
-                const shttp::HeaderMap::const_iterator if_match =
-                    request.headers.find("If-Match");
-                const shttp::HeaderMap::const_iterator if_none =
-                    request.headers.find("If-None-Match");
-                const bool exists = bodies.count(key) != 0;
-                if (if_none != request.headers.end() && if_none->second == "*" && exists) {
-                    r.status = 412;
-                    return r;
-                }
-                if (if_match != request.headers.end() &&
-                    (!exists || etags[key] != if_match->second)) {
-                    r.status = 412;
-                    return r;
-                }
-                bodies[key] = std::string(request.body.begin(), request.body.end());
-                etags[key] = Etag();
-                r.status = 200;
-                return r;
-            }
-            if (request.method == "DELETE") {
-                bodies.erase(key);
-                etags.erase(key);
-                r.status = 204;
-                return r;
-            }
-            r.status = 405;
-            return r;
-        };
-    }
-};
-
-DocumentUpdatePolicy InstantPolicy() {
-    DocumentUpdatePolicy policy;
-    policy.jitter = [](int64_t lo, int64_t) { return lo; };
-    policy.sleeper = [](int64_t) {};
-    return policy;
-}
 
 // The same race the fake-backed tests cover, now over the real client: the
 // competing write lands between this update's GET and its PUT, the

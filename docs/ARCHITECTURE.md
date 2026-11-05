@@ -168,12 +168,12 @@ earlier revision of this section listed `LocalRepository` / `S3Repository` /
   `PosixFsArtifactStore`, rooted at
   `{backend.posix_fs.snapshot_store}/repository`) and
   `InMemorySnapshotRepository` (tests).
-- `main.cc` constructs the posix-fs pair directly. The factories
-  `MakePosixFsRepository` / `MakeOssRepository` in
-  `src/snapshot/repository/backends.cc` still return the in-memory stub, so
-  **`[backend.oss]` is not yet reachable as a repository**: the document layer
-  and the network `ObjectStore` both exist (below), but nothing assembles them
-  into a `SnapshotRepository` yet.
+- `main.cc` constructs the posix-fs pair directly. `MakePosixFsRepository`
+  still returns the in-memory stub (it has no `OverlaybdLayerStore` or
+  `LocalArtifactCache` to build the real one with), while
+  `MakeOssRepository(const cfg::OssBackendConfig&)` now builds a real
+  `OssSnapshotRepository`. So **`[backend.oss]` is reachable for documents and
+  blobs, but not for snapshot records** — see the OSS section below.
 - The OSS document layer (`repository/oss/documents.{h,cc}`) is ported: shared
   catalog documents are serialised across nodes with an **ETag
   compare-and-swap** (read with a version token, write `If-Match`, create with
@@ -220,6 +220,42 @@ earlier revision of this section listed `LocalRepository` / `S3Repository` /
     flight and skip a document deleted since the listing; nothing here needs
     them yet, and a serial stand-in would quietly change the cost of whatever
     first does.
+- `OssSnapshotRepository` (`repository/oss/repository.{h,cc}`) assembles the
+  two halves behind `SnapshotRepository`, and `MakeOssRepository` returns it.
+  - **The record half is refused, not answered.** Upstream's `Repository`
+    trait has no record methods at all: `create` / `get` / `list` / `delete` /
+    `resolve_alias` / `try_start_build` / `mark_build_error` come from the
+    backend-agnostic `impl<R: Repository> SnapshotCatalog for R`
+    (`src/snapshot/catalog.rs`), which stores each record as an ordinary
+    *document*. That layer is not ported — this tree's posix-fs backend
+    answers the record methods from its own on-disk layout instead — so there
+    is nothing to reuse here, and inventing a second record layout would put
+    records under a key space the Rust server does not read. Each of the seven
+    reports `Unsupported`, and the refusals are deliberately not
+    interchangeable with a benign answer: `Get` returning `None` would make a
+    published snapshot look deleted, `List` returning empty would make a whole
+    catalog look empty, and `Delete` reporting success would strand what it
+    cannot see.
+  - The document half being complete is what makes the volume catalog
+    (`volume/catalog.h`, built on documents exactly as upstream) usable over
+    object storage today.
+  - Blobs: `HasBlob` is a `HEAD`, so probing a multi-gigabyte layer costs one
+    round trip — and a 403 there is an error rather than "absent", or a
+    publish would skip an upload it never verified. `LocateBlob` is always
+    `Remote`, since no node can reach the bytes by path. A layer is skipped
+    when it already exists (its digest names its contents), while a snapshot
+    file is replaced unconditionally.
+  - `FetchBlob` streams to the destination through a sink that is restarted
+    before each attempt and only creates the file once bytes arrive, so a
+    failed fetch leaves nothing behind and a retry cannot splice two responses
+    into a file of plausible length. A body shorter than its own
+    `Content-Length` is refused with the partial file removed.
+  - A file-bodied `PutBlob` goes to an injected `ObjectUploader`, whose
+    production implementation is `OssBackend::UploadPath` — the multipart
+    upload this tree already had (and whose first caller this is). The seam
+    exists because that code signs through the global libcurl transport and
+    cannot be driven by the client's injected one: routing stays testable
+    without a server, and the protocol stays one implementation.
 - Cross-node sharing therefore means *one shared POSIX filesystem*. Durable
   state (catalog documents, managed layers) lives in the repository and is
   serialised with `flock` + `mkstemp`/`rename` + read-modify-write CAS;

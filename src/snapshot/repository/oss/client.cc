@@ -5,7 +5,10 @@
 #include <algorithm>
 #include <sstream>
 
+#include <cstdio>
+
 #include "agentenv/core/digest.h"
+#include "agentenv/core/fs.h"
 
 namespace agentenv {
 namespace snapshot {
@@ -59,6 +62,83 @@ std::string BodyToString(const std::vector<uint8_t>& body) {
     if (body.empty()) return std::string();
     return std::string(reinterpret_cast<const char*>(&body[0]), body.size());
 }
+
+/// Writes a streamed response body into a file.
+///
+/// The file is opened on the first byte, not up front: a `GET` that answers
+/// 404 must leave nothing behind, or a failed fetch would be
+/// indistinguishable from a published zero-length blob. `Restart` throws away
+/// a previous attempt's bytes for the same reason — appending to them would
+/// splice two responses.
+class FileSink : public RetryableSink {
+ public:
+    explicit FileSink(const std::string& path) : path_(path), file_(0), written_(0), failed_(false) {}
+    ~FileSink() { Close(); }
+
+    core::Expected<core::Unit, std::string> Restart() {
+        Close();
+        // Removed rather than truncated in place, so a destination that was
+        // never written to is never created.
+        if (core::fs::Exists(path_)) {
+            const core::Expected<core::Unit, std::string> removed = core::fs::RemoveFile(path_);
+            if (!removed.ok()) return core::make_unexpected(removed.error());
+        }
+        written_ = 0;
+        failed_ = false;
+        return core::Unit();
+    }
+
+    bool Write(const uint8_t* data, size_t len) {
+        if (failed_) return false;
+        if (file_ == 0) {
+            file_ = std::fopen(path_.c_str(), "wb");
+            if (file_ == 0) {
+                failed_ = true;
+                return false;
+            }
+        }
+        if (len == 0) return true;
+        if (std::fwrite(data, 1, len, file_) != len) {
+            failed_ = true;
+            return false;
+        }
+        written_ += len;
+        return true;
+    }
+
+    /// Closes the file and reports how many bytes it holds.
+    core::Expected<uint64_t, std::string> Finish() {
+        const bool close_failed = !Close();
+        if (failed_ || close_failed) {
+            return core::make_unexpected("write '" + path_ + "' failed");
+        }
+        return written_;
+    }
+
+    /// Closes and removes the file, for a response that must leave nothing.
+    void Discard() {
+        Close();
+        if (core::fs::Exists(path_)) core::fs::RemoveFile(path_);
+    }
+
+ private:
+    FileSink(const FileSink&);
+    FileSink& operator=(const FileSink&);
+
+    /// False when the buffered data could not be flushed, which is a write
+    /// failure like any other and must not be mistaken for a complete file.
+    bool Close() {
+        if (file_ == 0) return true;
+        const bool ok = std::fclose(file_) == 0;
+        file_ = 0;
+        return ok;
+    }
+
+    std::string path_;
+    std::FILE* file_;
+    uint64_t written_;
+    bool failed_;
+};
 
 /// A server's `ETag` as sent, including its quotes.
 ///
@@ -272,7 +352,7 @@ sov::ParsedOssUrl OssClient::LocationOf(const std::string& key) const {
 
 core::Expected<http::Response, std::string> OssClient::Send(
     const std::string& method, const std::string& key, const std::string& canonical_query,
-    const http::HeaderMap& extra_headers, const std::string& body) const {
+    const http::HeaderMap& extra_headers, const std::string& body, RetryableSink* sink) const {
     const sov::ParsedOssUrl location = LocationOf(key);
 
     // Two passes, as the overlaybd backend does: the operation, then the same
@@ -285,6 +365,14 @@ core::Expected<http::Response, std::string> OssClient::Send(
     for (uint32_t pass = 0; pass < passes; ++pass) {
         const uint32_t attempts = config_.retry_count + 1;
         for (uint32_t attempt = 0; attempt < attempts; ++attempt) {
+            // Before the request, not after a failure: an attempt that died
+            // mid-body has already written part of the file, and the next one
+            // must not continue from there.
+            if (sink != 0) {
+                const core::Expected<core::Unit, std::string> restarted = sink->Restart();
+                if (!restarted.ok()) return core::make_unexpected(restarted.error());
+            }
+
             http::Request request;
             request.method = method;
             request.url = location.ObjectUrl();
@@ -295,6 +383,7 @@ core::Expected<http::Response, std::string> OssClient::Send(
             // redirect to somewhere unsigned.
             request.follow_redirects = false;
             request.headers = extra_headers;
+            request.body_sink = sink;
             if (!body.empty()) {
                 request.body.assign(body.begin(), body.end());
             }
@@ -502,6 +591,87 @@ RepositoryResult<std::vector<std::string> > OssClient::ListKeysPage(
         if (keys.size() >= limit) break;
     }
     return keys;
+}
+
+// ---- the blob half --------------------------------------------------------
+
+RepositoryResult<bool> OssClient::Exists(const std::string& key) const {
+    const std::string full = FullKey(key);
+    const core::Expected<http::Response, std::string> response =
+        Send("HEAD", full, std::string(), http::HeaderMap(), std::string());
+    if (!response.ok()) {
+        return core::make_unexpected(
+            RepositoryError::Backend("oss head '" + full + "'", response.error()));
+    }
+    // 404 is the answer the caller asked for, not a failure.
+    if (response.value().status == 404) return false;
+    if (!response.value().IsSuccess()) {
+        // Anything else -- 403 above all -- is *not* absence. Reporting it as
+        // "no" would make a publish skip an upload it never verified, or a
+        // reader conclude a layer was never published.
+        return core::make_unexpected(
+            RepositoryError::Backend(StatusMessage("oss head '" + full + "'", response.value())));
+    }
+    return true;
+}
+
+std::string OssClient::ObjectUrl(const std::string& key) const {
+    return "s3://" + config_.bucket + "/" + FullKey(key);
+}
+
+RepositoryResult<uint64_t> OssClient::GetToFile(const std::string& key,
+                                                const std::string& destination) const {
+    const std::string full = FullKey(key);
+
+    const core::Optional<std::string> parent = core::fs::Parent(destination);
+    if (parent.has_value() && !parent->empty()) {
+        const core::Expected<core::Unit, std::string> made = core::fs::CreateDirAll(*parent);
+        if (!made.ok()) {
+            return core::make_unexpected(
+                RepositoryError::Backend("create '" + *parent + "'", made.error()));
+        }
+    }
+
+    FileSink sink(destination);
+    const core::Expected<http::Response, std::string> response =
+        Send("GET", full, std::string(), http::HeaderMap(), std::string(), &sink);
+    if (!response.ok()) {
+        sink.Discard();
+        return core::make_unexpected(
+            RepositoryError::Backend("oss download '" + full + "'", response.error()));
+    }
+    if (response.value().status == 404) {
+        // Nothing was written -- the transport only feeds the sink on a 2xx --
+        // so there is no file to remove, and the caller can tell "not
+        // published yet" from a transport failure.
+        sink.Discard();
+        return core::make_unexpected(RepositoryError::ArtifactNotFound("'" + full + "'"));
+    }
+    if (!response.value().IsSuccess()) {
+        sink.Discard();
+        return core::make_unexpected(RepositoryError::Backend(
+            StatusMessage("oss download '" + full + "'", response.value())));
+    }
+
+    const core::Expected<uint64_t, std::string> written = sink.Finish();
+    if (!written.ok()) {
+        sink.Discard();
+        return core::make_unexpected(
+            RepositoryError::Backend("oss download '" + full + "'", written.error()));
+    }
+
+    // A response shorter than its own `Content-Length` is a truncated
+    // download. Returning its size as the blob's would publish a layer whose
+    // tail is missing, which the reader only discovers as a corrupt image.
+    uint64_t declared = 0;
+    if (response.value().ContentLength(&declared) && declared != written.value()) {
+        sink.Discard();
+        std::ostringstream o;
+        o << "oss download '" << full << "' delivered " << written.value()
+          << " bytes against a declared length of " << declared;
+        return core::make_unexpected(RepositoryError::Backend(o.str()));
+    }
+    return written.value();
 }
 
 }  // namespace oss

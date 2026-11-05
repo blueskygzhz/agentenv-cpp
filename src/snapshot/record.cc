@@ -2,6 +2,7 @@
 // Rust: src/snapshot/types/snapshot.rs
 #include "agentenv/snapshot/record.h"
 
+#include "agentenv/core/serde.h"
 #include "agentenv/core/time.h"
 
 namespace agentenv {
@@ -673,6 +674,9 @@ core::Json SnapshotRecord::ToJson() const {
     object["created_at_unix_ms"] = core::Json(created_at_unix_ms);
     object["updated_at_unix_ms"] = core::Json(updated_at_unix_ms);
     object["committed"] = committed.has_value() ? committed->ToJson() : core::Json();
+    // `skip_serializing_if = "Not::not"`: written only when true, so a record
+    // this version writes stays byte-identical to what older nodes expect.
+    if (deleting) object["deleting"] = core::Json(true);
     return core::Json(object);
 }
 
@@ -735,13 +739,22 @@ core::Expected<SnapshotRecord, std::string> SnapshotRecord::FromJson(const core:
         record.committed = core::Optional<CommittedSnapshot>(parsed.value());
     }
 
+    // `#[serde(default)]`: an older record that predates the field is live,
+    // not deleting. A present non-bool is refused rather than read as false —
+    // guessing "live" for a corrupt record would hand out a snapshot whose
+    // files are being removed.
+    const core::Expected<bool, std::string> deleting =
+        core::serde::DefaultBool(fields, "deleting");
+    if (!deleting.ok()) return core::make_unexpected(deleting.error());
+    record.deleting = deleting.value();
+
     return record;
 }
 
 bool SnapshotRecord::operator==(const SnapshotRecord& o) const {
     if (id != o.id || source != o.source || resources != o.resources ||
         created_at_unix_ms != o.created_at_unix_ms ||
-        updated_at_unix_ms != o.updated_at_unix_ms) {
+        updated_at_unix_ms != o.updated_at_unix_ms || deleting != o.deleting) {
         return false;
     }
     if (alias.has_value() != o.alias.has_value()) return false;

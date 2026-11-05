@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "agentenv/core/optional.h"
@@ -116,6 +117,20 @@ RepositoryResult<core::Unit> DeleteDocument(ObjectStore* store, const DocumentKe
 RepositoryResult<std::vector<std::string> > ListDocuments(
     const ObjectStore& store, DocumentCollection collection,
     const core::Optional<std::string>& after, std::size_t limit);
+
+/// Rust `read_all` — every document in `collection`, in object key order.
+///
+/// A document deleted between the listing and its read is **skipped**, not an
+/// error: the listing is a snapshot of a store other nodes are writing to, and
+/// failing the whole call would make a concurrent delete break every reader.
+///
+/// Upstream issues the reads with 16 in flight (`READ_CONCURRENCY`). These are
+/// serial: the executor this tree has is for blocking work on a pool thread,
+/// and fanning out here would need a bounded gather this port does not have
+/// yet. The visible difference is latency on a large collection, not the
+/// result.
+RepositoryResult<std::vector<std::pair<std::string, std::string> > > ReadAllDocuments(
+    const ObjectStore& store, DocumentCollection collection);
 
 /// Rust `document_id` — the id of the document stored at `key`.
 ///

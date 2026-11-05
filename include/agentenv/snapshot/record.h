@@ -202,6 +202,15 @@ struct SnapshotRecord {
     int64_t updated_at_unix_ms = 0;
     /// Absent while a template build is still in flight.
     core::Optional<CommittedSnapshot> committed;
+    /// Rust `#[serde(default, skip_serializing_if = "Not::not")] deleting`.
+    ///
+    /// Set when a delete starts, and the reason the delete sequence is safe to
+    /// retry: the mark lands before any file is removed, so a record whose
+    /// artifacts are half-gone is recognisable as such. Everything that reads
+    /// a record must treat a marked one as absent — a snapshot handed out here
+    /// would be resumed from files that are being deleted — which is why
+    /// `catalog.h` filters on it rather than leaving it to each caller.
+    bool deleting = false;
 
     /// Rust `SnapshotRecord::template_waiting`.
     static SnapshotRecord TemplateWaiting(const core::SnapshotId& id,
