@@ -157,23 +157,17 @@ DevicePlane::~DevicePlane() {
     StopAllDevices();
 }
 
-core::Expected<std::unique_ptr<DevicePlane>, std::string> DevicePlane::Open(
-    const DevicePlaneOptions& options) {
-    std::unique_ptr<DevicePlane> plane(new DevicePlane(options));
-
-    // An `sqe128` ring, probed down the way the ublk tests do: `coop_taskrun`
-    // and `single_issuer` landed across several kernel releases and one
-    // without them answers EINVAL, which would otherwise read as "no ublk".
-    //
-    // `single_issuer` is cleared unconditionally when we get that far, and not
-    // as a fallback: connection threads all submit here, and the flag is a
-    // promise that only one thread ever does. `ctrl_mutex_` serializes them,
-    // but the kernel's own fast paths assume the flag means what it says.
+core::Expected<std::shared_ptr<util::Ring>, std::string> OpenControlRing() {
+    // `single_issuer` is cleared unconditionally rather than as a fallback:
+    // connection threads all submit here, and the flag is a promise to the
+    // kernel that only one ever does. `ctrl_mutex_` serializes them, but the
+    // kernel's fast paths take the flag at its word.
     util::IoRingConfig config;
     config.sq_entries = 32;
     config.cq_entries = 64;
     config.sqe128 = true;
     config.single_issuer = false;
+
     core::Expected<std::unique_ptr<util::Ring>, std::string> ring = util::Ring::Open(config);
     if (!ring.ok()) {
         config.coop_taskrun = false;
@@ -187,43 +181,55 @@ core::Expected<std::unique_ptr<DevicePlane>, std::string> DevicePlane::Open(
         return core::make_unexpected(
             WithContext("open an sqe128 io_uring for the ublk control plane", ring.error()));
     }
-    plane->ctrl_ring_ = std::shared_ptr<util::Ring>(ring.take_value().release());
+    return std::shared_ptr<util::Ring>(ring.take_value().release());
+}
 
-    // Rust `detect_ublk_features`. GET_FEATURES creates no device, so the
-    // fixed id is only a command field.
-    {
-        ublk::UblkCtrlBuilder builder;
-        builder.Name(kDeviceName).DevId(0);
-        core::Expected<std::unique_ptr<ublk::UblkCtrl>, std::string> ctrl =
-            builder.Build(plane->ctrl_ring_);
-        if (!ctrl.ok()) {
-            return core::make_unexpected(
-                WithContext("build ctrl for feature detection", ctrl.error()));
-        }
-        const core::Expected<uint64_t, std::string> detected = ctrl.value()->GetFeatures();
-        if (detected.ok()) {
-            plane->features_ = detected.value();
-        } else if (IsErrno(detected.error(), ENOTTY) ||
-                   IsErrno(detected.error(), EINVAL) ||
-                   IsErrno(detected.error(), EOPNOTSUPP)) {
-            // An older driver answers the unknown command rather than
-            // reporting no features. Continuing with zero is right: every
-            // feature is optional, and `UBLK_F_UPDATE_SIZE`'s absence only
-            // costs the pool its cross-size reuse.
-            AGENTENV_WARN("ublk feature query unsupported; continuing without dynamic resize "
-                          "support: " << detected.error());
-        } else {
-            return core::make_unexpected(WithContext("get ublk features", detected.error()));
-        }
+core::Expected<uint64_t, std::string> DetectUblkFeatures(
+    const std::shared_ptr<util::Ring>& ctrl_ring) {
+    // GET_FEATURES creates no device, so the fixed id is only a command field.
+    ublk::UblkCtrlBuilder builder;
+    builder.Name(kDeviceName).DevId(0);
+    core::Expected<std::unique_ptr<ublk::UblkCtrl>, std::string> ctrl =
+        builder.Build(ctrl_ring);
+    if (!ctrl.ok()) {
+        return core::make_unexpected(
+            WithContext("build ctrl for feature detection", ctrl.error()));
     }
 
-    plane->image_service_cache_.reset(new ImageServiceCache(options.p2p_publish_url));
+    const core::Expected<uint64_t, std::string> detected = ctrl.value()->GetFeatures();
+    if (detected.ok()) return detected.value();
 
+    if (IsErrno(detected.error(), ENOTTY) || IsErrno(detected.error(), EINVAL) ||
+        IsErrno(detected.error(), EOPNOTSUPP)) {
+        AGENTENV_WARN("ublk feature query unsupported; continuing without dynamic resize "
+                      "support: " << detected.error());
+        return static_cast<uint64_t>(0);
+    }
+    return core::make_unexpected(WithContext("get ublk features", detected.error()));
+}
+
+std::unique_ptr<DevicePlane> DevicePlane::WithControlRing(
+    const DevicePlaneOptions& options, std::shared_ptr<util::Ring> ctrl_ring,
+    uint64_t features) {
+    std::unique_ptr<DevicePlane> plane(new DevicePlane(options));
+    plane->ctrl_ring_ = ctrl_ring;
+    plane->features_ = features;
+    plane->image_service_cache_.reset(new ImageServiceCache(options.p2p_publish_url));
     if (options.pool_config.has_value()) {
         plane->idle_.reset(new warmpool::WarmPool<PooledDevice>(*options.pool_config));
     }
+    return plane;
+}
 
-    return std::move(plane);
+core::Expected<std::unique_ptr<DevicePlane>, std::string> DevicePlane::Open(
+    const DevicePlaneOptions& options) {
+    const core::Expected<std::shared_ptr<util::Ring>, std::string> ring = OpenControlRing();
+    if (!ring.ok()) return core::make_unexpected(ring.error());
+
+    const core::Expected<uint64_t, std::string> features = DetectUblkFeatures(ring.value());
+    if (!features.ok()) return core::make_unexpected(features.error());
+
+    return WithControlRing(options, ring.value(), features.value());
 }
 
 bool DevicePlane::HasPool() const { return static_cast<bool>(idle_); }
@@ -366,6 +372,14 @@ core::Expected<core::Unit, std::string> DevicePlane::CreateNewDevice(
     const std::string& image_config, const std::shared_ptr<overlaybd::ImageFile>& image,
     std::unique_ptr<ublk::UblkDev>* out_dev,
     std::shared_ptr<ublk::OverlaybdTarget>* out_target) {
+    // The single gate for every device creation, so one check covers the raw
+    // create, the pool miss and the prewarm. A plane built without a ring --
+    // see `WithControlRing` -- can answer lookups but cannot add a device.
+    if (!ctrl_ring_) {
+        return core::make_unexpected(
+            std::string("no ublk control ring: this device plane cannot create devices"));
+    }
+
     // Derived, not configured: advertising discard on a read-only image would
     // have the guest issue TRIMs that can only ever fail.
     const bool discard_supported = !image->IsReadOnly();
@@ -474,6 +488,15 @@ void DevicePlane::CleanupFailedStart(std::unique_ptr<ublk::UblkDev> dev, uint32_
 }
 
 core::Expected<core::Unit, std::string> DevicePlane::DeleteDevById(uint32_t dev_id) {
+    if (!ctrl_ring_) {
+        // Unreachable in production, since nothing could have created the
+        // device being deleted. Checked anyway because the alternative is a
+        // null dereference on the teardown path, where it would surface as a
+        // crash at shutdown.
+        return core::make_unexpected(
+            std::string("no ublk control ring: cannot delete devices"));
+    }
+
     std::lock_guard<std::mutex> ring_guard(ctrl_mutex_);
 
     ublk::UblkCtrlBuilder builder;

@@ -101,14 +101,32 @@ struct DevicePlaneOptions {
 /// Rust `UblkDaemonServer`'s device half.
 class DevicePlane : public DeviceHandler {
  public:
-    /// Opens the control ring and detects the driver's features.
+    /// Opens the control ring, detects the driver's features, and builds the
+    /// plane around them.
     ///
-    /// Fails when there is no usable `/dev/ublk-control`, which is the one
-    /// startup condition worth refusing over: every device request would fail
-    /// anyway, and failing here names the host problem once instead of once
-    /// per sandbox.
+    /// Fails when there is no usable `/dev/ublk-control` or the kernel cannot
+    /// make an `sqe128` ring. That is the one startup condition worth
+    /// reporting up front: every device request would fail anyway, and naming
+    /// the host problem once beats naming it once per sandbox.
     static core::Expected<std::unique_ptr<DevicePlane>, std::string> Open(
         const DevicePlaneOptions& options);
+
+    /// Rust `UblkDaemonServer::new`, which takes its `ctrl_ring` as an
+    /// argument rather than opening one.
+    ///
+    /// Kept as the real entry point, with `Open` as the wrapper that supplies
+    /// the ring, for the reason upstream injects it: every decision the plane
+    /// makes *before* it reaches a device -- which requests need a pool, which
+    /// device ids it knows, which request families are refused -- is otherwise
+    /// unreachable on a host without ublk, which is exactly where getting one
+    /// wrong is hardest to notice.
+    ///
+    /// `ctrl_ring` may be null. A plane built that way serves every lookup and
+    /// classification path and refuses the ones that would submit a control
+    /// command, instead of dereferencing nothing.
+    static std::unique_ptr<DevicePlane> WithControlRing(
+        const DevicePlaneOptions& options, std::shared_ptr<util::Ring> ctrl_ring,
+        uint64_t features);
 
     ~DevicePlane();
 
@@ -374,6 +392,24 @@ class DevicePlane : public DeviceHandler {
     std::mutex startup_pack_mutex_;
     std::vector<overlaybd::StartupPackHandle> startup_pack_handles_;
 };
+
+/// The `sqe128` io_uring every ublk control command is submitted on.
+///
+/// Separate from `DevicePlane` because it is the half that needs the kernel,
+/// and because the probing is worth naming: `coop_taskrun` and
+/// `single_issuer` landed across several releases and a kernel without one
+/// answers `EINVAL`, which would otherwise read as "this host has no ublk".
+core::Expected<std::shared_ptr<util::Ring>, std::string> OpenControlRing();
+
+/// Rust `detect_ublk_features` — GET_FEATURES, with an old driver's refusal
+/// read as "no features" rather than as a failure.
+///
+/// A driver that predates the command answers `ENOTTY`/`EINVAL`/`EOPNOTSUPP`,
+/// which is not the same as a broken control plane: every feature is
+/// optional, and the only cost of assuming none is that the pool loses
+/// cross-size device reuse.
+core::Expected<uint64_t, std::string> DetectUblkFeatures(
+    const std::shared_ptr<util::Ring>& ctrl_ring);
 
 /// Rust `wait_for_ublk_dev` — wait for `/dev/ublkbN` to become openable.
 ///

@@ -194,6 +194,12 @@ agentenv_add_test(test_ublk_daemon_runtime test_ublk_daemon_runtime.cc agentenv-
 # error classification, and the device-handoff rollback. Links the client too,
 # because the only honest test of the accept loop is a real client calling it.
 agentenv_add_test(test_ublk_daemon_server  test_ublk_daemon_server.cc  agentenv-ublk-daemon-server agentenv-ublk-daemon-protocol)
+# Rust: storage/ublk-daemon/src/server.rs — the device half: the device table,
+# the warm pool, refcounted shared access. The cases that need a real device
+# skip themselves on a kernel without ublk; what always runs is the dispatch
+# and the best-effort paths, which is where a host with no ublk is either
+# reported honestly or hidden.
+agentenv_add_test(test_ublk_daemon_device_plane test_ublk_daemon_device_plane.cc agentenv-ublk-daemon-device-plane)
 agentenv_add_test(test_lsmt                test_lsmt.cc                agentenv-overlaybd)
 agentenv_add_test(test_lsmt_bptree         test_lsmt_bptree.cc         agentenv-overlaybd)
 agentenv_add_test(test_scheduler           test_scheduler.cc           agentenv-scheduler-internal)

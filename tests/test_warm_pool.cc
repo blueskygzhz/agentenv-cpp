@@ -21,6 +21,39 @@ PoolConfig Cfg(std::size_t low, std::size_t high, bool maintenance) {
     c.startup_prewarm = false;
     return c;
 }
+
+/// A move-only resource that reports its own destruction, standing in for the
+/// `PooledDevice` the ublk daemon pools.
+///
+/// The distinction only exists for a type like this: an `int` rejected by the
+/// pool costs nothing, while a ublk device whose wrapper is destroyed without
+/// a DEL_DEV leaks a kernel device for the lifetime of the module.
+struct Tracked {
+    int id;
+    int* destroyed;
+
+    Tracked() : id(0), destroyed(0) {}
+    Tracked(int i, int* counter) : id(i), destroyed(counter) {}
+    Tracked(Tracked&& o) : id(o.id), destroyed(o.destroyed) {
+        o.destroyed = 0;  // moved-from: not the owner any more
+        o.id = 0;
+    }
+    Tracked& operator=(Tracked&& o) {
+        if (destroyed != 0) ++(*destroyed);
+        id = o.id;
+        destroyed = o.destroyed;
+        o.destroyed = 0;
+        o.id = 0;
+        return *this;
+    }
+    ~Tracked() {
+        if (destroyed != 0) ++(*destroyed);
+    }
+
+ private:
+    Tracked(const Tracked&);
+    Tracked& operator=(const Tracked&);
+};
 }  // namespace
 
 MT_TEST(config_validation_clamps_low_to_high) {
@@ -178,6 +211,67 @@ MT_TEST(maintenance_worker_is_not_started_when_disabled) {
     pool.RequestMaintenance();
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     MT_EXPECT_EQ(cycles.load(), 0);
+}
+
+// Rust's `try_push_bounded` returns `Result<(), T>`: the rejected resource
+// comes *back*, because the caller is the only one who knows how to tear it
+// down. The pointer overload is what preserves that, and the by-value one
+// cannot -- it destroys the argument at the end of its own scope. For the
+// ublk daemon that is the difference between "the pool was full, so the
+// device was stopped and deleted" and a kernel device nobody ever deletes.
+MT_TEST(try_push_bounded_returns_a_rejected_resource_to_the_caller) {
+    WarmPool<Tracked> pool(Cfg(0, 1, false));
+    int destroyed = 0;
+
+    Tracked accepted(1, &destroyed);
+    MT_EXPECT_TRUE(pool.TryPushBounded(&accepted));
+    // Accepted: ownership moved into the pool, and the moved-from husk is not
+    // an owner, so nothing has been destroyed yet.
+    MT_EXPECT_EQ(destroyed, 0);
+
+    // At the high watermark now, so this one is refused.
+    Tracked rejected(2, &destroyed);
+    MT_EXPECT_TRUE(!pool.TryPushBounded(&rejected));
+    // Still the caller's: untouched, and specifically *not* destroyed.
+    MT_EXPECT_EQ(destroyed, 0);
+    MT_EXPECT_EQ(rejected.id, 2);
+
+    // The caller can now do the teardown the pool could not.
+    {
+        Tracked taken(std::move(rejected));
+        MT_EXPECT_EQ(taken.id, 2);
+    }
+    MT_EXPECT_EQ(destroyed, 1);
+
+    // And the one the pool took is still there to be handed out.
+    Tracked out;
+    MT_EXPECT_TRUE(pool.TryAcquire(&out));
+    MT_EXPECT_EQ(out.id, 1);
+}
+
+MT_TEST(drain_all_hands_back_every_pooled_resource) {
+    // Shutdown's contract: `DrainAll` must yield every device so each one can
+    // be stopped. A pool that dropped them instead would leak one kernel
+    // device per idle entry on every daemon exit.
+    int destroyed = 0;
+    {
+        WarmPool<Tracked> pool(Cfg(0, 4, false));
+        for (int i = 1; i <= 3; ++i) {
+            Tracked t(i, &destroyed);
+            MT_EXPECT_TRUE(pool.TryPushBounded(&t));
+        }
+        const std::vector<Tracked> drained = pool.DrainAll();
+        MT_EXPECT_EQ(drained.size(), static_cast<std::size_t>(3));
+        MT_EXPECT_EQ(destroyed, 0);
+
+        // Drained, so a late release is refused rather than parking a device
+        // nobody will ever stop.
+        Tracked late(9, &destroyed);
+        MT_EXPECT_TRUE(!pool.TryPushBounded(&late));
+        MT_EXPECT_EQ(late.id, 9);
+    }
+    // 3 drained + the refused one, all destroyed by their owners.
+    MT_EXPECT_EQ(destroyed, 4);
 }
 
 MT_TEST(maintenance_worker_starts_once) {
