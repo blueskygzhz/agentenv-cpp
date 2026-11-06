@@ -34,6 +34,8 @@
 #include "agentenv/sandbox/network.h"
 #include "agentenv/sandbox/network/manager.h"
 #include "agentenv/setup.h"
+#include "agentenv/setup/deps.h"
+#include "agentenv/setup/packages.h"
 
 namespace ae = agentenv;
 
@@ -371,6 +373,83 @@ int main(int argc, char** argv) {
         ae::setup::network_capacity::Check();
     }
 
+    // Rust `setup::ensure_environment`, the rest of it. These steps existed
+    // here as functions but nothing called them, so a node came up without
+    // its virtualization/ublk preconditions checked, without its dependencies
+    // installed and without the generated overlaybd configs the ublk daemon
+    // reads. Every one of those surfaced later as a launch failure that named
+    // the launch rather than the unmet prerequisite.
+    // Hoisted: the tools-drive binder installed further down needs the same
+    // manifest, and re-reading it there could pick up a different file.
+    ae::setup::deps::Manifest deps_manifest;
+    {
+        const ae::core::Optional<std::string> manifest_path = ae::setup::FindDepsManifest();
+        if (!manifest_path.has_value()) {
+            AGENTENV_ERROR("cannot locate config/deps_manifest.toml; set "
+                           "AGENTENV_DEPS_MANIFEST or run from a tree that contains it");
+            return 1;
+        }
+        const auto manifest = ae::setup::deps::Manifest::ParseFile(*manifest_path);
+        if (!manifest.ok()) {
+            AGENTENV_ERROR("parse " << *manifest_path << ": " << manifest.error());
+            return 1;
+        }
+        deps_manifest = manifest.value();
+
+        // Step 1. Runtime packages are validated, never installed, on the
+        // normal start path: installing would need root, which this process
+        // has deliberately just given up.
+        auto packages = ae::setup::packages::CheckRuntime(*manifest_path);
+        if (!packages.ok()) {
+            AGENTENV_ERROR(packages.error());
+            return 1;
+        }
+
+        // Steps 2, 3 and 6. Reported together rather than fail-fast, then
+        // failed as a group: an operator fixing a fresh host wants both the
+        // KVM and the ublk verdict from one run, not one per restart.
+        const std::vector<ae::setup::EnvironmentCheck> checks =
+            ae::setup::CheckEnvironment(app_cfg.virtualization_mode);
+        bool environment_ok = true;
+        for (std::size_t i = 0; i < checks.size(); ++i) {
+            if (checks[i].ok) continue;
+            environment_ok = false;
+            AGENTENV_ERROR("environment check failed step=" << checks[i].step << ": "
+                                                            << checks[i].detail);
+        }
+        if (!environment_ok) return 1;
+
+        // Step 4. Downloads firecracker, the kernel, regctl and the overlaybd
+        // CLI tools, then writes the generated overlaybd global configs. The
+        // configs come second because they are written per cache directory the
+        // install just created.
+        auto provisioned =
+            ae::setup::deps::Ensure(app_cfg, app_cfg.deps_path, manifest.value());
+        if (!provisioned.ok()) {
+            AGENTENV_ERROR("ensure dependencies: " << provisioned.error());
+            return 1;
+        }
+        // The p2p facade address is threaded in by the caller upstream; this
+        // build has no iroh transport, so the configs are written without one
+        // rather than with a placeholder that would point the daemon at a
+        // peer-to-peer endpoint that does not exist.
+        auto obd_configs = ae::setup::deps::WriteGeneratedOverlaybdGlobalConfigs(
+            app_cfg, ae::core::Optional<std::string>());
+        if (!obd_configs.ok()) {
+            AGENTENV_ERROR("write generated overlaybd configs: " << obd_configs.error());
+            return 1;
+        }
+
+        // Step 5. Advisory: a node that cannot raise its own limit still runs,
+        // just with fewer concurrent sandboxes, so this must not be fatal.
+        auto nofile = ae::setup::RaiseFileDescriptorLimit();
+        if (nofile.ok()) {
+            AGENTENV_INFO("file descriptor limit soft=" << nofile.value());
+        } else {
+            AGENTENV_WARN("raise file descriptor limit: " << nofile.error());
+        }
+    }
+
     auto store = std::shared_ptr<ae::orchestrator::MetadataStore>(
                      new ae::orchestrator::InMemoryMetadataStore());
 
@@ -412,6 +491,46 @@ int main(int argc, char** argv) {
         }
         fc_factory->SetUblkDeviceManager(std::make_shared<ae::sandbox::ublk::DeviceManager>(
             client, app_cfg.BlockPoolConfig().has_value()));
+    }
+
+    // Rust `crate::sandbox::resolve_tools_image` --
+    // `deps::prepare_tools_image(config, version, |r| ImageResolver::new(config)
+    //  .resolve_tools(&r))`. This binder is the whole reason the two sides stay
+    // decoupled: `setup::deps` performs the arbitration and the install, the
+    // image resolver performs the registry work, and the sandbox backend only
+    // learns which of the two drive shapes to attach.
+    //
+    // A *fresh* resolver per call, and deliberately without the snapshot
+    // repository: upstream's `resolve_tools` consumes `self` and mutates the
+    // conversion policy (it pins the v1 converter and clears the overlaybd
+    // referrer prefixes), so reusing one instance would leak a system
+    // dependency's policy into user-image resolution. System dependencies also
+    // come from their configured release source, which has nothing to do with
+    // the repository.
+    {
+        const ae::cfg::AppConfig tools_config = app_cfg;
+        const ae::setup::deps::Manifest tools_manifest = deps_manifest;
+        fc_factory->SetToolsDriveResolver(
+            [tools_config, tools_manifest](const std::string& version)
+                -> ae::core::Expected<ae::core::Optional<std::string>, std::string> {
+                return ae::setup::deps::PrepareToolsImage(
+                    tools_config, tools_manifest, version,
+                    [&tools_config](const std::string& image_ref)
+                        -> ae::core::Expected<ae::core::Optional<std::string>, std::string> {
+                        ae::image::DefaultImageResolver resolver(tools_config);
+                        const auto resolved = resolver.ResolveTools(image_ref);
+                        if (!resolved.ok()) {
+                            return ae::core::make_unexpected(resolved.error().ToString());
+                        }
+                        if (!resolved.value().has_value()) {
+                            // The release ships no overlaybd tools image; the
+                            // legacy ext4 fallback handles it.
+                            return ae::core::Optional<std::string>();
+                        }
+                        return ae::core::Optional<std::string>(
+                            resolved.value()->overlaybd_config_path);
+                    });
+            });
     }
     // Rust `NetworkManager::global()`: every sandbox gets a slot -- netns,
     // veth pair, tap0 -- and its VMM is spawned into that namespace. Created

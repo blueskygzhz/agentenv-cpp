@@ -157,6 +157,20 @@ struct LaunchMode {
 ///
 /// Firecracker only ever sees these relative names, so without this step the
 /// `PUT /drives` calls point at files that do not exist.
+/// Rust `deps::prepare_tools_image` as this layer consumes it: given a tools
+/// release version, either an installed overlaybd image config to attach as a
+/// shared ublk device, or an empty optional meaning "attach the legacy ext4
+/// file at `tools_drive_path` instead".
+///
+/// Injected rather than called, because the real implementation lives in
+/// `setup/deps` and needs the image resolver — neither of which this library
+/// links, and deliberately so. Unset (the default) means the ext4 path is
+/// used unconditionally, which is what every test wants and what a node with
+/// a locally provisioned tools drive gets.
+typedef std::function<core::Expected<core::Optional<std::string>, std::string>(
+    const std::string& tools_drive_version)>
+    ToolsDriveResolver;
+
 struct FreshDrivePlan {
     /// Rust `UblkDeviceManager::global()`. Required: the user rootfs is always
     /// a ublk device, so a missing or unavailable daemon fails the start.
@@ -164,7 +178,16 @@ struct FreshDrivePlan {
     /// Host path of the tools drive (`resolved_tools_drive_path`). Linked
     /// after `realpath`, as Rust canonicalizes it, so a dangling path fails
     /// here instead of inside the guest.
+    ///
+    /// The *fallback*, not necessarily what gets attached: when
+    /// `tools_drive_resolver` yields an overlaybd image, the shared ublk
+    /// device's path is attached instead (Rust `link_tools_drive`).
     std::string tools_drive_path;
+    /// Rust `common.tools_drive_version` — which release to prepare. Only
+    /// read when `tools_drive_resolver` is set.
+    std::string tools_drive_version;
+    /// Rust `FirecrackerSandbox::prepare_tools_drive`'s resolution step.
+    ToolsDriveResolver tools_drive_resolver;
     /// Rust `common.rootfs_image_config`.
     ublk::OverlaybdDeviceConfig rootfs_image_config;
     /// Rust `common.rootfs_virtual_size` — the requested target size.
@@ -198,6 +221,17 @@ class FreshDriveResources {
     FreshDriveResources& operator=(const FreshDriveResources&) = delete;
 
     void Adopt(std::shared_ptr<ublk::DeviceManager> manager) { manager_ = std::move(manager); }
+
+    /// Rust `SandboxResources::tools_ublk_device`.
+    ///
+    /// Held for the sandbox's lifetime rather than dropped after the symlink
+    /// is made: the handle *is* the refcount on a device shared with every
+    /// other sandbox on the same tools release. Releasing it early would let
+    /// the device — and its page cache, the entire reason for sharing — be
+    /// torn down under a running guest, turning its tools-drive I/O into
+    /// errors. `Release` drops it, which only relinquishes this sandbox's
+    /// share; the manager keeps one idle device alive for the next launch.
+    void AdoptSharedTools(const ublk::SharedReadOnlyDevice& device) { tools_ = device; }
     void SetRootfs(const ublk::OverlaybdRuntimeDevice& device) {
         rootfs_ = device;
         has_rootfs_ = true;
@@ -230,6 +264,9 @@ class FreshDriveResources {
 
  private:
     std::shared_ptr<ublk::DeviceManager> manager_;
+    /// Default-constructed (`valid() == false`) when the legacy ext4 drive is
+    /// in use, which is why this is the handle type rather than an optional.
+    ublk::SharedReadOnlyDevice tools_;
     ublk::OverlaybdRuntimeDevice rootfs_;
     bool has_rootfs_ = false;
     std::vector<ublk::OverlaybdRuntimeDevice> extra_drives_;
@@ -388,7 +425,14 @@ struct ResumeDrivePlan {
     /// Rust `UblkDeviceManager::global()`.
     std::shared_ptr<ublk::DeviceManager> device_manager;
     /// `common.resolved_tools_drive_path(..)` for the capture's tools version.
+    /// The fallback, as on the fresh path.
     std::string tools_drive_path;
+    /// The capture's tools release, not the node's: a resumed guest must get
+    /// the tools drive it was captured against. Only read when
+    /// `tools_drive_resolver` is set.
+    std::string tools_drive_version;
+    /// Rust `prepare_tools_drive`, which `start_resume` calls too.
+    ToolsDriveResolver tools_drive_resolver;
     /// Rust `ublk.overlaybd.global_config_path`.
     std::string overlaybd_global_config;
     /// Rust `ublk.overlaybd.runtime_upper_mode`.

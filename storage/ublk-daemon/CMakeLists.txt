@@ -54,6 +54,26 @@ target_link_libraries(agentenv-ublk-daemon-server PUBLIC
     agentenv-ublk-daemon-config
 )
 
+# `server.rs`'s device half: the device table, the warm pool, the refcounted
+# shared-access mode, and the lifecycle of one ublk device from ADD_DEV to
+# DEL_DEV. Separate from `-server` because this is the half that needs a real
+# control ring and real ublk char devices, and keeping it out is what lets the
+# socket half be driven over a socketpair with a fake handler.
+add_library(agentenv-ublk-daemon-device-plane STATIC
+    device_plane.cc
+)
+target_include_directories(agentenv-ublk-daemon-device-plane PUBLIC ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(agentenv-ublk-daemon-device-plane PUBLIC
+    agentenv-core
+    agentenv-overlaybd
+    agentenv-ublk
+    agentenv-warm-pool
+    agentenv-ublk-daemon-protocol
+    agentenv-ublk-daemon-config
+    agentenv-ublk-daemon-runtime
+    agentenv-ublk-daemon-server
+)
+
 add_executable(agentenv-ublk-daemon main.cc)
 target_link_libraries(agentenv-ublk-daemon PRIVATE
     agentenv-core
@@ -62,4 +82,5 @@ target_link_libraries(agentenv-ublk-daemon PRIVATE
     agentenv-ublk-daemon-config
     agentenv-ublk-daemon-runtime
     agentenv-ublk-daemon-server
+    agentenv-ublk-daemon-device-plane
 )

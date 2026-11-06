@@ -16,7 +16,7 @@
 // `Error` all read as "it failed" at a glance, but the client's retry decision
 // reads the difference: a terminal error means the live runtime may already
 // have been rewritten.
-#include "agentenv/storage/ublk_daemon/server.h"
+#include "agentenv/storage/ublk-daemon/server.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -29,7 +29,7 @@
 #include <thread>
 #include <vector>
 
-#include "agentenv/storage/ublk_daemon/client.h"
+#include "agentenv/storage/ublk-daemon/client.h"
 #include "microtest.h"
 
 namespace ud = agentenv::storage::ublk_daemon;

@@ -44,6 +44,10 @@ class FirecrackerSandboxFactory::Impl {
     /// Rust `UblkDeviceManager::global()`.
     std::shared_ptr<ublk::DeviceManager> ublk_device_manager;
 
+    /// Rust `crate::sandbox::resolve_tools_image`. Unset means every launch
+    /// attaches the legacy ext4 tools drive.
+    ToolsDriveResolver tools_drive_resolver;
+
     /// Rust `NetworkManager::global()`; NULL means no network.
     network::SlotNetworkManager* network_manager = NULL;
 
@@ -69,6 +73,10 @@ class FirecrackerSandboxFactory::Impl {
         ResumeDrivePlan plan;
         plan.device_manager = ublk_device_manager;
         plan.tools_drive_path = tools_drive.value();
+        // The capture's release, which `CommonConfig::New` already defaulted
+        // to the node's when the snapshot recorded none.
+        plan.tools_drive_version = snapshot_config.common.tools_drive_version;
+        plan.tools_drive_resolver = tools_drive_resolver;
         plan.overlaybd_global_config = app_config.ublk.overlaybd.global_config_path;
         plan.runtime_upper_mode = app_config.ublk.overlaybd.runtime_upper_mode;
         plan.extra_drive_allow_shrink = app_config.ublk.overlaybd.allow_shrink;
@@ -113,6 +121,10 @@ void FirecrackerSandboxFactory::SetResumeDepsForTesting(
 void FirecrackerSandboxFactory::SetUblkDeviceManager(
     std::shared_ptr<ublk::DeviceManager> manager) {
     impl_->ublk_device_manager = std::move(manager);
+}
+
+void FirecrackerSandboxFactory::SetToolsDriveResolver(const ToolsDriveResolver& resolver) {
+    impl_->tools_drive_resolver = resolver;
 }
 
 void FirecrackerSandboxFactory::SetNetworkManager(network::SlotNetworkManager* manager) {
@@ -245,6 +257,8 @@ FirecrackerSandboxFactory::Build(const FreshSandboxBuildSpec& spec,
     FreshDrivePlan drives;
     drives.device_manager = impl_->ublk_device_manager;
     drives.tools_drive_path = tools_drive.value();
+    drives.tools_drive_version = sandbox_config.common.tools_drive_version;
+    drives.tools_drive_resolver = impl_->tools_drive_resolver;
     drives.rootfs_image_config = *sandbox_config.common.rootfs_image_config;
     drives.rootfs_virtual_size = sandbox_config.common.rootfs_virtual_size;
     drives.rootfs_allow_shrink = sandbox_config.common.rootfs_allow_shrink;

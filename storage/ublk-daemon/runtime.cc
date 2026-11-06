@@ -47,7 +47,12 @@ namespace {
 /// reject configs that resolve perfectly well.
 std::string CanonicalizeOrSelf(const std::string& path) {
     char buf[PATH_MAX];
-    if (::realpath(path.c_str(), buf) != 0) return path;
+    // `realpath` returns the buffer on success and null on failure, so the
+    // fallback is the *null* case. The inverted test this replaces made every
+    // caller key by the raw path, which silently gave `ImageServiceCache` one
+    // `ImageService` per spelling of the same global config -- each with its
+    // own io pools and its own cache of the same blocks.
+    if (::realpath(path.c_str(), buf) == 0) return path;
     return std::string(buf);
 }
 

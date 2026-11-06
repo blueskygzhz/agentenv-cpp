@@ -17,6 +17,8 @@
 #include "agentenv/core/optional.h"
 #include "agentenv/sandbox/backend.h"
 #include "agentenv/sandbox/firecracker/sandbox.h"
+// `ToolsDriveResolver` and the drive plans the factory fills in.
+#include "agentenv/sandbox/firecracker/sandbox_backend.h"
 #include "agentenv/sandbox/ublk/device.h"
 
 namespace agentenv {
@@ -81,6 +83,23 @@ class FirecrackerSandboxFactory : public SandboxBackendFactory {
     /// it. Without one (or with one whose daemon is unavailable) `Build`
     /// refuses, as Rust's `require_client` does at start.
     void SetUblkDeviceManager(std::shared_ptr<ublk::DeviceManager> manager);
+
+    /// Rust `crate::sandbox::resolve_tools_image`, which
+    /// `FirecrackerSandbox::prepare_tools_drive` calls on every start.
+    ///
+    /// Injected for the same reason `SetUblkDeviceManager` is: the real
+    /// implementation (`setup::deps::PrepareToolsImage` bound to the node
+    /// config, the dependency manifest and the image resolver) lives in
+    /// libraries this one does not link, and must not — `agentenv-image`
+    /// reaches `agentenv-snapshot-record`, and `agentenv-snapshot` links both
+    /// this library and `agentenv-sandbox`, so a direct call would invert the
+    /// layering the CMake files guard.
+    ///
+    /// Unset, every launch attaches the legacy single-ext4 tools drive. That
+    /// is a working node, not a degraded one — but the shared overlaybd tools
+    /// device, and the page cache every sandbox on the release would share,
+    /// are unreachable without this.
+    void SetToolsDriveResolver(const ToolsDriveResolver& resolver);
 
     /// Rust `NetworkManager::global()`. Non-owning: the manager is
     /// process-wide and outlives every sandbox. With one, every fresh and

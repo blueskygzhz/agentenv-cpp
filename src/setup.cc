@@ -3,6 +3,8 @@
 #include "agentenv/setup.h"
 
 #include <cerrno>
+#include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <sstream>
 
@@ -166,6 +168,39 @@ core::Expected<uint64_t, std::string> RaiseFileDescriptorLimit() {
         return core::make_unexpected(std::string("set rlimit: ") + std::strerror(errno));
     }
     return static_cast<uint64_t>(raised.rlim_cur);
+}
+
+core::Optional<std::string> FindDepsManifest() {
+    const char* const override_path = ::getenv("AGENTENV_DEPS_MANIFEST");
+    if (override_path != NULL && override_path[0] != '\0') {
+        // Returned even when it does not exist, so a typo in the override is
+        // reported as a missing manifest at that path rather than silently
+        // falling through to a different file than the operator chose.
+        return core::Optional<std::string>(std::string(override_path));
+    }
+
+    // `/proc/self/exe` rather than argv[0]: argv[0] is attacker- and
+    // launcher-controlled and need not be a path at all.
+    char exe[PATH_MAX];
+    const ssize_t length = ::readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (length > 0) {
+        exe[length] = '\0';
+        const core::Optional<std::string> bin_dir = core::fs::Parent(std::string(exe));
+        if (bin_dir.has_value()) {
+            const core::Optional<std::string> prefix = core::fs::Parent(*bin_dir);
+            if (prefix.has_value()) {
+                const std::string installed =
+                    core::fs::Join(core::fs::Join(*prefix, "config"), "deps_manifest.toml");
+                if (core::fs::Exists(installed)) {
+                    return core::Optional<std::string>(installed);
+                }
+            }
+        }
+    }
+
+    const std::string local = "config/deps_manifest.toml";
+    if (core::fs::Exists(local)) return core::Optional<std::string>(local);
+    return core::Optional<std::string>();
 }
 
 std::vector<EnvironmentCheck> CheckEnvironment(core::VirtualizationMode mode) {

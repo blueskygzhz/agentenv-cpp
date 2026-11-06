@@ -11,13 +11,15 @@
 #ifndef AGENTENV_SANDBOX_UBLK_DEVICE_H_
 #define AGENTENV_SANDBOX_UBLK_DEVICE_H_
 
+#include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "agentenv/core/expected.h"
 #include "agentenv/core/optional.h"
-#include "agentenv/storage/ublk_daemon/client.h"
+#include "agentenv/storage/ublk-daemon/client.h"
 
 namespace agentenv {
 namespace sandbox {

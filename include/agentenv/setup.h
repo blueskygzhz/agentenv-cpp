@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "agentenv/core/expected.h"
+#include "agentenv/core/optional.h"
 #include "agentenv/core/virtualization.h"
 #include "agentenv/setup/kvm.h"
 #include "agentenv/setup/network_capacity.h"
@@ -71,6 +72,31 @@ std::vector<EnvironmentCheck> CheckEnvironment(core::VirtualizationMode mode);
 /// Rust `ensure_environment` step 5 — raises `RLIMIT_NOFILE` towards 65536
 /// without exceeding the hard limit. Returns the soft limit now in effect.
 core::Expected<uint64_t, std::string> RaiseFileDescriptorLimit();
+
+/// Where `config/deps_manifest.toml` is read from.
+///
+/// Upstream has no such function: Rust embeds the manifest with
+/// `include_str!`, so there is nothing to locate. This port parses it from
+/// disk (see the porting note in `setup/packages.h`), which means the port
+/// owes a resolution policy that upstream does not — and having none is why
+/// none of the provisioning steps were being called at all.
+///
+/// Precedence, first hit wins:
+///   1. `$AGENTENV_DEPS_MANIFEST` — an explicit operator override, so a
+///      packaged deployment can point at its own copy without relying on the
+///      process's working directory.
+///   2. `<dir of this executable>/../config/deps_manifest.toml` — the
+///      installed layout. Derived from the executable rather than the cwd
+///      because a service manager chooses the cwd and it is usually `/`.
+///   3. `config/deps_manifest.toml` relative to the cwd — the build tree,
+///      which is also what the tests use.
+///
+/// Returns an empty optional when none exists. The caller must treat that as
+/// a hard failure rather than skipping provisioning: silently continuing is
+/// precisely the state this replaces, where a node came up without its
+/// dependencies and failed later at the first launch, pointing at the launch
+/// instead of at the unmet prerequisite.
+core::Optional<std::string> FindDepsManifest();
 
 /// Rust `ensure_environment` step 6 — host IPv4 forwarding must already be on;
 /// this path only validates it, since enabling it belongs to `EnsureHost`.

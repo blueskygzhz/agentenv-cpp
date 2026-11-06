@@ -177,6 +177,15 @@ core::Expected<core::Unit, std::string> FreshDriveResources::Release() {
     }
     extra_drives_.clear();
 
+    // Rust `self.tools_ublk_device.take()`. Dropped, not released: the device
+    // is shared, so this hands back only *this* sandbox's share and the
+    // manager decides whether any holder is left. Calling `ReleaseDevice` on
+    // it instead would tear down a device other running sandboxes are still
+    // reading their tools drive from. Ordered after the per-sandbox devices
+    // for the same reason they come after the VMM stop — nothing may be
+    // removed from under a guest that is still running.
+    tools_ = ublk::SharedReadOnlyDevice();
+
     // Taken before the call, as Rust's `network_slot.take()`: the manager owns
     // the slot from here whether it pools it or tears it down, so a retry must
     // not hand it back a second time.
@@ -332,6 +341,8 @@ core::Expected<core::Unit, std::string> Symlink(const std::string& target,
 struct HostDriveRequest {
     std::shared_ptr<ublk::DeviceManager> device_manager;
     std::string tools_drive_path;
+    std::string tools_drive_version;
+    ToolsDriveResolver tools_drive_resolver;
     /// NULL: no user rootfs (Rust resume skips it without a `ublk_config`).
     const ublk::OverlaybdDeviceConfig* rootfs = NULL;
     core::Optional<uint64_t> rootfs_requested_size;
@@ -350,24 +361,59 @@ core::Expected<std::vector<DriveMount>, std::string> PrepareHostDrives(
     const std::string& work_dir, const HostDriveRequest& req, FreshDriveResources* resources) {
     if (resources == NULL) return core::make_unexpected(std::string("no resource holder"));
 
-    // ── Tools drive (Rust `link_tools_drive`) ──
-    // Canonicalized first: a dangling path must fail here, not as a guest
-    // with no root filesystem.
+    if (!req.device_manager || !req.device_manager->is_available()) {
+        return core::make_unexpected(std::string("ublk daemon client is unavailable"));
+    }
+    resources->Adopt(req.device_manager);
+
+    // ── Tools drive (Rust `prepare_tools_drive` then `link_tools_drive`) ──
+    //
+    // Two shapes, and the choice is made here rather than when the plan was
+    // built, because the shared device's lifetime has to be the sandbox's: the
+    // handle is adopted into `resources` in the same step that attaches it, so
+    // a failure after this point still releases it and a successful start
+    // holds it until teardown. Deciding at plan time would create the device
+    // with nobody holding it.
+    std::string tools_drive_path = req.tools_drive_path;
+    if (req.tools_drive_resolver) {
+        const core::Expected<core::Optional<std::string>, std::string> prepared =
+            req.tools_drive_resolver(req.tools_drive_version);
+        if (!prepared.ok()) {
+            return core::make_unexpected("prepare tools drive version '" +
+                                         req.tools_drive_version + "': " + prepared.error());
+        }
+        if (prepared.value().has_value()) {
+            ublk::CreateSpec spec;
+            spec.image_config = *prepared.value();
+            spec.global_config = req.overlaybd_global_config;
+            const ublk::daemon::DaemonResult<ublk::SharedReadOnlyDevice> shared =
+                req.device_manager->GetOrCreateSharedTools(spec);
+            if (!shared.ok()) {
+                return core::make_unexpected("create shared tools device for version '" +
+                                             req.tools_drive_version + "': " +
+                                             shared.error().message);
+            }
+            resources->AdoptSharedTools(shared.value());
+            tools_drive_path = shared.value().device_path();
+        }
+        // An empty optional is the legacy ext4 drive, already in
+        // `tools_drive_path` — not an error, and not a reason to skip the
+        // attach below.
+    }
+
+    // Canonicalized: a dangling path must fail here, not as a guest with no
+    // root filesystem. Applies to both shapes, since a ublk device node that
+    // the daemon reported but did not create would fail the same way.
     {
         char resolved[PATH_MAX];
-        if (::realpath(req.tools_drive_path.c_str(), resolved) == NULL) {
-            return core::make_unexpected("open tools drive at " + req.tools_drive_path + ": " +
+        if (::realpath(tools_drive_path.c_str(), resolved) == NULL) {
+            return core::make_unexpected("open tools drive at " + tools_drive_path + ": " +
                                          std::strerror(errno));
         }
         const core::Expected<core::Unit, std::string> linked =
             Symlink(resolved, work_dir + "/" + kRootfsDrivePath, "tools drive");
         if (!linked.ok()) return core::make_unexpected(linked.error());
     }
-
-    if (!req.device_manager || !req.device_manager->is_available()) {
-        return core::make_unexpected(std::string("ublk daemon client is unavailable"));
-    }
-    resources->Adopt(req.device_manager);
 
     // ── User image (Rust `attach_user_rootfs`) ──
     if (req.rootfs != NULL) {
@@ -460,6 +506,8 @@ core::Expected<std::vector<DriveMount>, std::string> PrepareFreshDrives(
     HostDriveRequest req;
     req.device_manager = plan.device_manager;
     req.tools_drive_path = plan.tools_drive_path;
+    req.tools_drive_version = plan.tools_drive_version;
+    req.tools_drive_resolver = plan.tools_drive_resolver;
     req.rootfs = &plan.rootfs_image_config;
     req.rootfs_requested_size = plan.rootfs_virtual_size;
     req.rootfs_allow_shrink = plan.rootfs_allow_shrink;
@@ -486,6 +534,8 @@ core::Expected<std::vector<VolumeSlotBind>, std::string> PrepareResumeDrives(
     HostDriveRequest req;
     req.device_manager = plan.device_manager;
     req.tools_drive_path = plan.tools_drive_path;
+    req.tools_drive_version = plan.tools_drive_version;
+    req.tools_drive_resolver = plan.tools_drive_resolver;
     // Rust `if config.common.ublk_config.is_some() { attach_user_rootfs(..,
     // Some(size), Some(size), false) }`: the recorded size is both the target
     // and the base, and a restored disk is never shrunk.
@@ -1661,6 +1711,10 @@ FirecrackerSandboxBackend::Fork(const std::vector<SandboxForkSpec>& specs) {
             ResumeDrivePlan drives;
             drives.device_manager = impl_->spec.drives->device_manager;
             drives.tools_drive_path = impl_->spec.drives->tools_drive_path;
+            // A fork must land on the parent's tools release, not the node's
+            // current one: the child resumes the parent's capture.
+            drives.tools_drive_version = impl_->spec.drives->tools_drive_version;
+            drives.tools_drive_resolver = impl_->spec.drives->tools_drive_resolver;
             drives.overlaybd_global_config = impl_->spec.drives->overlaybd_global_config;
             drives.runtime_upper_mode = impl_->spec.drives->runtime_upper_mode;
             drives.extra_drive_allow_shrink = impl_->spec.drives->extra_drive_allow_shrink;

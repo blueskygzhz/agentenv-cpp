@@ -19,6 +19,7 @@
 #define AGENTENV_SETUP_DEPS_H_
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -200,6 +201,49 @@ core::Expected<core::Unit, std::string> EnsureToolsVersion(const cfg::AppConfig&
 /// outlives image-cache eviction and the bundle stays relocatable.
 core::Expected<core::Unit, std::string> InstallToolsImage(const std::string& source,
                                                           const std::string& destination);
+
+/// Rust `prepare_tools_image`'s `resolve` parameter — turns a tools image
+/// reference into a local overlaybd image config, or reports that the release
+/// ships no such image.
+///
+/// Injected rather than called directly, exactly as upstream: this is what
+/// keeps the dependency installer from depending on the image resolver. Here
+/// that is not merely tidy — `agentenv-image` links `agentenv-snapshot-record`
+/// and `agentenv-snapshot` links both this library and `agentenv-sandbox`, so
+/// a direct call would add an edge against the layering the CMake files
+/// deliberately guard. The caller supplies the binder.
+///
+/// An empty optional means "this release has no overlaybd tools image", which
+/// is a supported outcome and not an error; a failure is reserved for a
+/// resolve that could not be completed.
+typedef std::function<core::Expected<core::Optional<std::string>, std::string>(
+    const std::string& image_ref)>
+    ToolsImageResolver;
+
+/// Rust `prepare_tools_image` — decides which *shape* of tools drive a launch
+/// of `version` gets, and installs it if needed.
+///
+/// Returns the installed overlaybd image config path when the launch should
+/// attach a shared ublk device, or an empty optional when it should attach the
+/// legacy single-ext4 file. That distinction is the whole purpose of the
+/// function: the two are different devices with different sharing behaviour,
+/// and the caller cannot pick without doing this work.
+///
+/// Serialized per resolved tools path, not globally: two concurrent launches
+/// of the *same* version would otherwise both install it, racing on the same
+/// destination, while two launches of *different* versions have no reason to
+/// wait for each other.
+///
+/// The probe order is load-bearing. An already-installed ext4 drive wins
+/// before anything else is considered, so a node that was provisioned the
+/// legacy way does not start pulling images; an operator-configured
+/// `tools.drive_path` wins over resolution for its own version only, since the
+/// file identifies the release declared beside it and nothing else; and an
+/// already-installed `image.json` short-circuits the resolve, which is a
+/// registry round trip.
+core::Expected<core::Optional<std::string>, std::string> PrepareToolsImage(
+    const cfg::AppConfig& config, const Manifest& manifest, const std::string& version,
+    const ToolsImageResolver& resolve);
 
 /// Rust `ensure` — the whole dependency provisioning pass.
 core::Expected<core::Unit, std::string> Ensure(const cfg::AppConfig& config,

@@ -6,6 +6,9 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <sstream>
 #include <vector>
 
@@ -1011,6 +1014,104 @@ core::Expected<Unit, std::string> InstallToolsImage(const std::string& source,
         return core::make_unexpected(std::string("cache tools image config"));
     }
     return Unit();
+}
+
+namespace {
+
+/// Rust's `static PREPARATIONS: LazyLock<DashMap<PathBuf, Arc<Mutex<()>>>>`.
+///
+/// One mutex per resolved tools path, created on first use and then kept: the
+/// entries are bounded by the number of tools versions a node ever launches,
+/// and dropping one while a waiter held it is the bug this avoids.
+std::mutex& ToolsPreparationLock(const std::string& tools_path) {
+    static std::mutex registry_mu;
+    static std::map<std::string, std::shared_ptr<std::mutex> >* registry =
+        new std::map<std::string, std::shared_ptr<std::mutex> >();
+
+    std::lock_guard<std::mutex> guard(registry_mu);
+    std::shared_ptr<std::mutex>& slot = (*registry)[tools_path];
+    if (!slot) slot.reset(new std::mutex());
+    return *slot;
+}
+
+/// Rust `ensure_legacy_tools_drive` — the single-ext4 fallback, which is just
+/// `ensure_tools_version` against the bundled manifest.
+core::Expected<Unit, std::string> EnsureLegacyToolsDrive(const cfg::AppConfig& config,
+                                                         const Manifest& manifest,
+                                                         const std::string& version) {
+    return EnsureToolsVersion(config, config.deps_path, manifest, version);
+}
+
+}  // namespace
+
+core::Expected<core::Optional<std::string>, std::string> PrepareToolsImage(
+    const cfg::AppConfig& config, const Manifest& manifest, const std::string& version,
+    const ToolsImageResolver& resolve) {
+    const core::Expected<std::string, std::string> tools_path =
+        config.ResolvedToolsDrivePathForVersion(version);
+    if (!tools_path.ok()) return core::make_unexpected(tools_path.error());
+
+    // Held across every probe and the install, not just the install: the
+    // checks are what decide whether to install at all, so releasing between
+    // them would let two launches both conclude "absent" and then both write.
+    std::lock_guard<std::mutex> guard(ToolsPreparationLock(tools_path.value()));
+
+    // An installed legacy drive wins outright. Checking the image config first
+    // would make a node provisioned the ext4 way start pulling from a registry
+    // on its next launch.
+    if (FileExistsNonEmpty(tools_path.value())) {
+        return core::Optional<std::string>();
+    }
+
+    // An operator-configured file identifies the release declared beside it,
+    // so it is honoured for that version and no other -- which is why the
+    // version comparison is here rather than folded into the branch above.
+    if (version == config.ResolvedToolsVersion() && config.tools.drive_path.has_value()) {
+        const core::Expected<Unit, std::string> legacy =
+            EnsureLegacyToolsDrive(config, manifest, version);
+        if (!legacy.ok()) return core::make_unexpected(legacy.error());
+        return core::Optional<std::string>();
+    }
+
+    const core::Optional<std::string> tools_dir = fs::Parent(tools_path.value());
+    if (!tools_dir.has_value()) {
+        return core::make_unexpected(std::string("resolved tools drive path has no parent"));
+    }
+    // Rust `tools_path.with_file_name("image.json")`.
+    const std::string image_path = fs::Join(*tools_dir, "image.json");
+    // Short-circuits a registry round trip for an already-installed release.
+    if (FileExistsNonEmpty(image_path)) {
+        return core::Optional<std::string>(image_path);
+    }
+
+    const std::string url_template =
+        config.tools.url.has_value() ? *config.tools.url : manifest.tools_url;
+    std::vector<std::pair<std::string, std::string> > vars;
+    vars.push_back(std::make_pair(std::string("version"), version));
+    const std::string image_ref = ResolveUrl(url_template, vars);
+
+    if (!resolve) {
+        return core::make_unexpected(
+            std::string("prepare tools image for version '") + version +
+            "': no tools image resolver is installed, so the overlaybd tools drive "
+            "cannot be resolved (install one or configure tools.drive_path)");
+    }
+    const core::Expected<core::Optional<std::string>, std::string> resolved = resolve(image_ref);
+    if (!resolved.ok()) return core::make_unexpected(resolved.error());
+
+    // An unresolvable *shape* is not a failure: a release may legitimately
+    // ship only the legacy drive, and that is what the fallback is for.
+    if (!resolved.value().has_value()) {
+        const core::Expected<Unit, std::string> legacy =
+            EnsureLegacyToolsDrive(config, manifest, version);
+        if (!legacy.ok()) return core::make_unexpected(legacy.error());
+        return core::Optional<std::string>();
+    }
+
+    const core::Expected<Unit, std::string> installed =
+        InstallToolsImage(*resolved.value(), image_path);
+    if (!installed.ok()) return core::make_unexpected(installed.error());
+    return core::Optional<std::string>(image_path);
 }
 
 core::Expected<Unit, std::string> Ensure(const cfg::AppConfig& config,

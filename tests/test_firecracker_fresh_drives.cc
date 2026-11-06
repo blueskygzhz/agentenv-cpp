@@ -24,8 +24,8 @@
 #include <vector>
 
 #include "agentenv/sandbox/firecracker/sandbox_backend.h"
-#include "agentenv/storage/ublk_daemon/client.h"
-#include "agentenv/storage/ublk_daemon/protocol.h"
+#include "agentenv/storage/ublk-daemon/client.h"
+#include "agentenv/storage/ublk-daemon/protocol.h"
 
 using namespace agentenv;
 using namespace agentenv::sandbox;

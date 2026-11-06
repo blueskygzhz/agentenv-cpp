@@ -161,14 +161,23 @@ class WarmPool {
     /// Try to enqueue an idle resource only if the pool is below the high
     /// watermark. Returns true on success; on failure `*resource` is untouched
     /// (still owned by the caller), mirroring Rust's `Result<(), T>`.
-    bool TryPushBounded(T resource) {
+    ///
+    /// Takes a pointer, not a value: Rust hands the resource *back* in the
+    /// `Err` arm so a rejected one can be torn down properly, and a by-value
+    /// parameter would destroy it at the end of this scope instead. For a
+    /// ublk device that difference is a leaked kernel device — the destructor
+    /// closes `/dev/ublkcN` but nothing issues `DEL_DEV`.
+    bool TryPushBounded(T* resource) {
         std::lock_guard<std::mutex> lg(mu_);
         if (!shutting_down_ && pool_.size() < config_.high_watermark) {
-            pool_.push_back(std::move(resource));
+            pool_.push_back(std::move(*resource));
             return true;
         }
         return false;
     }
+
+    /// By-value overload, for a `T` whose loss on rejection is harmless.
+    bool TryPushBounded(T resource) { return TryPushBounded(&resource); }
 
     /// Drain one idle resource from the back of the pool.
     bool TryDrainOne(T* out) {
