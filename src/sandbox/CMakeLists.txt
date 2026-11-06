@@ -5,6 +5,9 @@ add_library(agentenv-sandbox STATIC
     logs.cc
     # Rust: src/sandbox/metrics.rs
     metrics.cc
+    # Rust: src/sandbox/guest_volumes.rs — the in-guest mount/sync/freeze
+    # commands a volume-carrying sandbox needs around launch and capture.
+    guest_volumes.cc
     mock.cc
     envd.cc
     # Rust: src/sandbox/envd/user.rs — Dockerfile USER -> a guest account name

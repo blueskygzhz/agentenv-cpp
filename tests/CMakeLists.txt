@@ -96,6 +96,8 @@ agentenv_add_test(test_sandbox_logs        test_sandbox_logs.cc        agentenv-
 # envd-boundary validation and the retention cache's two clocks.
 agentenv_add_test(test_sandbox_metrics     test_sandbox_metrics.cc
                   agentenv-sandbox agentenv-orchestrator)
+# Rust: src/sandbox/guest_volumes.rs — in-guest mount/sync/freeze ordering.
+agentenv_add_test(test_sandbox_guest_volumes test_sandbox_guest_volumes.cc agentenv-sandbox)
 # Rust: src/snapshot/publish.rs + store_snapshot/delete_snapshot of store.rs
 agentenv_add_test(test_snapshot_publish    test_snapshot_publish.cc    agentenv-snapshot)
 # Rust: src/snapshot/image_export/acr/{source_image,client,publisher}.rs — the

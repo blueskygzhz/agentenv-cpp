@@ -1519,10 +1519,18 @@ SandboxCaptureResult<core::Unit> FirecrackerSandboxBackend::FreezeAndSnapshotVol
     // Rust freezes each writable persistent volume's mount, then seals them.
     // With no such mount the loop body never runs and the seal is a no-op, so
     // the whole operation succeeds without reaching the guest.
+    //
+    // The commands themselves are ported (`sandbox/guest_volumes.h`:
+    // `SetVolumeFreeze`, `SyncWritableVolumeFilesystems`), so what is missing
+    // is narrower than it was: an `Executor` that dispatches into the guest.
+    // That gap is not bridgeable with the host-local executor — running
+    // `fsfreeze` on the host would freeze a *host* filesystem by the same
+    // path, which is why no fallback is attempted here.
     if (!impl_->HasWritablePersistentVolumes()) return core::Unit();
     return core::make_unexpected(SandboxCaptureError::Recoverable(
-        "freeze_and_snapshot_volumes: freezing a volume filesystem needs an envd client to "
-        "run the fsfreeze ioctl in the guest, which is not available in this build"));
+        "freeze_and_snapshot_volumes: freezing a volume filesystem needs a guest-dispatching "
+        "executor to run the fsfreeze ioctl inside the VM, which is not available in this "
+        "build"));
 }
 
 core::Expected<core::Unit, core::AnyError> FirecrackerSandboxBackend::ThawVolumes() {
