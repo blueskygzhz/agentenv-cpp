@@ -2,6 +2,8 @@ add_library(agentenv-template STATIC
     engine.cc
     errors.cc
     build_spec.cc
+    # Rust: src/template/logs.rs (buffer + document access; no tracing bridge)
+    logs.cc
     # Rust: src/template/step_executor.rs
     step_executor.cc
     # Rust: src/template/builder.rs (preparation/validation half)

@@ -1,9 +1,5 @@
 add_library(agentenv-snapshot STATIC
-    layers.cc
-    types.cc
     acr_manifest.cc
-    drive.cc
-    record.cc
     source_registry.cc
     image_export_target.cc
     artifact_cache.cc
@@ -19,14 +15,18 @@ add_library(agentenv-snapshot STATIC
     # Rust: src/snapshot/image_export/acr/{client.rs,publisher.rs}, the
     # manifest-delete half: what rolling a publication back needs.
     image_export/acr_client.cc
+    # Rust: src/snapshot/image_export/regctl.rs — the `regctl` operations a
+    # rootfs export needs, including the cross-registry `blob get | blob put`.
+    image_export/regctl.cc
+    # Rust: src/snapshot/image_export/service.rs — resolve the target, compare
+    # the manifest digest, upload only what the target lacks.
+    image_export/service.cc
     repository/errors.cc
     repository/interfaces.cc
     # Rust: src/repository/layout.rs — `DocumentKey`.
     repository/documents.cc
     # Rust: src/repository/layout.rs — `BlobKey`; interfaces.rs blob types.
     repository/blobs.cc
-    # Rust: src/types/image_tag.rs
-    image_tag.cc
     repository/backends.cc
     repository/posixfs/layout.cc
     repository/posixfs/catalog.cc
@@ -62,6 +62,12 @@ target_link_libraries(agentenv-snapshot PUBLIC
     # `SnapshotRuntimeVersions` and its `--version` parsers; split out so
     # `agentenv-sandbox` can run the probes that feed them without a cycle.
     agentenv-snapshot-version
+    # The record/image-tag value types, in their own target because
+    # `agentenv-image` needs exactly those two and this library links it.
+    agentenv-snapshot-record
+    # `image_export/regctl.cc` shells out through `image::RunRegctl` for the
+    # retry budget, GOMAXPROCS cap and 404 classification.
+    agentenv-image
     # `StoreDiskLayers` must recognise a runtime-generated rootfs delta:
     # publishing passes `allow_descriptorless = false`, and that delta carries
     # no descriptor, so without this every snapshot of a sandbox that wrote to

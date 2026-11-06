@@ -5,6 +5,11 @@
 namespace agentenv {
 namespace snapshot {
 
+/// Here rather than in `image_export_target.cc`: this is the translation unit
+/// that owns the parser applying the default, and the export target merely
+/// reads it.
+const char* const kDefaultImageTag = "latest";
+
 namespace {
 
 const std::size_t kMaxLen = 128;

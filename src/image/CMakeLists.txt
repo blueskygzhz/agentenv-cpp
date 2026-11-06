@@ -52,9 +52,14 @@ target_link_libraries(agentenv-image PUBLIC
     agentenv-p2p
     agentenv-overlaybd
     # `PublishedImage` carries `snapshot::OverlaybdLayerRef` (Rust
-    # `crate::types::OverlaybdLayerRef`). The snapshot library does not link
-    # back to this one.
-    agentenv-snapshot
+    # `crate::types::OverlaybdLayerRef`), and `resolver.cc` builds snapshot
+    # image tags.
+    #
+    # Only those two translation units, not all of `agentenv-snapshot`: the
+    # snapshot library links *this* one for the regctl primitives its rootfs
+    # image export shells out through, so the whole-library edge would be a
+    # cycle.
+    agentenv-snapshot-record
     # `ImageCacheService` is built from `cfg::AppConfig` /
     # `cfg::ResolvedImageCacheConfig`. agentenv-cfg does not link back here.
     agentenv-cfg

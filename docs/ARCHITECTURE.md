@@ -186,10 +186,13 @@ earlier revision of this section listed `LocalRepository` / `S3Repository` /
   marker did not gate reads, a failed alias claim left the record behind,
   records were written compact rather than pretty, and `delete` only unlinked
   files instead of running upstream's full sequence.
-- `main.cc` constructs the posix-fs pair directly. `MakePosixFsRepository`
-  still returns the in-memory stub (it has no `OverlaybdLayerStore` or
-  `LocalArtifactCache` to build the real one with), while
-  `MakeOssRepository(const cfg::OssBackendConfig&)` now builds a real
+- `main.cc` constructs the posix-fs pair directly — a catalog store plus an
+  artifact store — which is the only way to get a working one. The
+  `MakePosixFsRepository(root_dir)` factory that used to sit beside it has been
+  removed: it ignored `root_dir` and returned an in-memory stub, so anything
+  trusting the name got a repository whose documents all answered
+  "unsupported". Meanwhile
+  `MakeOssRepository(const cfg::OssBackendConfig&)` builds a real
   `OssSnapshotRepository`. So **`[backend.oss]` is reachable for documents,
   blobs and snapshot records** — see the OSS section below.
 - The OSS document layer (`repository/oss/documents.{h,cc}`) is ported: shared

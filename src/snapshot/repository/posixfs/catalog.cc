@@ -209,6 +209,22 @@ RepositoryResult<core::Unit> PosixFsCatalogStore::RemoveDirIfExists(
 
 RepositoryResult<core::FileLockGuard> PosixFsCatalogStore::AcquireCatalogLock(
     const std::string& lock_path, const std::string& label) const {
+    // Rust `acquire_file_lock` creates the lock's parent first, and it has to:
+    // `EnsureLayout` only makes the directories the *record* layer uses, so a
+    // document collection outside that set -- `snapshots/build-logs/` is one --
+    // has no directory until something writes to it, and opening the lock file
+    // would fail with ENOENT. `WriteAtomic` already creates the document's own
+    // parent, so without this the lock is the only thing standing between a
+    // fresh repository and its first build log.
+    const core::Optional<std::string> parent = core::fs::Parent(lock_path);
+    if (parent.has_value()) {
+        const core::Expected<core::Unit, std::string> created = core::fs::CreateDirAll(*parent);
+        if (!created.ok()) {
+            return core::make_unexpected(
+                Backend("create " + label + " lock dir '" + *parent + "'", created.error()));
+        }
+    }
+
     bool timed_out = false;
     core::Expected<core::FileLockGuard, std::string> guard =
         core::AcquireFileLock(lock_path, CurrentPidText(), kFileLockTimeoutMs, &timed_out);

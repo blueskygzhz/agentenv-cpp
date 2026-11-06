@@ -416,4 +416,51 @@ MT_TEST(startup_shell_and_base_context_round_trip) {
     MT_EXPECT_TRUE(*spec.BaseContextRef() == context);
 }
 
+// Rust `ImageConfigs::rootfs_config`.
+//
+// Both conditions matter and the test exists to pin that. An entry with a
+// `drive_id` describes an attached volume and one mounted elsewhere describes a
+// different filesystem, so matching on either alone would hand a volume's
+// runtime config to the rootfs image export -- which is how a published image
+// ends up carrying the wrong `Env` and `Entrypoint`.
+MT_TEST(image_configs_rootfs_config_requires_no_drive_id_and_root_mount) {
+    ImageConfigs configs;
+    // A volume at `/`: right mount, wrong kind.
+    configs.Add(Optional<std::string>(std::string("drive-1")), "/",
+                agentenv::core::Json::Parse("{\"Env\":[\"FROM=volume\"]}").value());
+    // The rootfs mounted somewhere else: right kind, wrong mount.
+    configs.Add(Optional<std::string>(), "/mnt/data",
+                agentenv::core::Json::Parse("{\"Env\":[\"FROM=elsewhere\"]}").value());
+    MT_EXPECT_TRUE(!configs.RootfsConfig().has_value());
+
+    configs.Add(Optional<std::string>(), "/",
+                agentenv::core::Json::Parse("{\"Env\":[\"FROM=rootfs\"]}").value());
+    const Optional<agentenv::core::Json> found = configs.RootfsConfig();
+    MT_EXPECT_TRUE(found.has_value());
+    MT_EXPECT_EQ(found->as_object().find("Env")->second.as_array()[0].as_string(),
+                 std::string("FROM=rootfs"));
+}
+
+/// Absent, not an empty object: a snapshot taken from a base image with no
+/// runtime config must not be reported as having an empty one, because the
+/// export merges whatever it is given on top of the generated config.
+MT_TEST(image_configs_rootfs_config_absent_when_none_recorded) {
+    const ImageConfigs empty;
+    MT_EXPECT_TRUE(!empty.RootfsConfig().has_value());
+}
+
+/// The first match wins, as Rust's `find` does. A record with duplicates is
+/// malformed either way, but picking the last would differ from upstream for
+/// the same bytes.
+MT_TEST(image_configs_rootfs_config_takes_the_first_match) {
+    ImageConfigs configs;
+    configs.Add(Optional<std::string>(), "/",
+                agentenv::core::Json::Parse("{\"Env\":[\"FROM=first\"]}").value());
+    configs.Add(Optional<std::string>(), "/",
+                agentenv::core::Json::Parse("{\"Env\":[\"FROM=second\"]}").value());
+    MT_EXPECT_EQ(configs.RootfsConfig()->as_object().find("Env")->second.as_array()[0]
+                     .as_string(),
+                 std::string("FROM=first"));
+}
+
 int main() { return microtest::RunAll(); }

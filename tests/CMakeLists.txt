@@ -30,6 +30,10 @@ agentenv_add_test(test_volume              test_volume.cc              agentenv-
 # Rust: src/volume/catalog.rs
 agentenv_add_test(test_volume_catalog      test_volume_catalog.cc      agentenv-volume)
 agentenv_add_test(test_template_spec       test_template_spec.cc       agentenv-template)
+# Rust: src/template/logs.rs — the bounds and the document, over a real POSIX
+# repository so the persistence half is not faked.
+agentenv_add_test(test_template_logs       test_template_logs.cc
+                  agentenv-template agentenv-snapshot agentenv-volume-record)
 # Rust: src/template/step_executor.rs
 agentenv_add_test(test_template_step_executor test_template_step_executor.cc agentenv-template)
 # Rust: src/template/builder.rs
@@ -86,6 +90,12 @@ agentenv_add_test(test_snapshot_publish    test_snapshot_publish.cc    agentenv-
 # Rust: src/snapshot/image_export/acr/{source_image,client,publisher}.rs — the
 # manifest-delete half a snapshot delete needs.
 agentenv_add_test(test_snapshot_acr        test_snapshot_acr.cc        agentenv-snapshot)
+# Rust: src/snapshot/image_export/regctl.rs — driven against a real fake
+# `regctl` script, so the fork/pipe half of `BlobPipe` is actually exercised.
+agentenv_add_test(test_snapshot_regctl     test_snapshot_regctl.cc     agentenv-snapshot)
+# Rust: src/snapshot/image_export/service.rs — end to end over the fake regctl,
+# so the transfer-shape choices are asserted on argv.
+agentenv_add_test(test_snapshot_image_service test_snapshot_image_service.cc agentenv-snapshot)
 # Rust: src/sandbox/envd/user.rs — Dockerfile USER -> a guest account name
 agentenv_add_test(test_sandbox_envd_user   test_sandbox_envd_user.cc   agentenv-sandbox)
 agentenv_add_test(test_custom_extension    test_custom_extension.cc    agentenv-sandbox)

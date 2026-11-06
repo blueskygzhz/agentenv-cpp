@@ -27,6 +27,19 @@ void ImageConfigs::Add(const core::Optional<std::string>& drive_id, const std::s
     entries_.push_back(entry);
 }
 
+core::Optional<core::Json> ImageConfigs::RootfsConfig() const {
+    for (std::size_t i = 0; i < entries_.size(); ++i) {
+        // Rust `find(|e| e.drive_id.is_none() && e.mount_path == "/")`. The
+        // first match wins, as `find` does: a record with duplicates is
+        // malformed, and picking the last would differ from upstream for the
+        // same bytes.
+        if (!entries_[i].drive_id.has_value() && entries_[i].mount_path == "/") {
+            return core::Optional<core::Json>(entries_[i].config);
+        }
+    }
+    return core::Optional<core::Json>();
+}
+
 core::Json ImageConfigs::ToJson() const {
     // `#[serde(transparent)]`: the wire form is the inner Vec itself.
     core::JsonArray array;

@@ -48,6 +48,16 @@ class ImageConfigs {
     std::size_t size() const { return entries_.size(); }
     const std::vector<ImageConfigEntry>& entries() const { return entries_; }
 
+    /// Rust `ImageConfigs::rootfs_config` — the OCI `config` object of the
+    /// image mounted at `/`, or absent when none was recorded.
+    ///
+    /// Both conditions are required: an entry with a `drive_id` describes an
+    /// attached volume, and one mounted elsewhere describes a different
+    /// filesystem. Matching on either alone would hand a volume's runtime
+    /// config to a rootfs image export, which is how a snapshot ends up
+    /// publishing the wrong `Env` and `Entrypoint`.
+    core::Optional<core::Json> RootfsConfig() const;
+
     bool operator==(const ImageConfigs& o) const { return entries_ == o.entries_; }
     bool operator!=(const ImageConfigs& o) const { return !(*this == o); }
 

@@ -439,10 +439,11 @@ int main(int argc, char** argv) {
     // releases leases on delete and publishes backings on capture) and the API
     // bundle (which serves `/volumes*`).
     //
-    // Built from the posix-fs stores directly rather than through
-    // `MakePosixFsRepository`, which still answers with the in-memory stub
-    // whose document methods report "unsupported": a volume catalog on top of
-    // that would fail every call.
+    // Built from the posix-fs stores directly because that is the only way:
+    // the backend needs a catalog store *and* an artifact store, which no
+    // root-only factory can supply. (There used to be a
+    // `MakePosixFsRepository(root)` that pretended otherwise and returned an
+    // in-memory stub; it is gone.)
     std::shared_ptr<ae::volume::VolumeManager> volume_manager;
     std::shared_ptr<ae::image::ImageResolver> image_resolver;
     if (app_cfg.backend.posix_fs.has_value()) {

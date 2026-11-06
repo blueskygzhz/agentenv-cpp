@@ -37,8 +37,11 @@ class InMemorySnapshotRepository : public SnapshotRepository {
     std::map<std::string, std::string>    alias_to_id_;
 };
 
-/// Rust: backends/posixfs/ — a shared-POSIX filesystem repository.
-std::unique_ptr<SnapshotRepository> MakePosixFsRepository(const std::string& root_dir);
+// Rust: backends/posixfs/ — construct `posixfs::PosixFsSnapshotRepository`
+// directly (see `posixfs/backend.h`). There is deliberately no
+// `MakePosixFsRepository(root_dir)` factory: the backend needs a catalog store
+// *and* an artifact store, and the one that used to be declared here took only
+// a root, ignored it, and handed back an in-memory stub.
 
 /// Rust `OssRepository::from_config` — an object-storage repository.
 ///

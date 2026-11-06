@@ -133,16 +133,16 @@ InMemorySnapshotRepository::MarkBuildError(const core::SnapshotId& id,
     return core::Unit{};
 }
 
-// ---- backends/posixfs, backends/oss ----
-
-std::unique_ptr<SnapshotRepository> MakePosixFsRepository(const std::string& /*root_dir*/) {
-    // Still the in-memory store, but no longer for want of an implementation:
-    // `posixfs::PosixFsBackend::repository()` is the real one. What is missing
-    // here is the rest of its construction — an `OverlaybdLayerStore` and a
-    // `LocalArtifactCache`, neither of which this factory signature carries.
-    // Callers that have them should build `PosixFsBackend` directly.
-    return std::unique_ptr<SnapshotRepository>(new InMemorySnapshotRepository());
-}
+// ---- backends/oss ----
+//
+// `MakePosixFsRepository(root_dir)` used to live here and was removed rather
+// than fixed. It ignored `root_dir` and returned an `InMemorySnapshotRepository`
+// -- so a caller that believed the name got a repository whose documents all
+// answer "unsupported operation: repository documents", and whose data went
+// nowhere near the root it passed in. Nothing called it: `main.cc` already
+// builds `posixfs::PosixFsSnapshotRepository` directly, which is the only way
+// to supply the catalog *and* artifact stores it needs. A factory that cannot
+// take those is not a factory for this backend.
 
 RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeOssRepository(
     const cfg::OssBackendConfig& config) {

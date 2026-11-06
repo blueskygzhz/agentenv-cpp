@@ -105,6 +105,9 @@ add_subdirectory(src/image-local-layer)
 # probes that feed these parsers, without the cycle that linking all of
 # snapshot would create (`agentenv-snapshot` already depends on sandbox).
 add_subdirectory(src/snapshot-version)
+# The two translation units `agentenv-image` needs out of `agentenv-snapshot`,
+# so that `agentenv-snapshot` can link `agentenv-image` for regctl.
+add_subdirectory(src/snapshot-record)
 add_subdirectory(src/managed-secret)
 add_subdirectory(src/privileges-lib)
 add_subdirectory(src/snapshot-startup-pack)

@@ -10,7 +10,6 @@
 namespace agentenv {
 namespace snapshot {
 
-const char* const kDefaultImageTag = "latest";
 
 namespace {
 

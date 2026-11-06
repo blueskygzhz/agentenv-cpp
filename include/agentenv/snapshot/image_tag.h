@@ -16,7 +16,11 @@ namespace agentenv {
 namespace snapshot {
 
 /// Rust `DEFAULT_IMAGE_TAG` — the tag an image reference without `:tag` means.
-/// Defined in `image_export_target.cc`, which already carried it.
+///
+/// Defined in `image_tag.cc`, alongside the parser that applies it. It used to
+/// borrow the definition in `image_export_target.cc`, which happened to link
+/// only because both ended up in one library; splitting the record types into
+/// their own target broke that.
 extern const char* const kDefaultImageTag;
 
 /// Rust `ImageName` — the name of a published image, which owns its tags.
