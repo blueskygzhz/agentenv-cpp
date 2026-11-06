@@ -8,6 +8,7 @@
 #define AGENTENV_SNAPSHOT_RECORD_H_
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -132,9 +133,22 @@ struct SnapshotSource {
     TemplateBuildInfo build;
     /// `Sandbox { source_sandbox_id }`.
     std::string source_sandbox_id;
+    /// Rust `#[serde(default, skip_serializing_if = "Option::is_none")]
+    /// source_sandbox_metadata` — the source sandbox's user metadata at
+    /// capture time.
+    ///
+    /// Informational provenance only: it never affects launching. Absent is
+    /// distinct from empty and must stay that way on the wire, because older
+    /// records predate the field entirely — writing `{}` for them would claim
+    /// the sandbox had no metadata where the truth is that nobody recorded
+    /// any.
+    core::Optional<std::map<std::string, std::string> > source_sandbox_metadata;
 
     static SnapshotSource Template(const TemplateBuildInfo& build);
-    static SnapshotSource Sandbox(const std::string& source_sandbox_id);
+    static SnapshotSource Sandbox(
+        const std::string& source_sandbox_id,
+        const core::Optional<std::map<std::string, std::string> >& source_sandbox_metadata =
+            core::Optional<std::map<std::string, std::string> >());
 
     bool is_template() const { return kind == SnapshotSourceKind::Template; }
 
@@ -149,12 +163,20 @@ struct SnapshotSource {
 struct SnapshotPublishSource {
     SnapshotSourceKind kind = SnapshotSourceKind::Template;
     std::string source_sandbox_id;
+    /// Carried into `SnapshotSource::source_sandbox_metadata` by `commit`.
+    core::Optional<std::map<std::string, std::string> > source_sandbox_metadata;
 
     static SnapshotPublishSource Template();
-    static SnapshotPublishSource Sandbox(const std::string& source_sandbox_id);
+    static SnapshotPublishSource Sandbox(
+        const std::string& source_sandbox_id,
+        const core::Optional<std::map<std::string, std::string> >& source_sandbox_metadata =
+            core::Optional<std::map<std::string, std::string> >());
 
     bool operator==(const SnapshotPublishSource& o) const {
-        return kind == o.kind && source_sandbox_id == o.source_sandbox_id;
+        return kind == o.kind && source_sandbox_id == o.source_sandbox_id &&
+               source_sandbox_metadata.has_value() == o.source_sandbox_metadata.has_value() &&
+               (!source_sandbox_metadata.has_value() ||
+                *source_sandbox_metadata == *o.source_sandbox_metadata);
     }
     bool operator!=(const SnapshotPublishSource& o) const { return !(*this == o); }
 };

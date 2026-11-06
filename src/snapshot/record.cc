@@ -347,10 +347,13 @@ SnapshotSource SnapshotSource::Template(const TemplateBuildInfo& build) {
     return source;
 }
 
-SnapshotSource SnapshotSource::Sandbox(const std::string& source_sandbox_id) {
+SnapshotSource SnapshotSource::Sandbox(
+    const std::string& source_sandbox_id,
+    const core::Optional<std::map<std::string, std::string> >& source_sandbox_metadata) {
     SnapshotSource source;
     source.kind = SnapshotSourceKind::Sandbox;
     source.source_sandbox_id = source_sandbox_id;
+    source.source_sandbox_metadata = source_sandbox_metadata;
     return source;
 }
 
@@ -364,6 +367,19 @@ core::Json SnapshotSource::ToJson() const {
     } else {
         core::JsonObject inner;
         inner["source_sandbox_id"] = core::Json(source_sandbox_id);
+        // `skip_serializing_if = "Option::is_none"`: absent stays absent, so
+        // a record written before the field existed round-trips unchanged
+        // rather than gaining an empty map that claims the sandbox had no
+        // metadata.
+        if (source_sandbox_metadata.has_value()) {
+            core::JsonObject metadata;
+            for (std::map<std::string, std::string>::const_iterator it =
+                     source_sandbox_metadata->begin();
+                 it != source_sandbox_metadata->end(); ++it) {
+                metadata[it->first] = core::Json(it->second);
+            }
+            inner["source_sandbox_metadata"] = core::Json(metadata);
+        }
         object["Sandbox"] = core::Json(inner);
     }
     return core::Json(object);
@@ -398,7 +414,29 @@ core::Expected<SnapshotSource, std::string> SnapshotSource::FromJson(const core:
         const core::Expected<std::string, std::string> id =
             RequireString(sandbox_variant->as_object(), "source_sandbox_id");
         if (!id.ok()) return core::make_unexpected(id.error());
-        return SnapshotSource::Sandbox(id.value());
+
+        // `#[serde(default)]`: older records have no such field at all, so a
+        // missing one is absent metadata rather than a parse failure.
+        core::Optional<std::map<std::string, std::string> > metadata;
+        const core::Json* raw = Find(sandbox_variant->as_object(), "source_sandbox_metadata");
+        if (raw != NULL && raw->kind() != core::Json::Kind::Null) {
+            if (raw->kind() != core::Json::Kind::Object) {
+                return core::make_unexpected(
+                    std::string("`source_sandbox_metadata` must be an object"));
+            }
+            std::map<std::string, std::string> parsed;
+            const core::JsonObject& entries = raw->as_object();
+            for (core::JsonObject::const_iterator it = entries.begin(); it != entries.end();
+                 ++it) {
+                if (it->second.kind() != core::Json::Kind::String) {
+                    return core::make_unexpected(
+                        std::string("`source_sandbox_metadata` values must be strings"));
+                }
+                parsed[it->first] = it->second.as_string();
+            }
+            metadata = core::Optional<std::map<std::string, std::string> >(parsed);
+        }
+        return SnapshotSource::Sandbox(id.value(), metadata);
     }
 
     // An unknown tag must not default to a Template with a Waiting build,
@@ -409,8 +447,17 @@ core::Expected<SnapshotSource, std::string> SnapshotSource::FromJson(const core:
 
 bool SnapshotSource::operator==(const SnapshotSource& o) const {
     if (kind != o.kind) return false;
-    return kind == SnapshotSourceKind::Template ? build == o.build
-                                                : source_sandbox_id == o.source_sandbox_id;
+    if (kind == SnapshotSourceKind::Template) return build == o.build;
+    if (source_sandbox_id != o.source_sandbox_id) return false;
+    // Absent and empty are different records on the wire, so they must not
+    // compare equal here either — `commit`'s rollback decides whether to
+    // revert by comparing encoded records, and treating the two as equal
+    // would let a metadata-gaining update be mistaken for no change at all.
+    if (source_sandbox_metadata.has_value() != o.source_sandbox_metadata.has_value()) {
+        return false;
+    }
+    return !source_sandbox_metadata.has_value() ||
+           *source_sandbox_metadata == *o.source_sandbox_metadata;
 }
 
 SnapshotPublishSource SnapshotPublishSource::Template() {
@@ -419,10 +466,13 @@ SnapshotPublishSource SnapshotPublishSource::Template() {
     return source;
 }
 
-SnapshotPublishSource SnapshotPublishSource::Sandbox(const std::string& source_sandbox_id) {
+SnapshotPublishSource SnapshotPublishSource::Sandbox(
+    const std::string& source_sandbox_id,
+    const core::Optional<std::map<std::string, std::string> >& source_sandbox_metadata) {
     SnapshotPublishSource source;
     source.kind = SnapshotSourceKind::Sandbox;
     source.source_sandbox_id = source_sandbox_id;
+    source.source_sandbox_metadata = source_sandbox_metadata;
     return source;
 }
 
@@ -639,7 +689,8 @@ void SnapshotRecord::MarkCommitted(const core::Optional<SnapshotAlias>& new_alia
     // A sandbox publish rewrites the source; a template publish leaves it a
     // Template and only advances the build state below.
     if (publish_source.kind == SnapshotSourceKind::Sandbox) {
-        source = SnapshotSource::Sandbox(publish_source.source_sandbox_id);
+        source = SnapshotSource::Sandbox(publish_source.source_sandbox_id,
+                                         publish_source.source_sandbox_metadata);
     }
     if (source.kind == SnapshotSourceKind::Template) {
         source.build.status = TemplateBuildStatus::Ready;

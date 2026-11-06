@@ -3,6 +3,8 @@ add_library(agentenv-sandbox STATIC
     backend.cc
     mock.cc
     envd.cc
+    # Rust: src/sandbox/envd/user.rs — Dockerfile USER -> a guest account name
+    envd_user.cc
     extra_drive.cc
     process.cc
     network.cc

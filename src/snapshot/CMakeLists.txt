@@ -15,6 +15,8 @@ add_library(agentenv-snapshot STATIC
     mock.cc
     # Rust: src/snapshot/store.rs — `store_volume_layers`.
     store.cc
+    # Rust: src/snapshot/publish.rs — store the files, then commit the record
+    publish.cc
     repository/errors.cc
     repository/interfaces.cc
     # Rust: src/repository/layout.rs — `DocumentKey`.

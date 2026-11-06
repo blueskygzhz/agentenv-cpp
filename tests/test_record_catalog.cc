@@ -10,6 +10,7 @@
 // depends on it.
 #include "agentenv/snapshot/repository/record_catalog.h"
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -669,6 +670,272 @@ MT_TEST(delete_keeps_the_record_when_the_files_cannot_be_removed) {
     // The alias was released before the files, so the name is reusable even
     // though the delete is unfinished.
     MT_EXPECT_TRUE(!f.HasAlias("base"));
+}
+
+// ---- commit --------------------------------------------------------------
+
+namespace {
+
+/// Publish metadata naming `id`, optionally claiming `alias`.
+SnapshotPublishMetadata Metadata(const char* id, const core::Optional<std::string>& alias,
+                                 const SnapshotPublishSource& source) {
+    SnapshotPublishMetadata metadata;
+    metadata.id = Id(id);
+    if (alias.has_value()) metadata.alias = core::Optional<SnapshotAlias>(Alias(*alias));
+    metadata.source = source;
+    metadata.context.workdir = "/work";
+    return metadata;
+}
+
+CommittedSnapshot Committed() {
+    CommittedSnapshot committed;
+    committed.context.workdir = "/work";
+    return committed;
+}
+
+}  // namespace
+
+MT_TEST(commit_creates_a_ready_record_when_none_exists_and_claims_the_alias) {
+    Fixture f;
+    const RepositoryResult<SnapshotRecord> record = record_catalog::Commit(
+        f.Repo(), Metadata(kIdA, core::Optional<std::string>("base"),
+                           SnapshotPublishSource::Template()),
+        Committed());
+    MT_EXPECT_TRUE(record.ok());
+
+    // A sandbox snapshot has no pre-created Waiting record, so commit builds
+    // one outright -- and a template publish must land on Ready.
+    MT_EXPECT_TRUE(record.ok() && record.value().committed.has_value());
+    MT_EXPECT_TRUE(record.ok() && record.value().source.is_template());
+    MT_EXPECT_TRUE(record.ok() &&
+                   record.value().source.build.status == TemplateBuildStatus::Ready);
+    // `finished_at` is set and `started_at` is deliberately left absent: a
+    // record created straight into Ready was never observed starting, and
+    // claiming a start time would invent one.
+    MT_EXPECT_TRUE(record.ok() && record.value().source.build.finished_at_unix_ms.has_value());
+    MT_EXPECT_TRUE(record.ok() && !record.value().source.build.started_at_unix_ms.has_value());
+    MT_EXPECT_TRUE(f.HasAlias("base"));
+
+    // The *returned* record is the committed one. `UpdateDocument` reports the
+    // document it was applied to -- the pre-state -- so a port that decoded
+    // that as the result would hand back an uncommitted record here.
+    MT_EXPECT_TRUE(f.Stored(kIdA).has_value() && f.Stored(kIdA)->committed.has_value());
+}
+
+MT_TEST(commit_promotes_a_pre_created_waiting_template) {
+    Fixture f;
+    f.SeedRecord(WaitingTemplate(kIdA, core::Optional<std::string>("base"), 500));
+    const RepositoryResult<SnapshotRecord> record = record_catalog::Commit(
+        f.Repo(), Metadata(kIdA, core::Optional<std::string>("base"),
+                           SnapshotPublishSource::Template()),
+        Committed());
+    MT_EXPECT_TRUE(record.ok());
+    // The existing record is promoted, not replaced: its creation time stays.
+    MT_EXPECT_TRUE(record.ok() && record.value().created_at_unix_ms == 500);
+    MT_EXPECT_TRUE(record.ok() && record.value().committed.has_value());
+}
+
+MT_TEST(commit_refuses_an_already_committed_or_deleting_record) {
+    Fixture f;
+    // Republishing would overwrite the files the live record points at, and
+    // `publish` deletes what it stored when commit fails -- which would take
+    // the existing snapshot's artifacts with it.
+    SnapshotRecord live = WaitingTemplate(kIdA, core::Optional<std::string>());
+    live.committed = core::Optional<CommittedSnapshot>(Committed());
+    f.SeedRecord(live);
+    const RepositoryResult<SnapshotRecord> again = record_catalog::Commit(
+        f.Repo(),
+        Metadata(kIdA, core::Optional<std::string>(), SnapshotPublishSource::Template()),
+        Committed());
+    MT_EXPECT_TRUE(!again.ok());
+
+    // A record on its way out: its artifacts may already be gone.
+    SnapshotRecord dying = WaitingTemplate(kIdB, core::Optional<std::string>());
+    dying.deleting = true;
+    f.SeedRecord(dying);
+    const RepositoryResult<SnapshotRecord> deleting = record_catalog::Commit(
+        f.Repo(),
+        Metadata(kIdB, core::Optional<std::string>(), SnapshotPublishSource::Template()),
+        Committed());
+    MT_EXPECT_TRUE(!deleting.ok());
+}
+
+MT_TEST(commit_rolls_the_record_back_when_the_alias_is_lost) {
+    Fixture f;
+    // Another live snapshot already owns the name.
+    f.SeedRecord(WaitingTemplate(kIdB, core::Optional<std::string>()));
+    f.SeedAlias("base", kIdB);
+
+    const RepositoryResult<SnapshotRecord> record = record_catalog::Commit(
+        f.Repo(), Metadata(kIdA, core::Optional<std::string>("base"),
+                           SnapshotPublishSource::Template()),
+        Committed());
+    MT_EXPECT_TRUE(!record.ok());
+
+    // The record was written before the claim was attempted, so losing the
+    // claim must undo it: a committed record holding an alias it does not own
+    // is findable by id, invisible by name, and reconciled by nothing.
+    MT_EXPECT_TRUE(!f.Stored(kIdA).has_value());
+    // The other snapshot still owns the name.
+    const RepositoryResult<core::Optional<core::SnapshotId> > owner =
+        record_catalog::ResolveAlias(f.Repo(), "base");
+    MT_EXPECT_TRUE(owner.ok() && owner.value().has_value() && *owner.value() == Id(kIdB));
+}
+
+MT_TEST(a_lost_alias_restores_the_pre_created_record_rather_than_deleting_it) {
+    Fixture f;
+    // The record existed before this commit (a template build), so the
+    // rollback must put *that* back, not delete the document -- deleting would
+    // lose the build the publish was completing.
+    f.SeedRecord(WaitingTemplate(kIdA, core::Optional<std::string>("base"), 500));
+    f.SeedRecord(WaitingTemplate(kIdB, core::Optional<std::string>()));
+    f.SeedAlias("base", kIdB);
+
+    MT_EXPECT_TRUE(!record_catalog::Commit(
+                        f.Repo(), Metadata(kIdA, core::Optional<std::string>("base"),
+                                           SnapshotPublishSource::Template()),
+                        Committed())
+                        .ok());
+
+    MT_EXPECT_TRUE(f.Stored(kIdA).has_value());
+    MT_EXPECT_TRUE(f.Stored(kIdA).has_value() && !f.Stored(kIdA)->committed.has_value());
+    MT_EXPECT_TRUE(f.Stored(kIdA).has_value() && f.Stored(kIdA)->created_at_unix_ms == 500);
+}
+
+MT_TEST(a_lost_alias_keeps_a_concurrent_writers_record) {
+    Fixture f;
+    f.SeedRecord(WaitingTemplate(kIdB, core::Optional<std::string>()));
+    f.SeedAlias("base", kIdB);
+
+    // A competing writer lands on the record between the commit's write and
+    // the rollback. Reverting unconditionally would discard its record, so the
+    // rollback is conditional on the document still holding what we wrote.
+    SnapshotRecord intruder = WaitingTemplate(kIdA, core::Optional<std::string>(), 777);
+    intruder.updated_at_unix_ms = 999;
+    f.server.before_put = [&f, intruder]() { f.SeedRecord(intruder); };
+
+    MT_EXPECT_TRUE(!record_catalog::Commit(
+                        f.Repo(), Metadata(kIdA, core::Optional<std::string>("base"),
+                                           SnapshotPublishSource::Template()),
+                        Committed())
+                        .ok());
+
+    // The intruder's record survived untouched.
+    MT_EXPECT_TRUE(f.Stored(kIdA).has_value() && f.Stored(kIdA)->updated_at_unix_ms == 999);
+}
+
+MT_TEST(commit_carries_the_source_sandbox_metadata_into_the_record) {
+    Fixture f;
+    std::map<std::string, std::string> user_metadata;
+    user_metadata["team"] = "infra";
+    SnapshotPublishSource source = SnapshotPublishSource::Sandbox(
+        "sbx-1", core::Optional<std::map<std::string, std::string> >(user_metadata));
+
+    const RepositoryResult<SnapshotRecord> record = record_catalog::Commit(
+        f.Repo(), Metadata(kIdA, core::Optional<std::string>(), source), Committed());
+    MT_EXPECT_TRUE(record.ok());
+    MT_EXPECT_TRUE(record.ok() && !record.value().source.is_template());
+    MT_EXPECT_TRUE(record.ok() && record.value().source.source_sandbox_id == "sbx-1");
+
+    // Provenance survives the round trip through the stored document, which is
+    // the only thing that makes it readable on another node.
+    const core::Optional<SnapshotRecord> stored = f.Stored(kIdA);
+    MT_EXPECT_TRUE(stored.has_value() && stored->source.source_sandbox_metadata.has_value());
+    MT_EXPECT_TRUE(stored.has_value() && stored->source.source_sandbox_metadata.has_value() &&
+                   stored->source.source_sandbox_metadata->find("team") !=
+                       stored->source.source_sandbox_metadata->end() &&
+                   stored->source.source_sandbox_metadata->find("team")->second == "infra");
+}
+
+MT_TEST(absent_sandbox_metadata_is_not_written_as_an_empty_map) {
+    Fixture f;
+    MT_EXPECT_TRUE(record_catalog::Commit(
+                       f.Repo(),
+                       Metadata(kIdA, core::Optional<std::string>(),
+                                SnapshotPublishSource::Sandbox("sbx-1")),
+                       Committed())
+                       .ok());
+    // `skip_serializing_if = "Option::is_none"`. An empty map would claim the
+    // sandbox had no metadata, where the truth is that none was recorded --
+    // and it would make every pre-existing record change shape on rewrite.
+    const std::string key = DocumentKey::SnapshotRecord(Id(kIdA)).Path();
+    MT_EXPECT_TRUE(f.server.bodies[key].find("source_sandbox_metadata") == std::string::npos);
+    MT_EXPECT_TRUE(f.Stored(kIdA).has_value() &&
+                   !f.Stored(kIdA)->source.source_sandbox_metadata.has_value());
+}
+
+// ---- attach_startup_manifest ---------------------------------------------
+
+namespace {
+
+MemoryStartupPackInfo PackInfo() {
+    MemoryStartupPackInfo info;
+    info.pack_size = 4096;
+    info.mem_virtual_size = 1 << 20;
+    info.index_sha256 = "a1b2c3";
+    return info;
+}
+
+}  // namespace
+
+MT_TEST(attach_startup_manifest_records_the_pack_on_a_committed_snapshot) {
+    Fixture f;
+    SnapshotRecord live = WaitingTemplate(kIdA, core::Optional<std::string>());
+    live.committed = core::Optional<CommittedSnapshot>(Committed());
+    f.SeedRecord(live);
+
+    const RepositoryResult<bool> attached =
+        record_catalog::AttachStartupManifest(f.Repo(), Id(kIdA), PackInfo());
+    MT_EXPECT_TRUE(attached.ok() && attached.value());
+    MT_EXPECT_TRUE(f.Stored(kIdA).has_value() &&
+                   f.Stored(kIdA)->committed->memory_startup.has_value());
+}
+
+MT_TEST(attaching_to_a_vanished_or_deleting_snapshot_reports_false_not_an_error) {
+    Fixture f;
+    // The manifest is built after publication returns, so a delete can
+    // legitimately win the race. The caller uses the false to remove the
+    // manifest file it just stored -- an error instead would leave that blob
+    // referenced by no record and collected by nothing.
+    const RepositoryResult<bool> gone =
+        record_catalog::AttachStartupManifest(f.Repo(), Id(kIdA), PackInfo());
+    MT_EXPECT_TRUE(gone.ok());
+    MT_EXPECT_TRUE(gone.ok() && !gone.value());
+
+    SnapshotRecord dying = WaitingTemplate(kIdB, core::Optional<std::string>());
+    dying.committed = core::Optional<CommittedSnapshot>(Committed());
+    dying.deleting = true;
+    f.SeedRecord(dying);
+    const RepositoryResult<bool> deleting =
+        record_catalog::AttachStartupManifest(f.Repo(), Id(kIdB), PackInfo());
+    MT_EXPECT_TRUE(deleting.ok());
+    MT_EXPECT_TRUE(deleting.ok() && !deleting.value());
+}
+
+MT_TEST(attaching_to_an_uncommitted_snapshot_is_an_error_not_a_race) {
+    Fixture f;
+    // A caller bug rather than a race. Reported as a race, it would silently
+    // drop the manifest the caller just built.
+    f.SeedRecord(WaitingTemplate(kIdA, core::Optional<std::string>()));
+    MT_EXPECT_TRUE(!record_catalog::AttachStartupManifest(f.Repo(), Id(kIdA), PackInfo()).ok());
+}
+
+MT_TEST(attaching_twice_keeps_the_first_manifest) {
+    Fixture f;
+    SnapshotRecord live = WaitingTemplate(kIdA, core::Optional<std::string>());
+    live.committed = core::Optional<CommittedSnapshot>(Committed());
+    MemoryStartupPackInfo first = PackInfo();
+    first.index_sha256 = "first";
+    live.committed->memory_startup = core::Optional<MemoryStartupPackInfo>(first);
+    f.SeedRecord(live);
+
+    const RepositoryResult<bool> again =
+        record_catalog::AttachStartupManifest(f.Repo(), Id(kIdA), PackInfo());
+    // True, and a no-op: the first manifest is already the one the record
+    // names, so overwriting it would orphan the blob the record pointed at.
+    MT_EXPECT_TRUE(again.ok() && again.value());
+    MT_EXPECT_TRUE(f.Stored(kIdA).has_value() &&
+                   f.Stored(kIdA)->committed->memory_startup->index_sha256 == "first");
 }
 
 MT_MAIN

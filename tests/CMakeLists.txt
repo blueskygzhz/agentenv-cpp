@@ -78,6 +78,10 @@ agentenv_add_test(test_dto                 test_dto.cc                 agentenv-
 agentenv_add_test(test_mock_backend        test_mock_backend.cc        agentenv-sandbox)
 agentenv_add_test(test_sandbox_process     test_sandbox_process.cc     agentenv-sandbox)
 agentenv_add_test(test_sandbox_envd        test_sandbox_envd.cc        agentenv-sandbox)
+# Rust: src/snapshot/publish.rs + store_snapshot/delete_snapshot of store.rs
+agentenv_add_test(test_snapshot_publish    test_snapshot_publish.cc    agentenv-snapshot)
+# Rust: src/sandbox/envd/user.rs — Dockerfile USER -> a guest account name
+agentenv_add_test(test_sandbox_envd_user   test_sandbox_envd_user.cc   agentenv-sandbox)
 agentenv_add_test(test_custom_extension    test_custom_extension.cc    agentenv-sandbox)
 agentenv_add_test(test_sandbox_access      test_sandbox_access.cc      agentenv-sandbox agentenv-cfg)
 agentenv_add_test(test_sandbox_manifest    test_sandbox_manifest.cc    agentenv-sandbox)

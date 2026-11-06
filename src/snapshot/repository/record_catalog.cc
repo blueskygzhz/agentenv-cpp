@@ -84,6 +84,33 @@ RepositoryError AliasConflict(const SnapshotAlias& alias, const core::SnapshotId
     return RepositoryError::AliasConflict(alias.ToString(), existing.ToString(), id.ToString());
 }
 
+/// Rust `new_committed_record` — the record a commit creates when none exists.
+///
+/// Not `TemplateWaiting` followed by `MarkCommitted`: a template publish must
+/// land on `Ready` with `started_at` left absent, which that pair cannot
+/// express — it would report a build that was never started as having been.
+SnapshotRecord NewCommittedRecord(const SnapshotPublishMetadata& metadata,
+                                  const CommittedSnapshot& committed, int64_t now) {
+    SnapshotRecord record;
+    record.id = metadata.id;
+    record.alias = metadata.alias;
+    if (metadata.source.kind == SnapshotSourceKind::Template) {
+        TemplateBuildInfo build;
+        build.status = TemplateBuildStatus::Ready;
+        build.finished_at_unix_ms = core::Optional<int64_t>(now);
+        record.source = SnapshotSource::Template(build);
+    } else {
+        record.source = SnapshotSource::Sandbox(metadata.source.source_sandbox_id,
+                                                metadata.source.source_sandbox_metadata);
+    }
+    record.resources = metadata.resources;
+    record.created_at_unix_ms = now;
+    record.updated_at_unix_ms = now;
+    record.committed = core::Optional<CommittedSnapshot>(committed);
+    record.deleting = false;
+    return record;
+}
+
 /// Rust `read_record`.
 RepositoryResult<core::Optional<SnapshotRecord> > ReadRecord(SnapshotRepository& repository,
                                                              const core::SnapshotId& id) {
@@ -563,6 +590,152 @@ RepositoryResult<core::Unit> MarkBuildError(SnapshotRepository& repository,
         return decision;
     };
     return UpdateRecord<core::Unit>(repository, id, decide);
+}
+
+// ---- commit ----------------------------------------------------------------
+
+RepositoryResult<SnapshotRecord> Commit(SnapshotRepository& repository,
+                                        const SnapshotPublishMetadata& metadata,
+                                        const CommittedSnapshot& committed) {
+    const int64_t now = NowUnixMs();
+
+    // Rust's `next` closure: the pure pre-state -> committed-record step.
+    const std::function<RepositoryResult<SnapshotRecord>(const core::Optional<SnapshotRecord>&)>
+        next = [&metadata, &committed, now](const core::Optional<SnapshotRecord>& current)
+        -> RepositoryResult<SnapshotRecord> {
+        if (!current.has_value()) {
+            // A sandbox snapshot has no pre-created `Waiting` record the way a
+            // template build does, so the record is built outright.
+            return NewCommittedRecord(metadata, committed, now);
+        }
+        SnapshotRecord record = *current;
+        // Republishing over a live record would overwrite the files it points
+        // at, and `publish` deletes what it stored when commit fails — which
+        // would take the existing snapshot's artifacts with it.
+        if (record.committed.has_value()) {
+            return core::make_unexpected(RepositoryError::InvalidRequest(
+                "snapshot '" + record.id.ToString() + "' is already committed"));
+        }
+        // Its artifacts may already be gone. `InvalidRequest` rather than
+        // `SnapshotNotFound`: the caller asked to commit something that is on
+        // its way out, and a not-found would invite a retry that recreates the
+        // record a delete is in the middle of removing.
+        if (record.deleting) {
+            return core::make_unexpected(RepositoryError::InvalidRequest(
+                "snapshot '" + record.id.ToString() + "' is being deleted"));
+        }
+        record.MarkCommitted(metadata.alias, metadata.resources, committed, metadata.source,
+                             now);
+        return record;
+    };
+
+    // `UpdateRecord` reports the outcome by running `decide` a second time on
+    // the state the write was applied to, so the pair below is `(pre-state,
+    // committed record)`. The committed record is *computed*, never read back:
+    // `UpdateDocument` returns the document the update was applied to, which
+    // is the state *before* the write — decoding that as the result would
+    // return the uncommitted record this commit just replaced.
+    typedef std::pair<core::Optional<SnapshotRecord>, SnapshotRecord> CommitPair;
+    const std::function<RepositoryResult<Decision<CommitPair> >(
+        const core::SnapshotId&, const core::Optional<SnapshotRecord>&)>
+        decide = [&next](const core::SnapshotId&,
+                         const core::Optional<SnapshotRecord>& current)
+            -> RepositoryResult<Decision<CommitPair> > {
+        const RepositoryResult<SnapshotRecord> computed = next(current);
+        if (!computed.ok()) return core::make_unexpected(computed.error());
+        Decision<CommitPair> decision;
+        decision.write = core::Optional<SnapshotRecord>(computed.value());
+        decision.value = CommitPair(current, computed.value());
+        return decision;
+    };
+
+    const RepositoryResult<CommitPair> pair =
+        UpdateRecord<CommitPair>(repository, metadata.id, decide);
+    if (!pair.ok()) return core::make_unexpected(pair.error());
+
+    const core::Optional<SnapshotRecord> previous = pair.value().first;
+    const SnapshotRecord record = pair.value().second;
+
+    // The record is written first and the alias claimed second: a record
+    // holding an alias it does not own is findable by id, invisible by name,
+    // and reconciled by nothing, so the claim is what confirms the commit.
+    if (!metadata.alias.has_value()) return record;
+
+    const RepositoryResult<core::Unit> claimed =
+        ClaimAlias(repository, *metadata.alias, metadata.id);
+    if (claimed.ok()) return record;
+
+    // Restore the record this commit replaced, unless it changed since.
+    // Reverting unconditionally would discard a concurrent writer's record;
+    // not reverting would leave a committed snapshot nobody can reach by the
+    // name it claims.
+    const std::string written = EncodeRecord(record);
+    const core::Optional<std::string> restore =
+        previous.has_value() ? core::Optional<std::string>(EncodeRecord(*previous))
+                             : core::Optional<std::string>();
+    const DocumentUpdate revert =
+        [&written, &restore](
+            const core::Optional<std::string>& current) -> RepositoryResult<DocumentChange> {
+        if (!current.has_value() || *current != written) return DocumentChange::Keep();
+        if (!restore.has_value()) return DocumentChange::Delete();
+        return DocumentChange::Put(*restore);
+    };
+    const RepositoryResult<core::Optional<std::string> > rolled_back =
+        repository.UpdateDocument(DocumentKey::SnapshotRecord(metadata.id), revert);
+    if (!rolled_back.ok()) {
+        // Logged, not returned: the caller must see the alias conflict, which
+        // is the actionable cause. Reporting the rollback failure instead
+        // would name a symptom.
+        AGENTENV_WARN("failed to roll back snapshot record ", metadata.id.ToString(), ": ",
+                      rolled_back.error().ToString());
+    }
+    return core::make_unexpected(claimed.error());
+}
+
+// ---- attach_startup_manifest ----------------------------------------------
+
+RepositoryResult<bool> AttachStartupManifest(SnapshotRepository& repository,
+                                             const core::SnapshotId& id,
+                                             const MemoryStartupPackInfo& info) {
+    const int64_t now = NowUnixMs();
+    const std::function<RepositoryResult<Decision<bool> >(
+        const core::SnapshotId&, const core::Optional<SnapshotRecord>&)>
+        decide = [now, &info](const core::SnapshotId& id,
+                              const core::Optional<SnapshotRecord>& current)
+            -> RepositoryResult<Decision<bool> > {
+        Decision<bool> decision;
+
+        // Gone or being deleted is *not* an error: the manifest is built
+        // after publication returns, so a delete can legitimately win the
+        // race. The caller uses the false to remove the manifest file it just
+        // stored, which is otherwise referenced by no record and collected by
+        // nothing.
+        if (!current.has_value() || current->deleting) {
+            decision.value = false;
+            return decision;
+        }
+
+        SnapshotRecord record = *current;
+        if (!record.committed.has_value()) {
+            // A caller bug rather than a race. Reported as a race, it would
+            // silently drop the manifest.
+            return core::make_unexpected(RepositoryError::InvalidRequest(
+                "snapshot '" + id.ToString() + "' is not committed"));
+        }
+        // Attaching twice is a no-op: the first manifest is already the one
+        // the record names.
+        if (record.committed->memory_startup.has_value()) {
+            decision.value = true;
+            return decision;
+        }
+
+        record.committed->memory_startup = core::Optional<MemoryStartupPackInfo>(info);
+        record.updated_at_unix_ms = now;
+        decision.write = core::Optional<SnapshotRecord>(record);
+        decision.value = true;
+        return decision;
+    };
+    return UpdateRecord<bool>(repository, id, decide);
 }
 
 }  // namespace record_catalog
