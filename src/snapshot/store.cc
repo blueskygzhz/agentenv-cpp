@@ -8,6 +8,7 @@
 #include <climits>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <sstream>
 
 #include "agentenv/core/digest.h"
@@ -15,6 +16,7 @@
 #include "agentenv/core/identity.h"
 #include "agentenv/core/logging.h"
 #include "agentenv/image/local_layer.h"
+#include "agentenv/snapshot/image_export/acr.h"
 #include "agentenv/sandbox/extra_drive.h"
 #include "agentenv/storage/overlaybd/config.h"
 #include "agentenv/storage/overlaybd/dense_export.h"
@@ -453,9 +455,47 @@ RepositoryResult<StoredSnapshot> StoreSnapshotInner(
 
 }  // namespace
 
+PublicationRollback AcrPublicationRollback() {
+    // One exporter per call, shared across the publications of a single
+    // delete: that is what makes its per-registry client cache worth having,
+    // since a snapshot's publications are usually all in one registry.
+    const std::shared_ptr<image_export::AcrDiskImageExporter> exporter(
+        new image_export::AcrDiskImageExporter(
+            image_export::AcrDiskImageExporter::DockerConfigClientBuilder()));
+    return [exporter](const PersistedDiskImagePublication& publication)
+               -> RepositoryResult<core::Unit> {
+        return exporter->RollbackPublication(publication);
+    };
+}
+
+RepositoryResult<core::Unit> DeleteSnapshot(
+    SnapshotRepository& repository, const core::SnapshotId& id,
+    const std::vector<PersistedDiskImagePublication>& publications,
+    const PublicationRollback& rollback) {
+    // Reverse order, as upstream: publications are appended as they are
+    // created, so unwinding from the end undoes the most recent first.
+    for (std::vector<PersistedDiskImagePublication>::size_type i = publications.size(); i > 0;
+         --i) {
+        const PersistedDiskImagePublication& publication = publications[i - 1];
+        const RepositoryResult<core::Unit> rolled_back = rollback(publication);
+        if (!rolled_back.ok()) {
+            // Warned and stepped over, never returned: a registry that is
+            // down must not pin the record forever, and the record is what
+            // makes the delete retryable at all.
+            AGENTENV_WARN("failed to delete source-registry publication; continuing snapshot "
+                          "removal: snapshot "
+                          << id.ToString() << " image_ref " << publication.image_ref
+                          << " manifest_digest " << publication.manifest_digest << ": "
+                          << rolled_back.error().ToString());
+        }
+    }
+    return repository.DeleteSnapshotBlobs(id);
+}
+
 RepositoryResult<core::Unit> DeleteSnapshot(SnapshotRepository& repository,
                                             const core::SnapshotId& id) {
-    return repository.DeleteSnapshotBlobs(id);
+    return DeleteSnapshot(repository, id, std::vector<PersistedDiskImagePublication>(),
+                          PublicationRollback());
 }
 
 RepositoryResult<StoredSnapshot> StoreSnapshot(

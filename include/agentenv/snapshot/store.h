@@ -8,6 +8,7 @@
 #ifndef AGENTENV_SNAPSHOT_STORE_H_
 #define AGENTENV_SNAPSHOT_STORE_H_
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -74,13 +75,38 @@ repository::RepositoryResult<StoredSnapshot> StoreSnapshot(
     repository::SnapshotRepository& repository, const SnapshotPublishMetadata& metadata,
     const sandbox::SandboxSnapshotManifest& manifest);
 
-/// Rust `delete_snapshot` — removes one snapshot's files.
+/// Rolls one source-registry publication back. Rust calls
+/// `AcrDiskImageExporter::rollback_publication` directly; here it is a functor
+/// so `DeleteSnapshot` can be driven without a registry, and so this header
+/// does not have to pull in the HTTP transport.
+typedef std::function<repository::RepositoryResult<core::Unit>(
+    const PersistedDiskImagePublication&)>
+    PublicationRollback;
+
+/// The production rollback: `image_export::AcrDiskImageExporter` over
+/// Docker-config credentials and real HTTPS.
+PublicationRollback AcrPublicationRollback();
+
+/// Rust `delete_snapshot` — rolls the publications back, then removes the
+/// snapshot's files.
 ///
-/// Shared layers stay: other snapshots may reference them. Rust also rolls
-/// back source-registry publications here, in reverse order, before deleting
-/// blobs; that half needs `AcrDiskImageExporter` and is unreachable in this
-/// port for the reason given on `StoredSnapshot`, so this is the blob delete
-/// alone.
+/// Shared layers stay: other snapshots may reference them.
+///
+/// Publications go in **reverse** order, the opposite of how they were
+/// created, and each failure is logged and stepped over rather than returned.
+/// Both halves of that matter: a rollback error must not stop the record from
+/// being removed (the record is what makes the snapshot retryable, and a
+/// registry that is down would otherwise pin it forever), yet the attempt has
+/// to happen first, because once the record is gone nothing names the
+/// publications and they would stay in the registry with no way to find them.
+repository::RepositoryResult<core::Unit> DeleteSnapshot(
+    repository::SnapshotRepository& repository, const core::SnapshotId& id,
+    const std::vector<PersistedDiskImagePublication>& publications,
+    const PublicationRollback& rollback);
+
+/// `DeleteSnapshot` with nothing to roll back.
+///
+/// Used by the publish path, which fails before any publication exists.
 repository::RepositoryResult<core::Unit> DeleteSnapshot(
     repository::SnapshotRepository& repository, const core::SnapshotId& id);
 

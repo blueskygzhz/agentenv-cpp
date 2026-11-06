@@ -80,6 +80,9 @@ agentenv_add_test(test_sandbox_process     test_sandbox_process.cc     agentenv-
 agentenv_add_test(test_sandbox_envd        test_sandbox_envd.cc        agentenv-sandbox)
 # Rust: src/snapshot/publish.rs + store_snapshot/delete_snapshot of store.rs
 agentenv_add_test(test_snapshot_publish    test_snapshot_publish.cc    agentenv-snapshot)
+# Rust: src/snapshot/image_export/acr/{source_image,client,publisher}.rs — the
+# manifest-delete half a snapshot delete needs.
+agentenv_add_test(test_snapshot_acr        test_snapshot_acr.cc        agentenv-snapshot)
 # Rust: src/sandbox/envd/user.rs — Dockerfile USER -> a guest account name
 agentenv_add_test(test_sandbox_envd_user   test_sandbox_envd_user.cc   agentenv-sandbox)
 agentenv_add_test(test_custom_extension    test_custom_extension.cc    agentenv-sandbox)

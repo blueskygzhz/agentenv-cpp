@@ -10,7 +10,9 @@ add_library(agentenv-image STATIC
     resolver.cc
     reference.cc
     metadata.cc
-    local_layer.cc
+    # `local_layer.cc` is built by `agentenv-image-local-layer` and linked in
+    # below: `agentenv-snapshot` needs its predicates and cannot link all of
+    # this library back.
     layers.cc
     oci_image.cc
     # Rust: the rest of src/image/oci_image.rs -- credentials and regctl, then
@@ -41,6 +43,8 @@ add_library(agentenv-image STATIC
 target_include_directories(agentenv-image PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-image PUBLIC
     agentenv-core
+    # `local_layer.cc`, split out so `agentenv-snapshot` can use it too.
+    agentenv-image-local-layer
     # The cache metadata graph is persisted in a local KV store, keys P2P
     # artifacts by digest, and parses overlaybd image configs to find the
     # `file=` lowers it must pin. `local_layer.cc` also builds a `LayerConfig`.

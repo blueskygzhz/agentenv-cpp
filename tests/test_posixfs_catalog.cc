@@ -10,6 +10,7 @@
 #include "agentenv/snapshot/repository/posixfs/backend.h"
 #include "agentenv/snapshot/repository/posixfs/catalog.h"
 #include "microtest.h"
+#include "no_docker_credentials.h"
 
 namespace {
 
@@ -519,12 +520,11 @@ MT_TEST(delete_keeps_an_alias_rebound_to_another_snapshot) {
     MT_EXPECT_TRUE(*resolved.value() == second);
 }
 
-MT_TEST(delete_refuses_a_snapshot_with_a_published_disk_image) {
-    // Rolling a publication back needs Rust's `AcrDiskImageExporter`, which
-    // is not ported. Removing the snapshot anyway would leave the image live
-    // in the registry with nothing left pointing at it, so this is refused --
-    // and refused from inside the atomic update, so the record is not even
-    // marked.
+MT_TEST(delete_proceeds_for_a_snapshot_with_a_published_disk_image) {
+    // The publication is rolled back first, then the files and the record go.
+    // The rollback fails here -- there are no registry credentials, by
+    // construction -- and the delete finishes anyway: the record is what makes
+    // a delete retryable, so an unreachable registry must not pin it forever.
     Catalog catalog;
     const SnapshotId id = FreshId();
     Publish(catalog, id, Optional<snapshot::SnapshotAlias>());
@@ -541,14 +541,16 @@ MT_TEST(delete_refuses_a_snapshot_with_a_published_disk_image) {
                                     record.ToJson().ToStringPretty())
                        .ok());
 
-    const repository::RepositoryResult<Unit> refused = catalog.repo.Delete(id.ToString());
-    MT_EXPECT_TRUE(!refused.ok());
-    MT_EXPECT_TRUE(refused.error().kind == repository::RepositoryErrorKind::Unsupported);
+    // Declared only now, after the fixture has built its directories: this
+    // rewrites `HOME`, and a fixture that derived a path from it would
+    // otherwise be pointed at the throwaway directory.
+    const agentenv::testing::NoDockerCredentials no_credentials;
 
-    // Untouched: still visible, still has its files.
-    MT_EXPECT_TRUE(catalog.repo.Get(id.ToString()).value().has_value());
-    MT_EXPECT_TRUE(!catalog.repo.Get(id.ToString()).value()->deleting);
-    MT_EXPECT_TRUE(fs::Exists(Paths(catalog.root.path, id).SnapshotDir()));
+    MT_EXPECT_TRUE(catalog.repo.Delete(id.ToString()).ok());
+
+    // Gone: record and files both.
+    MT_EXPECT_TRUE(!catalog.repo.Get(id.ToString()).value().has_value());
+    MT_EXPECT_TRUE(!fs::Exists(Paths(catalog.root.path, id).SnapshotDir()));
 }
 
 MT_TEST(resolve_alias_drops_a_stale_binding) {

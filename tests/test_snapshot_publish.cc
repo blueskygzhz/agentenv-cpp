@@ -84,6 +84,40 @@ std::string RemoteLowerConfig(const std::string& repo_blob_url, const std::strin
            "\"}],\"upper\":{},\"resultFile\":\"\",\"download\":{}}";
 }
 
+/// Puts a file-bodied blob into the stub's object map.
+///
+/// Needed because a layer upload goes through the multipart uploader rather
+/// than the HTTP transport, and a null uploader reports `Unsupported`. Writing
+/// the bytes in means the blob-existence assertions below are real: a rollback
+/// that failed to delete a layer would still be visible here.
+struct StubUploader : public oss::ObjectUploader {
+    StubObjectServer* server;
+    explicit StubUploader(StubObjectServer* s) : server(s) {}
+
+    RepositoryResult<core::Unit> UploadFile(const std::string& object_url,
+                                            const std::string& path) {
+        // `s3://<bucket>/<key>` -> the key the stub files everything under.
+        const std::string marker = "/agentenv/";
+        const std::string::size_type at = object_url.find(marker);
+        MT_EXPECT_TRUE(at != std::string::npos);
+        if (at == std::string::npos) {
+            return core::make_unexpected(
+                RepositoryError::Backend("stub upload", "unexpected object url " + object_url));
+        }
+        std::FILE* file = std::fopen(path.c_str(), "rb");
+        if (file == NULL) {
+            return core::make_unexpected(RepositoryError::Backend("stub upload", path));
+        }
+        std::string bytes;
+        char buf[4096];
+        std::size_t read = 0;
+        while ((read = std::fread(buf, 1, sizeof(buf), file)) > 0) bytes.append(buf, read);
+        std::fclose(file);
+        server->Seed(object_url.substr(at + marker.size()), bytes);
+        return core::Unit();
+    }
+};
+
 struct Fixture {
     StubObjectServer server;
     std::shared_ptr<oss::OssSnapshotRepository> repository;
@@ -95,7 +129,7 @@ struct Fixture {
         MT_EXPECT_TRUE(client.ok());
         repository.reset(new oss::OssSnapshotRepository(
             std::shared_ptr<oss::OssClient>(client.ok() ? client.value() : 0),
-            std::shared_ptr<oss::ObjectUploader>()));
+            std::shared_ptr<oss::ObjectUploader>(new StubUploader(&server))));
     }
 
     SnapshotRepository& Repo() { return *repository; }
@@ -206,14 +240,22 @@ MT_TEST(the_stored_manifest_is_pretty_printed_like_the_rust_server_writes_it) {
 
 MT_TEST(duplicate_attached_drive_ids_are_refused_before_anything_is_uploaded) {
     Fixture f;
+    // Attached directly for the same reason as the zero-size case below: the
+    // manifest constructor rejects a duplicate id, so reaching publish's own
+    // check needs a manifest that did not come through it.
+    sandbox::SandboxSnapshotManifest manifest = f.Manifest();
     const std::string config = f.dir.At("drive-image.json");
     WriteFile(config, "{\"repoBlobUrl\":\"\",\"lowers\":[],\"upper\":{},\"resultFile\":\"\"}");
-    std::vector<sandbox::ExtraDrive> drives;
-    drives.push_back(Drive("data", 4096, config));
-    drives.push_back(Drive("data", 4096, config));
+    sandbox::SnapshotAttachedDriveArtifacts drive;
+    drive.drive_id = "data";
+    drive.virtual_size = 4096;
+    drive.image_config_path = config;
+    drive.mount_path = "/mnt/data";
+    manifest.attached_drives.push_back(drive);
+    manifest.attached_drives.push_back(drive);
 
     const RepositoryResult<SnapshotPublication> published =
-        Publish(f.Repo(), f.Metadata(), f.Manifest(drives));
+        Publish(f.Repo(), f.Metadata(), manifest);
     MT_EXPECT_TRUE(!published.ok());
     MT_EXPECT_TRUE(!published.ok() &&
                    Contains(published.error().ToString(), "duplicate attached drive id"));
@@ -226,13 +268,24 @@ MT_TEST(duplicate_attached_drive_ids_are_refused_before_anything_is_uploaded) {
 
 MT_TEST(a_zero_virtual_size_drive_is_refused) {
     Fixture f;
+    // `SandboxSnapshotManifest::New` already rejects a zero size, so the drive
+    // is attached directly to a built manifest. That is the point of this
+    // test: publish's check is the second line of defence, covering a manifest
+    // that reached it without going through that constructor -- one decoded
+    // from a stored document, say. Routing this through `New` would assert the
+    // constructor's rule twice and leave publish's unexercised.
+    sandbox::SandboxSnapshotManifest manifest = f.Manifest();
     const std::string config = f.dir.At("drive-image.json");
     WriteFile(config, "{\"repoBlobUrl\":\"\",\"lowers\":[],\"upper\":{},\"resultFile\":\"\"}");
-    std::vector<sandbox::ExtraDrive> drives;
-    drives.push_back(Drive("data", 0, config));
+    sandbox::SnapshotAttachedDriveArtifacts drive;
+    drive.drive_id = "data";
+    drive.virtual_size = 0;
+    drive.image_config_path = config;
+    drive.mount_path = "/mnt/data";
+    manifest.attached_drives.push_back(drive);
 
     const RepositoryResult<SnapshotPublication> published =
-        Publish(f.Repo(), f.Metadata(), f.Manifest(drives));
+        Publish(f.Repo(), f.Metadata(), manifest);
     MT_EXPECT_TRUE(!published.ok());
     // A zero size cannot be mounted on restore, and the failure would surface
     // there -- long after the publish reported success.
@@ -307,8 +360,19 @@ MT_TEST(a_null_committed_field_is_not_committed) {
     // missing key, but a hand-written or migrated document may carry an
     // explicit null. Treating null as committed would permanently refuse to
     // publish such a snapshot.
+    //
+    // Built from a real record and then given an explicit null, rather than
+    // hand-rolled: the gate must let it through *and* the commit that follows
+    // has to decode it, so a stub document missing `source` would fail for an
+    // unrelated reason and prove nothing about null handling.
+    SnapshotRecord waiting;
+    waiting.id = Id(kId);
+    waiting.source = SnapshotSource::Template(TemplateBuildInfo());
+    core::JsonObject fields = waiting.ToJson().as_object();
+    fields["committed"] = core::Json();
     f.server.Seed(DocumentKey::SnapshotRecord(Id(kId)).Path(),
-                  "{\"id\":\"" + std::string(kId) + "\",\"committed\":null}");
+                  core::Json(fields).ToStringPretty());
+
     MT_EXPECT_TRUE(Publish(f.Repo(), f.Metadata(), f.Manifest()).ok());
 }
 

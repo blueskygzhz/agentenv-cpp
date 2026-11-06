@@ -16,6 +16,7 @@
 #include "agentenv/core/fs.h"
 #include "agentenv/snapshot/repository/backends.h"
 #include "microtest.h"
+#include "no_docker_credentials.h"
 #include "oss_client_fixture.h"
 
 using namespace agentenv;                              // NOLINT
@@ -503,12 +504,12 @@ MT_TEST(delete_removes_the_snapshots_objects_under_a_configured_prefix) {
     MT_EXPECT_TRUE(server.bodies.count(record_key) == 0);
 }
 
-// Refused rather than half-done: upstream rolls each publication back through
-// `AcrDiskImageExporter`, which is not ported. Removing the snapshot anyway
-// would leave the image live in the registry with nothing pointing at it --
-// and the record must not even be marked, or the snapshot would vanish from
-// every read while still being published.
-MT_TEST(delete_is_refused_for_a_published_disk_image_without_marking_the_record) {
+// A published disk image is rolled back, then removed. The rollback here has
+// no credentials to work with, by construction, and the delete still finishes:
+// a registry that cannot be reached must not pin the record forever, since the
+// record is the only thing that makes the delete retryable.
+MT_TEST(delete_proceeds_for_a_published_disk_image) {
+    const agentenv::testing::NoDockerCredentials no_credentials;
     StubObjectServer server;
     OssSnapshotRepository repository(ClientOf(server.Fn(), GoodConfig()),
                                      std::shared_ptr<ObjectUploader>());
@@ -528,15 +529,11 @@ MT_TEST(delete_is_refused_for_a_published_disk_image_without_marking_the_record)
     server.Seed("catalog/records/" + TestId().ToString() + ".json",
                 record.ToJson().ToStringPretty());
 
-    const RepositoryResult<core::Unit> refused = repository.Delete(TestId().ToString());
-    MT_EXPECT_TRUE(!refused.ok());
-    MT_EXPECT_TRUE(!refused.ok() && refused.error().kind == RepositoryErrorKind::Unsupported);
+    MT_EXPECT_TRUE(repository.Delete(TestId().ToString()).ok());
 
-    const RepositoryResult<core::Optional<SnapshotRecord> > still_there =
+    const RepositoryResult<core::Optional<SnapshotRecord> > gone =
         repository.Get(TestId().ToString());
-    MT_EXPECT_TRUE(still_there.ok() && still_there.value().has_value());
-    MT_EXPECT_TRUE(still_there.ok() && still_there.value().has_value() &&
-                   !still_there.value()->deleting);
+    MT_EXPECT_TRUE(gone.ok() && !gone.value().has_value());
 }
 
 // ---- the factory ---------------------------------------------------------

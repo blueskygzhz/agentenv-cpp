@@ -20,6 +20,7 @@
 
 #include "agentenv/snapshot/repository/oss/repository.h"
 #include "microtest.h"
+#include "no_docker_credentials.h"
 #include "oss_client_fixture.h"
 
 using namespace agentenv;                              // NOLINT
@@ -561,12 +562,19 @@ MT_TEST(delete_leaves_an_alias_that_now_belongs_to_another_snapshot) {
     MT_EXPECT_TRUE(f.HasAlias("base"));
 }
 
-// Refused from inside the atomic update, so the record is not even marked.
-// Upstream rolls each publication back through `AcrDiskImageExporter`, which
-// is not ported; marking and then stopping would hide the snapshot from every
-// read while its image stayed live in the registry.
-MT_TEST(delete_refuses_a_snapshot_with_a_published_disk_image_without_marking_it) {
+// A published disk image no longer refuses the delete: `DeleteSnapshot` rolls
+// each publication back first, and a rollback that fails is warned about and
+// stepped over.
+//
+// Here it *does* fail -- there are no registry credentials, by construction --
+// and the record still goes. That is the deliberate choice: the record is what
+// makes a delete retryable, so a registry that is unreachable must not pin it
+// forever. The ordering and best-effort rules themselves are asserted in
+// test_snapshot_acr.cc, where the rollback is injected and observable; what
+// this pins is that the catalog no longer refuses outright.
+MT_TEST(delete_proceeds_for_a_snapshot_with_a_published_disk_image) {
     Fixture f;
+    const agentenv::testing::NoDockerCredentials no_credentials;
     SnapshotRecord record = WaitingTemplate(kIdA, core::nullopt);
     CommittedSnapshot committed;
     PersistedDiskImagePublication publication;
@@ -578,11 +586,8 @@ MT_TEST(delete_refuses_a_snapshot_with_a_published_disk_image_without_marking_it
     record.committed = core::Optional<CommittedSnapshot>(committed);
     f.SeedRecord(record);
 
-    const RepositoryResult<core::Unit> refused = record_catalog::Delete(f.Repo(), kIdA);
-    MT_EXPECT_TRUE(!refused.ok());
-    MT_EXPECT_TRUE(!refused.ok() && refused.error().kind == RepositoryErrorKind::Unsupported);
-    MT_EXPECT_TRUE(f.Stored(kIdA).has_value());
-    MT_EXPECT_TRUE(f.Stored(kIdA).has_value() && !f.Stored(kIdA)->deleting);
+    MT_EXPECT_TRUE(record_catalog::Delete(f.Repo(), kIdA).ok());
+    MT_EXPECT_TRUE(!f.Stored(kIdA).has_value());
 }
 
 namespace {

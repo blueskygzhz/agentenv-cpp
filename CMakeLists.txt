@@ -97,6 +97,10 @@ add_subdirectory(src/core)
 add_subdirectory(crates/shell-util)
 add_subdirectory(src/template-image-configs)
 add_subdirectory(src/volume-record)
+# Split out of `agentenv-image` so `agentenv-snapshot` can ask whether a
+# descriptorless lower is a runtime-generated delta without the cycle that
+# linking all of image would create.
+add_subdirectory(src/image-local-layer)
 add_subdirectory(src/managed-secret)
 add_subdirectory(src/privileges-lib)
 add_subdirectory(src/snapshot-startup-pack)

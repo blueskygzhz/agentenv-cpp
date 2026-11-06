@@ -10,6 +10,7 @@
 #include "agentenv/core/json.h"
 #include "agentenv/core/logging.h"
 #include "agentenv/snapshot/repository/documents.h"
+#include "agentenv/snapshot/store.h"
 
 namespace agentenv {
 namespace snapshot {
@@ -17,13 +18,6 @@ namespace repository {
 namespace record_catalog {
 
 namespace {
-
-/// A count for an error message.
-std::string ToDecimal(std::size_t value) {
-    std::ostringstream out;
-    out << value;
-    return out.str();
-}
 
 /// Rust `decode_record`.
 RepositoryResult<SnapshotRecord> DecodeRecord(const std::string& id, const std::string& bytes) {
@@ -464,20 +458,6 @@ RepositoryResult<core::Unit> Delete(SnapshotRepository& repository,
         Decision<core::Optional<SnapshotRecord> > decision;
         if (!current.has_value()) return decision;
 
-        if (current->committed.has_value() &&
-            !current->committed->disk_publications.empty()) {
-            // Refused from inside the update, so the record is left exactly
-            // as it was. Upstream rolls each publication back (best effort)
-            // before removing anything; without that, a "deleted" snapshot
-            // would stay published in the registry, which is the one failure
-            // the caller cannot see.
-            return core::make_unexpected(RepositoryError::Unsupported(
-                "deleting snapshot '" + current->id.ToString() +
-                "' with " + ToDecimal(current->committed->disk_publications.size()) +
-                " disk image publication(s); rolling those back needs Rust "
-                "AcrDiskImageExporter::rollback_publication, which is not ported"));
-        }
-
         if (current->deleting) {
             // Already marked: nothing to write, but the cleanup continues
             // from the record as it stands.
@@ -503,9 +483,19 @@ RepositoryResult<core::Unit> Delete(SnapshotRepository& repository,
         if (!released.ok()) return core::make_unexpected(released.error());
     }
 
+    // Read off the record *as marked*, which includes a commit that landed
+    // before the mark: that commit is the only place the publications are
+    // named, and the record is about to be removed.
+    std::vector<PersistedDiskImagePublication> publications;
+    if (marked.value()->committed.has_value()) {
+        publications = marked.value()->committed->disk_publications;
+    }
+
     // Files before the record, so a failure here leaves the record that still
-    // names them and the delete can be retried.
-    const RepositoryResult<core::Unit> blobs = repository.DeleteSnapshotBlobs(id);
+    // names them and the delete can be retried. The source-registry
+    // publications are rolled back first, inside `DeleteSnapshot`.
+    const RepositoryResult<core::Unit> blobs =
+        DeleteSnapshot(repository, id, publications, AcrPublicationRollback());
     if (!blobs.ok()) return core::make_unexpected(blobs.error());
 
     const RepositoryResult<core::Unit> log =
@@ -686,8 +676,8 @@ RepositoryResult<SnapshotRecord> Commit(SnapshotRepository& repository,
         // Logged, not returned: the caller must see the alias conflict, which
         // is the actionable cause. Reporting the rollback failure instead
         // would name a symptom.
-        AGENTENV_WARN("failed to roll back snapshot record ", metadata.id.ToString(), ": ",
-                      rolled_back.error().ToString());
+        AGENTENV_WARN("failed to roll back snapshot record " << metadata.id.ToString() << ": "
+                                                            << rolled_back.error().ToString());
     }
     return core::make_unexpected(claimed.error());
 }

@@ -17,6 +17,12 @@ add_library(agentenv-snapshot STATIC
     store.cc
     # Rust: src/snapshot/publish.rs — store the files, then commit the record
     publish.cc
+    # Rust: the pure helpers of src/snapshot/image_export/acr/{client.rs,
+    # source_image.rs} — URL shapes, auth challenges, Docker credentials.
+    image_export/acr_parse.cc
+    # Rust: src/snapshot/image_export/acr/{client.rs,publisher.rs}, the
+    # manifest-delete half: what rolling a publication back needs.
+    image_export/acr_client.cc
     repository/errors.cc
     repository/interfaces.cc
     # Rust: src/repository/layout.rs — `DocumentKey`.
@@ -57,6 +63,11 @@ target_include_directories(agentenv-snapshot PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-snapshot PUBLIC
     agentenv-core
     agentenv-sandbox
+    # `StoreDiskLayers` must recognise a runtime-generated rootfs delta:
+    # publishing passes `allow_descriptorless = false`, and that delta carries
+    # no descriptor, so without this every snapshot of a sandbox that wrote to
+    # its rootfs would be refused.
+    agentenv-image-local-layer
     agentenv-p2p
     agentenv-snapshot-startup-pack
     agentenv-shell-util
