@@ -40,11 +40,12 @@ SharedReadOnlyDeviceInner::SharedReadOnlyDeviceInner(DeviceManager* owner, Devic
 }
 
 SharedReadOnlyDeviceInner::~SharedReadOnlyDeviceInner() {
-    // Rust's `Drop` guards with `released.swap(true)`; the equivalent here is
-    // that a destructor runs once, but the flag is still set so a handle that
-    // observed the object mid-teardown sees it as released.
-    if (released_) return;
-    released_ = true;
+    // Rust's `Drop` guards with `released.swap(true)`. Spelled the same way
+    // here rather than as a load-then-store: the flag's reader is a lookup on
+    // another thread holding a locked `weak_ptr`, so the publish must be a
+    // single atomic step. A destructor cannot run twice, but the ordering
+    // guarantee is what the reader depends on.
+    if (released_.exchange(true)) return;
 
     // Close before deleting: the cache fd is an opener of the very device the
     // daemon is about to tear down.
@@ -64,7 +65,16 @@ DeviceManager::~DeviceManager() {
     // Drop the retained tools device first. Its destructor calls back into
     // `OnSharedDeviceReleased`, which touches `shared_devices_`, so it must run
     // while this object is still whole.
-    recent_tools_device_ = SharedReadOnlyDevice();
+    //
+    // Declared before the locked scope so it is destroyed *after* the guard:
+    // the callback takes `mutex_`, and dropping the handle under the lock
+    // would deadlock.
+    SharedReadOnlyDevice retained;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        retained = recent_tools_device_;
+        recent_tools_device_ = SharedReadOnlyDevice();
+    }
 }
 
 daemon::DaemonResult<OverlaybdRuntimeDevice> DeviceManager::CreateOverlaybdRuntimeDevice(
@@ -108,7 +118,16 @@ daemon::DaemonResult<SharedReadOnlyDevice> DeviceManager::GetOrCreateSharedTools
     // cache, would be destroyed whenever the last sandbox exits, and the next
     // launch would re-read the whole image. Active sandboxes retain any other
     // version through their own handles.
-    recent_tools_device_ = device.value();
+    //
+    // The outgoing handle is copied out before the swap and dropped after the
+    // guard: replacing a retained device of an *older* tools version is what
+    // deletes it, and that deletion goes through `OnSharedDeviceReleased`.
+    SharedReadOnlyDevice previous;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        previous = recent_tools_device_;
+        recent_tools_device_ = device.value();
+    }
     return device;
 }
 
@@ -127,11 +146,14 @@ daemon::DaemonResult<SharedReadOnlyDevice> DeviceManager::GetOrCreateSharedReadO
     // left behind". The `released()` check covers the narrower window where the
     // object exists but its teardown has begun.
     {
+        std::lock_guard<std::mutex> guard(mutex_);
         std::map<std::string, std::weak_ptr<SharedReadOnlyDeviceInner> >::iterator it =
             shared_devices_.find(key);
         if (it != shared_devices_.end()) {
             std::shared_ptr<SharedReadOnlyDeviceInner> strong = it->second.lock();
             if (strong && !strong->released()) {
+                // Returning a *copy* of the handle, so nothing is destroyed
+                // under the lock: the refcount only goes up here.
                 return SharedReadOnlyDevice(strong);
             }
         }
@@ -157,39 +179,63 @@ daemon::DaemonResult<SharedReadOnlyDevice> DeviceManager::GetOrCreateSharedReadO
         device.device_path = created.value().device_path;
     }
 
+    // Declared outside the locked scope below so that, if this caller loses
+    // the race, `inner`'s destructor -- which calls `OnSharedDeviceReleased`
+    // and takes `mutex_` -- runs after the guard is gone.
     std::shared_ptr<SharedReadOnlyDeviceInner> inner(
         new SharedReadOnlyDeviceInner(this, device, key));
+    // Declared after `inner` and before the locked scope, so the two possible
+    // results are both destroyed after the guard and never under it.
+    SharedReadOnlyDevice reused;
 
     // Re-check under the same key. A concurrent caller may have inserted a
     // live device while this one was acquiring; reusing theirs and dropping
     // ours is what keeps one device per key. Dropping `inner` runs its
     // destructor, which releases the redundant device -- so the loser cleans
     // up after itself rather than leaking.
-    std::map<std::string, std::weak_ptr<SharedReadOnlyDeviceInner> >::iterator it =
-        shared_devices_.find(key);
-    if (it != shared_devices_.end()) {
-        std::shared_ptr<SharedReadOnlyDeviceInner> winner = it->second.lock();
-        if (winner && !winner->released() && winner != inner) {
-            return SharedReadOnlyDevice(winner);
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        std::map<std::string, std::weak_ptr<SharedReadOnlyDeviceInner> >::iterator it =
+            shared_devices_.find(key);
+        if (it != shared_devices_.end()) {
+            std::shared_ptr<SharedReadOnlyDeviceInner> winner = it->second.lock();
+            if (winner && !winner->released() && winner != inner) {
+                reused = SharedReadOnlyDevice(winner);
+            }
+        }
+        if (!reused.valid()) {
+            // Either there was no entry, or the one there was stale.
+            shared_devices_[key] = std::weak_ptr<SharedReadOnlyDeviceInner>(inner);
         }
     }
-    // Either there was no entry, or the one there was stale. Replace it.
-    shared_devices_[key] = std::weak_ptr<SharedReadOnlyDeviceInner>(inner);
+
+    // `inner` is dropped on the way out of this function when the race was
+    // lost, which is the redundant device's release -- and by now the lock is
+    // free, so `OnSharedDeviceReleased` can take it.
+    if (reused.valid()) return reused;
     return SharedReadOnlyDevice(inner);
 }
 
 void DeviceManager::OnSharedDeviceReleased(const std::string& key, const Device& device) {
-    // Remove the entry only if it is still *ours*. A fresh device may already
-    // have taken this key, and removing that one would make the next lookup
-    // create a second device for an image that already has one.
-    std::map<std::string, std::weak_ptr<SharedReadOnlyDeviceInner> >::iterator it =
-        shared_devices_.find(key);
-    if (it != shared_devices_.end()) {
-        std::shared_ptr<SharedReadOnlyDeviceInner> current = it->second.lock();
-        if (!current || current->released()) {
-            shared_devices_.erase(it);
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        // Remove the entry only if it is still *ours*. A fresh device may
+        // already have taken this key, and removing that one would make the
+        // next lookup create a second device for an image that already has
+        // one.
+        std::map<std::string, std::weak_ptr<SharedReadOnlyDeviceInner> >::iterator it =
+            shared_devices_.find(key);
+        if (it != shared_devices_.end()) {
+            std::shared_ptr<SharedReadOnlyDeviceInner> current = it->second.lock();
+            if (!current || current->released()) {
+                shared_devices_.erase(it);
+            }
         }
     }
+    // Outside the lock: this is a round trip to the daemon, and holding
+    // `mutex_` across it would block every sandbox launch for the duration of
+    // one teardown.
+    //
     // Best-effort, as Rust logs and continues: the handle is already gone, so
     // there is nobody left to report a failure to.
     (void)ReleaseDevice(device);

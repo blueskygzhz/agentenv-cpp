@@ -33,9 +33,18 @@ int RunAll();
     }                                                                                \
     static void mt_##NAME()
 
+/// The stringized condition is passed as an *argument*, never concatenated
+/// into the format string.
+///
+/// Load-bearing: a condition containing a string literal with a `%` -- a
+/// percent-encoded URL (`"a%2Db"`), a `stat -c %d` command line -- would
+/// otherwise have it interpreted as a conversion specifier with no argument
+/// behind it. That is undefined behaviour, and it fires precisely when an
+/// assertion fails, so the run can crash inside the code meant to tell you
+/// what went wrong and take the real cause with it.
 #define MT_EXPECT_TRUE(cond)                                                         \
     do { if (!(cond)) {                                                              \
-        std::fprintf(stderr, "  FAIL: %s:%d  " #cond "\n", __FILE__, __LINE__);      \
+        std::fprintf(stderr, "  FAIL: %s:%d  %s\n", __FILE__, __LINE__, #cond);      \
         std::exit(1);                                                                \
     } } while (0)
 

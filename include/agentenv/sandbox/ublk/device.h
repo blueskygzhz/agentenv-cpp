@@ -55,7 +55,7 @@ class SharedReadOnlyDeviceInner {
 
     const Device& device() const { return device_; }
     const std::string& image_config_key() const { return key_; }
-    bool released() const { return released_; }
+    bool released() const { return released_.load(); }
 
  private:
     friend class DeviceManager;
@@ -63,7 +63,11 @@ class SharedReadOnlyDeviceInner {
     DeviceManager* owner_;
     Device device_;
     std::string key_;
-    bool released_;
+    /// Atomic because the table holds a `weak_ptr` and a lookup on another
+    /// thread can lock it while this object's destructor is running: the whole
+    /// point of the flag is to be readable from that thread. Rust uses an
+    /// `AtomicBool` with a `swap` for the same reason.
+    std::atomic<bool> released_;
     /// Linux drops a block device's page cache when its last opener closes
     /// (`blkdev_put_whole` -> `kill_bdev`), and the daemon's `/dev/ublkcN`
     /// handle does not keep `/dev/ublkbN` open. Holding an fd between launches
@@ -159,7 +163,10 @@ class DeviceManager {
         const Device& device, const std::string& output_layer_path);
 
     /// Number of live shared entries. Diagnostics only.
-    std::size_t shared_entry_count() const { return shared_devices_.size(); }
+    std::size_t shared_entry_count() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return shared_devices_.size();
+    }
 
  private:
     friend class SharedReadOnlyDeviceInner;
@@ -173,6 +180,21 @@ class DeviceManager {
 
     std::shared_ptr<daemon::DaemonClient> client_;
     bool pool_enabled_;
+
+    /// Guards `shared_devices_` and `recent_tools_device_`.
+    ///
+    /// Rust needs no such thing because `shared_readonly_devices` is a
+    /// `DashMap`; a `std::map` mutated by concurrent sandbox launches while
+    /// another thread's `find` walks it is undefined behaviour, not a lost
+    /// update. Every launch of a sandbox goes through this table, so the race
+    /// is on the normal path rather than in a corner.
+    ///
+    /// **Never held while a `SharedReadOnlyDevice` handle is destroyed.**
+    /// That destructor calls `OnSharedDeviceReleased`, which takes this lock;
+    /// holding it across the drop would deadlock on the first redundant
+    /// device the acquire race produces. The three places that drop a handle
+    /// declare it outside the locked scope so it dies after the guard.
+    mutable std::mutex mutex_;
 
     /// Rust `shared_readonly_devices: DashMap<PathBuf, Weak<..>>`.
     ///

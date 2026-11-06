@@ -457,8 +457,10 @@ MT_TEST(the_freeze_script_keeps_one_opened_fd_across_check_and_ioctl) {
     // the worst case the root filesystem hosting envd, freezing the daemon
     // that is supposed to thaw it.
     const std::string script = VolumeFreezeScript();
-    // Held in locals because `MT_EXPECT_TRUE` stringizes its condition into a
-    // printf format, where a literal `%d` would be read as a specifier.
+    // Kept in a local for readability only. It used to be required, because
+    // `MT_EXPECT_TRUE` concatenated its stringized condition into the printf
+    // format and the `%d` was read as a specifier; the macro now passes it as
+    // an argument, so an inline literal would be safe too.
     const std::string stat_the_fd = "stat -Lc %d /proc/self/fd/3";
     MT_EXPECT_TRUE(Contains(script, "exec 3< \"$1\""));
     MT_EXPECT_TRUE(Contains(script, stat_the_fd));
