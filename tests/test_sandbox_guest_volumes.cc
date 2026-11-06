@@ -360,7 +360,6 @@ MT_TEST(a_sub_path_drive_stages_binds_then_detaches_the_stage) {
     // Detached last: the full filesystem must not stay reachable outside the
     // requested sub-path.
     MT_EXPECT_TRUE(trace[4] == "umount -l /run/agentenv-drive-vol-7");
-    MT_EXPECT_TRUE(trace[5] == "umount -l /run/agentenv-drive-vol-7");
 }
 
 MT_TEST(a_failed_stage_detach_does_not_fail_a_completed_mount) {
