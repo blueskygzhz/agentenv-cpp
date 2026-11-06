@@ -36,6 +36,14 @@ TemplateBuildFailure TemplateBuildFailure::WithStep(const std::string& message,
     return failure;
 }
 
+core::AnyError AnyErrorFrom(const TemplateBuildFailure& failure) {
+    // The message *and* the payload: the rendered chain stays readable while
+    // `AnyError::Find<TemplateBuildFailure>()` still recovers the attributed
+    // reason, including its step.
+    return core::AnyError(failure.ToString(),
+                          std::make_shared<TemplateBuildFailure>(failure));
+}
+
 std::string CommandOutputSuffix(const std::string& stdout_text, const std::string& stderr_text) {
     // stderr wins: a failing command almost always explains itself there.
     const std::string err = Trim(stderr_text);

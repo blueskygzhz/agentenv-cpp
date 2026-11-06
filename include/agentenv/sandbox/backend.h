@@ -21,6 +21,7 @@
 #include "agentenv/core/json.h"
 #include "agentenv/sandbox/access.h"
 #include "agentenv/sandbox/custom_extension.h"
+#include "agentenv/sandbox/envd.h"
 #include "agentenv/sandbox/extra_drive.h"
 #include "agentenv/sandbox/network/policy.h"
 #include "agentenv/sandbox/types.h"
@@ -153,6 +154,26 @@ using SandboxForkResult = core::Expected<std::unique_ptr<class SandboxBackend>, 
 class SandboxBackend {
  public:
     virtual ~SandboxBackend() {}
+
+    /// Rust `envd` — the guest's envd API, or nothing while no guest agent is
+    /// connected.
+    ///
+    /// Take it under the runtime lock and make the call *after* releasing the
+    /// lock, which is the whole reason it returns a handle instead of doing
+    /// the call: guest I/O must never block a lifecycle operation, and a
+    /// metrics sweep holding the lock across a wedged guest's socket would
+    /// stall every pause, resume and stop on the node.
+    ///
+    /// A `shared_ptr` because the handle outlives the lock by design. It is
+    /// safe for it to outlive the *sandbox* too: `EnvdInstance` shares a
+    /// liveness flag between copies, so a handle taken before teardown refuses
+    /// rather than reaching the address a different VM has since been given.
+    ///
+    /// Defaulted to nothing rather than left pure: a backend with no guest
+    /// agent (the legacy shim's wrappers, a paused sandbox) has nothing to
+    /// return, and forcing each one to write `return {}` invites a stub that
+    /// hands back a handle to a guest that is not there.
+    virtual std::shared_ptr<EnvdApi> Envd() const { return std::shared_ptr<EnvdApi>(); }
 
     /// Rust `start` — start and block until ready.
     virtual core::Expected<core::Unit, core::AnyError> Start() = 0;

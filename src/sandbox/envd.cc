@@ -353,6 +353,64 @@ core::Expected<std::string, std::string> EnvdInstance::ReadAccountFile(
     return response.value().body;
 }
 
+// ---- GET /metrics ----------------------------------------------------------
+
+core::Expected<SandboxMetric, std::string> EnvdInstance::Metrics() const {
+    // `ensure_live` first, exactly as upstream. Not an optimisation: a handle
+    // taken before this sandbox was torn down must not reach the address a
+    // different VM has since been given, and that check is the only thing
+    // standing between a stale copy and another tenant's guest.
+    const core::Expected<core::Unit, std::string> live = EnsureLive();
+    if (!live.ok()) return core::make_unexpected(live.error());
+
+    core::http::Target target;
+    std::string prefix;
+    if (!ParseHttpBase(base_path_, &target, &prefix)) {
+        return core::make_unexpected(std::string("envd base path is not an http:// URL: ") +
+                                     base_path_);
+    }
+
+    // Upstream bounds this with `tokio::time::timeout`, which cancels the
+    // request. Nothing here can cancel a blocking call, so the budget is
+    // applied to the socket instead -- same wall-clock bound per call, and the
+    // sweep's schedule is what the bound exists to protect.
+    core::http::Timeouts timeouts;
+    timeouts.connect_ms = static_cast<int32_t>(kMetricsRequestTimeoutMs);
+    timeouts.read_ms = static_cast<int32_t>(kMetricsRequestTimeoutMs);
+
+    core::http::Request request;
+    request.method = "GET";
+    request.path = prefix + "/metrics";
+    if (access_token_.has_value()) {
+        request.headers["X-Access-Token"] = access_token_->Expose();
+    }
+
+    const core::Expected<core::http::Response, std::string> response =
+        core::http::HttpClient(target, timeouts).Request(request);
+    if (!response.ok()) {
+        return core::make_unexpected(std::string("sample guest metrics: ") + response.error());
+    }
+    if (response.value().status >= 400) {
+        char status[16];
+        std::snprintf(status, sizeof(status), "%d", response.value().status);
+        return core::make_unexpected(std::string("sample guest metrics: HTTP ") + status);
+    }
+    if (static_cast<int64_t>(response.value().body.size()) > kMetricsMaxBytes) {
+        return core::make_unexpected(
+            std::string("guest metrics response is implausibly large"));
+    }
+
+    const core::Expected<core::Json, core::AnyError> json =
+        core::Json::Parse(response.value().body);
+    if (!json.ok()) {
+        return core::make_unexpected(std::string("decode guest metrics: ") +
+                                     json.error().chain());
+    }
+    // Validation lives in `SandboxMetric::FromEnvdJson`, which is also what
+    // rejects the plausible-looking zeros an `Option` field decodes to.
+    return SandboxMetric::FromEnvdJson(json.value());
+}
+
 core::Expected<std::string, std::string> EnvdInstance::ResolveDefaultUser(
     const std::string& user) {
     const int64_t deadline = now_ms() + kResolveDefaultUserTimeoutMs;

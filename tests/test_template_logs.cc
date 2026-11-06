@@ -55,7 +55,7 @@ std::unique_ptr<SnapshotRepository> OpenRepository(const std::string& root) {
 MT_TEST(entry_json_round_trip_keeps_an_absent_step_absent) {
     BuildLogEntry entry;
     entry.timestamp = core::SystemTime(1730000000123456789LL);
-    entry.level = BuildLogLevel::Error;
+    entry.level = core::LogRecordLevel::Error;
     entry.message = "boom";
 
     const core::Json encoded = entry.ToJson();
@@ -78,16 +78,16 @@ MT_TEST(entry_json_rejects_a_level_it_cannot_represent) {
     // The four levels and nothing else. A fifth spelling in a document would
     // otherwise decode to a default and silently change a line's severity.
     const char* const levels[] = {"debug", "info", "warn", "error"};
-    const BuildLogLevel expected[] = {BuildLogLevel::Debug, BuildLogLevel::Info,
-                                      BuildLogLevel::Warn, BuildLogLevel::Error};
+    const core::LogRecordLevel expected[] = {core::LogRecordLevel::Debug, core::LogRecordLevel::Info,
+                                      core::LogRecordLevel::Warn, core::LogRecordLevel::Error};
     for (std::size_t i = 0; i < 4; ++i) {
-        MT_EXPECT_TRUE(BuildLogLevelFromString(levels[i]).has_value());
-        MT_EXPECT_TRUE(*BuildLogLevelFromString(levels[i]) == expected[i]);
-        MT_EXPECT_TRUE(std::string(BuildLogLevelToString(expected[i])) == levels[i]);
+        MT_EXPECT_TRUE(core::LogRecordLevelFromString(levels[i]).has_value());
+        MT_EXPECT_TRUE(*core::LogRecordLevelFromString(levels[i]) == expected[i]);
+        MT_EXPECT_TRUE(std::string(core::LogRecordLevelToString(expected[i])) == levels[i]);
     }
-    MT_EXPECT_TRUE(!BuildLogLevelFromString("trace").has_value());
-    MT_EXPECT_TRUE(!BuildLogLevelFromString("INFO").has_value());
-    MT_EXPECT_TRUE(!BuildLogLevelFromString("").has_value());
+    MT_EXPECT_TRUE(!core::LogRecordLevelFromString("trace").has_value());
+    MT_EXPECT_TRUE(!core::LogRecordLevelFromString("INFO").has_value());
+    MT_EXPECT_TRUE(!core::LogRecordLevelFromString("").has_value());
 
     const char* const broken[] = {
         "{}",
@@ -129,7 +129,7 @@ MT_TEST(output_splits_lines_and_maps_the_stream_to_a_level) {
     MT_EXPECT_EQ(buffer.entries().size(), static_cast<std::size_t>(2));
     MT_EXPECT_TRUE(buffer.entries()[0].message == "one");
     MT_EXPECT_TRUE(buffer.entries()[1].message == "two");
-    MT_EXPECT_TRUE(buffer.entries()[0].level == BuildLogLevel::Info);
+    MT_EXPECT_TRUE(buffer.entries()[0].level == core::LogRecordLevel::Info);
     MT_EXPECT_TRUE(buffer.entries()[0].step.has_value());
     MT_EXPECT_TRUE(*buffer.entries()[0].step == "build");
 
@@ -138,7 +138,7 @@ MT_TEST(output_splits_lines_and_maps_the_stream_to_a_level) {
     buffer.Output(NoStep(), true, "warned");
     MT_EXPECT_EQ(buffer.entries().size(), static_cast<std::size_t>(3));
     MT_EXPECT_TRUE(buffer.entries()[2].message == "warned");
-    MT_EXPECT_TRUE(buffer.entries()[2].level == BuildLogLevel::Warn);
+    MT_EXPECT_TRUE(buffer.entries()[2].level == core::LogRecordLevel::Warn);
     MT_EXPECT_TRUE(!buffer.entries()[2].step.has_value());
 
     // CRLF: the `\r` is stripped so a line does not end with a control
@@ -163,7 +163,7 @@ MT_TEST(message_cap_truncates_without_splitting_a_utf8_sequence) {
     // Lands the cut inside a 3-byte sequence: the last `a` is at
     // kBuildLogMaxMessageBytes - 2, so byte [max] is a continuation byte.
     const std::string head(kBuildLogMaxMessageBytes - 1, 'a');
-    buffer.Log(BuildLogLevel::Info, NoStep(), head + "\xE4\xBD\xA0");
+    buffer.Log(core::LogRecordLevel::Info, NoStep(), head + "\xE4\xBD\xA0");
 
     MT_EXPECT_EQ(buffer.entries().size(), static_cast<std::size_t>(1));
     const std::string& message = buffer.entries()[0].message;
@@ -173,13 +173,13 @@ MT_TEST(message_cap_truncates_without_splitting_a_utf8_sequence) {
     MT_EXPECT_TRUE(message.find('\xE4') == std::string::npos);
     // Truncating a message is not truncating the log: the build keeps logging.
     MT_EXPECT_TRUE(!buffer.truncated());
-    buffer.Log(BuildLogLevel::Info, NoStep(), "still open");
+    buffer.Log(core::LogRecordLevel::Info, NoStep(), "still open");
     MT_EXPECT_EQ(buffer.entries().size(), static_cast<std::size_t>(2));
 
     // Exactly at the cap is left alone -- the suffix is only for a real cut.
     BuildLogBuffer exact;
     const std::string full(kBuildLogMaxMessageBytes, 'b');
-    exact.Log(BuildLogLevel::Info, NoStep(), full);
+    exact.Log(core::LogRecordLevel::Info, NoStep(), full);
     MT_EXPECT_TRUE(exact.entries()[0].message == full);
 }
 
@@ -187,10 +187,10 @@ MT_TEST(build_log_limits_emit_one_notice) {
     // Upstream `build_log_limits_emit_one_notice`.
     BuildLogBuffer buffer;
     for (std::size_t i = 0; i < kBuildLogMaxEntries + 2; ++i) {
-        buffer.Log(BuildLogLevel::Info, NoStep(), "");
+        buffer.Log(core::LogRecordLevel::Info, NoStep(), "");
     }
     MT_EXPECT_EQ(buffer.entries().size(), kBuildLogMaxEntries + 1);
-    MT_EXPECT_TRUE(buffer.entries().back().level == BuildLogLevel::Warn);
+    MT_EXPECT_TRUE(buffer.entries().back().level == core::LogRecordLevel::Warn);
     MT_EXPECT_TRUE(buffer.entries().back().message == kBuildLogLimitNotice);
     MT_EXPECT_TRUE(buffer.truncated());
     // The notice carries no step: it is the log's own statement, not a line
@@ -203,20 +203,20 @@ MT_TEST(byte_cap_emits_one_notice_before_the_entry_cap) {
     const std::string chunk(kBuildLogMaxMessageBytes, 'x');
     const std::size_t fits = kBuildLogMaxBytes / kBuildLogMaxMessageBytes;
     for (std::size_t i = 0; i < fits; ++i) {
-        buffer.Log(BuildLogLevel::Info, Step("s"), chunk);
+        buffer.Log(core::LogRecordLevel::Info, Step("s"), chunk);
     }
     MT_EXPECT_EQ(buffer.entries().size(), fits);
     MT_EXPECT_TRUE(!buffer.truncated());
 
     // One more byte over and the log closes, well short of the entry cap --
     // which is the point of having both bounds.
-    buffer.Log(BuildLogLevel::Info, Step("s"), chunk);
+    buffer.Log(core::LogRecordLevel::Info, Step("s"), chunk);
     MT_EXPECT_EQ(buffer.entries().size(), fits + 1);
     MT_EXPECT_TRUE(buffer.entries().back().message == kBuildLogLimitNotice);
     MT_EXPECT_TRUE(buffer.truncated());
     MT_EXPECT_TRUE(fits + 1 < kBuildLogMaxEntries);
 
-    buffer.Log(BuildLogLevel::Info, Step("s"), "dropped");
+    buffer.Log(core::LogRecordLevel::Info, Step("s"), "dropped");
     MT_EXPECT_EQ(buffer.entries().size(), fits + 1);
 }
 
@@ -225,12 +225,12 @@ MT_TEST(sealed_buffer_ignores_late_writes) {
     // already persisted the document, so an accepted entry would be one a
     // reader never sees.
     BuildLogBuffer buffer;
-    buffer.Log(BuildLogLevel::Info, NoStep(), "before");
+    buffer.Log(core::LogRecordLevel::Info, NoStep(), "before");
     MT_EXPECT_TRUE(!buffer.sealed());
 
     buffer.Seal();
     MT_EXPECT_TRUE(buffer.sealed());
-    buffer.Log(BuildLogLevel::Info, NoStep(), "late write must not change the closed stream");
+    buffer.Log(core::LogRecordLevel::Info, NoStep(), "late write must not change the closed stream");
     buffer.Output(NoStep(), true, "late\nstderr\n");
     MT_EXPECT_EQ(buffer.entries().size(), static_cast<std::size_t>(1));
     MT_EXPECT_TRUE(buffer.entries()[0].message == "before");
@@ -242,7 +242,7 @@ MT_TEST(timestamps_never_move_backwards) {
     // stream is non-decreasing, and sorting by timestamp is order-preserving.
     BuildLogBuffer buffer;
     for (int i = 0; i < 500; ++i) {
-        buffer.Log(BuildLogLevel::Info, NoStep(), "line");
+        buffer.Log(core::LogRecordLevel::Info, NoStep(), "line");
     }
     MT_EXPECT_EQ(buffer.entries().size(), static_cast<std::size_t>(500));
     for (std::size_t i = 1; i < buffer.entries().size(); ++i) {
@@ -273,7 +273,7 @@ MT_TEST(build_logs_persist_in_one_file_and_survive_new_reader_and_delete) {
     for (int n = 0; n < 600; ++n) {
         char line[32];
         std::snprintf(line, sizeof(line), "line %d", n);
-        buffer.Log(BuildLogLevel::Info, NoStep(), line);
+        buffer.Log(core::LogRecordLevel::Info, NoStep(), line);
     }
     const snapshot::repository::RepositoryResult<core::Unit> written =
         WriteBuildLogs(*repository, id, buffer.entries());
@@ -282,7 +282,7 @@ MT_TEST(build_logs_persist_in_one_file_and_survive_new_reader_and_delete) {
     if (!written.ok()) std::fprintf(stderr, "  write: %s\n", written.error().ToString().c_str());
     MT_EXPECT_TRUE(written.ok());
     buffer.Seal();
-    buffer.Log(BuildLogLevel::Info, NoStep(), "late write must not change the closed stream");
+    buffer.Log(core::LogRecordLevel::Info, NoStep(), "late write must not change the closed stream");
 
     // A second repository over the same root, as upstream does: the log must
     // live in the shared key space, not in the writer's memory.

@@ -26,13 +26,35 @@
 
 #include "agentenv/core/expected.h"
 #include "agentenv/core/optional.h"
+#include "agentenv/sandbox/manifest.h"
 #include "agentenv/sandbox/process.h"
 #include "agentenv/snapshot/record.h"
 #include "agentenv/snapshot/types.h"
+#include "agentenv/snapshot/version.h"
+#include "agentenv/template/build_spec.h"
 #include "agentenv/template/errors.h"
 
 namespace agentenv {
 namespace tpl {
+
+/// Rust `struct TemplateBuildExecution` — what one build run produced, and
+/// the whole of what publication needs from it.
+///
+/// Rust additionally carries `capture_artifacts` (the backend's opaque capture
+/// payload) and `output_dir`, both of which exist solely to re-boot the
+/// capture for startup-pack recording. That continuation is not ported (see
+/// `snapshot/publish.h`), so neither field is declared: an unused
+/// `shared_ptr<void>` here would advertise a hand-off that nothing performs,
+/// and the `output_dir` would be a path no one reads.
+struct TemplateBuildExecution {
+    snapshot::SnapshotRuntimeVersions       runtime_versions;
+    sandbox::SandboxSnapshotManifest        manifest;
+    /// The context as the *steps left it* — WORKDIR/ENV/USER applied — not the
+    /// context the build started from.
+    snapshot::CommandContext                build_context;
+    core::Optional<snapshot::StartupCommand> startup;
+    ImageConfigs                            image_configs;
+};
 
 /// Rust `DEFAULT_READY_WITH_START_CMD` — what a start command with no ready
 /// command gets. Matches e2b's own default so a template behaves the same on

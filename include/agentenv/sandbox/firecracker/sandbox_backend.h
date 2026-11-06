@@ -645,6 +645,14 @@ class FirecrackerSandboxBackend : public SandboxBackend {
     /// the one answer that cannot be recovered from.
     core::Expected<core::Unit, core::AnyError> WaitForReady() override;
 
+    /// Rust `envd` — the stored instance, which exists only once
+    /// `WaitForReady` has observed a healthy guest.
+    ///
+    /// Nothing before that: a handle to an agent that is not answering *yet*
+    /// is indistinguishable, to the caller, from one that has stopped
+    /// answering.
+    std::shared_ptr<EnvdApi> Envd() const override;
+
     /// Rust `pause` — `PATCH /vm {"state":"Paused"}`, then wrap the capture
     /// descriptor in a `FirecrackerPausedState`.
     ///

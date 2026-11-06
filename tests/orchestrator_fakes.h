@@ -78,6 +78,17 @@ struct BackendScript {
     /// The specs the last `Fork` call received.
     std::vector<sandbox::SandboxForkSpec> last_fork_specs;
 
+    // ---- guest metrics ----------------------------------------------------
+    //
+    // `envd` is null by default, which is the honest default: a backend with
+    // no guest agent connected has nothing to hand out, and the metrics sweep
+    // must skip it rather than fail.
+
+    /// Handed out by `Envd()`. Shared, so a test can observe the call count
+    /// and flip the behaviour after the orchestrator has taken a copy -- which
+    /// is the whole point of the handle outliving the lock.
+    std::shared_ptr<class FakeEnvd> envd;
+
     BackendScript() {}
     ~BackendScript() {
         for (std::size_t i = 0; i < fork_children.size(); ++i) delete fork_children[i];
@@ -90,9 +101,41 @@ struct BackendScript {
     BackendScript& operator=(const BackendScript&);
 };
 
+/// A scripted `EnvdApi`.
+///
+/// Deliberately *not* an `EnvdInstance` with a stubbed transport: what the
+/// sweep's behaviour turns on is whether the call succeeds, how long it takes
+/// and whether the handle has been invalidated, none of which needs a socket.
+class FakeEnvd : public sandbox::EnvdApi {
+ public:
+    FakeEnvd() : calls(0), fail(false), live(true), mem_used(1) {}
+
+    core::Expected<sandbox::SandboxMetric, std::string> Metrics() const override {
+        ++calls;
+        // Mirrors `EnvdInstance::Metrics`, where `ensure_live()` precedes the
+        // request: an invalidated handle must refuse rather than reach the
+        // address a different VM now holds.
+        if (!live) return core::make_unexpected(std::string("sandbox is no longer active"));
+        if (fail) return core::make_unexpected(std::string("fake: guest unreachable"));
+        sandbox::SandboxMetric metric;
+        metric.timestamp = core::SystemTime(timestamp_secs * 1000000000LL);
+        metric.cpu_count = 1;
+        metric.mem_used = mem_used;
+        return metric;
+    }
+
+    mutable int calls;
+    bool        fail;
+    bool        live;
+    int64_t     mem_used;
+    int64_t     timestamp_secs = 1700000000LL;
+};
+
 class FakeSandbox : public sandbox::SandboxBackend {
  public:
     explicit FakeSandbox(BackendScript* script) : script_(script) {}
+
+    std::shared_ptr<sandbox::EnvdApi> Envd() const override { return script_->envd; }
 
     core::Expected<core::Unit, core::AnyError> Start() override {
         return StartNowait();

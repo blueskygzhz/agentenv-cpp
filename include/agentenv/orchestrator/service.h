@@ -27,6 +27,7 @@
 #include "agentenv/core/optional.h"
 #include "agentenv/orchestrator/launch_plan.h"
 #include "agentenv/orchestrator/metrics.h"
+#include "agentenv/orchestrator/sandbox_metrics.h"
 #include "agentenv/orchestrator/persistence.h"
 #include "agentenv/orchestrator/proxy.h"
 #include "agentenv/orchestrator/store.h"
@@ -61,6 +62,13 @@ class SandboxHandle {
      public:
         Guard(std::mutex& mu, sandbox::SandboxBackend* backend)
             : lock_(mu), backend_(backend) {}
+        /// Adopts a lock the caller already holds — `std::adopt_lock`.
+        ///
+        /// Needed by `TryLock`: acquiring with `try_lock` and then letting the
+        /// guard lock again would release the mutex in between, which is
+        /// exactly the window the try was meant to close.
+        Guard(std::mutex& mu, sandbox::SandboxBackend* backend, std::adopt_lock_t)
+            : lock_(mu, std::adopt_lock), backend_(backend) {}
         sandbox::SandboxBackend* operator->() const { return backend_; }
         sandbox::SandboxBackend& operator*()  const { return *backend_; }
         sandbox::SandboxBackend* get()        const { return backend_; }
@@ -71,6 +79,18 @@ class SandboxHandle {
     };
 
     Guard Lock() { return Guard(mu_, backend_.get()); }
+
+    /// Rust `handle.try_lock()` — nothing when the backend is busy.
+    ///
+    /// Used by the metrics sweep, which must *skip* a contended sandbox rather
+    /// than wait for it: a lifecycle operation holds this lock across a VMM
+    /// call, and a sweep queueing behind one would both miss its interval and
+    /// delay the operation it queued behind. A missed sample costs one point
+    /// in a graph.
+    std::shared_ptr<Guard> TryLock() {
+        if (!mu_.try_lock()) return std::shared_ptr<Guard>();
+        return std::shared_ptr<Guard>(new Guard(mu_, backend_.get(), std::adopt_lock));
+    }
 
  private:
     std::mutex                               mu_;
@@ -257,6 +277,48 @@ class Orchestrator {
     /// Rust `metrics_snapshot` — resource fields are derived from live
     /// metadata; the two creation counters come from `OrchestratorCounters`.
     OrchestratorResult<OrchestratorMetrics> MetricsSnapshot() const;
+
+    // ---- guest metrics (Rust: orchestrator/sandbox_metrics.rs) ------------
+
+    /// Rust `collect_sandbox_metrics` — one sweep.
+    ///
+    /// `target` absent means every `Running` sandbox (the periodic tick);
+    /// present means just that one (a create/resume/fork event, so a freshly
+    /// started sandbox has a sample before the next interval).
+    ///
+    /// Every failure is a *skip*, never an error: a sweep that aborted on the
+    /// first unreachable guest would sample nothing for the rest of the node.
+    ///
+    /// Deviation from upstream: the per-sandbox calls run sequentially rather
+    /// than through `for_each_concurrent(MetricsConcurrency(n), ..)`. There is
+    /// no task runtime here, and a thread pool would be a second concurrency
+    /// mechanism in a tree that has none. The bound that matters is preserved
+    /// — a contended sandbox is skipped via `TryLock` and each guest call is
+    /// capped at `kMetricsRequestTimeoutMs` — so the worst-case sweep is
+    /// `running × 200 ms` instead of `ceil(running/5) × 200 ms`. At the
+    /// default 15 s interval that is a node of 75 sandboxes before the sweep
+    /// can no longer finish within one tick; `MetricsConcurrency` is ported
+    /// and tested for when a runtime exists to use it.
+    void CollectSandboxMetrics(const core::Optional<core::SandboxId>& target);
+
+    /// Rust `sandbox_metrics_history` — retained samples in `[start, end]`
+    /// (guest seconds since the epoch), oldest first.
+    ///
+    /// Errors with `SandboxNotFound` for an unknown id, but returns an *empty*
+    /// history for a known sandbox with no samples: the two are different
+    /// answers and a client paging a graph needs to tell them apart.
+    OrchestratorResult<std::vector<sandbox::SandboxMetric> >
+        SandboxMetricsHistory(const core::SandboxId& id,
+                              const core::Optional<int64_t>& start_unix_secs,
+                              const core::Optional<int64_t>& end_unix_secs) const;
+
+    /// Rust `latest_sandbox_metrics` — the newest sample per requested id.
+    ///
+    /// An id is omitted entirely when it is not `Running`, has no proxy route,
+    /// or its newest sample belongs to a previous incarnation. Omission is the
+    /// honest answer: a stale number presented as current is worse than none.
+    OrchestratorResult<std::map<std::string, sandbox::SandboxMetric> >
+        LatestSandboxMetrics(const std::vector<core::SandboxId>& ids) const;
 
     // ---- lifecycle events (Rust: broadcast channel) -----------------------
 
@@ -509,6 +571,14 @@ class Orchestrator {
     void SetDefaultSandboxTimeoutMs(int64_t ms) { default_sandbox_timeout_ms_ = ms; }
     int64_t DefaultSandboxTimeoutMs() const { return default_sandbox_timeout_ms_; }
 
+    /// Rust `config.orchestrator.metrics_retention_secs` (default 3600).
+    ///
+    /// Injected rather than read from a global, following this class's existing
+    /// convention — upstream reaches for `ConfigManager::global_config()` at
+    /// each use, which there is no equivalent of here.
+    void SetMetricsRetentionSecs(uint64_t secs) { metrics_retention_secs_ = secs; }
+    uint64_t MetricsRetentionSecs() const { return metrics_retention_secs_; }
+
     /// Rust `is_shutting_down`.
     bool IsShuttingDown() const {
         return is_shutting_down_.load(std::memory_order_relaxed);
@@ -639,6 +709,10 @@ class Orchestrator {
 
     OrchestratorCounters counters_;
 
+    /// Rust `sandbox_metrics: Mutex<SandboxMetrics>`.
+    mutable std::mutex         sandbox_metrics_mu_;
+    mutable SandboxMetricsCache sandbox_metrics_;
+
     mutable std::mutex                    template_builds_mu_;
     std::set<std::string>                 template_build_ids_;
 
@@ -659,6 +733,8 @@ class Orchestrator {
 
     /// Rust `default_sandbox_timeout`.
     int64_t default_sandbox_timeout_ms_;
+    /// Rust `config.orchestrator.metrics_retention_secs`.
+    uint64_t metrics_retention_secs_ = 3600;
     snapshot::SnapshotRuntimeVersions configured_runtime_versions_;
 
     /// Rust `default_fresh_sandbox_resources()`, read from config.machine.

@@ -4,6 +4,9 @@ add_library(agentenv-orchestrator STATIC
     types.cc
     store.cc
     metrics.cc
+    # Rust: src/orchestrator/sandbox_metrics.rs (cache + concurrency rule; the
+    # sampling task itself needs SandboxBackend::Envd)
+    sandbox_metrics.cc
     launch_plan.cc
     proxy.cc
 )

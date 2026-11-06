@@ -21,6 +21,7 @@
 #include "agentenv/core/expected.h"
 #include "agentenv/core/identity.h"
 #include "agentenv/core/json.h"
+#include "agentenv/core/logging.h"
 #include "agentenv/core/optional.h"
 #include "agentenv/core/time.h"
 #include "agentenv/snapshot/repository/errors.h"
@@ -29,21 +30,16 @@
 namespace agentenv {
 namespace tpl {
 
-/// Rust `logging::LogLevel`, `#[serde(rename_all = "lowercase")]`.
-///
-/// Four levels, deliberately not `core::LogLevel`'s five: upstream's build log
-/// has no `Trace`. Reusing the host logger's enum would make a `Trace` entry
-/// representable here and then unserialisable, so a caller could write one and
-/// lose it at the flush.
-enum class BuildLogLevel { Debug, Info, Warn, Error };
-
-const char* BuildLogLevelToString(BuildLogLevel level);
-core::Optional<BuildLogLevel> BuildLogLevelFromString(const std::string& text);
+// The level of an entry is `core::LogRecordLevel` — Rust `logging::LogLevel`,
+// the four-level serialised severity. It lives in `core/logging.h` rather than
+// here because upstream puts it in `crate::logging` and it has two consumers:
+// this build log and `sandbox/logs.h`. (It was briefly a `core::LogRecordLevel` local
+// to this header; the second consumer made that name wrong.)
 
 /// Rust `struct BuildLogEntry`.
 struct BuildLogEntry {
     core::SystemTime timestamp;
-    BuildLogLevel level = BuildLogLevel::Info;
+    core::LogRecordLevel level = core::LogRecordLevel::Info;
     std::string message;
     /// Rust `#[serde(skip_serializing_if = "Option::is_none")]` — the build
     /// step that produced the line, absent for the build's own output.
@@ -83,7 +79,7 @@ class BuildLogBuffer {
     /// Silent once truncated or sealed, which is upstream's behaviour and the
     /// reason a late write cannot alter a closed stream: the flush has already
     /// happened and the document is final.
-    void Log(BuildLogLevel level, const core::Optional<std::string>& step,
+    void Log(core::LogRecordLevel level, const core::Optional<std::string>& step,
              const std::string& message);
 
     /// Rust's `output` helper — splits a child's output into lines, stderr at

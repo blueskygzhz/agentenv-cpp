@@ -38,6 +38,11 @@ agentenv_add_test(test_template_logs       test_template_logs.cc
 agentenv_add_test(test_template_step_executor test_template_step_executor.cc agentenv-template)
 # Rust: src/template/builder.rs
 agentenv_add_test(test_template_builder    test_template_builder.cc    agentenv-template)
+# Rust: src/template/builder.rs :: execute_and_publish / build_failure_reason —
+# over the real OSS repository on an HTTP stub, so the committed record is what
+# gets asserted rather than a recording fake's memory of the metadata.
+agentenv_add_test(test_template_publish    test_template_publish.cc
+                  agentenv-template agentenv-snapshot agentenv-volume-record agentenv-cfg)
 # Rust: src/template/runner.rs
 agentenv_add_test(test_template_runner     test_template_runner.cc     agentenv-template)
 agentenv_add_test(test_secrets             test_secrets.cc             agentenv-rootmod)
@@ -85,6 +90,12 @@ agentenv_add_test(test_sandbox_process     test_sandbox_process.cc     agentenv-
 # parsers in snapshot/version.cc.
 agentenv_add_test(test_sandbox_runtime_versions test_sandbox_runtime_versions.cc agentenv-sandbox)
 agentenv_add_test(test_sandbox_envd        test_sandbox_envd.cc        agentenv-sandbox)
+# Rust: src/sandbox/logs.rs — decoding plus the bounded query page.
+agentenv_add_test(test_sandbox_logs        test_sandbox_logs.cc        agentenv-sandbox)
+# Rust: src/sandbox/metrics.rs + src/orchestrator/sandbox_metrics.rs — the
+# envd-boundary validation and the retention cache's two clocks.
+agentenv_add_test(test_sandbox_metrics     test_sandbox_metrics.cc
+                  agentenv-sandbox agentenv-orchestrator)
 # Rust: src/snapshot/publish.rs + store_snapshot/delete_snapshot of store.rs
 agentenv_add_test(test_snapshot_publish    test_snapshot_publish.cc    agentenv-snapshot)
 # Rust: src/snapshot/image_export/acr/{source_image,client,publisher}.rs — the
@@ -240,6 +251,9 @@ agentenv_add_test(test_orchestrator_launch test_orchestrator_launch.cc agentenv-
 agentenv_add_test(test_orchestrator_delete test_orchestrator_delete.cc agentenv-orchestrator Threads::Threads)
 agentenv_add_test(test_orchestrator_fork_snapshot test_orchestrator_fork_snapshot.cc agentenv-orchestrator)
 agentenv_add_test(test_orchestrator_persistence test_orchestrator_persistence.cc agentenv-orchestrator)
+# Rust: src/orchestrator/sandbox_metrics.rs — the sweep over a scripted
+# EnvdApi, which `SandboxBackend::Envd()` made drivable without a VMM.
+agentenv_add_test(test_orchestrator_guest_metrics test_orchestrator_guest_metrics.cc agentenv-orchestrator)
 agentenv_add_test(test_firecracker_factory test_firecracker_factory.cc agentenv-orchestrator)
 agentenv_add_test(test_firecracker_paused_state test_firecracker_paused_state.cc agentenv-sandbox)
 agentenv_add_test(test_firecracker_instance_api test_firecracker_instance_api.cc agentenv-sandbox)

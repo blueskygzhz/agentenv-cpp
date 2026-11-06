@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "agentenv/core/expected.h"
+#include "agentenv/sandbox/metrics.h"
 #include "agentenv/core/json.h"
 #include "agentenv/core/optional.h"
 #include "agentenv/sandbox/access.h"
@@ -142,8 +143,38 @@ struct InitPostRequest {
     core::Json ToJson() const;
 };
 
+/// Rust `trait EnvdApi` — the calls the orchestrator makes into a running
+/// guest through envd.
+///
+/// Separate from `EnvdInstance` for the reason upstream gives: the backend
+/// hands this out under the runtime lock and callers make the call *after*
+/// releasing it, so what crosses the lock boundary has to be an interface with
+/// no backend internals attached. It is also what lets the metrics sweep be
+/// driven without a VMM.
+///
+/// Upstream's `logs()` is deliberately absent. It dispatches over envd's
+/// *filesystem gRPC* service — `list_dir` on the guest log directory, `stat`
+/// on envd's stderr, then a ranged read per file — and there is no gRPC stack
+/// in this port (`EnvdInstance::FilesystemClient` reports exactly that).
+/// Declaring it here would put a method on the interface that no
+/// implementation can honour, and the orchestrator's log handler would then
+/// fail at the transport rather than at a stated gap. `sandbox/logs.h` holds
+/// the decoding and paging half, which is the part that does not need the
+/// transport.
+class EnvdApi {
+ public:
+    virtual ~EnvdApi() {}
+
+    /// Rust `EnvdApi::metrics` — `ensure_live()` then `GET {base}/metrics`.
+    ///
+    /// The liveness gate comes first and is not an optimisation: a handle
+    /// taken before the sandbox was torn down must not reach the IP address a
+    /// *different* VM has since been given.
+    virtual core::Expected<SandboxMetric, std::string> Metrics() const = 0;
+};
+
 /// Rust struct `EnvdInstance` — bootstrap handle to a guest envd daemon.
-class EnvdInstance {
+class EnvdInstance : public EnvdApi {
  public:
     /// A single health probe attempt bounded by `probe_timeout_ms`.
     /// Returns true when envd is healthy. Should itself respect the timeout.
@@ -273,6 +304,13 @@ class EnvdInstance {
     /// error. Capped at 1 MiB.
     core::Expected<std::string, std::string> ReadAccountFile(const std::string& path) const;
 
+    /// Rust `EnvdApi::metrics` for `EnvdInstance`.
+    ///
+    /// Bounded by `kMetricsRequestTimeoutMs` rather than the client default:
+    /// the sampling sweep must stay on schedule, and one wedged guest is worth
+    /// far less than the sweep for every other sandbox on the node.
+    core::Expected<SandboxMetric, std::string> Metrics() const;
+
     /// Rust `HEALTH_PROBE_TIMEOUT` (1s).
     static const int64_t kHealthProbeTimeoutMs = 1000;
     /// Rust `read_account_file`'s `1024 * 1024` guard.
@@ -282,6 +320,12 @@ class EnvdInstance {
     /// Rust `ProcessOpts::default().with_timeout(Duration::from_secs(10))` on
     /// the passwd append.
     static const int64_t kAddPasswdEntryTimeoutMs = 10 * 1000;
+    /// Rust `METRICS_REQUEST_TIMEOUT` (200 ms), applied per guest call.
+    static const int64_t kMetricsRequestTimeoutMs = 200;
+    /// A `/metrics` body larger than this is refused rather than read: the
+    /// response is eight scalars, so anything approaching a megabyte means the
+    /// address is answering with something that is not envd.
+    static const int64_t kMetricsMaxBytes = 64 * 1024;
 
  private:
     std::string base_path_;

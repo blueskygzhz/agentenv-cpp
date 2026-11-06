@@ -26,6 +26,24 @@ const char* LevelName(LogLevel lv) {
 }
 }  // namespace
 
+const char* LogRecordLevelToString(LogRecordLevel level) {
+    switch (level) {
+        case LogRecordLevel::Debug: return "debug";
+        case LogRecordLevel::Info:  return "info";
+        case LogRecordLevel::Warn:  return "warn";
+        case LogRecordLevel::Error: return "error";
+    }
+    return "info";
+}
+
+Optional<LogRecordLevel> LogRecordLevelFromString(const std::string& text) {
+    if (text == "debug") return Optional<LogRecordLevel>(LogRecordLevel::Debug);
+    if (text == "info") return Optional<LogRecordLevel>(LogRecordLevel::Info);
+    if (text == "warn") return Optional<LogRecordLevel>(LogRecordLevel::Warn);
+    if (text == "error") return Optional<LogRecordLevel>(LogRecordLevel::Error);
+    return Optional<LogRecordLevel>();
+}
+
 Logger& Logger::Get() {
     static Logger inst;
     return inst;

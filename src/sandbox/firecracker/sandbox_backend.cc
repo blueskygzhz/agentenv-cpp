@@ -1080,6 +1080,15 @@ class FirecrackerSandboxBackend::Impl {
     bool startable;
     LaunchMode launch;
     EnvdInstance::HealthProbe envd_probe;
+    /// Rust `envd_instance: Option<EnvdInstance>`.
+    ///
+    /// Held rather than rebuilt per call, which is what makes `Envd()`
+    /// meaningful: `EnvdInstance` shares its liveness flag between copies, so
+    /// invalidating *this* one on teardown invalidates every handle the
+    /// orchestrator took from it. Rebuilding a fresh instance on each call
+    /// would hand out handles that can never be invalidated, and one taken
+    /// before teardown would keep talking to whatever VM next holds that IP.
+    std::shared_ptr<EnvdInstance> envd_instance;
     /// Test override for the guest-memory layer write.
     MemoryLayerWriter memory_layer_writer;
 
@@ -1229,6 +1238,12 @@ core::Expected<core::Unit, core::AnyError> FirecrackerSandboxBackend::Stop() {
     // stop and that is a success, not an error. `Stop` on an already-dead
     // child reaps it and removes the socket, so a second call is also fine.
     if (!impl_->instance) return core::Unit{};
+    // Invalidated *before* the VMM goes, and unconditionally: the flag is
+    // shared with every handle already handed out, and the window between
+    // "VMM gone" and "handles refuse" is exactly when a sampling sweep would
+    // connect to an IP the next sandbox has been given. Done even if the stop
+    // below fails, because a half-stopped sandbox is no more safe to talk to.
+    if (impl_->envd_instance) impl_->envd_instance->Invalidate();
     const core::Expected<core::Unit, std::string> r =
         impl_->instance->Stop(kPoolFirecrackerStopTimeoutMs);
     if (!r.ok()) return core::make_unexpected(core::err(r.error()));
@@ -1444,13 +1459,31 @@ core::Expected<core::Unit, core::AnyError> FirecrackerSandboxBackend::WaitForRea
     if (!interaction_ip.has_value()) {
         return core::make_unexpected(core::err("wait_for_ready: envd instance not initialized"));
     }
-    EnvdInstance envd("http://" + *interaction_ip + ":" +
-                          std::to_string(impl_->spec.control_plane_port),
-                      impl_->spec.envd_access_token);
-    const core::Expected<core::Unit, std::string> r =
-        envd.WaitForReady(impl_->spec.envd_timeout_ms, impl_->spec.envd_poll_ms);
-    if (!r.ok()) return core::make_unexpected(core::err(r.error()));
+    // Rust `init_envd_instance` stores the instance on the sandbox; this is
+    // the point at which the address is known, so it is where the handle
+    // `Envd()` hands out comes into being.
+    impl_->envd_instance.reset(
+        new EnvdInstance("http://" + *interaction_ip + ":" +
+                             std::to_string(impl_->spec.control_plane_port),
+                         impl_->spec.envd_access_token));
+    const core::Expected<core::Unit, std::string> r = impl_->envd_instance->WaitForReady(
+        impl_->spec.envd_timeout_ms, impl_->spec.envd_poll_ms);
+    if (!r.ok()) {
+        // Readiness was never observed, so the instance must not be handed
+        // out: a caller would send guest I/O to an address that answered
+        // nothing. Dropped rather than kept-and-invalidated because this one
+        // was never published to anybody.
+        impl_->envd_instance.reset();
+        return core::make_unexpected(core::err(r.error()));
+    }
     return core::Unit{};
+}
+
+std::shared_ptr<EnvdApi> FirecrackerSandboxBackend::Envd() const {
+    // Nothing until `WaitForReady` has observed a healthy guest. Returning a
+    // handle earlier would be a handle to an agent that is not answering yet,
+    // and the caller has no way to tell that from one that has stopped.
+    return impl_->envd_instance;
 }
 
 core::Expected<core::Unit, core::AnyError> FirecrackerSandboxBackend::Start() {

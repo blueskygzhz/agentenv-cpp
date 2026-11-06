@@ -18,32 +18,11 @@ const std::size_t kBuildLogMaxMessageBytes = 16 * 1024;
 const char* const kBuildLogLimitNotice =
     "Build log limit reached; subsequent output is omitted";
 
-const char* BuildLogLevelToString(BuildLogLevel level) {
-    switch (level) {
-        case BuildLogLevel::Debug:
-            return "debug";
-        case BuildLogLevel::Info:
-            return "info";
-        case BuildLogLevel::Warn:
-            return "warn";
-        case BuildLogLevel::Error:
-            return "error";
-    }
-    return "info";
-}
-
-core::Optional<BuildLogLevel> BuildLogLevelFromString(const std::string& text) {
-    if (text == "debug") return core::Optional<BuildLogLevel>(BuildLogLevel::Debug);
-    if (text == "info") return core::Optional<BuildLogLevel>(BuildLogLevel::Info);
-    if (text == "warn") return core::Optional<BuildLogLevel>(BuildLogLevel::Warn);
-    if (text == "error") return core::Optional<BuildLogLevel>(BuildLogLevel::Error);
-    return core::Optional<BuildLogLevel>();
-}
 
 core::Json BuildLogEntry::ToJson() const {
     core::JsonObject out;
     out["timestamp"] = core::Json(core::FormatRfc3339Nanos(timestamp));
-    out["level"] = core::Json(std::string(BuildLogLevelToString(level)));
+    out["level"] = core::Json(std::string(core::LogRecordLevelToString(level)));
     out["message"] = core::Json(message);
     // `skip_serializing_if = "Option::is_none"`: a build's own output has no
     // step, and writing `"step": null` would change the shape of every such
@@ -75,8 +54,8 @@ core::Expected<BuildLogEntry, std::string> BuildLogEntry::FromJson(const core::J
     if (level == fields.end() || level->second.kind() != core::Json::Kind::String) {
         return core::make_unexpected(std::string("build log entry: level is required"));
     }
-    const core::Optional<BuildLogLevel> decoded =
-        BuildLogLevelFromString(level->second.as_string());
+    const core::Optional<core::LogRecordLevel> decoded =
+        core::LogRecordLevelFromString(level->second.as_string());
     if (!decoded.has_value()) {
         return core::make_unexpected("build log entry: unknown level '" +
                                      level->second.as_string() + "'");
@@ -128,7 +107,7 @@ std::string TruncateAtCharBoundary(const std::string& message, std::size_t max) 
 
 }  // namespace
 
-void BuildLogBuffer::Log(BuildLogLevel level, const core::Optional<std::string>& step,
+void BuildLogBuffer::Log(core::LogRecordLevel level, const core::Optional<std::string>& step,
                          const std::string& message) {
     // Silent once either is set. Sealed means the final flush has run and the
     // document is final, so accepting more would record lines that are never
@@ -140,7 +119,7 @@ void BuildLogBuffer::Log(BuildLogLevel level, const core::Optional<std::string>&
         text = TruncateAtCharBoundary(text, kBuildLogMaxMessageBytes) + " [truncated]";
     }
 
-    BuildLogLevel entry_level = level;
+    core::LogRecordLevel entry_level = level;
     core::Optional<std::string> entry_step = step;
     if (entries_.size() >= kBuildLogMaxEntries ||
         bytes_ + text.size() > kBuildLogMaxBytes) {
@@ -148,7 +127,7 @@ void BuildLogBuffer::Log(BuildLogLevel level, const core::Optional<std::string>&
         // that a reader can tell the log is incomplete. Dropping silently
         // would make a truncated build look like a short one.
         text = kBuildLogLimitNotice;
-        entry_level = BuildLogLevel::Warn;
+        entry_level = core::LogRecordLevel::Warn;
         entry_step = core::Optional<std::string>();
         truncated_ = true;
     }
@@ -176,7 +155,7 @@ void BuildLogBuffer::Output(const core::Optional<std::string>& step, bool stderr
     // Rust `str::lines`: splits on `\n`, drops a single trailing `\r`, and
     // yields nothing for empty input -- so a child that writes nothing adds
     // no entries rather than one blank one.
-    const BuildLogLevel level = stderr_stream ? BuildLogLevel::Warn : BuildLogLevel::Info;
+    const core::LogRecordLevel level = stderr_stream ? core::LogRecordLevel::Warn : core::LogRecordLevel::Info;
     std::string::size_type begin = 0;
     while (begin < bytes.size()) {
         std::string::size_type end = bytes.find('\n', begin);

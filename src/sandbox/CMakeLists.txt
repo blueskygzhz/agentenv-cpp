@@ -1,6 +1,10 @@
 add_library(agentenv-sandbox STATIC
     # top-level sandbox modules (Rust: src/sandbox/*.rs)
     backend.cc
+    # Rust: src/sandbox/logs.rs
+    logs.cc
+    # Rust: src/sandbox/metrics.rs
+    metrics.cc
     mock.cc
     envd.cc
     # Rust: src/sandbox/envd/user.rs — Dockerfile USER -> a guest account name

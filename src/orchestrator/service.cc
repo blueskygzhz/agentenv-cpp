@@ -300,6 +300,173 @@ OrchestratorResult<OrchestratorMetrics> Orchestrator::MetricsSnapshot() const {
     return metrics;
 }
 
+// ---- guest metrics ---------------------------------------------------------
+
+namespace {
+
+/// The host's monotonic clock, in nanoseconds — Rust `Instant::now()`.
+///
+/// Monotonic and not `SystemTime`: retention measures how long *this process*
+/// has held a sample, and an NTP step must not expire a cache or keep it alive.
+int64_t MonotonicNowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+}  // namespace
+
+// Rust `collect_sandbox_metrics`.
+void Orchestrator::CollectSandboxMetrics(const core::Optional<core::SandboxId>& target) {
+    const int64_t retention_ns =
+        static_cast<int64_t>(metrics_retention_secs_) * 1000000000LL;
+    {
+        std::lock_guard<std::mutex> g(sandbox_metrics_mu_);
+        sandbox_metrics_.Prune(MonotonicNowNs(), retention_ns);
+    }
+
+    // Pruning happens even when the listing fails, which is why it is first:
+    // a store that cannot be enumerated must not also mean the cache grows
+    // without bound.
+    const core::Expected<std::vector<SandboxMetadata>, StoreError> listed = store_->List();
+    if (!listed.ok()) {
+        AGENTENV_WARN("cannot enumerate sandboxes for metrics: " << listed.error().Message());
+        return;
+    }
+
+    for (std::size_t i = 0; i < listed.value().size(); ++i) {
+        const SandboxMetadata& metadata = listed.value()[i];
+        if (metadata.state != SandboxState::Running) continue;
+        if (target.has_value() && !(metadata.id == *target)) continue;
+
+        // The generation is the proxy route's version, which is bumped on
+        // every (re)publish. No route means nothing is reachable yet, so there
+        // is no incarnation to attribute a sample to.
+        core::Optional<ProxyRoute> route;
+        {
+            std::lock_guard<std::mutex> g(proxy_mu_);
+            route = proxy_routes_.Route(metadata.id);
+        }
+        if (!route.has_value()) continue;
+        const uint64_t generation = route->version;
+
+        // An event-triggered sweep skips a sandbox the periodic one already
+        // sampled for this incarnation, so a burst of create/resume events
+        // does not multiply guest calls.
+        if (target.has_value()) {
+            std::lock_guard<std::mutex> g(sandbox_metrics_mu_);
+            if (sandbox_metrics_.HasGeneration(metadata.id, generation)) continue;
+        }
+
+        SandboxHandlePtr handle = SandboxHandleFor(metadata.id);
+        if (!handle) continue;
+
+        // `TryLock`, never `Lock`: a lifecycle operation holds this across a
+        // VMM call, and a sweep queueing behind one would both miss its
+        // interval and delay the operation. A missed sample costs one point in
+        // a graph.
+        std::shared_ptr<sandbox::EnvdApi> envd;
+        {
+            const std::shared_ptr<SandboxHandle::Guard> guard = handle->TryLock();
+            if (!guard) continue;
+            envd = (*guard)->Envd();
+        }
+        // The guest call is made *after* the lock is released, which is the
+        // entire reason `Envd()` returns a handle instead of doing the call.
+        if (!envd) continue;
+
+        const core::Expected<sandbox::SandboxMetric, std::string> metric = envd->Metrics();
+        if (!metric.ok()) {
+            AGENTENV_DEBUG("guest metrics sample unavailable: sandbox_id="
+                           << metadata.id.ToString() << " error=" << metric.error());
+            continue;
+        }
+
+        // Re-checked after the call, because it was made without the lock and
+        // the sandbox may have been stopped, resumed or forked meanwhile.
+        // Storing without these would attribute a dead incarnation's numbers
+        // to whatever now holds the id.
+        const core::Expected<core::Optional<SandboxMetadata>, StoreError> still =
+            store_->Get(metadata.id);
+        if (!still.ok() || !still.value() ||
+            still.value()->state != SandboxState::Running) {
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> g(proxy_mu_);
+            const core::Optional<ProxyRoute> current = proxy_routes_.Route(metadata.id);
+            if (!current.has_value() || current->version != generation) continue;
+        }
+
+        std::lock_guard<std::mutex> g(sandbox_metrics_mu_);
+        sandbox_metrics_.Insert(metadata.id, generation, MonotonicNowNs(), metric.value());
+    }
+}
+
+// Rust `sandbox_metrics_history`.
+OrchestratorResult<std::vector<sandbox::SandboxMetric> > Orchestrator::SandboxMetricsHistory(
+    const core::SandboxId& id, const core::Optional<int64_t>& start_unix_secs,
+    const core::Optional<int64_t>& end_unix_secs) const {
+    const core::Expected<core::Optional<SandboxMetadata>, StoreError> got = store_->Get(id);
+    if (!got.ok()) {
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(got.error().Message()));
+    }
+    // An unknown sandbox is an error; a known one with no samples is an empty
+    // history. A client paging a graph needs to tell those apart.
+    if (!got.value()) return core::make_unexpected(OrchestratorError::SandboxNotFound(id));
+
+    std::lock_guard<std::mutex> g(sandbox_metrics_mu_);
+    // Pruned on read as well as on sweep, so a response never contains a
+    // sample older than retention even if no sweep has run since.
+    sandbox_metrics_.Prune(MonotonicNowNs(),
+                           static_cast<int64_t>(metrics_retention_secs_) * 1000000000LL);
+    return sandbox_metrics_.History(id, start_unix_secs, end_unix_secs);
+}
+
+// Rust `latest_sandbox_metrics`.
+OrchestratorResult<std::map<std::string, sandbox::SandboxMetric> >
+Orchestrator::LatestSandboxMetrics(const std::vector<core::SandboxId>& ids) const {
+    const core::Expected<std::vector<SandboxMetadata>, StoreError> listed = store_->List();
+    if (!listed.ok()) {
+        return core::make_unexpected(
+            OrchestratorError::StoreOperationFailed(listed.error().Message()));
+    }
+    std::set<std::string> running;
+    for (std::size_t i = 0; i < listed.value().size(); ++i) {
+        if (listed.value()[i].state == SandboxState::Running) {
+            running.insert(listed.value()[i].id.ToString());
+        }
+    }
+
+    // Generations are gathered under one lock pass rather than one per id:
+    // upstream takes the read lock once, and re-taking it per id would let the
+    // table change between two ids in the same response.
+    std::vector<std::pair<core::SandboxId, uint64_t> > generations;
+    {
+        std::lock_guard<std::mutex> g(proxy_mu_);
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            if (running.find(ids[i].ToString()) == running.end()) continue;
+            const core::Optional<ProxyRoute> route = proxy_routes_.Route(ids[i]);
+            if (!route.has_value()) continue;
+            generations.push_back(std::make_pair(ids[i], route->version));
+        }
+    }
+
+    std::map<std::string, sandbox::SandboxMetric> result;
+    std::lock_guard<std::mutex> g(sandbox_metrics_mu_);
+    sandbox_metrics_.Prune(MonotonicNowNs(),
+                           static_cast<int64_t>(metrics_retention_secs_) * 1000000000LL);
+    for (std::size_t i = 0; i < generations.size(); ++i) {
+        const core::Optional<sandbox::SandboxMetric> metric =
+            sandbox_metrics_.Latest(generations[i].first, generations[i].second);
+        // Omitted rather than defaulted when the generation has moved on: a
+        // stale number presented as current is worse than none.
+        if (metric.has_value()) result[generations[i].first.ToString()] = *metric;
+    }
+    return result;
+}
+
 // ---- lifecycle events ------------------------------------------------------
 
 // Rust `subscribe_sandbox_events`.

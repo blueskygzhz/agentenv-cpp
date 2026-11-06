@@ -8,10 +8,35 @@
 #include <sstream>
 #include <string>
 
+#include "agentenv/core/optional.h"
+
 namespace agentenv {
 namespace core {
 
+/// The host logger's severity — Rust `tracing::Level`, which is why `Trace` is
+/// here. Not serialised anywhere.
 enum class LogLevel : int { Trace = 0, Debug, Info, Warn, Error };
+
+/// Rust `logging::LogLevel` — the severity of a *serialised* log record, as it
+/// appears in a build log document and in a sandbox log entry.
+///
+/// Deliberately narrower than `LogLevel` above, and deliberately a separate
+/// type rather than an alias. Upstream keeps these two apart for the same
+/// reason: `tracing::Level` has `TRACE` and this does not, so folding them
+/// together would make a `Trace` record *representable* in a document that has
+/// no spelling for it — the writer would accept the entry and the flush would
+/// have to invent a level or drop it. The ordering matters too: it backs the
+/// `entry.level < requested` filter in a sandbox log query, so the four must
+/// stay in ascending severity.
+enum class LogRecordLevel : int { Debug = 0, Info, Warn, Error };
+
+/// `"debug" | "info" | "warn" | "error"` — Rust's `rename_all = "lowercase"`.
+const char* LogRecordLevelToString(LogRecordLevel level);
+
+/// Exactly those four spellings; anything else is rejected rather than
+/// defaulted, so an unknown level in a stored document cannot silently become
+/// `Info` and downgrade an error.
+Optional<LogRecordLevel> LogRecordLevelFromString(const std::string& text);
 
 class Logger {
  public:

@@ -6,6 +6,8 @@
 
 #include "agentenv/cfg.h"
 #include "agentenv/core/fs.h"
+#include "agentenv/core/logging.h"
+#include "agentenv/snapshot/publish.h"
 
 namespace agentenv {
 namespace tpl {
@@ -234,6 +236,138 @@ TemplateBuildResult<TemplateBuildContext> TemplateBuilder::PrepareSnapshotBaseCo
     // capture's own value is the authoritative one.
     context.virtualization_mode = base_mode;
     return context;
+}
+
+// ---------------------------------------------------------------------------
+// execute + publish
+// ---------------------------------------------------------------------------
+
+snapshot::TemplateBuildErrorReason TemplateBuilder::BuildFailureReason(
+    const core::AnyError& error) {
+    if (const TemplateBuildFailure* failure = error.Find<TemplateBuildFailure>()) {
+        return failure->reason;
+    }
+    return snapshot::TemplateBuildErrorReason::New(
+        "template build failed while running the build sandbox");
+}
+
+namespace {
+
+/// Rust `virtual_size.div_ceil(1 << 20).try_into().unwrap_or(u32::MAX)`.
+///
+/// Rounds **up**: a rootfs of 1 MiB + 1 byte needs two mebibytes of disk, and
+/// rounding down would publish a template whose declared disk cannot hold the
+/// image it was built from. Saturates rather than wrapping, because a wrapped
+/// value would be a *small* disk size for an enormous image — the one failure
+/// mode worse than refusing.
+uint32_t DiskSizeMibCeil(uint64_t virtual_size) {
+    const uint64_t kMib = 1024 * 1024;
+    // Divide first, then correct. The obvious `(size + kMib - 1) / kMib`
+    // overflows for a size within a mebibyte of `UINT64_MAX` and lands on a
+    // *tiny* disk size -- which is the exact failure the saturation below
+    // exists to prevent, reintroduced one line above it. Rust's `div_ceil`
+    // does it this way for the same reason.
+    uint64_t mib = virtual_size / kMib;
+    if (virtual_size % kMib != 0) ++mib;
+    const uint64_t kMaxU32 = 0xFFFFFFFFULL;
+    return static_cast<uint32_t>(mib > kMaxU32 ? kMaxU32 : mib);
+}
+
+}  // namespace
+
+TemplatePipelineResult<snapshot::SnapshotRecord> TemplateBuilder::ExecuteAndPublish(
+    snapshot::repository::SnapshotRepository& repository, const TemplateBuildContext& context,
+    const std::string& operation, const TemplateBuildExecuteFn& execute) const {
+    AGENTENV_INFO("executing template build: build_id=" + context.build_snapshot_id.ToString());
+
+    const core::Expected<TemplateBuildExecution, core::AnyError> executed = execute(context);
+    if (!executed.ok()) {
+        // The reason comes from the payload when there is one, so a step
+        // failure keeps its step number; `operation` is layered on as context
+        // the way Rust's `error.context(operation)` does.
+        return core::make_unexpected(TemplatePipelineError::FromBuild(
+            TemplateBuildError::WithReasonSource(BuildFailureReason(executed.error()),
+                                                 executed.error().context(operation).chain())));
+    }
+    const TemplateBuildExecution& execution = executed.value();
+
+    // The disk size is the one resource the *caller* could not supply: it is
+    // only known once the build has measured the rootfs it produced, which is
+    // why `DefaultSandboxResources` leaves it at 0.
+    sandbox::SandboxResources resources = context.resources;
+    resources.disk_size_mib = DiskSizeMibCeil(execution.manifest.rootfs.virtual_size);
+
+    AGENTENV_INFO("publishing template snapshot: build_id=" +
+                  context.build_snapshot_id.ToString());
+
+    snapshot::SnapshotPublishMetadata metadata;
+    metadata.id      = context.build_snapshot_id;
+    metadata.alias   = context.alias;
+    metadata.source  = snapshot::SnapshotPublishSource::Template();
+    // The context the steps *left*, not the one they started from: WORKDIR,
+    // ENV and USER set by a step have to be what a sandbox resumes with.
+    metadata.context = execution.build_context;
+    metadata.startup = execution.startup;
+    metadata.resources            = resources;
+    metadata.runtime_versions     = execution.runtime_versions;
+    metadata.virtualization_mode  = context.virtualization_mode;
+    metadata.image_configs        = execution.image_configs;
+    // Template builds publish no volume snapshots: a build VM gets no volumes
+    // attached, so there is nothing to seal.
+    metadata.volume_snapshots.clear();
+    // Deliberately not propagated from the base snapshot, as upstream
+    // comments: the extension's custom config is a per-sandbox user setting,
+    // not part of the built image's content. Inheriting it would bake one
+    // caller's runtime parameters into a template everyone else then gets.
+    metadata.custom_extension_params = core::Optional<core::Json>();
+
+    // Rust spawns the startup-manifest recording here, before publishing, so
+    // the throwaway recording VM overlaps the backend's layer uploads. Not
+    // ported: the recording needs `record_startup_pack` and the detached
+    // continuation that attaches the manifest afterwards (see
+    // `snapshot/publish.h`). Its absence costs the published snapshot its
+    // memory startup pack, nothing else -- `publish` leaves that field absent
+    // on return upstream too.
+    const snapshot::repository::RepositoryResult<snapshot::SnapshotPublication> published =
+        snapshot::Publish(repository, metadata, execution.manifest);
+    if (!published.ok()) {
+        return core::make_unexpected(TemplatePipelineError::FromRepository(published.error()));
+    }
+
+    AGENTENV_INFO("template snapshot published: build_id=" +
+                  context.build_snapshot_id.ToString());
+    return published.value().record;
+}
+
+TemplatePipelineResult<snapshot::SnapshotRecord> TemplateBuilder::BuildAndPublishWithId(
+    snapshot::repository::SnapshotRepository& repository, const core::SnapshotId& snapshot_id,
+    const TemplateBuildSpec& spec, const TemplateBuildExecuteFn& execute) const {
+    const TemplateBuildResult<TemplateBuildContext> context =
+        PrepareFreshContext(spec, snapshot_id);
+    if (!context.ok()) {
+        return core::make_unexpected(TemplatePipelineError::FromBuild(context.error()));
+    }
+    return ExecuteAndPublish(repository, context.value(),
+                             "build snapshot artifacts from requested base", execute);
+}
+
+TemplatePipelineResult<snapshot::SnapshotRecord> TemplateBuilder::BuildAndPublish(
+    snapshot::repository::SnapshotRepository& repository, const TemplateBuildSpec& spec,
+    const TemplateBuildExecuteFn& execute) const {
+    return BuildAndPublishWithId(repository, core::SnapshotId::Fresh(), spec, execute);
+}
+
+TemplatePipelineResult<snapshot::SnapshotRecord> TemplateBuilder::BuildFromSnapshotAndPublish(
+    snapshot::repository::SnapshotRepository& repository, const TemplateBuildSpec& spec,
+    const core::SnapshotId& snapshot_id, const snapshot::SnapshotRecord& base_snapshot,
+    const TemplateBuildExecuteFn& execute) const {
+    const TemplateBuildResult<TemplateBuildContext> context =
+        PrepareSnapshotBaseContext(spec, snapshot_id, base_snapshot);
+    if (!context.ok()) {
+        return core::make_unexpected(TemplatePipelineError::FromBuild(context.error()));
+    }
+    return ExecuteAndPublish(repository, context.value(),
+                             "build snapshot artifacts from committed snapshot", execute);
 }
 
 }  // namespace tpl

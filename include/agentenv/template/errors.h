@@ -6,6 +6,7 @@
 #include <ostream>
 #include <string>
 
+#include "agentenv/core/error.h"
 #include "agentenv/core/expected.h"
 #include "agentenv/core/optional.h"
 #include "agentenv/snapshot/repository/errors.h"
@@ -16,7 +17,15 @@ namespace tpl {
 
 /// Rust struct `TemplateBuildFailure` — a build failure carrying the reason
 /// that gets persisted on the template record. `#[error("{reason}")]`.
-struct TemplateBuildFailure {
+///
+/// An `ErrorPayload`, so it survives being erased into an `AnyError` chain and
+/// can be recovered with `AnyError::Find`. Upstream relies on exactly that:
+/// the build worker's result is an `anyhow::Error`, and `build_failure_reason`
+/// walks the chain for a `TemplateBuildFailure` to get the *attributed* reason
+/// (with its failing step) instead of a generic one. Without the payload the
+/// step number would be lost crossing that boundary, and the e2b SDKs read
+/// that field as an index into their own stack traces.
+struct TemplateBuildFailure : public core::ErrorPayload {
     snapshot::TemplateBuildErrorReason reason;
 
     /// Rust `TemplateBuildFailure::new`.
@@ -26,6 +35,10 @@ struct TemplateBuildFailure {
 
     std::string ToString() const { return reason.ToString(); }
 };
+
+/// Erases a failure into an `AnyError` while keeping it recoverable — Rust's
+/// `anyhow::Error::new(failure)`.
+core::AnyError AnyErrorFrom(const TemplateBuildFailure& failure);
 
 /// Rust `command_output_suffix` — appends whichever stream carries a clue,
 /// preferring stderr. Returns an empty string when both are blank, so callers
