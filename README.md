@@ -191,37 +191,60 @@ Legend: 🟩 behaviourally aligned + tested · 🟨 main path real, some branche
 | `snapshot/p2p` | `src/snapshot/p2p.rs` | `SnapshotP2pArtifact`: fixed per-snapshot keys (`snapshot/v1/artifacts/<id>/<name>`) plus digest- and uuid-keyed overlaybd layer artifacts. `local_overlaybd_layers` reproduces both publication guards — a raw layer whose digest is absent from the committed record is *not* published (publish-time compression recontainerized it as zfile, so the raw-digest key would never be looked up), and uuid-keyed publication is gated on the committed uuid set. Every failure path is a skip-with-warning, since P2P is an optional acceleration path |
 | `storage/overlaybd` layer metadata | `storage/overlaybd/src/layer/layer_metadata.rs` | `ReadOverlaybdLayerUuid` / `ReadOverlaybdLayerVirtualSize` over the sealed trailer, with Rust's "unparseable uuid ⇒ nil" behaviour preserved (nil is the empty string here) |
 | `image/cache` metadata graph | `src/image/cache/graph.rs` | `ImageCacheMetadataStore`: schema-version reconcile (wipes on mismatch), hard-commit object records with merge-preserving P2P key sets, config→hard and the mirrored hold→hard / hard→hold edges, `rebuild_from_configs` that fails closed on a malformed config, LRU touch on every resolve, and the store-backed capacity-eviction planner |
+| `sandbox/runtime_versions` | `src/sandbox/runtime_versions.rs` | The `--version` probes recorded with a snapshot. The *parsers* were already here (`snapshot/version.cc`) and tested — but nothing in production called them, so a capture recorded no runtime versions at all, and those versions are what a restore checks before resuming a VM against a kernel or VMM it was not captured on. **Only the envd probe is fatal**: the kernel and VMM readings are diagnostics and degrade to `"unknown"` with a warning, while the envd version gates whether a restored sandbox can reach its guest agent, so `"unknown"` there would let a resume proceed against an envd the snapshot was never captured against. The VMM is asked **on the host** and the other two **inside the sandbox** — collapsing the two injection points would run `firecracker --version` in the guest, where it does not exist — and the host probe keeps upstream's 5 s timeout, because an optional probe that hangs must not hang the capture. stdout and stderr are combined whichever way round they arrive, since firecracker has printed its version to either. Run sequentially rather than through `tokio::join!`: there is no async runtime here, and three short probes do not justify threads whose only effect is to reorder log lines |
 
-### Per-module state
+### Removed rather than left in place
 
-| Module                        | Header | Stub cpp | Notes                                       |
-|-------------------------------|:------:|:--------:|---------------------------------------------|
-| core / expected / identity    |  🟩    |   🟨     | `Expected<T,E>` mirrors `Result<T,E>`       |
-| core / logging                |  🟩    |   🟨     | ADT-based structured logging               |
-| core / digest                 |  🟩    |   🟨     | SHA256 wrapper                              |
-| api / DTOs                    |  🟩    |   🟨     | subset of E2B-compatible schema             |
-| api / server                  |  🟩    |   🟨     | trait-style handler                         |
-| image                         |  🟩    |   🟨     | OCI descriptor / manifest / config          |
-| orchestrator / types          |  🟩    |   🟨     | `Sandbox`, `LifecyclePhase` ADT             |
-| orchestrator / service        |  🟩    |   🟨     | main state machine                          |
-| orchestrator / persistence    |  🟩    |   🟨     | pluggable persister interface               |
-| sandbox / backend             |  🟩    |   🟨     | polymorphic base class                      |
-| sandbox / firecracker         |  🟩    |   🟨     | HTTP client, config validation, boot args, disk limits |
-| sandbox / mock                |  🟩    |   🟨     | in-memory fake for tests                    |
-| snapshot / manager            |  🟩    |   🟨     | snapshot workflow                           |
-| snapshot / repository         |  🟩    |   🟨     | pluggable storage backend                   |
-| p2p                           |  🟩    |   🟨     | iroh-blobs stand-in                         |
-| storage / util                |  🟩    |   🟨     | offset / range types                        |
-| storage / overlaybd           |  🟩    |   🟨     | LSMT read-only header/trailer               |
-| storage / ublk                |  🟩    |   🟨     | target trait + io-uring bridge              |
-| storage / ublk-daemon         |  🟩    |   🟨     | unix-socket control                         |
-| crates / aenv (CLI)           |  🟩    |   🟨     | subcommand framework                        |
-| crates / linux-cap            |  🟩    |   🟨     | capability manipulation                     |
-| crates / shell-util           |  🟩    |   🟩     | `ShellQuote`, aligned with Rust `shell_quote` |
-| crates / observability        |  🟩    |   🟨     | metrics façade                              |
-| crates / warm-pool            |  🟩    |   🟩     | header-only `WarmPool<T>`, watermark maintenance |
-| services / scheduler          |  🟩    |   🟨     | gRPC ports                                  |
-| services / gateway            |  🟩    |   🟨     | HTTP reverse proxy                          |
+- **`snapshot::Manager` / `snapshot::Repository` / `snapshot::MockRepository`** (6 files) were skeleton-era inventions that only referenced each other — zero callers tree-wide — yet still compiled. They were actively misleading: `snapshot/repository.h` declared a `class Repository` that shadows the real `SnapshotRepository` when reading, and `snapshot/manager.cc` hard-coded `/tmp/agentenv_snap_` with `created_at_ms = 0; // TODO: use system clock`. Anyone opening `src/snapshot/manager.cc` would conclude snapshot management was ported. `SnapshotMeta`, which existed only to serve them, went too.
+- **`AGENTENV_LOG` no longer takes varargs.** `AGENTENV_WARN("a=", a)` expanded to `_oss << "a=", a` — the comma operator, which evaluates `a` and discards it. That compiled silently and truncated the message at the first comma, so the one value worth logging was the one that vanished. Six such calls existed; the two in `repository/oss/lease.cc` were worse, passing `printf` format strings to a streaming macro, so the log would have read `key=%s holder=%s` with both values lost. `-Wunused-value` catches only the subset whose dropped argument has no side effect — it missed exactly those two — so the macro now takes one named parameter and every occurrence becomes a compile error instead.
+
+### Known gaps
+
+The per-module 🟩/🟨 table that used to be here has been **deleted rather than
+updated**. Every row of it claimed "header done, cpp stubbed", which stopped
+being true module by module until the table said nothing checkable — and two
+rows (`snapshot / manager`, `snapshot / repository`) pointed at files that no
+longer exist. A status table that has to be trusted on faith is worse than no
+table: it is what you consult *instead of* reading the code.
+
+What follows is the list of things upstream does that this tree does not, kept
+as a list of Rust paths so it can be checked against the source. The same
+applies to `docs/RUST_TO_CPP_MAPPING.md`, whose §11 file map is stale (it
+names `src/image/image.cc`, `src/api/dto/` and a single-file
+`src/snapshot/repository.cc`, none of which exist); read it for the idiom
+table, not for the layout.
+
+**Absent entirely** — no corresponding symbol anywhere in this tree:
+
+| Rust | Why it matters |
+|---|---|
+| `src/snapshot/image_export/service.rs` | Chooses and drives an image exporter. Without it nothing selects the ACR exporter for a *push*, which is why `disk_publications` is only ever written by an upstream node |
+| `src/snapshot/image_export/regctl.rs` | The `regctl`-based exporter. Note the `Regctl` matches in `src/image/*` are the **dependency tool name**, not this exporter |
+| `src/snapshot/recontainerize.rs` | Repacking a snapshot back into an OCI image. Existing `Recontainerize` matches in this tree are comments only |
+| `src/template/logs.rs` | The build-log store a template build streams into |
+| `src/sandbox/logs.rs` | Sandbox log decoding/streaming |
+| `src/sandbox/guest_volumes.rs` | In-guest volume mount plumbing |
+| `src/sandbox/metrics.rs` | Per-sandbox metric sampling |
+| `src/p2p/iroh/transport.rs` | Deliberate: `src/p2p/iroh.cc` answers `Disabled` for every op and `#error`s if `AGENTENV_WITH_IROH` is set, so a node configured for iroh fails to start rather than coming up silently without p2p. `src/p2p/http_transport.cc` is the substitute this tree actually uses, and it has no upstream counterpart |
+
+**Partially ported** — the main path is real, named branches are not:
+
+| Rust | What is missing |
+|---|---|
+| `src/template/{runner,builder}.rs` | The execute/publish half. `include/agentenv/template/builder.h` states this at the top: only preparation-and-validation is here. This is the largest single gap |
+| `src/sandbox/firecracker/overlaybd_snapshot.rs` | Only `ConvertDirtyMemoryToOverlaybd` is ported. `capture_live_overlaybd_snapshot` / `restack_target_upper_data` are not, which is what the note at the top of this README means by snapshot/restore/fork still being stubs |
+| `src/sandbox/mock.rs` | The mock backend is a fraction of upstream's, which bounds what can be tested without a VMM |
+| `src/api/impls/{sandbox,template,image_build}.rs` | Parameter validation is ported; the handler bodies largely are not |
+| `src/orchestrator/metrics.rs` | Sampling loop absent |
+| `src/sandbox/envd.rs` | The guest client and `exec` report "not available in this build" — they need an in-guest transport |
+| `src/snapshot/image_export/acr/publisher.rs` | The push half (~3,000 lines). The delete half is ported; see the row above |
+| `storage/overlaybd` `zfile` / `tar` | Encode half and archive-index half respectively; a plain file passes straight through |
+| `src/sandbox/ublk/device.rs` | Device orchestration needs the ublk target, which is not ported |
+
+Counting lines across the two trees overstates these gaps, because Rust keeps
+`#[cfg(test)] mod tests` inline — often half a file — while the tests here live
+in `tests/`. `step_executor.rs` looks like a third of upstream by raw line
+count and is in fact aligned.
 
 ## License
 

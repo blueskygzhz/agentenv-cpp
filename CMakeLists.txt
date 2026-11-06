@@ -101,6 +101,10 @@ add_subdirectory(src/volume-record)
 # descriptorless lower is a runtime-generated delta without the cycle that
 # linking all of image would create.
 add_subdirectory(src/image-local-layer)
+# Split out of `agentenv-snapshot` so `agentenv-sandbox` can run the version
+# probes that feed these parsers, without the cycle that linking all of
+# snapshot would create (`agentenv-snapshot` already depends on sandbox).
+add_subdirectory(src/snapshot-version)
 add_subdirectory(src/managed-secret)
 add_subdirectory(src/privileges-lib)
 add_subdirectory(src/snapshot-startup-pack)

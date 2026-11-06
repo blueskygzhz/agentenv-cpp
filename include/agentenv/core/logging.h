@@ -68,20 +68,38 @@ class BuildLogger {
 }  // namespace core
 }  // namespace agentenv
 
-#define AGENTENV_LOG(lv, ...)                                                            \
+/// The message is **one** streaming expression: `AGENTENV_WARN("a=" << a)`.
+///
+/// Deliberately a single named parameter rather than `...`. With varargs,
+/// `AGENTENV_WARN("a=", a)` expands to `_oss << "a=", a` — the *comma
+/// operator*, which evaluates `a` and throws it away. That compiles silently
+/// and truncates the message to everything before the first comma, so the one
+/// value worth logging is the one that disappears. Four such calls were found
+/// in this tree, each dropping the error text from a failure path.
+///
+/// `-Wunused-value` catches only the subset whose dropped argument has no side
+/// effect, so it cannot be relied on. Taking exactly one argument turns every
+/// occurrence into "macro passed N arguments but takes just 1" at compile
+/// time instead.
+#define AGENTENV_LOG(lv, message_expr)                                                   \
     do {                                                                                 \
         auto& _lg = ::agentenv::core::Logger::Get();                                     \
         if (static_cast<int>(_lg.Level()) <= static_cast<int>(lv)) {                     \
             std::ostringstream _oss;                                                     \
-            _oss << __VA_ARGS__;                                                         \
+            _oss << message_expr;                                                        \
             _lg.Log(lv, __FILE__, __LINE__, _oss.str());                                 \
         }                                                                                \
     } while (0)
 
-#define AGENTENV_TRACE(...) AGENTENV_LOG(::agentenv::core::LogLevel::Trace, __VA_ARGS__)
-#define AGENTENV_DEBUG(...) AGENTENV_LOG(::agentenv::core::LogLevel::Debug, __VA_ARGS__)
-#define AGENTENV_INFO(...)  AGENTENV_LOG(::agentenv::core::LogLevel::Info,  __VA_ARGS__)
-#define AGENTENV_WARN(...)  AGENTENV_LOG(::agentenv::core::LogLevel::Warn,  __VA_ARGS__)
-#define AGENTENV_ERROR(...) AGENTENV_LOG(::agentenv::core::LogLevel::Error, __VA_ARGS__)
+#define AGENTENV_TRACE(message_expr) \
+    AGENTENV_LOG(::agentenv::core::LogLevel::Trace, message_expr)
+#define AGENTENV_DEBUG(message_expr) \
+    AGENTENV_LOG(::agentenv::core::LogLevel::Debug, message_expr)
+#define AGENTENV_INFO(message_expr) \
+    AGENTENV_LOG(::agentenv::core::LogLevel::Info, message_expr)
+#define AGENTENV_WARN(message_expr) \
+    AGENTENV_LOG(::agentenv::core::LogLevel::Warn, message_expr)
+#define AGENTENV_ERROR(message_expr) \
+    AGENTENV_LOG(::agentenv::core::LogLevel::Error, message_expr)
 
 #endif  // AGENTENV_CORE_LOGGING_H_

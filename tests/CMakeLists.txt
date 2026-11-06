@@ -77,6 +77,9 @@ agentenv_add_test(test_mpsc_queue          test_mpsc_queue.cc          agentenv-
 agentenv_add_test(test_dto                 test_dto.cc                 agentenv-api)
 agentenv_add_test(test_mock_backend        test_mock_backend.cc        agentenv-sandbox)
 agentenv_add_test(test_sandbox_process     test_sandbox_process.cc     agentenv-sandbox)
+# Rust: src/sandbox/runtime_versions.rs — the probes that feed the `--version`
+# parsers in snapshot/version.cc.
+agentenv_add_test(test_sandbox_runtime_versions test_sandbox_runtime_versions.cc agentenv-sandbox)
 agentenv_add_test(test_sandbox_envd        test_sandbox_envd.cc        agentenv-sandbox)
 # Rust: src/snapshot/publish.rs + store_snapshot/delete_snapshot of store.rs
 agentenv_add_test(test_snapshot_publish    test_snapshot_publish.cc    agentenv-snapshot)

@@ -7,6 +7,10 @@ add_library(agentenv-sandbox STATIC
     envd_user.cc
     extra_drive.cc
     process.cc
+    # Rust: src/sandbox/runtime_versions.rs — runs the `--version` probes whose
+    # parsers live in snapshot/version.cc. Without this nothing in production
+    # called those parsers, so a snapshot recorded no runtime versions.
+    runtime_versions.cc
     network.cc
     access.cc
     manifest.cc
@@ -59,6 +63,10 @@ target_link_libraries(agentenv-sandbox PUBLIC
     agentenv-cfg
     agentenv-managed-secret
     agentenv-snapshot-startup-pack
+    # `ProbeRuntimeVersions` assembles a `SnapshotRuntimeVersions` from the
+    # `--version` parsers. Only the value type and those parsers, not all of
+    # `agentenv-snapshot` -- which depends on this library.
+    agentenv-snapshot-version
     agentenv-privileges
     # `ublk::OverlaybdDeviceConfig` serializes `runtime_upper_mode` through
     # `storage::overlaybd::UpperModeToString` / `UpperModeParse`, so the

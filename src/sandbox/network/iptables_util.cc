@@ -174,7 +174,7 @@ core::Expected<core::Unit, std::string> HandleRestoreFailure(
     if (policy.kind == OpenFailurePolicy::Kind::ReturnErr) {
         return core::make_unexpected(error);
     }
-    AGENTENV_WARN(policy.message.c_str(), " error=", error);
+    AGENTENV_WARN(policy.message << " error=" << error);
     return core::Unit();
 }
 
@@ -331,7 +331,7 @@ core::Expected<core::Unit, std::string> ApplyIptablesCommands(
             if (open_failure_policy.kind == OpenFailurePolicy::Kind::ReturnErr) {
                 return core::make_unexpected(applied.error());
             }
-            AGENTENV_WARN(open_failure_policy.message.c_str(), " error=", applied.error());
+            AGENTENV_WARN(open_failure_policy.message << " error=" << applied.error());
         }
         return core::Unit();
     }

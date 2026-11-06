@@ -168,8 +168,8 @@ core::Expected<std::string, std::string> ParseFirecrackerVersion(const std::stri
 std::string VersionOrUnknown(const std::string& component,
                              const core::Expected<std::string, std::string>& result) {
     if (result.ok()) return result.value();
-    AGENTENV_WARN("failed to probe runtime version; falling back to unknown component=",
-                  component, " error=", result.error());
+    AGENTENV_WARN("failed to probe runtime version; falling back to unknown component="
+                  << component << " error=" << result.error());
     return kUnknownVersion;
 }
 

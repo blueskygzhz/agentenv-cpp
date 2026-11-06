@@ -1,18 +1,14 @@
 add_library(agentenv-snapshot STATIC
-    manager.cc
     layers.cc
     types.cc
-    version.cc
     acr_manifest.cc
     drive.cc
     record.cc
     source_registry.cc
     image_export_target.cc
-    repository.cc
     artifact_cache.cc
     p2p.cc
     runtime_support.cc
-    mock.cc
     # Rust: src/snapshot/store.rs — `store_volume_layers`.
     store.cc
     # Rust: src/snapshot/publish.rs — store the files, then commit the record
@@ -63,6 +59,9 @@ target_include_directories(agentenv-snapshot PUBLIC ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(agentenv-snapshot PUBLIC
     agentenv-core
     agentenv-sandbox
+    # `SnapshotRuntimeVersions` and its `--version` parsers; split out so
+    # `agentenv-sandbox` can run the probes that feed them without a cycle.
+    agentenv-snapshot-version
     # `StoreDiskLayers` must recognise a runtime-generated rootfs delta:
     # publishing passes `allow_descriptorless = false`, and that delta carries
     # no descriptor, so without this every snapshot of a sandbox that wrote to

@@ -232,8 +232,8 @@ RepositoryResult<Lease> Take(LockStore& store, const std::string& key,
             }
             const int64_t since = waiting_on->second;
             if (NowMs(clock) - since >= kLeaseMs) {
-                AGENTENV_WARN("taking over a lock its holder kept too long: key=%s holder=%s",
-                              key.c_str(), holder.c_str());
+                AGENTENV_WARN("taking over a lock its holder kept too long: key="
+                              << key << " holder=" << holder);
                 break;
             }
             if (NowMs(clock) >= give_up_at) return core::make_unexpected(timed_out);
@@ -261,8 +261,8 @@ void Release(LockStore& store, const Lease& lease, const LeaseClock& clock) {
         // Left to run out rather than reported: the write this lease guarded
         // has already landed, and failing here would make it look like it had
         // not.
-        AGENTENV_WARN("left a lease to run out: key=%s error=%s", lease.key().c_str(),
-                      deleted.error().message.c_str());
+        AGENTENV_WARN("left a lease to run out: key=" << lease.key() << " error="
+                                                      << deleted.error().message);
     }
 }
 

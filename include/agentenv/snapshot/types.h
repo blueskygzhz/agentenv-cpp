@@ -18,18 +18,6 @@
 namespace agentenv {
 namespace snapshot {
 
-/// Metadata describing a snapshot bundle on disk.
-struct SnapshotMeta {
-    core::SnapshotId id;
-    std::string      template_id;
-    core::Digest     mem_digest;
-    core::Digest     disk_digest;
-    int64_t          mem_size = 0;
-    int64_t          disk_size = 0;
-    int64_t          created_at_ms = 0;
-    std::string      guest_arch;   // "x86_64" | "aarch64"
-};
-
 /// Rust newtype `SnapshotAlias(String)` (src/snapshot/types/value.rs).
 ///
 /// Only constructible through `Parse`, so an invalid alias cannot exist — the

@@ -97,7 +97,7 @@ core::Expected<std::string, std::string> CreateManagedSeed(const std::string& pa
     if (!outcome.ok()) return core::make_unexpected(outcome.error());
 
     if (outcome.value().created()) {
-        AGENTENV_INFO("generated managed sandbox access-token seed path=", path);
+        AGENTENV_INFO("generated managed sandbox access-token seed path=" << path);
         return seed;
     }
 
@@ -165,8 +165,8 @@ SandboxAccessTokenGenerator::LoadOrCreate(const cfg::AppConfig& config,
         AGENTENV_WARN(
             "using a node-local managed sandbox access-token seed; configure"
             " AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED with the same value on every node in a"
-            " clustered deployment path=",
-            managed_seed_path);
+            " clustered deployment path="
+            << managed_seed_path);
     }
 
     return New(seed.value());
