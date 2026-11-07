@@ -6,12 +6,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "agentenv/core/expected.h"
 #include "agentenv/storage/overlaybd/metrics.h"
 #include "agentenv/storage/overlaybd/virtual_file.h"
+#include "agentenv/storage/util/compact_writer.h"
 
 namespace agentenv {
 namespace storage {
@@ -93,22 +95,45 @@ struct CompressArgs {
         : opt(o), overwrite_header(false), workers(1) {}
 };
 
-/// Rust `trait Compressor`, decode half only.
+/// Rust `trait Compressor`.
 ///
-/// The encode half (`compress` / `compress_batch`) is not ported: nothing in
-/// this codebase writes zfiles, and the write path additionally needs the
-/// worker pool and builder that go with it.
-///
-/// `Decompress` is const because one instance decodes concurrently; keep
-/// implementations stateless, with scratch on the stack or caller-provided.
+/// Thread-safety contract, copied from upstream because both halves depend on
+/// it: `Decompress` is **const**, so one shared instance decodes blocks
+/// concurrently — keep decoders stateless, with per-call scratch on the stack
+/// or in caller-provided buffers. `Compress` / `CompressBatch` are
+/// **non-const**, mirroring Rust's `&mut self`: the encode side is only ever
+/// used by a single owner. The worker pool therefore gives each thread its
+/// own compressor rather than sharing one.
 class Compressor {
  public:
     virtual ~Compressor() {}
     virtual size_t MaxDstSize() const = 0;
     virtual size_t SrcBlockSize() const = 0;
+
+    /// Rust `compress` — encode one block. Returns the encoded length.
+    virtual core::Expected<size_t, std::string> Compress(const uint8_t* src, size_t src_len,
+                                                            uint8_t* dst, size_t dst_cap) = 0;
+
     virtual core::Expected<size_t, std::string> Decompress(const uint8_t* src, size_t src_len,
                                                               uint8_t* dst,
                                                               size_t dst_cap) const = 0;
+
+    /// Rust `nbatch` — how many blocks one `CompressBatch` call covers.
+    virtual size_t Nbatch() const { return 1; }
+
+    /// Rust `compress_batch` — encode `n` blocks into `n` equally sized
+    /// destination slots.
+    ///
+    /// `dst` is partitioned into `n` slots of `dst_len / n` bytes each, and
+    /// each slot must be at least `MaxDstSize()`: the slot stride is what the
+    /// caller uses to locate each encoded block afterwards, so a smaller
+    /// stride would let one block's output run into the next one's slot.
+    ///
+    /// The chunk-length arrays are passed as vectors, not pointers, so the
+    /// `>= n` checks Rust performs on their lengths remain possible.
+    virtual core::Expected<core::Unit, std::string> CompressBatch(
+        const uint8_t* src, size_t src_len, const std::vector<size_t>& src_chunk_len,
+        uint8_t* dst, size_t dst_len, std::vector<size_t>* dst_chunk_len, size_t n);
 };
 
 /// Rust `create_compressor` — LZ4 or ZSTD, nothing else.
@@ -162,6 +187,24 @@ struct HeaderTrailer {
     /// Trivially true when digests are disabled: an absent digest is not a
     /// failed one.
     bool IsValid(const uint8_t* bytes, size_t len) const;
+
+    // -- write side --------------------------------------------------------
+    //
+    // Rust `set_header` … `set_compress_option`. `header`/`trailer`,
+    // `data_file`/`index_file` and `sealed`/unsealed are the same bit written
+    // two ways, which is why the clearing halves exist: a trailer is not a
+    // header with an extra flag, it is the header flag *absent*, and a
+    // builder that reuses one record for both must be able to go back.
+
+    void SetHeader() { SetFlagBit(kFlagShiftHeader); }
+    void SetTrailer() { ClrFlagBit(kFlagShiftHeader); }
+    void SetDataFile() { SetFlagBit(kFlagShiftType); }
+    void SetIndexFile() { ClrFlagBit(kFlagShiftType); }
+    void SetSealed() { SetFlagBit(kFlagShiftSealed); }
+    void ClrSealed() { ClrFlagBit(kFlagShiftSealed); }
+    void SetHeaderOverwrite() { SetFlagBit(kFlagShiftHeaderOverwrite); }
+    void SetDigestEnable() { SetFlagBit(kFlagShiftCalcDigest); }
+    void SetCompressOption(const CompressOptions& o) { opt = o; }
 };
 
 /// Rust `JumpTable` — block index to encoded file offset.
@@ -310,6 +353,147 @@ core::Expected<std::shared_ptr<ZFileRO>, std::string> ZFileOpenRo(
 /// Rust `zfile_open_ro_vfile` — the same reader as a plain `VirtualFile`.
 core::Expected<std::shared_ptr<VirtualFile>, std::string> ZFileOpenRoVfile(
     std::shared_ptr<VirtualFile> file, bool verify);
+
+/// Rust `ZFILE_COMPACT_WRITER_BUFFER_SIZE`.
+const size_t kZFileCompactWriterBufferSize = 512 * 1024;
+
+/// Rust `ZFileBuilder` — streaming zfile encoder.
+///
+/// Bytes arrive in arbitrary chunks and leave as whole compressed blocks: a
+/// tail shorter than one block is held in `reserved_buf` until the next write
+/// completes it, which is why `Finish` must be called to flush it. Each
+/// block's encoded length is appended to an in-memory index that `Finish`
+/// writes out, followed by the trailer that points at it. **A builder that is
+/// dropped without `Finish` leaves a file with a header and data but no
+/// index**, which the reader rejects — deliberately, since the alternative
+/// is a file that decodes to a silently truncated image.
+///
+/// Move-only, like Rust's `ZFileBuilder`: it owns a worker pool and a
+/// half-written destination, neither of which may be duplicated. Returned by
+/// value, as `ZFileBuilder::new` returns `Result<Self>` — `core::Expected`
+/// carries a move-only payload, so no handle wrapper is needed.
+class ZFileBuilder {
+ public:
+    /// Rust `ZFileBuilder::new`.
+    ///
+    /// Writes the header immediately, so the destination is a (not yet
+    /// indexed) zfile from this point on, and spawns the worker pool when
+    /// `args.workers > 1`.
+    static core::Expected<ZFileBuilder, std::string> Create(std::shared_ptr<VirtualFile> file,
+                                                               const CompressArgs& args);
+
+    ZFileBuilder(ZFileBuilder&& other) : impl_(other.impl_) { other.impl_ = NULL; }
+    ZFileBuilder& operator=(ZFileBuilder&& other);
+    ~ZFileBuilder();
+
+    /// Rust `write` — returns the number of bytes consumed, always `len` on
+    /// success.
+    core::Expected<size_t, std::string> Write(const uint8_t* buf, size_t len);
+
+    /// Rust `write_owned`.
+    ///
+    /// Named for what it does rather than after Rust's name: upstream takes
+    /// the `Vec` by value purely to avoid one copy on the fan-out path, and
+    /// there is no ownership to take here, because `util::CompactWriter::
+    /// Write` delivers a const reference (Rust's `Box<dyn CompactBuffer>`
+    /// hand-off is not part of that ported interface). What remains is the
+    /// behaviour that *is* load-bearing: a buffer covering a whole number of
+    /// blocks with no pending tail skips straight to the block path, and
+    /// anything else falls back to `Write`.
+    core::Expected<size_t, std::string> WriteWholeBlocks(const uint8_t* buf, size_t len);
+
+    /// Rust `finish` — flush the partial tail, write the index and trailer,
+    /// and rewrite the header when `overwrite_header` was requested.
+    /// Idempotent.
+    core::Expected<core::Unit, std::string> Finish();
+
+    /// Rust `close` — `Finish`, then hand back the destination.
+    core::Expected<std::shared_ptr<VirtualFile>, std::string> Close();
+
+    /// Makes this pool's workers fail instead of compressing.
+    ///
+    /// Rust gates the equivalent switch behind `#[cfg(test)]`; there is no
+    /// such gate here, so it is named for what it is. Scoped to one builder,
+    /// as upstream's is, so a concurrent test with its own builder never
+    /// observes another's injection. It exists to pin one invariant that is
+    /// otherwise untestable: a worker that fails must still answer its work
+    /// item, or the collection loop waits for a result that never comes.
+    void InjectWorkerFailureForTest();
+
+ private:
+    class Impl;
+    explicit ZFileBuilder(Impl* impl) : impl_(impl) {}
+    ZFileBuilder(const ZFileBuilder&);
+    ZFileBuilder& operator=(const ZFileBuilder&);
+
+    Impl* impl_;
+};
+
+/// Rust `new_zfile_builder`.
+core::Expected<ZFileBuilder, std::string> NewZFileBuilder(std::shared_ptr<VirtualFile> file,
+                                                             const CompressArgs& args);
+
+/// Rust `ZFileCompactWriter` — a `CompactWriter` that compresses as it goes.
+///
+/// Sequential-only (`RequiresOrderedWrites()` is true) because the builder
+/// compresses a stream: an out-of-order offset cannot be honoured after the
+/// preceding bytes have already been encoded, so it is refused rather than
+/// written to the wrong place.
+///
+/// Every entry point is poisoned by a failure: once a write fails, later
+/// writes and `Finalize` are refused instead of continuing onto a file whose
+/// block index no longer matches its data. The flag is set *before* the
+/// builder call and cleared only after it reports success, so a failure
+/// cannot leave the writer usable.
+class ZFileCompactWriter : public util::CompactWriter {
+ public:
+    /// Rust `ZFileCompactWriter::new`.
+    static core::Expected<std::shared_ptr<ZFileCompactWriter>, std::string> Create(
+        std::shared_ptr<VirtualFile> destination, const CompressArgs& args);
+
+    core::Expected<util::CompactBuffer, std::string> AllocBuffer();
+    size_t BufferSize() const { return kZFileCompactWriterBufferSize; }
+    bool RequiresOrderedWrites() const { return true; }
+
+    core::Expected<core::Unit, std::string> Write(const util::CompactBuffer& buf,
+                                                    uint64_t offset, size_t len);
+    core::Expected<core::Unit, std::string> WriteAllAt(const uint8_t* data, size_t len,
+                                                          uint64_t offset);
+    core::Expected<core::Unit, std::string> Finalize();
+
+ private:
+    explicit ZFileCompactWriter(ZFileBuilder&& builder)
+        : builder_(std::move(builder)), next_offset_(0), finalized_(false), failed_(false) {}
+    ZFileCompactWriter(const ZFileCompactWriter&);
+    ZFileCompactWriter& operator=(const ZFileCompactWriter&);
+
+    /// Rust `write_slice_at` — the offset-checked single-chunk write.
+    ///
+    /// Takes the lock itself, so it must not be called with the lock already
+    /// held: `WriteAllAt` chunks through it one slice at a time, which is
+    /// also how upstream re-checks the offset for every chunk rather than
+    /// only the first.
+    core::Expected<core::Unit, std::string> WriteSliceAt(const uint8_t* data, size_t len,
+                                                            uint64_t offset);
+
+    /// Rust `ZFileCompactWriterState`, inlined: the Rust struct exists only
+    /// to be the thing the mutex wraps, and C++ puts the mutex beside the
+    /// fields instead.
+    ZFileBuilder builder_;
+    std::mutex mutex_;
+    uint64_t next_offset_;
+    bool finalized_;
+    bool failed_;
+};
+
+/// Rust `zfile_compress` — compress all of `src` into `dst` in one pass.
+///
+/// Distinct from `ZFileBuilder`: this one owns the read loop and needs no
+/// partial-block buffering, so it is what a whole-file conversion uses, while
+/// the builder is what a streaming producer (the compact writer) drives.
+core::Expected<core::Unit, std::string> ZFileCompress(std::shared_ptr<VirtualFile> src,
+                                                         std::shared_ptr<VirtualFile> dst,
+                                                         const CompressArgs& args);
 
 /// Rust `is_zfile` — 1 if the file carries a zfile header, 0 if not.
 ///

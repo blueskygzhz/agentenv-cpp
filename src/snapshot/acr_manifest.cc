@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Rust: src/snapshot/repository/backends/common/acr/manifest.rs
+// Rust: src/snapshot/image_export/acr/manifest.rs
 #include "agentenv/snapshot/acr_manifest.h"
 
 #include <algorithm>

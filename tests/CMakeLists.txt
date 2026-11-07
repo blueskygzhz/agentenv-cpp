@@ -72,6 +72,12 @@ agentenv_add_test(test_overlaybd_cache_open test_overlaybd_cache_open.cc agenten
 # Rust: the ZFile read metrics of src/metrics.rs and the pread sampler of
 # src/compression/zfile.rs.
 agentenv_add_test(test_overlaybd_zfile_metrics test_overlaybd_zfile_metrics.cc agentenv-overlaybd)
+# Rust: the encode half of src/compression/zfile.rs -- `zfile_compress`,
+# `ZFileBuilder`, `ZFileCompactWriter` and the worker pool. Closes the loop
+# through the decode half, so the assertion is that a reader accepts what the
+# encoder wrote.
+agentenv_add_test(test_overlaybd_zfile_compress test_overlaybd_zfile_compress.cc
+                  agentenv-overlaybd)
 # Rust: src/dense_export.rs
 agentenv_add_test(test_overlaybd_dense_export test_overlaybd_dense_export.cc agentenv-overlaybd)
 # Rust: src/tools/oci.rs
@@ -115,6 +121,15 @@ agentenv_add_test(test_snapshot_acr_source_image test_snapshot_acr_source_image.
 # what a snapshot is published as, checked before any blob is uploaded.
 agentenv_add_test(test_snapshot_acr_publisher test_snapshot_acr_publisher.cc
                   agentenv-snapshot)
+# Rust: src/snapshot/recontainerize.rs + the `OverlaybdCompactOutput` half of
+# src/overlaybd/compact.rs — the descriptor must describe the uploaded bytes.
+agentenv_add_test(test_snapshot_recontainerize test_snapshot_recontainerize.cc
+                  agentenv-snapshot)
+# Rust: src/overlaybd/compact.rs :: compact_layers. Every assertion reads the
+# compacted image back through the runtime's open chain, because a merge that
+# dropped shadowing or block order still yields a file that opens and parses.
+agentenv_add_test(test_overlaybd_compact test_overlaybd_compact.cc
+                  agentenv-overlaybd-compact)
 # Rust: src/snapshot/image_export/regctl.rs — driven against a real fake
 # `regctl` script, so the fork/pipe half of `BlobPipe` is actually exercised.
 agentenv_add_test(test_snapshot_regctl     test_snapshot_regctl.cc     agentenv-snapshot)

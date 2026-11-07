@@ -16,7 +16,9 @@
 #include "agentenv/core/identity.h"
 #include "agentenv/core/logging.h"
 #include "agentenv/image/local_layer.h"
+#include "agentenv/overlaybd/compact.h"
 #include "agentenv/snapshot/image_export/acr.h"
+#include "agentenv/snapshot/recontainerize.h"
 #include "agentenv/sandbox/extra_drive.h"
 #include "agentenv/storage/overlaybd/config.h"
 #include "agentenv/storage/overlaybd/dense_export.h"
@@ -62,33 +64,24 @@ core::Optional<std::string> OverlaybdLayerUuid(const std::string& source) {
     return core::Optional<std::string>(parsed.ToString());
 }
 
-/// Rust `PreparedLayerUpload` as `passthrough` builds it — the only shape the
-/// port produces (see the header's note on compression).
-struct PreparedLayerUpload {
-    std::string path;
-    std::string digest;
-    uint64_t size;
-};
-
-/// Rust `passthrough`.
-RepositoryResult<PreparedLayerUpload> Passthrough(const std::string& source,
-                                                  const core::Optional<std::string>& digest,
-                                                  uint64_t size) {
-    PreparedLayerUpload upload;
-    upload.path = source;
-    if (digest.has_value()) {
-        upload.digest = *digest;
-        upload.size = size;
-        return upload;
-    }
-    const core::Expected<core::FileDigest, std::string> described = core::DescribeFile(source);
-    if (!described.ok()) {
-        return core::make_unexpected(RepositoryError::Backend(
-            "describe managed layer '" + source + "'", described.error()));
-    }
-    upload.digest = described.value().sha256;
-    upload.size = described.value().size;
-    return upload;
+/// Rust `LayerStore::compression`, which `LayerStore::new` reads from
+/// `repository.publish_policy().compression`.
+///
+/// The C++ repository has no publish policy, so the mode is fixed to what
+/// Rust's default policy yields — see the port-gap note in store.h. It is
+/// named and passed explicitly at both call sites, rather than hidden by
+/// calling `passthrough` directly, because `PrepareLayerUpload` is where the
+/// mode decides whether the descriptor describes the source bytes or
+/// recompressed ones; the choice belongs in sight at the call.
+///
+/// Note that `Raw()` here is now the *only* thing gating compression: the
+/// zfile path behind it is complete and tested (`PrepareLayerUpload` →
+/// `overlaybd::CompactLayers`), so returning a `ZFile(...)` mode would
+/// compress for real. It stays fixed until `SnapshotRepository` grows
+/// `publish_policy()`, because inventing an operator's compression setting
+/// here would silently change what every publish uploads.
+overlaybd::OverlaybdCompactOutput PublishCompression() {
+    return overlaybd::OverlaybdCompactOutput::Raw();
 }
 
 /// Rust `LayerStore::put_prepared`.
@@ -97,11 +90,11 @@ RepositoryResult<ManagedLayer> PutPrepared(SnapshotRepository& repository,
                                            const core::Optional<std::string>& uuid,
                                            LayerRole role) {
     ManagedLayer layer;
-    layer.digest = upload.digest;
-    layer.size = upload.size;
+    layer.digest = upload.Digest();
+    layer.size = upload.Size();
     layer.uuid = uuid;
     const RepositoryResult<core::Unit> put =
-        repository.PutBlob(BlobKey::Layer(layer.digest, role), BlobBody::File(upload.path));
+        repository.PutBlob(BlobKey::Layer(layer.digest, role), BlobBody::File(upload.Path()));
     if (!put.ok()) return core::make_unexpected(put.error());
     return layer;
 }
@@ -128,10 +121,13 @@ RepositoryResult<ManagedLayer> StoreLayer(SnapshotRepository& repository,
                 ToStr(source_size.value())));
         }
     }
+    // Recontainerizing changes the bytes, so `PrepareLayerUpload` re-hashes
+    // its output instead of trusting the descriptor.
     const RepositoryResult<PreparedLayerUpload> upload =
-        Passthrough(canonical.value(), digest, size);
+        PrepareLayerUpload(canonical.value(), PublishCompression(), digest, size);
     if (!upload.ok()) return core::make_unexpected(upload.error());
-    return PutPrepared(repository, upload.value(), OverlaybdLayerUuid(upload.value().path), role);
+    return PutPrepared(repository, upload.value(), OverlaybdLayerUuid(upload.value().Path()),
+                       role);
 }
 
 /// Rust `LayerStore::store_descriptorless_layer`.
@@ -184,9 +180,14 @@ RepositoryResult<ManagedLayer> StoreDescriptorlessLayer(SnapshotRepository& repo
                 descriptor.error()));
             break;
         }
-        const RepositoryResult<PreparedLayerUpload> upload =
-            Passthrough(dense_path, core::Optional<std::string>(descriptor.value().sha256),
-                        descriptor.value().size);
+        // Rust follows this with `upload.retain_source(dense_temp)`, which
+        // keeps the staging file alive for as long as the upload is held in
+        // `StoredSnapshot::local_layers` (post-commit P2P publication). That
+        // field is not ported — see store.h — so nothing outlives this
+        // function and the explicit removal below is the whole lifetime.
+        const RepositoryResult<PreparedLayerUpload> upload = PrepareLayerUpload(
+            dense_path, PublishCompression(),
+            core::Optional<std::string>(descriptor.value().sha256), descriptor.value().size);
         if (!upload.ok()) {
             stored = core::make_unexpected(upload.error());
             break;

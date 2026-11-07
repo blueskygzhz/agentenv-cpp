@@ -426,6 +426,14 @@ core::Expected<core::Unit, std::string> LsmtReadOnlyFile::Flatten(
     if (!dest) {
         return core::make_unexpected(std::string("flatten requires a destination writer"));
     }
+    VirtualFileCompactSink sink(dest);
+    return FlattenTo(&sink);
+}
+
+core::Expected<core::Unit, std::string> LsmtReadOnlyFile::FlattenTo(lsmt::CompactSink* sink) {
+    if (sink == 0) {
+        return core::make_unexpected(std::string("flatten requires a destination writer"));
+    }
     // The whole virtual size, not the mapped ranges only: flattening has to
     // resolve shadowing, and the merged index's lookup is what decides which
     // layer owns a block.
@@ -439,9 +447,8 @@ core::Expected<core::Unit, std::string> LsmtReadOnlyFile::Flatten(
     // Rust `CommitArgs::from_writer`: no identity is supplied, so the output
     // carries the nil uuid and no parent.
     LayerStackCompactSource source(layers_);
-    VirtualFileCompactSink sink(dest);
     std::string err;
-    if (!lsmt::CompactTo(&sink, &source, mappings, virtual_size_,
+    if (!lsmt::CompactTo(sink, &source, mappings, virtual_size_,
                          lsmt::CompactCommitArgs(), &err)) {
         return core::make_unexpected(std::string("flatten: ") + err);
     }

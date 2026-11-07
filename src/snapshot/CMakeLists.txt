@@ -4,6 +4,9 @@ add_library(agentenv-snapshot STATIC
     artifact_cache.cc
     p2p.cc
     runtime_support.cc
+    # Rust: src/snapshot/recontainerize.rs — prepare a local layer for upload,
+    # so the descriptor describes the bytes that actually get uploaded.
+    recontainerize.cc
     # Rust: src/snapshot/store.rs — `store_volume_layers`.
     store.cc
     # Rust: src/snapshot/publish.rs — store the files, then commit the record
@@ -88,5 +91,7 @@ target_link_libraries(agentenv-snapshot PUBLIC
     # `snapshot/p2p` keys overlaybd layers by digest/uuid and reads the layer
     # trailer + image config to decide what is publishable.
     agentenv-overlaybd-p2p
+    # `recontainerize.cc` takes the publish-compression mode as its input.
+    agentenv-overlaybd-compact
     agentenv-overlaybd
 )

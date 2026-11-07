@@ -4,8 +4,20 @@
 
 #include <time.h>
 
+#include <atomic>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <exception>
+#include <map>
+#include <mutex>
 #include <sstream>
+#include <thread>
+#include <utility>
+
+// `CommitCompressedBatch` recovers the concrete local file to take the
+// synchronous-pwrite fast path, which is what Rust's `as_any` downcast does.
+#include "agentenv/storage/overlaybd/local_file.h"
 
 #ifdef AGENTENV_WITH_ZSTD
 #include <lz4.h>
@@ -119,12 +131,41 @@ core::Expected<core::Unit, std::string> ReadExactAt(VirtualFile* file, uint8_t* 
 
 #ifdef AGENTENV_WITH_ZSTD
 
+/// Rust `ZSTD_C_LEVEL`.
+const int kZstdCLevel = 3;
+
+/// "destination buffer too small (N), expected at least M" — the guard both
+/// encoders apply before handing the buffer to the codec.
+///
+/// Checked against `MaxDstSize()` rather than against the source length,
+/// because that is what the codec is allowed to emit in the worst case: a
+/// buffer merely as large as the input is enough for every *compressible*
+/// block and silently too small for an incompressible one.
+std::string DstTooSmall(size_t have, size_t want) {
+    std::ostringstream o;
+    o << "destination buffer too small (" << have << "), expected at least " << want;
+    return o.str();
+}
+
 class Lz4Compressor : public Compressor {
  public:
     Lz4Compressor(size_t max_dst, size_t src_blk) : max_dst_(max_dst), src_blk_(src_blk) {}
 
     size_t MaxDstSize() const { return max_dst_; }
     size_t SrcBlockSize() const { return src_blk_; }
+
+    core::Expected<size_t, std::string> Compress(const uint8_t* src, size_t src_len,
+                                                    uint8_t* dst, size_t dst_cap) {
+        if (dst_cap < max_dst_) return core::make_unexpected(DstTooSmall(dst_cap, max_dst_));
+        // C liblz4 block format, as upstream OverlayBD writes it. Block sizes
+        // are 4 KiB-scale, so the int casts cannot overflow.
+        const int n = ::LZ4_compress_default(reinterpret_cast<const char*>(src),
+                                             reinterpret_cast<char*>(dst),
+                                             static_cast<int>(src_len),
+                                             static_cast<int>(dst_cap));
+        if (n <= 0) return core::make_unexpected(std::string("lz4 compression failed"));
+        return static_cast<size_t>(n);
+    }
 
     core::Expected<size_t, std::string> Decompress(const uint8_t* src, size_t src_len,
                                                       uint8_t* dst, size_t dst_cap) const {
@@ -141,6 +182,35 @@ class Lz4Compressor : public Compressor {
     size_t src_blk_;
 };
 
+/// Rust's `thread_local! { ZSTD_CCTX }` — one reusable context per thread.
+///
+/// Creating a context costs more than compressing one 4 KiB block, so it must
+/// be reused; it cannot live in the compressor instance because a zstd
+/// context is not shareable across threads, and the same class also serves
+/// the const, concurrently shared decode side. Thread-local storage satisfies
+/// both: reused within a worker, never shared between workers.
+class ZstdCCtxHolder {
+ public:
+    ZstdCCtxHolder() : ctx_(NULL) {}
+    ~ZstdCCtxHolder() {
+        if (ctx_ != NULL) ::ZSTD_freeCCtx(ctx_);
+    }
+    ::ZSTD_CCtx* Get() {
+        if (ctx_ == NULL) ctx_ = ::ZSTD_createCCtx();
+        return ctx_;
+    }
+
+ private:
+    ZstdCCtxHolder(const ZstdCCtxHolder&);
+    ZstdCCtxHolder& operator=(const ZstdCCtxHolder&);
+    ::ZSTD_CCtx* ctx_;
+};
+
+::ZSTD_CCtx* ThreadZstdCCtx() {
+    static thread_local ZstdCCtxHolder holder;
+    return holder.Get();
+}
+
 class ZstdCompressor : public Compressor {
  public:
     ZstdCompressor(size_t max_dst, size_t src_blk) : max_dst_(max_dst), src_blk_(src_blk) {}
@@ -148,13 +218,26 @@ class ZstdCompressor : public Compressor {
     size_t MaxDstSize() const { return max_dst_; }
     size_t SrcBlockSize() const { return src_blk_; }
 
+    core::Expected<size_t, std::string> Compress(const uint8_t* src, size_t src_len,
+                                                    uint8_t* dst, size_t dst_cap) {
+        if (dst_cap < max_dst_) return core::make_unexpected(DstTooSmall(dst_cap, max_dst_));
+        ::ZSTD_CCtx* ctx = ThreadZstdCCtx();
+        if (ctx == NULL) {
+            return core::make_unexpected(std::string("create zstd compression context"));
+        }
+        const size_t n = ::ZSTD_compressCCtx(ctx, dst, dst_cap, src, src_len, kZstdCLevel);
+        if (::ZSTD_isError(n)) {
+            return core::make_unexpected(std::string("zstd compress failed: ") +
+                                         ::ZSTD_getErrorName(n));
+        }
+        if (n == 0) return core::make_unexpected(std::string("zstd returned empty output"));
+        return n;
+    }
+
     core::Expected<size_t, std::string> Decompress(const uint8_t* src, size_t src_len,
                                                       uint8_t* dst, size_t dst_cap) const {
         if (dst_cap < src_blk_) {
-            std::ostringstream o;
-            o << "destination buffer too small (" << dst_cap << "), expected at least "
-              << src_blk_;
-            return core::make_unexpected(o.str());
+            return core::make_unexpected(DstTooSmall(dst_cap, src_blk_));
         }
         const size_t n = ::ZSTD_decompress(dst, dst_cap, src, src_len);
         if (::ZSTD_isError(n)) {
@@ -245,6 +328,44 @@ core::Expected<core::Unit, std::string> CompressOptions::EncodeInto(uint8_t* buf
 // ---------------------------------------------------------------------------
 // Compressor
 // ---------------------------------------------------------------------------
+
+core::Expected<core::Unit, std::string> Compressor::CompressBatch(
+    const uint8_t* src, size_t src_len, const std::vector<size_t>& src_chunk_len, uint8_t* dst,
+    size_t dst_len, std::vector<size_t>* dst_chunk_len, size_t n) {
+    if (n == 0) return core::Unit();
+    if (src_chunk_len.size() < n || dst_chunk_len == NULL || dst_chunk_len->size() < n) {
+        return core::make_unexpected(std::string("chunk length arrays are smaller than n"));
+    }
+    const size_t each_dst_capacity = dst_len / n;
+    if (each_dst_capacity < MaxDstSize()) {
+        std::ostringstream o;
+        o << "destination chunk capacity (" << each_dst_capacity
+          << ") smaller than max_dst_size (" << MaxDstSize() << ")";
+        return core::make_unexpected(o.str());
+    }
+
+    size_t src_offset = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const size_t chunk_len = src_chunk_len[i];
+        if (chunk_len > SIZE_MAX - src_offset) {
+            return core::make_unexpected(std::string("source offset overflow"));
+        }
+        const size_t end = src_offset + chunk_len;
+        if (end > src_len) {
+            return core::make_unexpected(std::string("source chunk exceeds source buffer"));
+        }
+        if (each_dst_capacity != 0 && i > SIZE_MAX / each_dst_capacity) {
+            return core::make_unexpected(std::string("destination offset overflow"));
+        }
+        const size_t dst_begin = i * each_dst_capacity;
+        const core::Expected<size_t, std::string> nout =
+            Compress(src + src_offset, chunk_len, dst + dst_begin, each_dst_capacity);
+        if (!nout.ok()) return core::make_unexpected(nout.error());
+        (*dst_chunk_len)[i] = nout.value();
+        src_offset = end;
+    }
+    return core::Unit();
+}
 
 core::Expected<std::shared_ptr<Compressor>, std::string> CreateCompressor(
     const CompressArgs& args) {
@@ -996,6 +1117,1092 @@ core::Expected<int, std::string> IsZFile(VirtualFile* file) {
         return core::make_unexpected(std::string("file is zfile but header digest is invalid"));
     }
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Encode side
+//
+// Rust `write_header_trailer` .. `zfile_compress`. These live in one named
+// namespace rather than the file's anonymous one because `ZFileBuilder::Impl`
+// has members of these types and is itself externally linked; an
+// internal-linkage member type there is exactly what -Wsubobject-linkage
+// warns about.
+// ---------------------------------------------------------------------------
+
+namespace detail {
+
+/// Rust `BUF_SIZE` — the slack the per-block output buffer carries on top of
+/// one logical block, covering codec expansion on incompressible input plus
+/// the optional CRC trailer. Numerically equal to `kHeaderTrailerSpace`, and
+/// unrelated to it: upstream keeps them as two constants for that reason.
+const size_t kBufSize = 512;
+
+/// Rust `ZFILE_PHYSICAL_WRITE_CHUNK_SIZE`.
+const size_t kZFilePhysicalWriteChunkSize = 4096;
+
+/// Rust `write_all_at` — a short write is an error.
+///
+/// `VirtualFile::WriteAt` is permitted to be short; at this level it is not,
+/// because every caller is laying down a block, an index or a trailer whose
+/// length the format depends on.
+core::Expected<core::Unit, std::string> WriteAllAtFile(VirtualFile* file, const uint8_t* buf,
+                                                          size_t len, uint64_t offset) {
+    if (len == 0) return core::Unit();
+    if (offset > UINT64_MAX - static_cast<uint64_t>(len)) {
+        return core::make_unexpected(std::string("offset overflow"));
+    }
+    size_t done = 0;
+    while (done < len) {
+        const core::Expected<size_t, std::string> n =
+            file->WriteAt(offset + done, buf + done, len - done);
+        if (!n.ok()) return core::make_unexpected(n.error());
+        if (n.value() == 0) return core::make_unexpected(std::string("short write"));
+        done += n.value();
+    }
+    return core::Unit();
+}
+
+/// Rust `write_header_trailer`.
+///
+/// The flag pairs are written both ways round (`SetHeader`/`SetTrailer` and
+/// so on) because one `HeaderTrailer` is reused for both records: the trailer
+/// `Finish` writes is the same struct the header came from, so leaving the
+/// header bit set would produce a file with two headers and no trailer.
+///
+/// The digest is computed over the encoded slot with its own four bytes
+/// blanked, which is the only order that works — the digest cannot cover
+/// itself — and is the same convention `IsValid` checks.
+core::Expected<core::Unit, std::string> WriteHeaderTrailer(VirtualFile* file, bool is_header,
+                                                              bool is_sealed, bool is_data_file,
+                                                              bool overwrite_header,
+                                                              HeaderTrailer* ht,
+                                                              uint64_t offset) {
+    if (is_header) {
+        ht->SetHeader();
+    } else {
+        ht->SetTrailer();
+    }
+    if (is_sealed) {
+        ht->SetSealed();
+    } else {
+        ht->ClrSealed();
+    }
+    if (is_data_file) {
+        ht->SetDataFile();
+    } else {
+        ht->SetIndexFile();
+    }
+    if (overwrite_header) ht->SetHeaderOverwrite();
+
+    ht->SetDigestEnable();
+    ht->digest = 0;
+    uint8_t encoded[kHeaderTrailerSpace];
+    const core::Expected<core::Unit, std::string> enc = ht->Encode512(encoded, sizeof(encoded));
+    if (!enc.ok()) return core::make_unexpected(enc.error());
+    for (size_t i = 28; i < 32; ++i) encoded[i] = 0;
+    ht->digest = Crc32c(encoded, kHeaderTrailerSpace);
+    WriteU32Le(encoded, 28, ht->digest);
+
+    return WriteAllAtFile(file, encoded, kHeaderTrailerSpace, offset);
+}
+
+/// Rust `compress_data` — encode one block, appending the CRC when asked.
+///
+/// The CRC is salted and taken over the *compressed* bytes, and it is counted
+/// into the returned length: the jump table measures encoded blocks including
+/// their trailer, so a length excluding it would make every later block
+/// unreadable.
+core::Expected<size_t, std::string> CompressData(Compressor* compressor, const uint8_t* src,
+                                                   size_t src_len, uint8_t* dst, size_t dst_cap,
+                                                   bool gen_crc) {
+    const core::Expected<size_t, std::string> encoded =
+        compressor->Compress(src, src_len, dst, dst_cap);
+    if (!encoded.ok()) return core::make_unexpected(encoded.error());
+    size_t compressed_len = encoded.value();
+    if (compressed_len == 0) return core::make_unexpected(std::string("compress returned zero"));
+
+    if (gen_crc) {
+        if (compressed_len > SIZE_MAX - sizeof(uint32_t)) {
+            return core::make_unexpected(std::string("crc length overflow"));
+        }
+        const size_t end = compressed_len + sizeof(uint32_t);
+        if (end > dst_cap) {
+            return core::make_unexpected(
+                std::string("destination buffer cannot hold crc32 trailer"));
+        }
+        const uint32_t crc = Crc32cSalt(dst, compressed_len);
+        WriteU32Le(dst, compressed_len, crc);
+        compressed_len = end;
+    }
+    return compressed_len;
+}
+
+/// Rust `CompressedSegment` — a run of encoded blocks plus their lengths.
+struct CompressedSegment {
+    std::vector<uint8_t> bytes;
+    std::vector<uint32_t> block_lengths;
+};
+
+/// Rust `max_compressed_block_size`.
+core::Expected<size_t, std::string> MaxCompressedBlockSize(const Compressor* compressor,
+                                                              bool gen_crc) {
+    const size_t base = compressor->MaxDstSize();
+    const size_t extra = gen_crc ? sizeof(uint32_t) : 0;
+    if (base > SIZE_MAX - extra) {
+        return core::make_unexpected(std::string("buffer size overflow"));
+    }
+    return base + extra;
+}
+
+/// Rust `compress_segment`.
+///
+/// Encodes into worst-case slots and then truncates: the blocks are written
+/// back to back in the output, so each one has to be compressed into the
+/// position the previous one actually ended at, not into a fixed stride.
+core::Expected<CompressedSegment, std::string> CompressSegment(
+    Compressor* compressor, const uint8_t* source, size_t source_len, size_t block_size,
+    size_t max_compressed_block_size, bool gen_crc) {
+    if (block_size == 0) return core::make_unexpected(std::string("block_size must be > 0"));
+    if (source_len % block_size != 0) {
+        return core::make_unexpected(std::string("source must contain a whole number of blocks"));
+    }
+
+    const size_t block_count = source_len / block_size;
+    CompressedSegment out;
+    if (block_count == 0) return std::move(out);
+    if (block_count > SIZE_MAX / max_compressed_block_size) {
+        return core::make_unexpected(std::string("compressed segment size overflow"));
+    }
+    out.bytes.assign(block_count * max_compressed_block_size, 0);
+    out.block_lengths.reserve(block_count);
+
+    size_t output_offset = 0;
+    for (size_t i = 0; i < block_count; ++i) {
+        if (output_offset > out.bytes.size() - max_compressed_block_size) {
+            return core::make_unexpected(std::string("compressed segment offset overflow"));
+        }
+        const core::Expected<size_t, std::string> compressed_len =
+            CompressData(compressor, source + i * block_size, block_size,
+                         &out.bytes[output_offset], max_compressed_block_size, gen_crc);
+        if (!compressed_len.ok()) return core::make_unexpected(compressed_len.error());
+        if (compressed_len.value() > 0xFFFFFFFFu) {
+            return core::make_unexpected(
+                std::string("compressed_len cannot fit in u32 jump table entry"));
+        }
+        out.block_lengths.push_back(static_cast<uint32_t>(compressed_len.value()));
+        output_offset += compressed_len.value();
+    }
+    out.bytes.resize(output_offset);
+    return std::move(out);
+}
+
+/// Rust's `crossbeam_channel::bounded` pair, reduced to what the pool needs.
+///
+/// Bounded so submission backpressures rather than queueing unbounded segment
+/// buffers. `Close` stands in for crossbeam's "all senders dropped": after it,
+/// `Send` fails and `Recv` fails *once drained*, which is what lets a worker
+/// loop finish its queue and then exit instead of being cut off mid-batch.
+template <typename T>
+class BoundedChannel {
+ public:
+    explicit BoundedChannel(size_t capacity)
+        : capacity_(capacity == 0 ? 1 : capacity), closed_(false) {}
+
+    bool Send(T item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (!closed_ && queue_.size() >= capacity_) not_full_.wait(lock);
+        if (closed_) return false;
+        queue_.push_back(std::move(item));
+        lock.unlock();
+        not_empty_.notify_one();
+        return true;
+    }
+
+    bool Recv(T* out) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (queue_.empty() && !closed_) not_empty_.wait(lock);
+        if (queue_.empty()) return false;
+        *out = std::move(queue_.front());
+        queue_.pop_front();
+        lock.unlock();
+        not_full_.notify_one();
+        return true;
+    }
+
+    void Close() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            closed_ = true;
+        }
+        not_empty_.notify_all();
+        not_full_.notify_all();
+    }
+
+ private:
+    BoundedChannel(const BoundedChannel&);
+    BoundedChannel& operator=(const BoundedChannel&);
+
+    std::mutex mutex_;
+    std::condition_variable not_full_;
+    std::condition_variable not_empty_;
+    std::deque<T> queue_;
+    size_t capacity_;
+    bool closed_;
+};
+
+/// Rust `WorkItem` — one segment of full blocks, tagged with its submission
+/// order so out-of-order completions can be put back in source order.
+struct WorkItem {
+    size_t seq;
+    std::vector<uint8_t> source;
+    WorkItem() : seq(0) {}
+};
+
+/// Rust `CompressedBatch`.
+struct CompressedBatch {
+    size_t seq;
+    bool ok;
+    CompressedSegment segment;
+    std::string error;
+    CompressedBatch() : seq(0), ok(false) {}
+};
+
+/// Rust `WorkerPool` — persistent compression workers.
+///
+/// Each worker owns one compressor, because a zstd context costs more to
+/// create than a small block costs to compress, and loops on a shared bounded
+/// queue returning exactly one `CompressedBatch` per `WorkItem`. That
+/// one-for-one guarantee is the pool's contract: the consumer drains by
+/// count, so a work item that went unanswered would leave it waiting forever.
+class WorkerPool {
+ public:
+    /// Rust `MAX_WORKERS`. Bounds both the thread count and the channel
+    /// capacity arithmetic below it.
+    static const size_t kMaxWorkers = 256;
+
+    WorkerPool(size_t workers, const CompressOptions& opt, bool gen_crc, size_t block_size,
+               size_t max_compressed_block_size)
+        : work_(Clamp(workers) * 2), results_(Clamp(workers) * 2), fail_work_(false) {
+        const size_t n = Clamp(workers);
+        threads_.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            threads_.push_back(std::thread(&WorkerPool::WorkerMain, this, opt, gen_crc,
+                                           block_size, max_compressed_block_size));
+        }
+    }
+
+    ~WorkerPool() {
+        // Rust drops its real sender in favour of a disconnected one so every
+        // worker's `recv()` fails and the joins below cannot hang. Closing the
+        // queue says the same thing directly.
+        work_.Close();
+        for (size_t i = 0; i < threads_.size(); ++i) threads_[i].join();
+        results_.Close();
+    }
+
+    size_t WorkerCount() const { return threads_.size(); }
+    bool Submit(WorkItem item) { return work_.Send(std::move(item)); }
+    bool Recv(CompressedBatch* out) { return results_.Recv(out); }
+    void InjectFailure() { fail_work_.store(true); }
+
+ private:
+    WorkerPool(const WorkerPool&);
+    WorkerPool& operator=(const WorkerPool&);
+
+    static size_t Clamp(size_t workers) {
+        if (workers < 1) return 1;
+        if (workers > kMaxWorkers) return kMaxWorkers;
+        return workers;
+    }
+
+    void WorkerMain(CompressOptions opt, bool gen_crc, size_t block_size,
+                    size_t max_compressed_block_size) {
+        const core::Expected<std::shared_ptr<Compressor>, std::string> compressor =
+            CreateCompressor(CompressArgs(opt));
+        if (!compressor.ok()) {
+            // Construction is config-driven and `ZFileBuilder::Create` has
+            // already validated it; if it still fails, answer *every* item
+            // with that failure so the one-result-per-item protocol holds
+            // until the pool shuts down.
+            const std::string message =
+                "zfile worker compressor init failed: " + compressor.error();
+            WorkItem item;
+            while (work_.Recv(&item)) {
+                CompressedBatch batch;
+                batch.seq = item.seq;
+                batch.ok = false;
+                batch.error = message;
+                if (!results_.Send(std::move(batch))) break;
+            }
+            return;
+        }
+
+        WorkItem item;
+        while (work_.Recv(&item)) {
+            CompressedBatch batch;
+            batch.seq = item.seq;
+            // Rust turns a panicking compression into this seq's Err for one
+            // reason, and the same reason applies to an exception here: the
+            // consumer drains by count, so an item that never produced a
+            // result would hang it. Letting the exception escape a thread
+            // would additionally terminate the process.
+            try {
+                if (fail_work_.load()) {
+                    batch.ok = false;
+                    batch.error = "injected zfile worker failure";
+                } else {
+                    core::Expected<CompressedSegment, std::string> segment = CompressSegment(
+                        compressor.value().get(), item.source.empty() ? NULL : &item.source[0],
+                        item.source.size(), block_size, max_compressed_block_size, gen_crc);
+                    if (segment.ok()) {
+                        batch.ok = true;
+                        batch.segment = segment.take_value();
+                    } else {
+                        batch.ok = false;
+                        batch.error = segment.error();
+                    }
+                }
+            } catch (const std::exception& e) {
+                batch.ok = false;
+                batch.error = std::string("zfile worker threw during compression: ") + e.what();
+            } catch (...) {
+                batch.ok = false;
+                batch.error = "zfile worker threw during compression";
+            }
+            if (!results_.Send(std::move(batch))) break;
+        }
+    }
+
+    BoundedChannel<WorkItem> work_;
+    BoundedChannel<CompressedBatch> results_;
+    std::vector<std::thread> threads_;
+    std::atomic<bool> fail_work_;
+};
+
+/// Rust `write_batch_size` — how much of one `Write` call is handed to the
+/// block path at a time, rounded down to whole blocks and never zero.
+core::Expected<size_t, std::string> WriteBatchSize(size_t block_size) {
+    if (block_size == 0) return core::make_unexpected(std::string("block_size must be > 0"));
+    size_t blocks = kZFileCompactWriterBufferSize / block_size;
+    if (blocks < 1) blocks = 1;
+    if (blocks > SIZE_MAX / block_size) {
+        return core::make_unexpected(std::string("write batch size overflow"));
+    }
+    return blocks * block_size;
+}
+
+}  // namespace detail
+
+// ---------------------------------------------------------------------------
+// ZFileBuilder
+// ---------------------------------------------------------------------------
+
+class ZFileBuilder::Impl {
+ public:
+    Impl() : reserved_size(0), raw_data_size(0), moffset(0), finished(false) {}
+
+    core::Expected<core::Unit, std::string> WriteBuffer(const uint8_t* src, size_t len);
+    core::Expected<core::Unit, std::string> CommitCompressedBatch(
+        detail::CompressedSegment batch);
+    core::Expected<core::Unit, std::string> CompressAndCommit(const uint8_t* source, size_t len,
+                                                                 size_t block_size);
+    core::Expected<core::Unit, std::string> WriteFullBlocks(const uint8_t* source, size_t len);
+    core::Expected<size_t, std::string> Write(const uint8_t* buf, size_t len);
+    core::Expected<size_t, std::string> WriteWholeBlocks(const uint8_t* buf, size_t len);
+    core::Expected<core::Unit, std::string> Finish();
+
+    std::shared_ptr<VirtualFile> dest;
+    CompressArgs args;
+    CompressOptions opt;
+    std::shared_ptr<Compressor> compressor;
+    /// Rust's `Option<WorkerPool>`: absent means multi-block writes fall back
+    /// to the in-line compressor. Created only when `workers > 1`, and
+    /// released on a pool failure.
+    std::unique_ptr<detail::WorkerPool> pool;
+    std::vector<uint32_t> block_len;
+    std::vector<uint8_t> compressed_data;
+    std::vector<uint8_t> reserved_buf;
+    size_t reserved_size;
+    uint64_t raw_data_size;
+    uint64_t moffset;
+    HeaderTrailer ht;
+    bool finished;
+
+ private:
+    Impl(const Impl&);
+    Impl& operator=(const Impl&);
+};
+
+core::Expected<core::Unit, std::string> ZFileBuilder::Impl::WriteBuffer(const uint8_t* src,
+                                                                           size_t len) {
+    const core::Expected<size_t, std::string> compressed_len =
+        detail::CompressData(compressor.get(), src, len, &compressed_data[0],
+                             compressed_data.size(), opt.verify != 0);
+    if (!compressed_len.ok()) return core::make_unexpected(compressed_len.error());
+
+    const core::Expected<core::Unit, std::string> w = detail::WriteAllAtFile(
+        dest.get(), &compressed_data[0], compressed_len.value(), moffset);
+    if (!w.ok()) return core::make_unexpected(w.error());
+
+    if (compressed_len.value() > 0xFFFFFFFFu) {
+        return core::make_unexpected(
+            std::string("compressed_len cannot fit in u32 jump table entry"));
+    }
+    block_len.push_back(static_cast<uint32_t>(compressed_len.value()));
+    if (static_cast<uint64_t>(compressed_len.value()) > UINT64_MAX - moffset) {
+        return core::make_unexpected(std::string("moffset overflow"));
+    }
+    moffset += compressed_len.value();
+    return core::Unit();
+}
+
+core::Expected<core::Unit, std::string> ZFileBuilder::Impl::CommitCompressedBatch(
+    detail::CompressedSegment batch) {
+    // The declared lengths must account for every byte in the batch. A
+    // mismatch here would be written out as valid data with a jump table that
+    // disagrees with it, which no reader can detect.
+    size_t encoded_size = 0;
+    for (size_t i = 0; i < batch.block_lengths.size(); ++i) {
+        const uint32_t block_length = batch.block_lengths[i];
+        if (block_length == 0) {
+            return core::make_unexpected(std::string("compressed block length cannot be zero"));
+        }
+        if (static_cast<size_t>(block_length) > SIZE_MAX - encoded_size) {
+            return core::make_unexpected(std::string("compressed batch length overflow"));
+        }
+        encoded_size += block_length;
+    }
+    if (encoded_size != batch.bytes.size()) {
+        return core::make_unexpected(
+            std::string("compressed block lengths do not match batch size"));
+    }
+
+    if (static_cast<uint64_t>(batch.bytes.size()) > UINT64_MAX - moffset) {
+        return core::make_unexpected(std::string("moffset overflow"));
+    }
+    const uint64_t next_offset = moffset + batch.bytes.size();
+
+    // Rust takes one synchronous pwrite for large batches bound for a local
+    // file, bypassing io_uring's per-4 KiB submit/completion round trips. The
+    // branch is kept because the condition it tests still holds: the builder
+    // owns the destination exclusively and the bytes land in local page
+    // cache, so a single blocked syscall is the cheaper path. Non-local
+    // destinations take the ordinary write path.
+    LocalFile* local = NULL;
+    if (batch.bytes.size() > detail::kZFilePhysicalWriteChunkSize) {
+        local = dynamic_cast<LocalFile*>(dest.get());
+    }
+    if (local != NULL) {
+        const core::Expected<size_t, std::string> written =
+            local->WriteAtSyncPwrite(moffset, &batch.bytes[0], batch.bytes.size());
+        if (!written.ok()) return core::make_unexpected(written.error());
+        if (written.value() != batch.bytes.size()) {
+            return core::make_unexpected(std::string("short sync pwrite"));
+        }
+    } else if (!batch.bytes.empty()) {
+        const core::Expected<core::Unit, std::string> w = detail::WriteAllAtFile(
+            dest.get(), &batch.bytes[0], batch.bytes.size(), moffset);
+        if (!w.ok()) return core::make_unexpected(w.error());
+    }
+
+    block_len.insert(block_len.end(), batch.block_lengths.begin(), batch.block_lengths.end());
+    moffset = next_offset;
+    return core::Unit();
+}
+
+core::Expected<core::Unit, std::string> ZFileBuilder::Impl::CompressAndCommit(
+    const uint8_t* source, size_t len, size_t block_size) {
+    const core::Expected<size_t, std::string> max_block_size =
+        detail::MaxCompressedBlockSize(compressor.get(), opt.verify != 0);
+    if (!max_block_size.ok()) return core::make_unexpected(max_block_size.error());
+
+    core::Expected<detail::CompressedSegment, std::string> batch =
+        detail::CompressSegment(compressor.get(), source, len, block_size,
+                                max_block_size.value(), opt.verify != 0);
+    if (!batch.ok()) return core::make_unexpected(batch.error());
+    return CommitCompressedBatch(batch.take_value());
+}
+
+core::Expected<core::Unit, std::string> ZFileBuilder::Impl::WriteFullBlocks(
+    const uint8_t* source, size_t len) {
+    // Rust splits this into `write_full_blocks_borrowed` and
+    // `write_full_blocks_owned`; the owned one only ever *borrows* `source`
+    // (its fan-out copies each segment separately), so the sole difference is
+    // the `to_vec()` the borrowed one performs before delegating. A pointer
+    // and a length express "borrowed" here, which leaves the two bodies
+    // identical — so there is one, rather than a second copy that is
+    // permanently equivalent to the first.
+    const size_t block_size = static_cast<size_t>(opt.block_size);
+    if (block_size == 0) return core::make_unexpected(std::string("block_size must be > 0"));
+    if (len % block_size != 0) {
+        return core::make_unexpected(std::string("source must contain a whole number of blocks"));
+    }
+    if (len == 0) return core::Unit();
+
+    const size_t block_count = len / block_size;
+    if (args.workers <= 1 || block_count == 1 || !pool) {
+        return CompressAndCommit(source, len, block_size);
+    }
+
+    // Persistent-pool fan-out: split into per-worker segments, submit them
+    // all, then collect every result before committing in `seq` order.
+    const size_t worker_count = pool->WorkerCount();
+    const size_t workers = worker_count < block_count ? worker_count : block_count;
+    const size_t segment_blocks = (block_count + workers - 1) / workers;
+
+    std::map<size_t, detail::CompressedSegment> segments;
+    size_t pending = 0;
+    bool have_error = false;
+    std::string first_error;
+
+    for (size_t begin_block = 0; begin_block < block_count; begin_block += segment_blocks) {
+        size_t end_block = begin_block + segment_blocks;
+        if (end_block > block_count) end_block = block_count;
+        detail::WorkItem item;
+        item.seq = pending;
+        item.source.assign(source + begin_block * block_size, source + end_block * block_size);
+        if (!pool->Submit(std::move(item))) {
+            have_error = true;
+            first_error = "zfile worker pool is shut down";
+            break;
+        }
+        ++pending;
+    }
+
+    // Drain exactly the submitted results, even after an error, so the pool
+    // stays clean for the next round. A failed `Recv` means every worker is
+    // gone, in which case no further result can arrive and the drain stops.
+    while (pending > 0) {
+        --pending;
+        detail::CompressedBatch batch;
+        if (!pool->Recv(&batch)) {
+            if (!have_error) {
+                have_error = true;
+                first_error = "zfile worker pool result channel closed";
+            }
+            break;
+        }
+        if (batch.ok) {
+            segments[batch.seq] = std::move(batch.segment);
+        } else if (!have_error) {
+            have_error = true;
+            first_error = batch.error;
+        }
+    }
+
+    if (have_error) {
+        // Nothing was committed. Drop the pool so a later write falls back to
+        // the in-line compressor rather than risking stale results from a
+        // half-drained queue.
+        pool.reset();
+        return core::make_unexpected(first_error);
+    }
+
+    for (std::map<size_t, detail::CompressedSegment>::iterator it = segments.begin();
+         it != segments.end(); ++it) {
+        const core::Expected<core::Unit, std::string> c =
+            CommitCompressedBatch(std::move(it->second));
+        if (!c.ok()) return core::make_unexpected(c.error());
+    }
+    return core::Unit();
+}
+
+core::Expected<size_t, std::string> ZFileBuilder::Impl::Write(const uint8_t* buf, size_t len) {
+    if (finished) return core::make_unexpected(std::string("builder already closed"));
+    if (static_cast<uint64_t>(len) > UINT64_MAX - raw_data_size) {
+        return core::make_unexpected(std::string("raw_data_size overflow"));
+    }
+    const uint64_t next_raw_data_size = raw_data_size + len;
+
+    const size_t expected = len;
+    const size_t block_size = static_cast<size_t>(opt.block_size);
+    if (block_size == 0) return core::make_unexpected(std::string("block_size must be > 0"));
+    const core::Expected<size_t, std::string> batch_size = detail::WriteBatchSize(block_size);
+    if (!batch_size.ok()) return core::make_unexpected(batch_size.error());
+
+    if (reserved_size != 0) {
+        const size_t needed = block_size - reserved_size;
+        if (len < needed) {
+            // Still short of a block: hold it and report the bytes as taken.
+            // `Finish` is what eventually flushes a tail this short.
+            if (len != 0) std::memcpy(&reserved_buf[reserved_size], buf, len);
+            reserved_size += len;
+            raw_data_size = next_raw_data_size;
+            return expected;
+        }
+
+        std::memcpy(&reserved_buf[reserved_size], buf, needed);
+        // Copied out before the block path runs, as upstream does: that path
+        // can hand the buffer to the worker pool, and `reserved_buf` is the
+        // builder's own scratch, reused by the next call.
+        std::vector<uint8_t> completed_block(reserved_buf.begin(),
+                                             reserved_buf.begin() + block_size);
+        const core::Expected<core::Unit, std::string> w =
+            WriteFullBlocks(&completed_block[0], block_size);
+        if (!w.ok()) return core::make_unexpected(w.error());
+        reserved_size = 0;
+        buf += needed;
+        len -= needed;
+    }
+
+    while (len >= block_size) {
+        const size_t full_bytes = (len / block_size) * block_size;
+        const size_t batch_bytes =
+            full_bytes < batch_size.value() ? full_bytes : batch_size.value();
+        const core::Expected<core::Unit, std::string> w = WriteFullBlocks(buf, batch_bytes);
+        if (!w.ok()) return core::make_unexpected(w.error());
+        buf += batch_bytes;
+        len -= batch_bytes;
+    }
+
+    if (len != 0) {
+        std::memcpy(&reserved_buf[0], buf, len);
+        reserved_size = len;
+    }
+
+    raw_data_size = next_raw_data_size;
+    return expected;
+}
+
+core::Expected<size_t, std::string> ZFileBuilder::Impl::WriteWholeBlocks(const uint8_t* buf,
+                                                                           size_t len) {
+    if (finished) return core::make_unexpected(std::string("builder already closed"));
+    const size_t block_size = static_cast<size_t>(opt.block_size);
+    if (block_size == 0) return core::make_unexpected(std::string("block_size must be > 0"));
+
+    // A pending tail or a partial block cannot take the whole-block path:
+    // the tail has to be completed in order first.
+    if (reserved_size != 0 || len % block_size != 0) return Write(buf, len);
+
+    if (static_cast<uint64_t>(len) > UINT64_MAX - raw_data_size) {
+        return core::make_unexpected(std::string("raw_data_size overflow"));
+    }
+    const uint64_t next_raw_data_size = raw_data_size + len;
+
+    const core::Expected<core::Unit, std::string> w = WriteFullBlocks(buf, len);
+    if (!w.ok()) return core::make_unexpected(w.error());
+
+    raw_data_size = next_raw_data_size;
+    return len;
+}
+
+core::Expected<core::Unit, std::string> ZFileBuilder::Impl::Finish() {
+    if (finished) return core::Unit();
+
+    if (reserved_size != 0) {
+        // The final block is short, and goes through the single-block path:
+        // `WriteFullBlocks` would reject it for not being a whole block.
+        std::vector<uint8_t> chunk(reserved_buf.begin(), reserved_buf.begin() + reserved_size);
+        const core::Expected<core::Unit, std::string> w = WriteBuffer(&chunk[0], chunk.size());
+        if (!w.ok()) return core::make_unexpected(w.error());
+        reserved_size = 0;
+    }
+
+    const uint64_t index_offset = moffset;
+    const uint64_t index_size = static_cast<uint64_t>(block_len.size());
+    std::vector<uint8_t> index_raw(block_len.size() * sizeof(uint32_t), 0);
+    for (size_t i = 0; i < block_len.size(); ++i) {
+        WriteU32Le(index_raw.data(), i * sizeof(uint32_t), block_len[i]);
+    }
+
+    const core::Expected<core::Unit, std::string> iw =
+        detail::WriteAllAtFile(dest.get(), index_raw.data(), index_raw.size(), index_offset);
+    if (!iw.ok()) return core::make_unexpected(iw.error());
+
+    ht.index_crc = Crc32c(index_raw.data(), index_raw.size());
+    ht.index_offset = index_offset;
+    ht.index_size = index_size;
+    ht.original_file_size = raw_data_size;
+
+    if (static_cast<uint64_t>(index_raw.size()) > UINT64_MAX - index_offset) {
+        return core::make_unexpected(std::string("trailer offset overflow"));
+    }
+    const uint64_t trailer_offset = index_offset + index_raw.size();
+    const core::Expected<core::Unit, std::string> tw = detail::WriteHeaderTrailer(
+        dest.get(), false, true, true, false, &ht, trailer_offset);
+    if (!tw.ok()) return core::make_unexpected(tw.error());
+
+    if (args.overwrite_header) {
+        // Rewrites the header now that the index is known, flagged so a
+        // reader can tell it apart from the placeholder written at Create.
+        const core::Expected<core::Unit, std::string> hw =
+            detail::WriteHeaderTrailer(dest.get(), true, false, true, true, &ht, 0);
+        if (!hw.ok()) return core::make_unexpected(hw.error());
+    }
+
+    finished = true;
+    return core::Unit();
+}
+
+core::Expected<ZFileBuilder, std::string> ZFileBuilder::Create(std::shared_ptr<VirtualFile> file,
+                                                                  const CompressArgs& args) {
+    if (!file) return core::make_unexpected(std::string("zfile builder: null destination"));
+
+    std::unique_ptr<Impl> impl(new Impl);
+    impl->dest = file;
+    impl->args = args;
+    impl->opt = args.opt;
+    impl->ht.SetCompressOption(args.opt);
+
+    // The header goes down before anything is validated, as upstream does it,
+    // so the destination is an (unindexed) zfile from here on: a crash leaves
+    // a file the reader refuses rather than one it mistakes for raw data.
+    const core::Expected<core::Unit, std::string> header =
+        detail::WriteHeaderTrailer(file.get(), true, false, true, false, &impl->ht, 0);
+    if (!header.ok()) return core::make_unexpected(header.error());
+
+    const size_t block_size = static_cast<size_t>(args.opt.block_size);
+    if (block_size == 0) return core::make_unexpected(std::string("block_size must be > 0"));
+    if (block_size > SIZE_MAX - detail::kBufSize) {
+        return core::make_unexpected(std::string("buffer size overflow"));
+    }
+    const size_t buf_size = block_size + detail::kBufSize;
+
+    const core::Expected<std::shared_ptr<Compressor>, std::string> compressor =
+        CreateCompressor(args);
+    if (!compressor.ok()) return core::make_unexpected(compressor.error());
+    impl->compressor = compressor.value();
+
+    if (args.workers > 1) {
+        const bool gen_crc = args.opt.verify != 0;
+        const core::Expected<size_t, std::string> max_cbs =
+            detail::MaxCompressedBlockSize(impl->compressor.get(), gen_crc);
+        if (!max_cbs.ok()) return core::make_unexpected(max_cbs.error());
+        impl->pool.reset(new detail::WorkerPool(args.workers, args.opt, gen_crc, block_size,
+                                                max_cbs.value()));
+    }
+
+    impl->compressed_data.assign(buf_size, 0);
+    impl->reserved_buf.assign(buf_size, 0);
+    impl->moffset =
+        static_cast<uint64_t>(kHeaderTrailerSpace) + static_cast<uint64_t>(args.opt.dict_size);
+
+    return ZFileBuilder(impl.release());
+}
+
+ZFileBuilder& ZFileBuilder::operator=(ZFileBuilder&& other) {
+    if (this != &other) {
+        delete impl_;
+        impl_ = other.impl_;
+        other.impl_ = NULL;
+    }
+    return *this;
+}
+
+ZFileBuilder::~ZFileBuilder() { delete impl_; }
+
+namespace {
+
+const char* kMovedFromBuilder = "zfile builder was moved from";
+
+}  // namespace
+
+core::Expected<size_t, std::string> ZFileBuilder::Write(const uint8_t* buf, size_t len) {
+    if (impl_ == NULL) return core::make_unexpected(std::string(kMovedFromBuilder));
+    return impl_->Write(buf, len);
+}
+
+core::Expected<size_t, std::string> ZFileBuilder::WriteWholeBlocks(const uint8_t* buf,
+                                                                      size_t len) {
+    if (impl_ == NULL) return core::make_unexpected(std::string(kMovedFromBuilder));
+    return impl_->WriteWholeBlocks(buf, len);
+}
+
+core::Expected<core::Unit, std::string> ZFileBuilder::Finish() {
+    if (impl_ == NULL) return core::make_unexpected(std::string(kMovedFromBuilder));
+    return impl_->Finish();
+}
+
+core::Expected<std::shared_ptr<VirtualFile>, std::string> ZFileBuilder::Close() {
+    if (impl_ == NULL) return core::make_unexpected(std::string(kMovedFromBuilder));
+    const core::Expected<core::Unit, std::string> f = impl_->Finish();
+    if (!f.ok()) return core::make_unexpected(f.error());
+    // Rust's `close(mut self)` consumes the builder; this one cannot, since
+    // the caller holds it by value. `Finish` is idempotent, so a `Close`
+    // followed by the destructor is well defined either way.
+    return impl_->dest;
+}
+
+void ZFileBuilder::InjectWorkerFailureForTest() {
+    if (impl_ != NULL && impl_->pool) impl_->pool->InjectFailure();
+}
+
+core::Expected<ZFileBuilder, std::string> NewZFileBuilder(std::shared_ptr<VirtualFile> file,
+                                                             const CompressArgs& args) {
+    return ZFileBuilder::Create(file, args);
+}
+
+// ---------------------------------------------------------------------------
+// ZFileCompactWriter
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const char* kWriterFinalized = "zfile compact writer already finalized";
+const char* kWriterPoisoned = "zfile compact writer failed after previous write error";
+const char* kWriterOffsetOverflow = "zfile compact writer logical offset overflow";
+
+std::string WrongOffset(uint64_t got, uint64_t want) {
+    std::ostringstream o;
+    o << "zfile compact writer received offset " << got << ", expected " << want;
+    return o.str();
+}
+
+}  // namespace
+
+core::Expected<std::shared_ptr<ZFileCompactWriter>, std::string> ZFileCompactWriter::Create(
+    std::shared_ptr<VirtualFile> destination, const CompressArgs& args) {
+    core::Expected<ZFileBuilder, std::string> builder =
+        ZFileBuilder::Create(destination, args);
+    if (!builder.ok()) return core::make_unexpected(builder.error());
+    return std::shared_ptr<ZFileCompactWriter>(
+        new ZFileCompactWriter(builder.take_value()));
+}
+
+core::Expected<util::CompactBuffer, std::string> ZFileCompactWriter::AllocBuffer() {
+    return util::CompactBuffer(kZFileCompactWriterBufferSize, 0);
+}
+
+core::Expected<core::Unit, std::string> ZFileCompactWriter::WriteSliceAt(const uint8_t* data,
+                                                                           size_t len,
+                                                                           uint64_t offset) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (finalized_) return core::make_unexpected(std::string(kWriterFinalized));
+    if (failed_) return core::make_unexpected(std::string(kWriterPoisoned));
+    if (offset != next_offset_) {
+        return core::make_unexpected(WrongOffset(offset, next_offset_));
+    }
+    if (static_cast<uint64_t>(len) > UINT64_MAX - offset) {
+        return core::make_unexpected(std::string(kWriterOffsetOverflow));
+    }
+    const uint64_t next_offset = offset + len;
+
+    // Poisoned before the call and cleared only after success, so a failure
+    // part-way through a block cannot leave the writer looking usable.
+    failed_ = true;
+    const core::Expected<size_t, std::string> written = builder_.Write(data, len);
+    if (!written.ok()) return core::make_unexpected(written.error());
+    if (written.value() != len) {
+        return core::make_unexpected(std::string("zfile builder performed a short write"));
+    }
+    next_offset_ = next_offset;
+    failed_ = false;
+    return core::Unit();
+}
+
+core::Expected<core::Unit, std::string> ZFileCompactWriter::Write(const util::CompactBuffer& buf,
+                                                                     uint64_t offset,
+                                                                     size_t len) {
+    // Rust's `ensure!(len <= buffer.len())` lives in `write_owned`; it has to
+    // be here instead, because the whole-block entry point takes a pointer
+    // and cannot see the buffer's length.
+    if (len > buf.size()) return core::make_unexpected(std::string("write length exceeds buffer"));
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (finalized_) return core::make_unexpected(std::string(kWriterFinalized));
+    if (failed_) return core::make_unexpected(std::string(kWriterPoisoned));
+    if (offset != next_offset_) {
+        return core::make_unexpected(WrongOffset(offset, next_offset_));
+    }
+    if (static_cast<uint64_t>(len) > UINT64_MAX - offset) {
+        return core::make_unexpected(std::string(kWriterOffsetOverflow));
+    }
+    const uint64_t next_offset = offset + len;
+
+    failed_ = true;
+    const core::Expected<size_t, std::string> written =
+        builder_.WriteWholeBlocks(len == 0 ? NULL : &buf[0], len);
+    if (!written.ok()) return core::make_unexpected(written.error());
+    if (written.value() != len) {
+        return core::make_unexpected(std::string("zfile builder performed a short write"));
+    }
+    next_offset_ = next_offset;
+    failed_ = false;
+    return core::Unit();
+}
+
+core::Expected<core::Unit, std::string> ZFileCompactWriter::WriteAllAt(const uint8_t* data,
+                                                                         size_t len,
+                                                                         uint64_t offset) {
+    // An empty write still goes through the checked path rather than
+    // returning early: the offset assertion is the point, so a caller that
+    // skips ahead with a zero-length write is told, not accommodated.
+    if (len == 0) return WriteSliceAt(data, 0, offset);
+
+    uint64_t at = offset;
+    size_t done = 0;
+    while (done < len) {
+        const size_t remain = len - done;
+        const size_t chunk =
+            remain < kZFileCompactWriterBufferSize ? remain : kZFileCompactWriterBufferSize;
+        const core::Expected<core::Unit, std::string> w = WriteSliceAt(data + done, chunk, at);
+        if (!w.ok()) return core::make_unexpected(w.error());
+        if (static_cast<uint64_t>(chunk) > UINT64_MAX - at) {
+            return core::make_unexpected(std::string(kWriterOffsetOverflow));
+        }
+        at += chunk;
+        done += chunk;
+    }
+    return core::Unit();
+}
+
+core::Expected<core::Unit, std::string> ZFileCompactWriter::Finalize() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (finalized_) return core::Unit();
+    if (failed_) return core::make_unexpected(std::string(kWriterPoisoned));
+    failed_ = true;
+    const core::Expected<core::Unit, std::string> f = builder_.Finish();
+    if (!f.ok()) return core::make_unexpected(f.error());
+    finalized_ = true;
+    failed_ = false;
+    return core::Unit();
+}
+
+// ---------------------------------------------------------------------------
+// ZFileCompress
+// ---------------------------------------------------------------------------
+
+core::Expected<core::Unit, std::string> ZFileCompress(std::shared_ptr<VirtualFile> src,
+                                                         std::shared_ptr<VirtualFile> dst,
+                                                         const CompressArgs& args) {
+    if (!src || !dst) return core::make_unexpected(std::string("zfile compress: null file"));
+
+    const CompressOptions opt = args.opt;
+    const core::Expected<std::shared_ptr<Compressor>, std::string> compressor_handle =
+        CreateCompressor(args);
+    if (!compressor_handle.ok()) return core::make_unexpected(compressor_handle.error());
+    Compressor* compressor = compressor_handle.value().get();
+
+    HeaderTrailer ht;
+    ht.SetCompressOption(opt);
+    const core::Expected<core::Unit, std::string> header =
+        detail::WriteHeaderTrailer(dst.get(), true, false, true, false, &ht, 0);
+    if (!header.ok()) return core::make_unexpected(header.error());
+
+    const size_t block_size = static_cast<size_t>(opt.block_size);
+    if (block_size == 0) return core::make_unexpected(std::string("block_size must be > 0"));
+    if (block_size > SIZE_MAX - detail::kBufSize) {
+        return core::make_unexpected(std::string("buffer size overflow"));
+    }
+    const size_t buf_size = block_size + detail::kBufSize;
+
+    size_t nbatch = compressor->Nbatch();
+    if (nbatch < 1) nbatch = 1;
+
+    std::vector<uint32_t> block_len;
+    uint64_t moffset =
+        static_cast<uint64_t>(kHeaderTrailerSpace) + static_cast<uint64_t>(opt.dict_size);
+    uint64_t infile_size = 0;
+
+    const core::Expected<uint64_t, std::string> src_size = src->Size();
+    if (!src_size.ok()) return core::make_unexpected(src_size.error());
+    uint64_t src_offset = 0;
+
+    std::vector<uint8_t> raw_data(block_size * nbatch, 0);
+    std::vector<uint8_t> compressed_data(buf_size * nbatch, 0);
+
+    while (src_offset < src_size.value()) {
+        const uint64_t remain64 = src_size.value() - src_offset;
+        const size_t to_read = remain64 < static_cast<uint64_t>(raw_data.size())
+                                   ? static_cast<size_t>(remain64)
+                                   : raw_data.size();
+        size_t readn = 0;
+        while (readn < to_read) {
+            const core::Expected<ByteBuffer, std::string> chunk =
+                src->ReadAt(src_offset + readn, to_read - readn);
+            if (!chunk.ok()) return core::make_unexpected(chunk.error());
+            if (chunk.value().empty()) break;
+            std::memcpy(&raw_data[readn], &chunk.value()[0], chunk.value().size());
+            readn += chunk.value().size();
+        }
+        // A source that reports a size but stops delivering is not an error
+        // here: the trailer records what was actually read.
+        if (readn == 0) break;
+        src_offset += readn;
+        infile_size += readn;
+
+        std::vector<size_t> raw_chunk_len;
+        size_t remain = readn;
+        while (remain > 0) {
+            const size_t chunk = remain < block_size ? remain : block_size;
+            raw_chunk_len.push_back(chunk);
+            remain -= chunk;
+        }
+        const size_t n = raw_chunk_len.size();
+
+        std::vector<size_t> compressed_len(n, 0);
+        const core::Expected<core::Unit, std::string> batched =
+            compressor->CompressBatch(&raw_data[0], readn, raw_chunk_len, &compressed_data[0],
+                                      n * buf_size, &compressed_len, n);
+        if (!batched.ok()) return core::make_unexpected(batched.error());
+
+        for (size_t j = 0; j < n; ++j) {
+            const size_t compressed = compressed_len[j];
+            const size_t begin = j * buf_size;
+            const core::Expected<core::Unit, std::string> w = detail::WriteAllAtFile(
+                dst.get(), &compressed_data[begin], compressed, moffset);
+            if (!w.ok()) return core::make_unexpected(w.error());
+            size_t written = compressed;
+
+            if (opt.verify != 0) {
+                // Written as a separate call at the block's end rather than
+                // into the batch buffer: the slots are strided, so the CRC
+                // would land in the next block's slot, not after this one.
+                const uint32_t crc = Crc32cSalt(&compressed_data[begin], compressed);
+                uint8_t crc_bytes[4];
+                WriteU32Le(crc_bytes, 0, crc);
+                if (static_cast<uint64_t>(written) > UINT64_MAX - moffset) {
+                    return core::make_unexpected(std::string("crc offset overflow"));
+                }
+                const core::Expected<core::Unit, std::string> cw = detail::WriteAllAtFile(
+                    dst.get(), crc_bytes, sizeof(crc_bytes), moffset + written);
+                if (!cw.ok()) return core::make_unexpected(cw.error());
+                written += sizeof(uint32_t);
+            }
+
+            if (written > 0xFFFFFFFFu) {
+                return core::make_unexpected(
+                    std::string("compressed length cannot fit in u32"));
+            }
+            block_len.push_back(static_cast<uint32_t>(written));
+            if (static_cast<uint64_t>(written) > UINT64_MAX - moffset) {
+                return core::make_unexpected(std::string("moffset overflow"));
+            }
+            moffset += written;
+        }
+    }
+
+    const uint64_t index_offset = moffset;
+    const uint64_t index_size = static_cast<uint64_t>(block_len.size());
+    std::vector<uint8_t> index_raw(block_len.size() * sizeof(uint32_t), 0);
+    for (size_t i = 0; i < block_len.size(); ++i) {
+        WriteU32Le(index_raw.data(), i * sizeof(uint32_t), block_len[i]);
+    }
+
+    const core::Expected<core::Unit, std::string> iw =
+        detail::WriteAllAtFile(dst.get(), index_raw.data(), index_raw.size(), index_offset);
+    if (!iw.ok()) return core::make_unexpected(iw.error());
+
+    ht.index_crc = Crc32c(index_raw.data(), index_raw.size());
+    ht.index_offset = index_offset;
+    ht.index_size = index_size;
+    ht.original_file_size = infile_size;
+
+    if (static_cast<uint64_t>(index_raw.size()) > UINT64_MAX - index_offset) {
+        return core::make_unexpected(std::string("trailer offset overflow"));
+    }
+    const uint64_t trailer_offset = index_offset + index_raw.size();
+    const core::Expected<core::Unit, std::string> tw =
+        detail::WriteHeaderTrailer(dst.get(), false, true, true, false, &ht, trailer_offset);
+    if (!tw.ok()) return core::make_unexpected(tw.error());
+
+    if (args.overwrite_header) {
+        const core::Expected<core::Unit, std::string> hw =
+            detail::WriteHeaderTrailer(dst.get(), true, false, true, true, &ht, 0);
+        if (!hw.ok()) return core::make_unexpected(hw.error());
+    }
+
+    return core::Unit();
 }
 
 core::Expected<core::Unit, std::string> ZFileDecompress(std::shared_ptr<VirtualFile> src,

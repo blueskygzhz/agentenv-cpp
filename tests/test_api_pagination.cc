@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Rust: src/api/impls/pagination.rs, src/snapshot/types/version.rs and
-// src/snapshot/repository/backends/common/acr/manifest.rs test modules, plus
+// src/snapshot/image_export/acr/manifest.rs test modules, plus
 // the `core::base64` / `core::time` primitives this port had to add.
 #include <string>
 #include <vector>

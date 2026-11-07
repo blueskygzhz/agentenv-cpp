@@ -7,6 +7,10 @@ add_library(agentenv-overlaybd STATIC
     config.cc
     lsmt.cc
     zfile.cc
+    # The joint between `lsmt::CompactSink` (what `CompactTo` writes through)
+    # and `util::CompactWriter` (what the zfile compressor implements). Rust
+    # needs no counterpart: its `compact_to` takes the trait directly.
+    compact_writer_sink.cc
     layer.cc
     prefetch.cc
     download_gate.cc

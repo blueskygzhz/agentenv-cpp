@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Rust: src/snapshot/repository/backends/common/acr/manifest.rs
+// Rust: src/snapshot/image_export/acr/manifest.rs
 //
 // Builds the OCI descriptors, config blob and image manifest that a snapshot
 // is published as. The config bytes are canonicalised before hashing, because

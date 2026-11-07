@@ -205,6 +205,16 @@ class LsmtReadOnlyFile : public VirtualFile {
     /// when the bytes have to be durable.
     core::Expected<core::Unit, std::string> Flatten(std::shared_ptr<VirtualFile> dest);
 
+    /// The same operation against an arbitrary sink, for the same reason
+    /// `CommitPreservingMetadataTo` exists: a destination that is not a file
+    /// (the zfile compressor, a hash-only stream) cannot be expressed as a
+    /// `VirtualFile`. `Flatten` is a thin wrapper over this.
+    ///
+    /// Note for a sequential-only sink: the writes this issues are
+    /// contiguous and in increasing offset order, so one is safe here. See
+    /// `CompactWriterSink`, which is what relies on that.
+    core::Expected<core::Unit, std::string> FlattenTo(lsmt::CompactSink* sink);
+
     /// Rust `commit_preserving_metadata` — rewrite a sealed layer into
     /// `args.writer`, carrying its stamped identity across.
     ///
