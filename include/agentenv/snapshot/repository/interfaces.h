@@ -28,6 +28,8 @@
 
 #include <cstddef>
 
+// `cfg::SnapshotPublishCompressionConfig`, carried by `PublishPolicy`.
+#include "agentenv/cfg.h"
 #include "agentenv/core/identity.h"
 #include "agentenv/core/optional.h"
 #include "agentenv/snapshot/layers.h"
@@ -81,6 +83,37 @@ struct SnapshotListFilter {
     static SnapshotListFilter ByIds(const std::vector<core::SnapshotId>& ids);
     /// Rust: does this record satisfy the filter?
     bool Matches(const SnapshotRecord& r) const;
+};
+
+/// Rust `PublishPolicy` — how snapshots and volumes are published into one
+/// repository.
+///
+/// **Only `compression` is ported.** Rust also carries `image_storage`
+/// (`SnapshotImageStoragePolicy`), whose single consumer is the branch in
+/// `store_snapshot` that builds an `AcrDiskImageExporter` for the
+/// `SourceRegistry` case. That exporter's publish half does not exist here
+/// (see the note on `StoredSnapshot::disk_publications` in `store.h`), so the
+/// field would be read by nothing. Carrying it anyway would be worse than
+/// omitting it: a dead field that *looks* like a supported switch invites a
+/// caller to set `SourceRegistry` and silently get object storage. When the
+/// ACR publish half lands, this is where the field goes back.
+struct PublishPolicy {
+    /// Recontainerizes raw local layers as zfile before they are stored.
+    cfg::SnapshotPublishCompressionConfig compression;
+
+    /// Rust `impl Default for PublishPolicy` — raw layers.
+    ///
+    /// **`enabled` is forced off here, and that is not a copy of the config
+    /// default.** `cfg::SnapshotPublishCompressionConfig` defaults `enabled`
+    /// to `true`, because that is the TOML default an operator gets when the
+    /// `[snapshot.publish_compression]` table is absent. Rust's
+    /// `PublishPolicy::default()` deliberately overrides it to `false`
+    /// (`interfaces.rs:20-31`), so a backend that does not implement the
+    /// policy stores layers raw rather than inheriting an operator default it
+    /// never consulted. Defaulting the member instead would turn every such
+    /// backend -- posix-fs and in-memory, i.e. every production repository in
+    /// this tree today -- from passthrough into lz4 compression.
+    PublishPolicy() { compression.enabled = false; }
 };
 
 /// Rust trait `SnapshotRepository`, which has since become `Repository`.
@@ -160,6 +193,19 @@ class SnapshotRepository {
     // `unsupported("blob storage")`, `None` for the URL) -----------------------
     //
     // Rust's `staging_file` is not ported; nothing in this tree calls it.
+
+    /// Rust `publish_policy` — how layers are published into this repository.
+    ///
+    /// Named `GetPublishPolicy` rather than `PublishPolicy` only because a
+    /// member function may not share its name with the type it returns.
+    ///
+    /// A virtual with a default body, exactly as upstream: Rust declares it
+    /// on the trait returning `PublishPolicy::default()`, and only the OSS
+    /// backend overrides it. The default is the reason an operator's
+    /// `[snapshot.publish_compression]` switch has no effect on a posix-fs
+    /// repository -- upstream behaves identically, because the switch is read
+    /// where the OSS backend is constructed, not where layers are stored.
+    virtual PublishPolicy GetPublishPolicy() const;
 
     /// Rust `managed_layers_repo_blob_url` — set when readers address managed
     /// layers by URL.

@@ -31,10 +31,11 @@ namespace snapshot {
 /// is hashed; a sparse layer is dense-exported first). Lowers that only carry
 /// a `repoBlobUrl` stay external references.
 ///
-/// Port gap: Rust picks the upload format from the repository's
-/// `publish_policy().compression`. The C++ repository has no publish policy,
-/// so layers are always stored as Rust's `OverlaybdCompactOutput::Raw` stores
-/// them — passed through unchanged.
+/// The upload format comes from the repository's
+/// `GetPublishPolicy().compression`, as it does upstream. A backend that does
+/// not override the policy stores layers raw -- which is every backend except
+/// OSS, here and in Rust alike, because that is the one the operator's
+/// `[snapshot.publish_compression]` switch is wired to.
 repository::RepositoryResult<std::vector<OverlaybdLayerRef> > StoreVolumeLayers(
     repository::SnapshotRepository& repository, const std::string& image_config_path);
 

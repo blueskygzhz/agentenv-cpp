@@ -145,7 +145,8 @@ InMemorySnapshotRepository::MarkBuildError(const core::SnapshotId& id,
 // take those is not a factory for this backend.
 
 RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeOssRepository(
-    const cfg::OssBackendConfig& config) {
+    const cfg::OssBackendConfig& config,
+    const cfg::SnapshotPublishCompressionConfig& publish_compression) {
     // Rust `OssRepository::from_config`: normalise, then connect. Validation
     // first, so an incomplete section is reported as itself rather than as a
     // 403 on the first signed request.
@@ -164,8 +165,13 @@ RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeOssRepository(
         oss::MakeOssBackendUploader(normalized.value());
     if (!uploader.ok()) return core::make_unexpected(uploader.error());
 
+    // Rust `OssRepository::new`: the policy is captured here, so it cannot
+    // change under a publish already in flight.
+    PublishPolicy policy;
+    policy.compression = publish_compression;
+
     return std::shared_ptr<SnapshotRepository>(
-        new oss::OssSnapshotRepository(owned, uploader.value()));
+        new oss::OssSnapshotRepository(owned, uploader.value(), policy));
 }
 
 }  // namespace repository

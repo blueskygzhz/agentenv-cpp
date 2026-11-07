@@ -123,6 +123,13 @@ SnapshotRepository::ReadDocuments(DocumentCollection) {
     return core::make_unexpected(RepositoryError::Unsupported("repository documents"));
 }
 
+PublishPolicy SnapshotRepository::GetPublishPolicy() const {
+    // Rust `PublishPolicy::default()`. The default constructor is what forces
+    // `enabled` off -- see the comment on the struct, which explains why that
+    // is not the same as the config default.
+    return PublishPolicy();
+}
+
 core::Optional<std::string> SnapshotRepository::ManagedLayersRepoBlobUrl() const {
     return core::Optional<std::string>();
 }

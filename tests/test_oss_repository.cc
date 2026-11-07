@@ -540,17 +540,26 @@ MT_TEST(delete_proceeds_for_a_published_disk_image) {
 
 // Validation precedes connection, so an incomplete section is reported as
 // itself rather than as a 403 on the first signed request.
+/// The compression config the factory takes. Passthrough, so a test that does
+/// not care about the policy cannot accidentally depend on compression being
+/// on -- the config struct's *own* default has `enabled = true`.
+cfg::SnapshotPublishCompressionConfig NoCompression() {
+    cfg::SnapshotPublishCompressionConfig config;
+    config.enabled = false;
+    return config;
+}
+
 MT_TEST(the_factory_refuses_an_incomplete_backend_section) {
     cfg::OssBackendConfig blank;
     const RepositoryResult<std::shared_ptr<SnapshotRepository> > made =
-        MakeOssRepository(blank);
+        MakeOssRepository(blank, NoCompression());
     MT_EXPECT_TRUE(!made.ok());
     MT_EXPECT_TRUE(!made.ok() && made.error().kind == RepositoryErrorKind::InvalidRequest);
 
     cfg::OssBackendConfig process = GoodConfig();
     process.credential_process = core::Optional<std::string>("/usr/bin/aliyun-cred");
     const RepositoryResult<std::shared_ptr<SnapshotRepository> > refused =
-        MakeOssRepository(process);
+        MakeOssRepository(process, NoCompression());
     MT_EXPECT_TRUE(!refused.ok() && refused.error().kind == RepositoryErrorKind::Unsupported);
 }
 
@@ -559,7 +568,7 @@ MT_TEST(the_factory_refuses_an_incomplete_backend_section) {
 // correctly refuses to build something that could never send a request.
 MT_TEST(the_factory_builds_a_repository_from_a_complete_section) {
     const RepositoryResult<std::shared_ptr<SnapshotRepository> > made =
-        MakeOssRepository(GoodConfig());
+        MakeOssRepository(GoodConfig(), NoCompression());
     if (!shttp::Available()) {
         MT_EXPECT_TRUE(!made.ok() && made.error().kind == RepositoryErrorKind::Unsupported);
         return;
@@ -569,6 +578,52 @@ MT_TEST(the_factory_builds_a_repository_from_a_complete_section) {
     MT_EXPECT_TRUE(made.ok() && *made.value()->ManagedLayersRepoBlobUrl() ==
                                     "s3://agentenv/managed-layers");
     // Built but not used: every operation past construction needs the bucket.
+}
+
+// ---- the publish policy --------------------------------------------------
+
+/// The operator's compression switch reaches the repository's policy.
+///
+/// This is the whole point of the OSS override: the switch is read where the
+/// backend is constructed, and `store.cc` asks the repository rather than the
+/// config. All three fields are checked, because carrying `enabled` across
+/// while dropping the algorithm would publish lz4 where zstd was configured.
+MT_TEST(the_factory_carries_the_compression_switch_into_the_publish_policy) {
+    cfg::SnapshotPublishCompressionConfig configured;
+    configured.enabled = true;
+    configured.algorithm = cfg::OverlaybdCompressionAlgorithm::Zstd;
+    configured.workers = 3;
+
+    const RepositoryResult<std::shared_ptr<SnapshotRepository> > made =
+        MakeOssRepository(GoodConfig(), configured);
+    if (!shttp::Available()) {
+        MT_EXPECT_TRUE(!made.ok());
+        return;
+    }
+    MT_EXPECT_TRUE(made.ok());
+    if (!made.ok()) return;
+
+    const PublishPolicy policy = made.value()->GetPublishPolicy();
+    MT_EXPECT_TRUE(policy.compression.enabled);
+    MT_EXPECT_TRUE(policy.compression.algorithm == cfg::OverlaybdCompressionAlgorithm::Zstd);
+    MT_EXPECT_TRUE(policy.compression.workers == 3);
+}
+
+/// A repository that does not override the policy publishes raw.
+///
+/// Asserted against the base class' default body, which is what every backend
+/// but OSS inherits. The value under test is `enabled == false`, and it is
+/// *not* the config struct's default -- that one is `true`. Getting this
+/// wrong would turn every posix-fs and in-memory publish into lz4
+/// compression, so the distinction is pinned here rather than left to the
+/// comment that explains it.
+MT_TEST(a_backend_without_a_policy_override_publishes_raw) {
+    InMemorySnapshotRepository plain;
+    const PublishPolicy policy = plain.GetPublishPolicy();
+    MT_EXPECT_TRUE(!policy.compression.enabled);
+    // The config default is the opposite, which is why the policy sets it
+    // explicitly instead of default-constructing the member.
+    MT_EXPECT_TRUE(cfg::SnapshotPublishCompressionConfig().enabled);
 }
 
 MT_MAIN

@@ -130,6 +130,12 @@ agentenv_add_test(test_snapshot_recontainerize test_snapshot_recontainerize.cc
 # dropped shadowing or block order still yields a file that opens and parses.
 agentenv_add_test(test_overlaybd_compact test_overlaybd_compact.cc
                   agentenv-overlaybd-compact)
+# The `publish_policy` → `PrepareLayerUpload` → `PutBlob` chain. Closes the
+# loop between test_oss_repository (switch reaches the policy) and
+# test_snapshot_recontainerize (a mode compresses): neither shows that the
+# policy is what selects the mode, so a wiring mistake would leave both green.
+agentenv_add_test(test_snapshot_publish_compression test_snapshot_publish_compression.cc
+                  agentenv-snapshot)
 # Rust: src/snapshot/image_export/regctl.rs — driven against a real fake
 # `regctl` script, so the fork/pipe half of `BlobPipe` is actually exercised.
 agentenv_add_test(test_snapshot_regctl     test_snapshot_regctl.cc     agentenv-snapshot)

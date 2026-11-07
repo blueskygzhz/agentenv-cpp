@@ -54,8 +54,19 @@ class InMemorySnapshotRepository : public SnapshotRepository {
 /// instead of at the first request. The returned repository serves documents
 /// and blobs; its snapshot *record* methods report `Unsupported` (see
 /// `oss/repository.h`).
+///
+/// `publish_compression` is `AppConfig.snapshot.publish_compression`, and is
+/// **required** rather than defaulted, matching Rust's `from_config`. It is
+/// the switch that decides whether published layers are recontainerized as
+/// zfile, so a caller that does not name it has not decided what this
+/// repository uploads -- and the safe-looking default (the config struct's
+/// own, which has `enabled = true`) would turn compression *on* for a caller
+/// that said nothing. The `OssSnapshotRepository` constructor does default
+/// its policy, because there the fallback is `PublishPolicy()`, which is
+/// passthrough.
 RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeOssRepository(
-    const cfg::OssBackendConfig& config);
+    const cfg::OssBackendConfig& config,
+    const cfg::SnapshotPublishCompressionConfig& publish_compression);
 
 }  // namespace repository
 }  // namespace snapshot

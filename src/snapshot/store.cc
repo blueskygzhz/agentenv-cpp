@@ -67,21 +67,20 @@ core::Optional<std::string> OverlaybdLayerUuid(const std::string& source) {
 /// Rust `LayerStore::compression`, which `LayerStore::new` reads from
 /// `repository.publish_policy().compression`.
 ///
-/// The C++ repository has no publish policy, so the mode is fixed to what
-/// Rust's default policy yields — see the port-gap note in store.h. It is
-/// named and passed explicitly at both call sites, rather than hidden by
+/// Named and passed explicitly at both call sites, rather than hidden by
 /// calling `passthrough` directly, because `PrepareLayerUpload` is where the
 /// mode decides whether the descriptor describes the source bytes or
 /// recompressed ones; the choice belongs in sight at the call.
 ///
-/// Note that `Raw()` here is now the *only* thing gating compression: the
-/// zfile path behind it is complete and tested (`PrepareLayerUpload` →
-/// `overlaybd::CompactLayers`), so returning a `ZFile(...)` mode would
-/// compress for real. It stays fixed until `SnapshotRepository` grows
-/// `publish_policy()`, because inventing an operator's compression setting
-/// here would silently change what every publish uploads.
-overlaybd::OverlaybdCompactOutput PublishCompression() {
-    return overlaybd::OverlaybdCompactOutput::Raw();
+/// Read per call rather than cached in a struct, which is the one shape
+/// difference from Rust: `LayerStore` reads the policy once in `new` and
+/// keeps it, while this port has free functions that each take the
+/// repository. The values agree because a repository's policy is fixed at
+/// construction (see `OssSnapshotRepository`), so there is no window in which
+/// two calls could disagree.
+overlaybd::OverlaybdCompactOutput PublishCompression(const SnapshotRepository& repository) {
+    return overlaybd::OverlaybdCompactOutput::FromPublishCompressionConfig(
+        repository.GetPublishPolicy().compression);
 }
 
 /// Rust `LayerStore::put_prepared`.
@@ -124,7 +123,7 @@ RepositoryResult<ManagedLayer> StoreLayer(SnapshotRepository& repository,
     // Recontainerizing changes the bytes, so `PrepareLayerUpload` re-hashes
     // its output instead of trusting the descriptor.
     const RepositoryResult<PreparedLayerUpload> upload =
-        PrepareLayerUpload(canonical.value(), PublishCompression(), digest, size);
+        PrepareLayerUpload(canonical.value(), PublishCompression(repository), digest, size);
     if (!upload.ok()) return core::make_unexpected(upload.error());
     return PutPrepared(repository, upload.value(), OverlaybdLayerUuid(upload.value().Path()),
                        role);
@@ -186,7 +185,7 @@ RepositoryResult<ManagedLayer> StoreDescriptorlessLayer(SnapshotRepository& repo
         // field is not ported — see store.h — so nothing outlives this
         // function and the explicit removal below is the whole lifetime.
         const RepositoryResult<PreparedLayerUpload> upload = PrepareLayerUpload(
-            dense_path, PublishCompression(),
+            dense_path, PublishCompression(repository),
             core::Optional<std::string>(descriptor.value().sha256), descriptor.value().size);
         if (!upload.ok()) {
             stored = core::make_unexpected(upload.error());

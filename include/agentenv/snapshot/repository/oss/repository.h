@@ -71,9 +71,15 @@ class OssSnapshotRepository : public SnapshotRepository {
  public:
     /// `uploader` may be null, in which case a file-bodied `PutBlob` reports
     /// `Unsupported` instead of silently reading a layer into memory.
+    ///
+    /// The policy is fixed at construction rather than read from a config on
+    /// every call, matching Rust (`OssRepository::new` builds `self.policy`
+    /// and `publish_policy()` clones it). That keeps the upload format from
+    /// changing underneath a publish that is already in flight.
     OssSnapshotRepository(std::shared_ptr<OssClient> client,
-                          std::shared_ptr<ObjectUploader> uploader)
-        : client_(client), uploader_(uploader) {}
+                          std::shared_ptr<ObjectUploader> uploader,
+                          const PublishPolicy& policy = PublishPolicy())
+        : client_(client), uploader_(uploader), policy_(policy) {}
 
     // ---- snapshot records: see the file comment -------------------------
 
@@ -101,6 +107,11 @@ class OssSnapshotRepository : public SnapshotRepository {
 
     // ---- blobs ----------------------------------------------------------
 
+    /// Rust `OssRepository::publish_policy` — the one backend that overrides
+    /// it, because it is the one an operator's compression switch is wired
+    /// to.
+    PublishPolicy GetPublishPolicy() const { return policy_; }
+
     core::Optional<std::string> ManagedLayersRepoBlobUrl() const;
     RepositoryResult<core::Unit> PutBlob(const BlobKey& key, const BlobBody& body);
     RepositoryResult<BlobLocation> LocateBlob(const BlobKey& key) const;
@@ -112,6 +123,7 @@ class OssSnapshotRepository : public SnapshotRepository {
  private:
     std::shared_ptr<OssClient> client_;
     std::shared_ptr<ObjectUploader> uploader_;
+    PublishPolicy policy_;
 };
 
 }  // namespace oss
