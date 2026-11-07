@@ -14,11 +14,16 @@
 //     answer-only test.
 #include "agentenv/snapshot/image_export/acr.h"
 
+#include <unistd.h>
+
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
 #include "agentenv/core/base64.h"
+#include "agentenv/core/digest.h"
+#include "agentenv/snapshot/acr_manifest.h"
 #include "agentenv/snapshot/store.h"
 #include "microtest.h"
 
@@ -1157,6 +1162,580 @@ MT_TEST(delete_snapshot_without_publications_skips_rollback) {
     BlobDeleteRecorder repository;
     MT_EXPECT_TRUE(DeleteSnapshot(repository, SomeId()).ok());
     MT_EXPECT_EQ(repository.deleted.size(), static_cast<std::size_t>(1));
+}
+
+// ---------------------------------------------------------------------------
+// the push half
+// ---------------------------------------------------------------------------
+//
+// Driven over the same scripted transport, and for the same reason: an upload
+// is a *sequence* -- POST, PATCH per chunk, PUT with the digest -- and only
+// asserting the recorded requests can tell a correct upload from one that
+// sent the right total number of bytes in the wrong shape.
+
+const char* kUploadUrl = "https://reg.example.com/v2/team/app/blobs/uploads/";
+const char* kRepoBlobUrl = "https://reg.example.com/v2/team/app/blobs";
+const char* kPutManifestUrl = "https://reg.example.com/v2/team/app/manifests/snap-1";
+
+ScriptedTransport::Reply WithLocation(long status, const std::string& location) {
+    ScriptedTransport::Reply reply;
+    reply.status = status;
+    reply.headers["Location"] = location;
+    return reply;
+}
+
+std::string HeaderOf(const ScriptedTransport& transport, std::size_t index,
+                     const std::string& name) {
+    const obdhttp::HeaderMap::const_iterator at = transport.requests[index].headers.find(name);
+    return at == transport.requests[index].headers.end() ? std::string() : at->second;
+}
+
+std::string BodyOf(const ScriptedTransport& transport, std::size_t index) {
+    const std::vector<uint8_t>& body = transport.requests[index].body;
+    return std::string(body.begin(), body.end());
+}
+
+std::vector<uint8_t> Bytes(const std::string& text) {
+    return std::vector<uint8_t>(text.begin(), text.end());
+}
+
+AcrClientOptions ChunkedOptions(std::size_t chunk_size) {
+    AcrClientOptions options = FastOptions();
+    options.upload_chunk_size = chunk_size;
+    return options;
+}
+
+/// A real file, because `upload_blob` stats and reads one. The chunking is
+/// driven off the size on disk, so a fake would not exercise it.
+struct TempBlob {
+    std::string path;
+
+    explicit TempBlob(const std::string& contents) {
+        char name[] = "/tmp/agentenv-acr-blob-XXXXXX";
+        const int fd = ::mkstemp(name);
+        path = name;
+        MT_EXPECT_TRUE(fd >= 0);
+        if (fd >= 0) {
+            const ssize_t written = ::write(fd, contents.data(), contents.size());
+            MT_EXPECT_EQ(static_cast<std::size_t>(written), contents.size());
+            ::close(fd);
+        }
+    }
+
+    ~TempBlob() { ::unlink(path.c_str()); }
+};
+
+// ---- append_digest_query / absolutize_location ----------------------------
+
+MT_TEST(acr_append_digest_query_picks_the_right_delimiter) {
+    MT_EXPECT_EQ(AppendDigestQuery("https://r/v2/x/blobs/uploads/abc", "sha256:ff"),
+                 std::string("https://r/v2/x/blobs/uploads/abc?digest=sha256:ff"));
+    // An upload session `Location` is opaque and commonly already carries a
+    // query, which is the case a `?` would corrupt into a second one.
+    MT_EXPECT_EQ(AppendDigestQuery("https://r/v2/x/blobs/uploads/abc?_state=y", "sha256:ff"),
+                 std::string("https://r/v2/x/blobs/uploads/abc?_state=y&digest=sha256:ff"));
+}
+
+/// The colon stays literal, matching upstream: it is legal in a query value,
+/// and a percent-encoded `sha256%3A...` is rejected by some registries.
+MT_TEST(acr_append_digest_query_does_not_encode_the_digest) {
+    const std::string url = AppendDigestQuery("https://r/v2/x/blobs/uploads/a", "sha256:ff00");
+    MT_EXPECT_TRUE(url.find("digest=sha256:ff00") != std::string::npos);
+    MT_EXPECT_TRUE(url.find("%3A") == std::string::npos);
+}
+
+MT_TEST(acr_absolutize_location_passes_an_absolute_url_through) {
+    const core::Expected<std::string, AcrClientError> out =
+        AbsolutizeLocation(kUploadUrl, "https://cdn.example.com/upload/1?token=t");
+    MT_EXPECT_TRUE(out.ok());
+    if (out.ok()) {
+        MT_EXPECT_EQ(out.value(), std::string("https://cdn.example.com/upload/1?token=t"));
+    }
+}
+
+MT_TEST(acr_absolutize_location_resolves_a_path_against_the_origin) {
+    const core::Expected<std::string, AcrClientError> absolute_path =
+        AbsolutizeLocation(kUploadUrl, "/v2/team/app/blobs/uploads/sess?_state=x");
+    MT_EXPECT_TRUE(absolute_path.ok());
+    if (absolute_path.ok()) {
+        MT_EXPECT_EQ(
+            absolute_path.value(),
+            std::string("https://reg.example.com/v2/team/app/blobs/uploads/sess?_state=x"));
+    }
+
+    // A relative path joins onto the *directory* of the base, not onto the
+    // origin: resolving it against the origin would send the chunks to
+    // `https://reg.example.com/sess`.
+    const core::Expected<std::string, AcrClientError> relative =
+        AbsolutizeLocation(kUploadUrl, "sess");
+    MT_EXPECT_TRUE(relative.ok());
+    if (relative.ok()) {
+        MT_EXPECT_EQ(relative.value(),
+                     std::string("https://reg.example.com/v2/team/app/blobs/uploads/sess"));
+    }
+}
+
+/// Dot segments are removed, as `Url::join` does upstream. Left in, the
+/// completing `PUT` would go to a path the registry has no session for.
+MT_TEST(acr_absolutize_location_removes_dot_segments) {
+    const core::Expected<std::string, AcrClientError> out = AbsolutizeLocation(
+        "https://reg.example.com/v2/team/app/blobs/uploads/sess", "../uploads/sess2");
+    MT_EXPECT_TRUE(out.ok());
+    if (out.ok()) {
+        MT_EXPECT_EQ(out.value(),
+                     std::string("https://reg.example.com/v2/team/app/blobs/uploads/sess2"));
+    }
+}
+
+/// A protocol-relative `Location` inherits the base's scheme rather than
+/// being upgraded to https, so a plain-HTTP test registry keeps working.
+MT_TEST(acr_absolutize_location_inherits_the_scheme) {
+    const core::Expected<std::string, AcrClientError> out =
+        AbsolutizeLocation("http://127.0.0.1:5000/v2/x/blobs/uploads/", "//other:5000/u/1");
+    MT_EXPECT_TRUE(out.ok());
+    if (out.ok()) MT_EXPECT_EQ(out.value(), std::string("http://other:5000/u/1"));
+}
+
+MT_TEST(acr_absolutize_location_refuses_a_relative_url_without_a_base) {
+    const core::Expected<std::string, AcrClientError> out =
+        AbsolutizeLocation("not a url", "/v2/x/blobs/uploads/sess");
+    MT_EXPECT_TRUE(!out.ok());
+    if (!out.ok()) MT_EXPECT_TRUE(out.error().kind == AcrClientError::Kind::Registry);
+}
+
+// ---- ensure_manifest_absent ----------------------------------------------
+
+/// A `HEAD`, not a `GET`: this runs before any blob is uploaded, so the cost
+/// of discovering a taken tag has to stay at one empty round trip.
+MT_TEST(acr_ensure_manifest_absent_accepts_404) {
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(ScriptedTransport::Status(404));
+    AcrClient client = fixture.Build();
+
+    MT_EXPECT_TRUE(client.EnsureManifestAbsent(kPutManifestUrl, "team/app", "snap-1").ok());
+    MT_EXPECT_EQ(fixture.transport.requests.size(), static_cast<std::size_t>(1));
+    MT_EXPECT_EQ(fixture.transport.requests[0].method, std::string("HEAD"));
+    MT_EXPECT_EQ(fixture.transport.requests[0].url, std::string(kPutManifestUrl));
+    MT_EXPECT_TRUE(fixture.transport.requests[0].body.empty());
+}
+
+MT_TEST(acr_ensure_manifest_absent_refuses_an_existing_tag) {
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(ScriptedTransport::Status(200));
+    AcrClient client = fixture.Build();
+
+    const core::Expected<core::Unit, AcrClientError> out =
+        client.EnsureManifestAbsent(kPutManifestUrl, "team/app", "snap-1");
+    MT_EXPECT_TRUE(!out.ok());
+    if (!out.ok()) {
+        // `ManifestExists` and not a generic failure: it is the one variant
+        // the caller can act on, by choosing another tag.
+        MT_EXPECT_TRUE(out.error().kind == AcrClientError::Kind::ManifestExists);
+        MT_EXPECT_EQ(out.error().detail, std::string("snap-1"));
+    }
+}
+
+/// Any other 2xx also means something answers to the tag. A `204` read as
+/// "absent" would overwrite a published manifest.
+MT_TEST(acr_ensure_manifest_absent_treats_any_success_as_existing) {
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(ScriptedTransport::Status(204));
+    AcrClient client = fixture.Build();
+    const core::Expected<core::Unit, AcrClientError> out =
+        client.EnsureManifestAbsent(kPutManifestUrl, "team/app", "snap-1");
+    MT_EXPECT_TRUE(!out.ok());
+    if (!out.ok()) MT_EXPECT_TRUE(out.error().kind == AcrClientError::Kind::ManifestExists);
+}
+
+// ---- blob_exists ----------------------------------------------------------
+
+MT_TEST(acr_blob_exists_reports_a_present_blob) {
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(ScriptedTransport::Status(200));
+    AcrClient client = fixture.Build();
+
+    const core::Expected<bool, AcrClientError> out =
+        client.BlobExists(kRepoBlobUrl, "team/app", "sha256:ff");
+    MT_EXPECT_TRUE(out.ok());
+    if (out.ok()) MT_EXPECT_TRUE(out.value());
+    MT_EXPECT_EQ(fixture.transport.requests[0].method, std::string("HEAD"));
+    MT_EXPECT_EQ(fixture.transport.requests[0].url,
+                 std::string("https://reg.example.com/v2/team/app/blobs/sha256:ff"));
+}
+
+/// `trim_end_matches('/')` strips *every* trailing slash. One pass would
+/// leave `blobs//sha256:ff`, which is a different path at the registry.
+MT_TEST(acr_blob_exists_collapses_trailing_slashes) {
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(ScriptedTransport::Status(200));
+    AcrClient client = fixture.Build();
+    MT_EXPECT_TRUE(client.BlobExists(std::string(kRepoBlobUrl) + "///", "team/app",
+                                     "sha256:ff").ok());
+    MT_EXPECT_EQ(fixture.transport.requests[0].url,
+                 std::string("https://reg.example.com/v2/team/app/blobs/sha256:ff"));
+}
+
+MT_TEST(acr_blob_exists_reports_an_absent_blob) {
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(ScriptedTransport::Status(404));
+    AcrClient client = fixture.Build();
+    const core::Expected<bool, AcrClientError> out =
+        client.BlobExists(kRepoBlobUrl, "team/app", "sha256:ff");
+    MT_EXPECT_TRUE(out.ok());
+    if (out.ok()) MT_EXPECT_TRUE(!out.value());
+}
+
+/// A failure is not "absent". Collapsing it would re-upload a layer the
+/// registry already holds and hide the error while doing it.
+MT_TEST(acr_blob_exists_propagates_a_failure) {
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(ScriptedTransport::Status(400));
+    AcrClient client = fixture.Build();
+    const core::Expected<bool, AcrClientError> out =
+        client.BlobExists(kRepoBlobUrl, "team/app", "sha256:ff");
+    MT_EXPECT_TRUE(!out.ok());
+}
+
+// ---- upload_blob ----------------------------------------------------------
+
+/// The whole protocol in one assertion: a `POST` to open the session, one
+/// `PATCH` per chunk with a bare `<start>-<end>` range and that chunk's
+/// bytes, then a bodyless `PUT ?digest=`.
+MT_TEST(acr_upload_blob_sends_one_patch_per_chunk) {
+    TempBlob blob("abcde");
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(WithLocation(202, "/v2/team/app/blobs/uploads/sess"));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(202));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(202));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(202));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(201));
+    AcrClient client = fixture.Build(ChunkedOptions(2));
+
+    MT_EXPECT_TRUE(
+        client.UploadBlob(kUploadUrl, "team/app", blob.path, "sha256:ff").ok());
+    MT_EXPECT_EQ(fixture.transport.requests.size(), static_cast<std::size_t>(5));
+
+    MT_EXPECT_EQ(fixture.transport.requests[0].method, std::string("POST"));
+    MT_EXPECT_EQ(fixture.transport.requests[0].url, std::string(kUploadUrl));
+
+    const char* const ranges[] = {"0-1", "2-3", "4-4"};
+    const char* const chunks[] = {"ab", "cd", "e"};
+    for (std::size_t i = 0; i < 3; ++i) {
+        MT_EXPECT_EQ(fixture.transport.requests[1 + i].method, std::string("PATCH"));
+        MT_EXPECT_EQ(fixture.transport.requests[1 + i].url,
+                     std::string("https://reg.example.com/v2/team/app/blobs/uploads/sess"));
+        // Bare `<start>-<end>`: no `bytes ` prefix and no `/<total>`.
+        MT_EXPECT_EQ(HeaderOf(fixture.transport, 1 + i, "Content-Range"),
+                     std::string(ranges[i]));
+        MT_EXPECT_EQ(BodyOf(fixture.transport, 1 + i), std::string(chunks[i]));
+        MT_EXPECT_EQ(HeaderOf(fixture.transport, 1 + i, "Content-Type"),
+                     std::string("application/octet-stream"));
+    }
+
+    // The completing PUT carries no further bytes -- everything went out as
+    // chunks, and repeating the tail here would append it twice.
+    MT_EXPECT_EQ(fixture.transport.requests[4].method, std::string("PUT"));
+    MT_EXPECT_EQ(
+        fixture.transport.requests[4].url,
+        std::string("https://reg.example.com/v2/team/app/blobs/uploads/sess?digest=sha256:ff"));
+    MT_EXPECT_TRUE(fixture.transport.requests[4].body.empty());
+}
+
+/// One chunk larger than the file is one `PATCH`, covering the whole range.
+MT_TEST(acr_upload_blob_sends_one_patch_when_the_chunk_covers_the_file) {
+    TempBlob blob("abcde");
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(WithLocation(202, "/v2/team/app/blobs/uploads/sess"));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(202));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(201));
+    AcrClient client = fixture.Build(ChunkedOptions(1024));
+
+    MT_EXPECT_TRUE(client.UploadBlob(kUploadUrl, "team/app", blob.path, "sha256:ff").ok());
+    MT_EXPECT_EQ(fixture.transport.requests.size(), static_cast<std::size_t>(3));
+    MT_EXPECT_EQ(HeaderOf(fixture.transport, 1, "Content-Range"), std::string("0-4"));
+    MT_EXPECT_EQ(BodyOf(fixture.transport, 1), std::string("abcde"));
+}
+
+/// A chunk size of zero is clamped to one rather than dividing by it: left
+/// alone, the loop would read nothing and never advance.
+MT_TEST(acr_upload_blob_clamps_a_zero_chunk_size) {
+    TempBlob blob("ab");
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(WithLocation(202, "/v2/team/app/blobs/uploads/sess"));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(202));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(202));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(201));
+    AcrClient client = fixture.Build(ChunkedOptions(0));
+
+    MT_EXPECT_TRUE(client.UploadBlob(kUploadUrl, "team/app", blob.path, "sha256:ff").ok());
+    MT_EXPECT_EQ(fixture.transport.requests.size(), static_cast<std::size_t>(4));
+    MT_EXPECT_EQ(HeaderOf(fixture.transport, 1, "Content-Range"), std::string("0-0"));
+    MT_EXPECT_EQ(HeaderOf(fixture.transport, 2, "Content-Range"), std::string("1-1"));
+}
+
+/// A registry may relocate the session between chunks, and will not accept
+/// the old URL again. Ignoring the new `Location` is how an upload fails
+/// halfway through with a 404 the client reports as a registry error.
+MT_TEST(acr_upload_blob_follows_a_relocated_session) {
+    TempBlob blob("abcd");
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(WithLocation(202, "/v2/team/app/blobs/uploads/one"));
+    fixture.transport.replies.push_back(WithLocation(202, "/v2/team/app/blobs/uploads/two"));
+    fixture.transport.replies.push_back(WithLocation(202, "/v2/team/app/blobs/uploads/three"));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(201));
+    AcrClient client = fixture.Build(ChunkedOptions(2));
+
+    MT_EXPECT_TRUE(client.UploadBlob(kUploadUrl, "team/app", blob.path, "sha256:ff").ok());
+    MT_EXPECT_EQ(fixture.transport.requests[1].url,
+                 std::string("https://reg.example.com/v2/team/app/blobs/uploads/one"));
+    MT_EXPECT_EQ(fixture.transport.requests[2].url,
+                 std::string("https://reg.example.com/v2/team/app/blobs/uploads/two"));
+    MT_EXPECT_EQ(
+        fixture.transport.requests[3].url,
+        std::string("https://reg.example.com/v2/team/app/blobs/uploads/three?digest=sha256:ff"));
+}
+
+/// Without a `Location` there is nowhere to send the chunks. Falling back to
+/// the upload endpoint would open a fresh session per chunk and leave every
+/// one of them incomplete.
+MT_TEST(acr_upload_blob_refuses_a_session_without_a_location) {
+    TempBlob blob("abcd");
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(ScriptedTransport::Status(202));
+    AcrClient client = fixture.Build();
+
+    const core::Expected<core::Unit, AcrClientError> out =
+        client.UploadBlob(kUploadUrl, "team/app", blob.path, "sha256:ff");
+    MT_EXPECT_TRUE(!out.ok());
+    if (!out.ok()) {
+        MT_EXPECT_TRUE(out.error().kind == AcrClientError::Kind::Registry);
+        MT_EXPECT_TRUE(out.error().detail.find("missing Location") != std::string::npos);
+    }
+    MT_EXPECT_EQ(fixture.transport.requests.size(), static_cast<std::size_t>(1));
+}
+
+MT_TEST(acr_upload_blob_reports_a_missing_file_without_opening_a_session) {
+    ClientFixture fixture;
+    AcrClient client = fixture.Build();
+    const core::Expected<core::Unit, AcrClientError> out =
+        client.UploadBlob(kUploadUrl, "team/app", "/tmp/agentenv-acr-no-such-blob",
+                          "sha256:ff");
+    MT_EXPECT_TRUE(!out.ok());
+    // Nothing was sent: an orphaned session would otherwise sit on the
+    // registry until its own timeout.
+    MT_EXPECT_EQ(fixture.transport.requests.size(), static_cast<std::size_t>(0));
+}
+
+/// The bodyless `POST` still declares a length. libcurl sends no
+/// `Content-Length` for a custom method with no payload, and a registry
+/// behind a proxy answers that with `411 Length Required`.
+MT_TEST(acr_upload_blob_declares_a_zero_length_on_the_session_post) {
+    TempBlob blob("ab");
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(WithLocation(202, "/v2/team/app/blobs/uploads/sess"));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(202));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(201));
+    AcrClient client = fixture.Build(ChunkedOptions(1024));
+
+    MT_EXPECT_TRUE(client.UploadBlob(kUploadUrl, "team/app", blob.path, "sha256:ff").ok());
+    MT_EXPECT_EQ(HeaderOf(fixture.transport, 0, "Content-Length"), std::string("0"));
+    // The chunk's length is the transport's business, derived from the body;
+    // writing it here as well would send the header twice.
+    MT_EXPECT_EQ(HeaderOf(fixture.transport, 1, "Content-Length"), std::string());
+}
+
+// ---- upload_blob_with_descriptor -----------------------------------------
+
+/// The deduplication that makes a re-publish cheap: one `HEAD`, no session.
+MT_TEST(acr_upload_blob_with_descriptor_skips_an_existing_blob) {
+    TempBlob blob("abcde");
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(ScriptedTransport::Status(200));
+    AcrClient client = fixture.Build();
+
+    const core::Expected<std::pair<std::string, uint64_t>, AcrClientError> out =
+        client.UploadBlobWithDescriptor(kUploadUrl, kRepoBlobUrl, "team/app", blob.path,
+                                        "sha256:ff", 5);
+    MT_EXPECT_TRUE(out.ok());
+    if (out.ok()) {
+        MT_EXPECT_EQ(out.value().first, std::string("sha256:ff"));
+        MT_EXPECT_EQ(out.value().second, static_cast<uint64_t>(5));
+    }
+    MT_EXPECT_EQ(fixture.transport.requests.size(), static_cast<std::size_t>(1));
+    MT_EXPECT_EQ(fixture.transport.requests[0].method, std::string("HEAD"));
+}
+
+MT_TEST(acr_upload_blob_with_descriptor_uploads_an_absent_blob) {
+    TempBlob blob("abcde");
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(ScriptedTransport::Status(404));
+    fixture.transport.replies.push_back(WithLocation(202, "/v2/team/app/blobs/uploads/sess"));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(202));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(201));
+    AcrClient client = fixture.Build(ChunkedOptions(1024));
+
+    MT_EXPECT_TRUE(client
+                       .UploadBlobWithDescriptor(kUploadUrl, kRepoBlobUrl, "team/app",
+                                                 blob.path, "sha256:ff", 5)
+                       .ok());
+    MT_EXPECT_EQ(fixture.transport.requests.size(), static_cast<std::size_t>(4));
+    MT_EXPECT_EQ(BodyOf(fixture.transport, 2), std::string("abcde"));
+}
+
+/// The descriptor is what the manifest will claim and nothing downstream
+/// re-derives it, so a disagreement with the file is refused *before* any
+/// request -- publishing it would name a layer that is not what was sent.
+MT_TEST(acr_upload_blob_with_descriptor_refuses_a_size_mismatch) {
+    TempBlob blob("abcde");
+    ClientFixture fixture;
+    AcrClient client = fixture.Build();
+
+    const core::Expected<std::pair<std::string, uint64_t>, AcrClientError> out =
+        client.UploadBlobWithDescriptor(kUploadUrl, kRepoBlobUrl, "team/app", blob.path,
+                                        "sha256:ff", 9);
+    MT_EXPECT_TRUE(!out.ok());
+    if (!out.ok()) {
+        MT_EXPECT_TRUE(out.error().detail.find("descriptor says 9") != std::string::npos);
+        MT_EXPECT_TRUE(out.error().detail.find("file has 5") != std::string::npos);
+    }
+    MT_EXPECT_EQ(fixture.transport.requests.size(), static_cast<std::size_t>(0));
+}
+
+MT_TEST(acr_upload_blob_with_descriptor_refuses_an_empty_digest_or_size) {
+    TempBlob blob("abcde");
+    ClientFixture fixture;
+    AcrClient client = fixture.Build();
+
+    // An empty digest would publish a manifest pointing at `sha256:`, leaving
+    // the layer unreachable.
+    MT_EXPECT_TRUE(!client
+                        .UploadBlobWithDescriptor(kUploadUrl, kRepoBlobUrl, "team/app",
+                                                  blob.path, "", 5)
+                        .ok());
+    MT_EXPECT_TRUE(!client
+                        .UploadBlobWithDescriptor(kUploadUrl, kRepoBlobUrl, "team/app",
+                                                  blob.path, "sha256:ff", 0)
+                        .ok());
+    MT_EXPECT_EQ(fixture.transport.requests.size(), static_cast<std::size_t>(0));
+}
+
+// ---- upload_blob_bytes ---------------------------------------------------
+
+/// No `PATCH` phase at all: the config blob is a few hundred bytes, and
+/// chunking something smaller than one chunk only adds a round trip.
+MT_TEST(acr_upload_blob_bytes_puts_the_whole_body_at_once) {
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(WithLocation(202, "/v2/team/app/blobs/uploads/sess"));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(201));
+    AcrClient client = fixture.Build();
+
+    MT_EXPECT_TRUE(
+        client.UploadBlobBytes(kUploadUrl, "team/app", Bytes("{\"config\":1}"), "sha256:cc")
+            .ok());
+    MT_EXPECT_EQ(fixture.transport.requests.size(), static_cast<std::size_t>(2));
+    MT_EXPECT_EQ(fixture.transport.requests[0].method, std::string("POST"));
+    MT_EXPECT_EQ(fixture.transport.requests[1].method, std::string("PUT"));
+    MT_EXPECT_EQ(
+        fixture.transport.requests[1].url,
+        std::string("https://reg.example.com/v2/team/app/blobs/uploads/sess?digest=sha256:cc"));
+    MT_EXPECT_EQ(BodyOf(fixture.transport, 1), std::string("{\"config\":1}"));
+    MT_EXPECT_EQ(HeaderOf(fixture.transport, 1, "Content-Type"),
+                 std::string("application/octet-stream"));
+    MT_EXPECT_TRUE(HeaderOf(fixture.transport, 1, "Content-Range").empty());
+}
+
+MT_TEST(acr_upload_blob_bytes_reports_a_refused_completion) {
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(WithLocation(202, "/v2/team/app/blobs/uploads/sess"));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(400));
+    AcrClient client = fixture.Build();
+    MT_EXPECT_TRUE(
+        !client.UploadBlobBytes(kUploadUrl, "team/app", Bytes("x"), "sha256:cc").ok());
+}
+
+// ---- put_manifest --------------------------------------------------------
+
+/// The registry's `Docker-Content-Digest` wins over the locally computed one:
+/// it is the digest the registry will answer to later, and they differ only
+/// when the registry re-serialised the manifest.
+MT_TEST(acr_put_manifest_prefers_the_registry_digest) {
+    ClientFixture fixture;
+    ScriptedTransport::Reply created;
+    created.status = 201;
+    created.headers["Docker-Content-Digest"] = "sha256:fromregistry";
+    fixture.transport.replies.push_back(created);
+    AcrClient client = fixture.Build();
+
+    const core::Expected<std::string, AcrClientError> out =
+        client.PutManifest(kPutManifestUrl, "team/app", Bytes("{\"schemaVersion\":2}"));
+    MT_EXPECT_TRUE(out.ok());
+    if (out.ok()) MT_EXPECT_EQ(out.value(), std::string("sha256:fromregistry"));
+
+    MT_EXPECT_EQ(fixture.transport.requests[0].method, std::string("PUT"));
+    MT_EXPECT_EQ(BodyOf(fixture.transport, 0), std::string("{\"schemaVersion\":2}"));
+    // The OCI manifest media type, not `application/octet-stream`: a registry
+    // stores the body under the type it was declared as, and an octet-stream
+    // manifest is not resolvable as one.
+    MT_EXPECT_EQ(HeaderOf(fixture.transport, 0, "Content-Type"),
+                 std::string(kOciImageManifestMediaType));
+}
+
+/// A missing header is not an error, which is why the local digest is
+/// computed up front rather than only on demand.
+MT_TEST(acr_put_manifest_falls_back_to_the_local_digest) {
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(ScriptedTransport::Status(201));
+    AcrClient client = fixture.Build();
+
+    const std::string manifest = "{\"schemaVersion\":2}";
+    const core::Expected<std::string, AcrClientError> out =
+        client.PutManifest(kPutManifestUrl, "team/app", Bytes(manifest));
+    MT_EXPECT_TRUE(out.ok());
+    if (out.ok()) MT_EXPECT_EQ(out.value(), core::Sha256Digest(manifest));
+}
+
+MT_TEST(acr_put_manifest_reports_a_refused_manifest) {
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(ScriptedTransport::Status(400));
+    AcrClient client = fixture.Build();
+    MT_EXPECT_TRUE(!client.PutManifest(kPutManifestUrl, "team/app", Bytes("{}")).ok());
+}
+
+/// The body goes out again with the post-401 retry. Omitted, an authenticated
+/// upload becomes an empty one the registry accepts, leaving a blob whose
+/// content does not match the digest it was stored under -- a corruption no
+/// status code reports.
+MT_TEST(acr_resends_the_body_on_the_authenticated_retry) {
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(ScriptedTransport::Unauthorized(kChallenge));
+    fixture.transport.replies.push_back(ScriptedTransport::Token("tok-1", 300));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(201));
+    AcrClient client = fixture.Build();
+
+    const std::string manifest = "{\"schemaVersion\":2}";
+    MT_EXPECT_TRUE(client.PutManifest(kPutManifestUrl, "team/app", Bytes(manifest)).ok());
+    MT_EXPECT_EQ(fixture.transport.requests.size(), static_cast<std::size_t>(3));
+    MT_EXPECT_EQ(BodyOf(fixture.transport, 0), manifest);
+    // The retry, with both the token and the body.
+    MT_EXPECT_EQ(fixture.transport.AuthorizationOf(2), std::string("Bearer tok-1"));
+    MT_EXPECT_EQ(BodyOf(fixture.transport, 2), manifest);
+    MT_EXPECT_EQ(HeaderOf(fixture.transport, 2, "Content-Type"),
+                 std::string(kOciImageManifestMediaType));
+}
+
+/// And again across a transient retry, where the whole attempt is repeated
+/// rather than re-authenticated.
+MT_TEST(acr_resends_the_body_on_a_transient_retry) {
+    ClientFixture fixture;
+    fixture.transport.replies.push_back(ScriptedTransport::Status(503));
+    fixture.transport.replies.push_back(ScriptedTransport::Status(201));
+    AcrClient client = fixture.Build();
+
+    const std::string manifest = "{\"schemaVersion\":2}";
+    MT_EXPECT_TRUE(client.PutManifest(kPutManifestUrl, "team/app", Bytes(manifest)).ok());
+    MT_EXPECT_EQ(fixture.transport.requests.size(), static_cast<std::size_t>(2));
+    MT_EXPECT_EQ(BodyOf(fixture.transport, 1), manifest);
+    MT_EXPECT_EQ(fixture.sleeps.size(), static_cast<std::size_t>(1));
 }
 
 }  // namespace

@@ -2,7 +2,9 @@
 // Rust: src/snapshot/repository/backends/common/ — in-memory reference impl.
 #include "agentenv/snapshot/repository/backends.h"
 
+#include "agentenv/core/fs.h"
 #include "agentenv/snapshot/repository/oss/repository.h"
+#include "agentenv/snapshot/repository/posixfs/backend.h"
 
 namespace agentenv {
 namespace snapshot {
@@ -146,7 +148,8 @@ InMemorySnapshotRepository::MarkBuildError(const core::SnapshotId& id,
 
 RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeOssRepository(
     const cfg::OssBackendConfig& config,
-    const cfg::SnapshotPublishCompressionConfig& publish_compression) {
+    const cfg::SnapshotPublishCompressionConfig& publish_compression,
+    std::shared_ptr<oss::OssClient>* client_out) {
     // Rust `OssRepository::from_config`: normalise, then connect. Validation
     // first, so an incomplete section is reported as itself rather than as a
     // 403 on the first signed request.
@@ -170,8 +173,50 @@ RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeOssRepository(
     PublishPolicy policy;
     policy.compression = publish_compression;
 
+    // Handed out only after every fallible step above succeeded, so a caller
+    // that ignores the error cannot end up holding a client built over a
+    // config this function rejected.
+    if (client_out != 0) *client_out = owned;
     return std::shared_ptr<SnapshotRepository>(
         new oss::OssSnapshotRepository(owned, uploader.value(), policy));
+}
+
+RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeRepositoryFromConfig(
+    const cfg::AppConfig& config) {
+    switch (config.snapshot.repository_backend) {
+        case cfg::SnapshotRepositoryBackendKind::PosixFs: {
+            if (!config.backend.posix_fs.has_value()) {
+                // Normalisation inserts a default section for this backend
+                // (`cfg.cc:578`), so reaching here means the config was not
+                // normalised -- not that an operator omitted it. Reported
+                // rather than defaulted, because guessing a snapshot store
+                // root would put a node's layers somewhere nobody chose.
+                return core::make_unexpected(RepositoryError::InvalidRequest(
+                    "backend.posix_fs config is required when repository_backend = posix_fs"));
+            }
+            // Rust `config.backend.posix_fs.snapshot_store.join("repository")`.
+            const std::string root =
+                core::fs::Join(config.backend.posix_fs->snapshot_store, "repository");
+            // Both stores take the same root; the split is internal to this
+            // backend (catalog records vs. blobs), not two configured paths.
+            return std::shared_ptr<SnapshotRepository>(new posixfs::PosixFsSnapshotRepository(
+                std::make_shared<posixfs::PosixFsCatalogStore>(root),
+                std::make_shared<posixfs::PosixFsArtifactStore>(root)));
+        }
+        case cfg::SnapshotRepositoryBackendKind::Oss: {
+            if (!config.backend.oss.has_value()) {
+                return core::make_unexpected(RepositoryError::InvalidRequest(
+                    "backend.oss config is required when repository_backend = oss"));
+            }
+            return MakeOssRepository(*config.backend.oss, config.snapshot.publish_compression);
+        }
+    }
+    // Unreachable for the two declared kinds; present because a `switch` over
+    // an enum class without a default is only exhaustive as long as the enum
+    // is, and a third backend should fail loudly here rather than fall
+    // through to a null repository.
+    return core::make_unexpected(
+        RepositoryError::InvalidRequest("unknown snapshot.repository_backend"));
 }
 
 }  // namespace repository

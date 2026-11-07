@@ -419,6 +419,132 @@ std::string ChallengeCacheKey(const std::string& url) {
     return host.has_value() ? *host : url;
 }
 
+// ---- upload URLs ----------------------------------------------------------
+
+std::string AppendDigestQuery(const std::string& url, const std::string& digest) {
+    const char* const delimiter = url.find('?') != std::string::npos ? "&" : "?";
+    // Not percent-encoded, matching upstream: a digest is `sha256:<hex>`, the
+    // colon is legal in a query value, and encoding it yields a URL some
+    // registries reject outright.
+    return url + delimiter + "digest=" + digest;
+}
+
+namespace {
+
+/// Whether the last segment of `path` is `.` or `..`.
+///
+/// RFC 3986 replaces such a final segment with a bare `/`, so `a/b/..`
+/// resolves to `/a/` and not to `/a`. Without this the two would name
+/// different upload sessions.
+bool EndsWithDotSegment(const std::string& path) {
+    if (path == "." || path == "..") return true;
+    if (path.size() >= 2 && path.compare(path.size() - 2, 2, "/.") == 0) return true;
+    if (path.size() >= 3 && path.compare(path.size() - 3, 3, "/..") == 0) return true;
+    return false;
+}
+
+/// RFC 3986 §5.2.4 `remove_dot_segments`.
+///
+/// Rust reaches this through `Url::join`, which normalises as it resolves. A
+/// `Location` of `../uploads/x` is unusual but legal, and leaving the dots in
+/// would send the completing `PUT` to a path the registry does not know.
+std::string RemoveDotSegments(const std::string& path) {
+    std::vector<std::string> out;
+    const bool trailing_slash =
+        !path.empty() && (path[path.size() - 1] == '/' || EndsWithDotSegment(path));
+    std::string::size_type at = 0;
+    while (at < path.size()) {
+        if (path[at] == '/') {
+            ++at;
+            continue;
+        }
+        const std::string::size_type next = path.find('/', at);
+        const std::string segment =
+            next == std::string::npos ? path.substr(at) : path.substr(at, next - at);
+        if (segment == ".") {
+            // Dropped.
+        } else if (segment == "..") {
+            // Popping an empty stack is a no-op, not an error: that is what
+            // keeps a `..` above the root from escaping the origin.
+            if (!out.empty()) out.pop_back();
+        } else {
+            out.push_back(segment);
+        }
+        if (next == std::string::npos) break;
+        at = next + 1;
+    }
+
+    std::string joined;
+    for (std::vector<std::string>::size_type i = 0; i < out.size(); ++i) {
+        joined += "/";
+        joined += out[i];
+    }
+    if (trailing_slash || joined.empty()) joined += "/";
+    return joined;
+}
+
+}  // namespace
+
+core::Expected<std::string, AcrClientError> AbsolutizeLocation(const std::string& base_url,
+                                                               const std::string& location) {
+    ParsedUrl parsed;
+    // Already absolute: returned verbatim, as upstream does. Note this port
+    // requires `scheme://`, where Rust's `Url::parse` would also accept a
+    // schemed opaque form such as `foo:bar`. No registry answers with one,
+    // and treating it as relative resolves it against the session URL rather
+    // than sending the upload somewhere unintended.
+    if (ParseUrl(location, &parsed)) return location;
+
+    ParsedUrl base;
+    if (!ParseUrl(base_url, &base)) {
+        return core::make_unexpected(AcrClientError::Registry(
+            "resolve ACR upload Location '" + location + "': relative URL without a base"));
+    }
+    // `Url::join("")` is the base itself. Pinned rather than left to the
+    // merge below, which would drop the base's query.
+    if (location.empty()) return base_url;
+
+    if (location.size() >= 2 && location[0] == '/' && location[1] == '/') {
+        // Protocol-relative. The scheme is inherited, which is why a plain
+        // HTTP base stays HTTP instead of being silently upgraded.
+        return base.scheme + ":" + location;
+    }
+
+    // The origin is sliced out of the *raw* base rather than rebuilt from
+    // `ParsedUrl`, which lowercases the host and drops userinfo: an upload
+    // session URL has to be reproduced exactly or the registry does not
+    // recognise it.
+    const std::string::size_type scheme_end = base_url.find("://");
+    std::string::size_type authority_end = base_url.find_first_of("/?#", scheme_end + 3);
+    if (authority_end == std::string::npos) authority_end = base_url.size();
+    const std::string origin = base_url.substr(0, authority_end);
+
+    std::string base_path = base_url.substr(authority_end);
+    const std::string::size_type base_query = base_path.find_first_of("?#");
+    if (base_query != std::string::npos) base_path = base_path.substr(0, base_query);
+    if (base_path.empty()) base_path = "/";
+
+    std::string location_path = location;
+    std::string location_suffix;
+    const std::string::size_type location_query = location.find_first_of("?#");
+    if (location_query != std::string::npos) {
+        location_path = location.substr(0, location_query);
+        location_suffix = location.substr(location_query);
+    }
+
+    std::string merged;
+    if (location_path.empty()) {
+        // A query-only `Location`: the base's path is kept and its query
+        // replaced.
+        merged = base_path;
+    } else if (location_path[0] == '/') {
+        merged = location_path;
+    } else {
+        merged = base_path.substr(0, base_path.rfind('/') + 1) + location_path;
+    }
+    return origin + RemoveDotSegments(merged) + location_suffix;
+}
+
 // ---- Docker credentials ---------------------------------------------------
 
 bool DockerAuthAddressMatches(const std::string& address, const std::string& registry) {

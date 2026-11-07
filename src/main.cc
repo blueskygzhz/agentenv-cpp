@@ -22,6 +22,7 @@
 #include "agentenv/orchestrator/persistence.h"
 #include "agentenv/orchestrator/service.h"
 #include "agentenv/cfg.h"
+#include "agentenv/snapshot/repository/backends.h"
 #include "agentenv/snapshot/repository/posixfs/backend.h"
 #include "agentenv/volume.h"
 #include "agentenv/p2p/http_transport.h"
@@ -558,23 +559,27 @@ int main(int argc, char** argv) {
     // releases leases on delete and publishes backings on capture) and the API
     // bundle (which serves `/volumes*`).
     //
-    // Built from the posix-fs stores directly because that is the only way:
-    // the backend needs a catalog store *and* an artifact store, which no
-    // root-only factory can supply. (There used to be a
-    // `MakePosixFsRepository(root)` that pretended otherwise and returned an
-    // in-memory stub; it is gone.)
+    // The repository comes from `MakeRepositoryFromConfig`, which selects on
+    // `snapshot.repository_backend`. This used to branch on
+    // `backend.posix_fs.has_value()` and build the posix-fs stores inline --
+    // which silently sent an OSS-configured node to its local disk whenever a
+    // `[backend.posix_fs]` section was also present, the ordinary state of a
+    // migrated node. See that function for the whole argument.
     std::shared_ptr<ae::volume::VolumeManager> volume_manager;
     std::shared_ptr<ae::image::ImageResolver> image_resolver;
-    if (app_cfg.backend.posix_fs.has_value()) {
-        // Rust `config.backend.posix_fs.snapshot_store.join("repository")`.
-        const std::string repository_root =
-            ae::core::fs::Join(app_cfg.backend.posix_fs->snapshot_store, "repository");
-        auto repository = std::shared_ptr<ae::snapshot::repository::SnapshotRepository>(
-            new ae::snapshot::repository::posixfs::PosixFsSnapshotRepository(
-                std::make_shared<ae::snapshot::repository::posixfs::PosixFsCatalogStore>(
-                    repository_root),
-                std::make_shared<ae::snapshot::repository::posixfs::PosixFsArtifactStore>(
-                    repository_root)));
+    {
+        auto made = ae::snapshot::repository::MakeRepositoryFromConfig(app_cfg);
+        if (!made.ok()) {
+            // Fatal, as Rust's `?` in `build_snapshot_backend_from_config`
+            // is. Carrying on would serve a node whose declared storage
+            // backend does not exist: publishes would either fail one at a
+            // time or, worse, land somewhere other than where the config
+            // says.
+            AGENTENV_ERROR("snapshot repository backend startup failed: "
+                           << made.error().ToString());
+            return 1;
+        }
+        std::shared_ptr<ae::snapshot::repository::SnapshotRepository> repository = made.value();
 
         ae::volume::VolumeLimits limits;
         limits.max_size_mb = app_cfg.volume.max_size_mb;
@@ -597,13 +602,6 @@ int main(int argc, char** argv) {
         auto resolver = std::make_shared<ae::image::DefaultImageResolver>(app_cfg);
         resolver->WithRepository(repository);
         image_resolver = resolver;
-    } else {
-        // Rust reaches `build_snapshot_backend`'s posix-fs arm whenever the
-        // repository backend is posix-fs, so an absent section is a
-        // configuration gap rather than a mode. Warn instead of failing: the
-        // sandbox control plane does not need volumes to serve.
-        AGENTENV_WARN("no [backend.posix_fs] section;"
-                      << " volumes are disabled and /volumes* will answer 500");
     }
 
     auto built = ae::orchestrator::Orchestrator::New(store, factory, persister, app_cfg,

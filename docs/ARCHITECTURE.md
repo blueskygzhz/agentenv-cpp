@@ -192,9 +192,16 @@ earlier revision of this section listed `LocalRepository` / `S3Repository` /
   removed: it ignored `root_dir` and returned an in-memory stub, so anything
   trusting the name got a repository whose documents all answered
   "unsupported". Meanwhile
-  `MakeOssRepository(const cfg::OssBackendConfig&)` builds a real
+  `MakeOssRepository(const cfg::OssBackendConfig&,
+  const cfg::SnapshotPublishCompressionConfig&)` builds a real
   `OssSnapshotRepository`. So **`[backend.oss]` is reachable for documents,
-  blobs and snapshot records** — see the OSS section below.
+  blobs and snapshot records** — see the OSS section below. The second
+  parameter is `AppConfig.snapshot.publish_compression` and is required rather
+  than defaulted: it decides whether published layers are recontainerized as
+  zfile, and the config struct's own default has `enabled = true`, so a
+  defaulted parameter would turn compression on for a caller that said
+  nothing. It becomes the repository's `GetPublishPolicy()`, which is what
+  `snapshot::StoreVolumeLayers` and `StoreSnapshot` consult per layer.
 - The OSS document layer (`repository/oss/documents.{h,cc}`) is ported: shared
   catalog documents are serialised across nodes with an **ETag
   compare-and-swap** (read with a version token, write `If-Match`, create with
@@ -308,11 +315,16 @@ earlier revision of this section listed `LocalRepository` / `S3Repository` /
     - Deleting by an id whose record is already gone still removes the build
       log, which is how an attempt that died right after the record was
       removed gets finished.
-    - A snapshot with a **disk-image publication** is refused, from *inside*
-      the atomic update so the record is not even marked: rolling a
-      publication back needs Rust's `AcrDiskImageExporter`, which is not
-      ported, and marking-then-stopping would hide the snapshot from every
-      read while its image stayed live in the registry.
+    - A snapshot with a **disk-image publication** has those publications
+      rolled back first, inside `DeleteSnapshot`, through
+      `AcrPublicationRollback`. They are read off the record *as marked*,
+      because a commit that landed before the mark is the only place the
+      publications are named and the record is about to be removed. The
+      rollback runs before the record is gone for the same reason: once it is,
+      nothing names them. Earlier this was refused outright from inside the
+      atomic update, so the record was not even marked — marking-then-stopping
+      would have hidden the snapshot from every read while its image stayed
+      live in the registry.
   - `delete_snapshot_blobs` is the backend's own half. `posixfs` removes the
     snapshot directory and `fsync`s its parent (without that, a crash could
     leave the record durably deleted and the files resurrected as garbage);
@@ -322,9 +334,13 @@ earlier revision of this section listed `LocalRepository` / `S3Repository` /
     before the record is deleted and has to be retryable. Content-addressed
     **managed layers stay** in both: they live outside the snapshot and may
     belong to other snapshots.
-  - Also not ported from that file: `publish` / `publish_with_local_layers` /
-    `commit` / `attach_startup_manifest`, which need `publish.rs` and
-    `store.rs`.
+  - `commit` and `attach_startup_manifest` *are* ported here. What is not
+    reproduced is upstream's `publish` / `publish_with_local_layers`, and only
+    because they are trait wrappers with nowhere to live: both forward to
+    `publish::publish` — ported as the free function `snapshot::Publish` — and
+    the only thing they add is dropping `local_layers`, the upload files kept
+    alive for the post-commit P2P announcement, which is not ported either.
+    So the behaviour is here; the two forwarding methods are not.
   - Both backends answer their record methods from here. `posixfs` used to
     keep a second implementation over the same files; it is gone — see
     section 5.

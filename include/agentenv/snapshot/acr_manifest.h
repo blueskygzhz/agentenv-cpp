@@ -66,6 +66,23 @@ core::Json CanonicalizeJson(const core::Json& value);
 core::Json MergedRuntimeConfig(const CommandContext& context,
                                const core::Optional<core::Json>& raw_config);
 
+/// Rust `struct SnapshotOciConfigInput` — the effective runtime metadata plus
+/// the optional source rootfs OCI config.
+///
+/// `SnapshotOciConfigBlob` below takes the two fields separately, which is all
+/// it needs. This exists for the one caller that has to express *absence* of
+/// the pair as a whole — `AcrDiskImageExporter::Export` picks
+/// `MinimalOciConfigBlob` then — and a pair of unrelated optionals could also
+/// spell the nonsensical "no context but a raw config".
+///
+/// Rust holds both by reference and is `Copy`; these are values, because the
+/// struct outlives its caller's expression here and the config is small
+/// relative to the upload it accompanies.
+struct SnapshotOciConfigInput {
+    CommandContext context;
+    core::Optional<core::Json> raw_config;
+};
+
 /// Rust `host_architecture_for_oci`.
 std::string HostArchitectureForOci();
 

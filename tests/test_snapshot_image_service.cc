@@ -423,6 +423,263 @@ MT_TEST(image_service_export_removes_its_scratch_directory) {
     MT_EXPECT_EQ(::system(command.c_str()), 0);
 }
 
+// ---- target inference -----------------------------------------------------
+
+/// With no explicit target the destination is inferred from the snapshot's own
+/// registry source, under a **standalone** `snapshot-<id>` tag.
+///
+/// That tag is deliberately *not* `RootfsSnapshotImageTag`'s
+/// `agentenv-snapshot-<id>`, which is the tag the ACR exporter publishes a
+/// snapshot's own disk image under. Reusing it would put the operator's
+/// exported image on the ref the snapshot records as its own publication, so
+/// deleting the snapshot would delete the deliverable. The prefixes differing
+/// is what keeps an inferred export from landing there, and the warning
+/// `PublishCommittedRootfs` logs covers the case where an operator aims at
+/// that ref on purpose.
+MT_TEST(image_service_infers_a_standalone_tag_not_the_publication_tag) {
+    Fixture f;
+    const std::string same = "inferred layer";
+    const std::string managed = "managed bytes";
+    f.fake.SeedBlob("reg.example/team/app", DigestOf(same), same);
+    f.SeedPosixLayer(managed);
+
+    SnapshotImageService service = f.Service();
+    const RepositoryResult<SnapshotImageResult> out = service.PublishCommittedRootfs(
+        SomeId(), CommittedWith({ExternalRef(same, kSrcUrl), ManagedRef(managed)}),
+        core::Optional<std::string>(), core::Optional<std::string>(), f.scratch);
+    MT_EXPECT_TRUE(out.ok());
+    if (!out.ok()) {
+        std::fprintf(stderr, "  note: %s\n", out.error().ToString().c_str());
+        return;
+    }
+    MT_EXPECT_EQ(out.value().image_ref,
+                 "reg.example/team/app:snapshot-" + SomeId().ToString());
+    MT_EXPECT_TRUE(out.value().image_ref !=
+                   "reg.example/team/app:" + RootfsSnapshotImageTag(SomeId()));
+}
+
+/// A managed-only stack has no registry source to infer from, and there is no
+/// safe default registry to publish someone's rootfs to.
+MT_TEST(image_service_refuses_an_uninferable_target) {
+    Fixture f;
+    const std::string managed = "managed bytes";
+    f.SeedPosixLayer(managed);
+
+    SnapshotImageService service = f.Service();
+    const RepositoryResult<SnapshotImageResult> out = service.PublishCommittedRootfs(
+        SomeId(), CommittedWith({ManagedRef(managed)}), core::Optional<std::string>(),
+        core::Optional<std::string>(), f.scratch);
+    MT_EXPECT_TRUE(!out.ok());
+    if (!out.ok()) {
+        MT_EXPECT_TRUE(out.error().kind == RepositoryErrorKind::InvalidRequest);
+    }
+    // Refused before the registry was contacted at all.
+    MT_EXPECT_EQ(f.fake.ArgvLines().size(), static_cast<std::size_t>(0));
+}
+
+/// The config blob is content addressed like any other blob, so republishing
+/// the same snapshot under a *different* tag re-puts the manifest but not the
+/// config.
+MT_TEST(image_service_skips_a_config_blob_the_target_already_has) {
+    Fixture f;
+    const std::string managed = "managed bytes";
+    f.SeedPosixLayer(managed);
+    const CommittedSnapshot committed = CommittedWith({ManagedRef(managed)});
+
+    MT_EXPECT_TRUE(Publish(f, committed).ok());
+    const core::Expected<core::Json, core::AnyError> manifest =
+        core::Json::Parse(f.fake.StoredManifestBody(kTargetRef));
+    MT_EXPECT_TRUE(manifest.ok());
+    if (!manifest.ok()) return;
+    const std::string config_digest =
+        manifest.value().as_object().find("config")->second.as_object()
+            .find("digest")->second.as_string();
+
+    f.fake.ClearLog();
+    SnapshotImageService service = f.Service();
+    MT_EXPECT_TRUE(service
+                       .PublishCommittedRootfs(
+                           SomeId(), committed,
+                           core::Optional<std::string>(std::string(kTargetRepo)),
+                           core::Optional<std::string>(std::string("snap-2")), f.scratch)
+                       .ok());
+    MT_EXPECT_TRUE(!f.fake.Logged("blob put " + std::string(kTargetRepo) + " --digest " +
+                                  config_digest));
+    // The manifest, on the other hand, is new: a different tag is a different
+    // image reference even for identical content.
+    MT_EXPECT_TRUE(f.fake.Logged("manifest put --content-type " +
+                                 std::string(kRegctlOciManifestContentType) + " " +
+                                 std::string(kTargetRepo) + ":snap-2"));
+}
+
+// ---- the OSS managed-layer arm --------------------------------------------
+//
+// `OssClient` is a concrete class with no virtual interface, so the arm as a
+// whole cannot be driven without a bucket. Its two *decisions* are reached
+// through `FinishManagedLayerDownload` instead; what stays uncovered is the
+// single `GetToFile` call between them.
+
+/// A completed download of the right size yields the path `regctl` will read.
+MT_TEST(oss_arm_returns_the_downloaded_path) {
+    ManagedLayer layer;
+    layer.digest = DigestOf("oss bytes");
+    layer.size = std::string("oss bytes").size();
+
+    const RepositoryResult<std::string> out = FinishManagedLayerDownload(
+        layer, "/scratch/blob", RepositoryResult<uint64_t>(layer.size));
+    MT_EXPECT_TRUE(out.ok());
+    if (out.ok()) MT_EXPECT_EQ(out.value(), std::string("/scratch/blob"));
+}
+
+/// A short download is `IntegrityMismatch`, not success. The digest is never
+/// recomputed here -- `regctl blob put` is *told* it -- so a truncated object
+/// would otherwise be pushed and rejected far from the cause.
+MT_TEST(oss_arm_rejects_a_truncated_download) {
+    ManagedLayer layer;
+    layer.digest = DigestOf("oss bytes");
+    layer.size = 9;
+
+    const RepositoryResult<std::string> out = FinishManagedLayerDownload(
+        layer, "/scratch/blob", RepositoryResult<uint64_t>(static_cast<uint64_t>(4)));
+    MT_EXPECT_TRUE(!out.ok());
+    if (!out.ok()) {
+        MT_EXPECT_TRUE(out.error().kind == RepositoryErrorKind::IntegrityMismatch);
+        MT_EXPECT_EQ(out.error().expected, std::string("9"));
+        MT_EXPECT_EQ(out.error().actual, std::string("4"));
+    }
+}
+
+/// An absent object is `ManagedLayerNotFound`, the same kind the POSIX arm
+/// reports. `GetToFile` calls it `ArtifactNotFound`, and leaving it that way
+/// would make the answer depend on which backend holds the layer.
+MT_TEST(oss_arm_reports_an_absent_object_as_a_missing_managed_layer) {
+    ManagedLayer layer;
+    layer.digest = DigestOf("oss bytes");
+    layer.size = 9;
+
+    const RepositoryResult<std::string> out = FinishManagedLayerDownload(
+        layer, "/scratch/blob",
+        core::make_unexpected(RepositoryError::ArtifactNotFound("layers/" + layer.digest)));
+    MT_EXPECT_TRUE(!out.ok());
+    if (!out.ok()) {
+        MT_EXPECT_TRUE(out.error().kind == RepositoryErrorKind::ManagedLayerNotFound);
+        // The layer's digest, not the object key `GetToFile` complained about:
+        // the caller works in digests.
+        MT_EXPECT_TRUE(out.error().ToString().find(layer.digest) != std::string::npos);
+    }
+}
+
+/// Any other failure stays a backend fault: the object store being broken is
+/// not the same as the layer being gone, and collapsing them would send an
+/// operator looking for a layer that is still there.
+MT_TEST(oss_arm_keeps_a_transport_failure_a_backend_error) {
+    ManagedLayer layer;
+    layer.digest = DigestOf("oss bytes");
+    layer.size = 9;
+
+    const RepositoryResult<std::string> out = FinishManagedLayerDownload(
+        layer, "/scratch/blob",
+        core::make_unexpected(RepositoryError::Backend("get object", "connection reset")));
+    MT_EXPECT_TRUE(!out.ok());
+    if (!out.ok()) MT_EXPECT_TRUE(out.error().kind == RepositoryErrorKind::Backend);
+}
+
+/// The `:` of `sha256:` is replaced, so the scratch name is a plain filename.
+MT_TEST(oss_arm_turns_a_digest_into_a_filename) {
+    const std::string path = ManagedLayerDownloadPath("/scratch", "sha256:abc123");
+    MT_EXPECT_EQ(path, std::string("/scratch/sha256_abc123.overlaybd.commit"));
+    MT_EXPECT_TRUE(path.find(':') == std::string::npos);
+}
+
+// ---- ConfiguredSnapshotImageService::FromConfig ---------------------------
+//
+// The wiring that gives an export a call site at all. Until this existed the
+// locator had to be hand-built, so nothing in this port could export from an
+// OSS node.
+
+/// Selected by the **declared** backend, never by which section happens to be
+/// present. The regression this guards is the one `MakeRepositoryFromConfig`
+/// exists for: a node migrated from posix-fs still carries its
+/// `[backend.posix_fs]` section, and branching on presence would read layers
+/// off local disk while the config said `oss`.
+MT_TEST(configured_service_requires_the_declared_backends_section) {
+    cfg::AppConfig config;
+    config.snapshot.repository_backend = cfg::SnapshotRepositoryBackendKind::Oss;
+    // The leftover section, and no oss one.
+    cfg::PosixFsBackendConfig posix;
+    posix.snapshot_store = "/var/lib/agentenv/snapshots";
+    config.backend.posix_fs = core::Optional<cfg::PosixFsBackendConfig>(posix);
+    config.backend.oss = core::Optional<cfg::OssBackendConfig>();
+
+    const RepositoryResult<ConfiguredSnapshotImageService> configured =
+        ConfiguredSnapshotImageService::FromConfig(config, "/usr/bin/regctl");
+    MT_EXPECT_TRUE(!configured.ok());
+    if (!configured.ok()) {
+        // Named for the declared backend, not the present one.
+        MT_EXPECT_TRUE(configured.error().ToString().find("backend.oss") != std::string::npos);
+    }
+}
+
+MT_TEST(configured_service_requires_a_posixfs_section_when_declared) {
+    cfg::AppConfig config;
+    config.snapshot.repository_backend = cfg::SnapshotRepositoryBackendKind::PosixFs;
+    config.backend.posix_fs = core::Optional<cfg::PosixFsBackendConfig>();
+
+    const RepositoryResult<ConfiguredSnapshotImageService> configured =
+        ConfiguredSnapshotImageService::FromConfig(config, "/usr/bin/regctl");
+    MT_EXPECT_TRUE(!configured.ok());
+    if (!configured.ok()) {
+        MT_EXPECT_TRUE(configured.error().ToString().find("backend.posix_fs") !=
+                       std::string::npos);
+    }
+}
+
+/// The posix-fs branch wires the locator to `<snapshot_store>/repository`, one
+/// level *below* the store. Pointed at the store itself it would look one
+/// directory too high and report every managed layer as missing.
+///
+/// Driven through a complete publish, because that is the only way the
+/// assertion bites: with a non-existent regctl the flow dies at the first
+/// `manifest head`, before a layer is ever resolved, and a misplaced root
+/// would go unnoticed.
+MT_TEST(configured_service_wires_the_posix_locator_to_the_repository_root) {
+    Fixture f;
+    cfg::AppConfig config;
+    config.snapshot.repository_backend = cfg::SnapshotRepositoryBackendKind::PosixFs;
+    cfg::PosixFsBackendConfig posix;
+    // `Fixture::layer_root` is `<fake.dir()>/repository`, so the store is the
+    // directory above it -- exactly the relationship production has.
+    posix.snapshot_store = f.fake.dir();
+    config.backend.posix_fs = core::Optional<cfg::PosixFsBackendConfig>(posix);
+
+    const RepositoryResult<ConfiguredSnapshotImageService> configured =
+        ConfiguredSnapshotImageService::FromConfig(config, f.fake.binary());
+    MT_EXPECT_TRUE(configured.ok());
+    if (!configured.ok()) {
+        std::fprintf(stderr, "  note: %s\n", configured.error().ToString().c_str());
+        return;
+    }
+
+    const std::string managed = "wired correctly";
+    f.SeedPosixLayer(managed);
+    ConfiguredSnapshotImageService owned = configured.value();
+    SnapshotImageService service = owned.Service();
+    const RepositoryResult<SnapshotImageResult> out = service.PublishCommittedRootfs(
+        SomeId(), CommittedWith({ManagedRef(managed)}),
+        core::Optional<std::string>(std::string(kTargetRepo)),
+        core::Optional<std::string>(std::string("snap-1")), f.scratch);
+    MT_EXPECT_TRUE(out.ok());
+    if (!out.ok()) {
+        std::fprintf(stderr, "  note: %s\n", out.error().ToString().c_str());
+        return;
+    }
+    // Found under the repository root, and really transferred.
+    MT_EXPECT_EQ(f.fake.ReadBlob(kTargetRepo, DigestOf(managed)), managed);
+    // No OSS client on this backend, so nothing holds object-store state the
+    // posix path would never use.
+    MT_EXPECT_TRUE(!owned.oss_client());
+}
+
 }  // namespace
 
 MT_MAIN

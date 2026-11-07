@@ -11,8 +11,10 @@
 #define AGENTENV_SNAPSHOT_IMAGE_EXPORT_SERVICE_H_
 
 #include <functional>
+#include <memory>
 #include <string>
 
+#include "agentenv/cfg.h"
 #include "agentenv/core/expected.h"
 #include "agentenv/core/optional.h"
 #include "agentenv/snapshot/image_export/regctl.h"
@@ -23,6 +25,13 @@
 
 namespace agentenv {
 namespace snapshot {
+namespace repository {
+namespace oss {
+// Forward declared, not included: see `OssManagedLayerLocator`.
+class OssClient;
+}  // namespace oss
+}  // namespace repository
+
 namespace image_export {
 
 /// Rust `struct SnapshotImageResult`.
@@ -109,6 +118,97 @@ class SnapshotImageService {
 /// The POSIX arm of Rust's `ManagedLayerLocator`: the layer is validated where
 /// it already lives under `root`, never copied.
 ManagedLayerLocator PosixManagedLayerLocator(const std::string& root);
+
+/// The scratch path one managed layer downloads to.
+///
+/// Rust `layer.digest.replace([':', '/'], "_")`: a digest is not a filename,
+/// and leaving the `:` of `sha256:` in would produce a name some tools read as
+/// a drive-letter-shaped path.
+std::string ManagedLayerDownloadPath(const std::string& scratch_dir, const std::string& digest);
+
+/// The two checks the OSS arm makes once a download has finished.
+///
+/// Split out of `OssManagedLayerLocator` because `OssClient` is a concrete
+/// class with no virtual interface, so the arm as a whole cannot be driven
+/// without a bucket. These are the only *decisions* in it — the rest is one
+/// `GetToFile` call — and this way they are covered without one.
+repository::RepositoryResult<std::string> FinishManagedLayerDownload(
+    const ManagedLayer& layer, const std::string& destination,
+    const repository::RepositoryResult<uint64_t>& downloaded);
+
+/// The OSS arm of Rust's `ManagedLayerLocator`: the object is **downloaded**
+/// into the scratch directory, because `regctl` needs a path and an object
+/// store has none.
+///
+/// Held as a `shared_ptr` to an incomplete type on purpose — the whole reason
+/// the locator is a functor is to keep `oss/client.h` out of this header, and
+/// a type-erased deleter means a forward declaration is enough.
+ManagedLayerLocator OssManagedLayerLocator(
+    const std::shared_ptr<repository::oss::OssClient>& client);
+
+/// The config-driven wiring of one export, owning the parts the service only
+/// borrows.
+///
+/// This is what was missing for a rootfs export to have a call site at all:
+/// `SnapshotImageService` borrows its repository, so something has to own one,
+/// and choosing *which* backend to own is exactly the decision
+/// `snapshot.repository_backend` exists to make. Without it the locator had to
+/// be hand-wired, which meant nothing in this port could export from an OSS
+/// node.
+///
+/// Kept separate from `SnapshotImageService` rather than folded into it so the
+/// service keeps its injectable shape: the thirteen tests that drive it with a
+/// hand-made locator and no config are the reason that shape is worth
+/// preserving.
+class ConfiguredSnapshotImageService {
+ public:
+    /// Rust `SnapshotImageService::from_global_config`.
+    ///
+    /// Takes the config explicitly where Rust reads
+    /// `ConfigManager::global_config()`: this port has no such singleton, and
+    /// an argument also makes the backend selection testable without touching
+    /// process-wide state.
+    ///
+    /// **Selected by the declared `snapshot.repository_backend`, never by
+    /// which `[backend.*]` section happens to be present** — see
+    /// `MakeRepositoryFromConfig`, where that distinction is spelled out as
+    /// the bug it fixes. A missing section for the declared backend is an
+    /// error, matching Rust's `.context(..)`, because degrading to the other
+    /// one is that same bug.
+    ///
+    /// Deliberately skips the node-runtime resolver, artifact cache, layer
+    /// store and P2P machinery, as upstream does: an export reads committed
+    /// records and pushes blobs, and none of those take part.
+    static repository::RepositoryResult<ConfiguredSnapshotImageService> FromConfig(
+        const cfg::AppConfig& config, const std::string& regctl_binary);
+
+    /// The service, borrowing this object's repository. It must not outlive
+    /// the `ConfiguredSnapshotImageService` it came from.
+    SnapshotImageService Service() {
+        return SnapshotImageService(*repository_, locator_, regctl_);
+    }
+
+    const std::shared_ptr<repository::SnapshotRepository>& repository() const {
+        return repository_;
+    }
+    /// Null on the posix-fs backend.
+    const std::shared_ptr<repository::oss::OssClient>& oss_client() const { return oss_client_; }
+
+ private:
+    ConfiguredSnapshotImageService(
+        const std::shared_ptr<repository::SnapshotRepository>& repository,
+        const std::shared_ptr<repository::oss::OssClient>& oss_client,
+        const ManagedLayerLocator& locator, const Regctl& regctl)
+        : repository_(repository),
+          oss_client_(oss_client),
+          locator_(locator),
+          regctl_(regctl) {}
+
+    std::shared_ptr<repository::SnapshotRepository> repository_;
+    std::shared_ptr<repository::oss::OssClient> oss_client_;
+    ManagedLayerLocator locator_;
+    Regctl regctl_;
+};
 
 /// Rust's `s3://` marker on an external layer's `repo_blob_url`.
 ///

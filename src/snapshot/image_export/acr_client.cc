@@ -4,6 +4,7 @@
 #include "agentenv/snapshot/image_export/acr.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -14,7 +15,13 @@
 #include <fstream>
 #include <sstream>
 
+#include "agentenv/core/digest.h"
 #include "agentenv/core/logging.h"
+#include "agentenv/snapshot/acr_manifest.h"
+#include "agentenv/snapshot/image_export/acr_source_image.h"
+#include "agentenv/snapshot/recontainerize.h"
+#include "agentenv/storage/overlaybd/dense_export.h"
+#include "agentenv/storage/overlaybd/local_file.h"
 
 namespace agentenv {
 namespace snapshot {
@@ -82,7 +89,47 @@ bool IsHttpsUrl(const std::string& url) {
     return url.size() >= 8 && (url.compare(0, 8, "https://") == 0);
 }
 
+/// Rust `trim_end_matches('/')` — *every* trailing slash, not just one.
+std::string TrimTrailingSlashes(const std::string& text) {
+    std::string::size_type end = text.size();
+    while (end > 0 && text[end - 1] == '/') --end;
+    return text.substr(0, end);
+}
+
+std::string Decimal(uint64_t value) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%llu", static_cast<unsigned long long>(value));
+    return buf;
+}
+
 }  // namespace
+
+// ---- AcrRequestBody -------------------------------------------------------
+
+AcrRequestBody AcrRequestBody::Blob(const std::vector<uint8_t>& bytes) {
+    AcrRequestBody out;
+    out.bytes = bytes;
+    out.content_type = "application/octet-stream";
+    return out;
+}
+
+AcrRequestBody AcrRequestBody::BlobRange(const std::vector<uint8_t>& bytes, uint64_t offset,
+                                         uint64_t end) {
+    AcrRequestBody out = Blob(bytes);
+    // Bare `<start>-<end>`: the registry API's `Content-Range` for a chunked
+    // `PATCH` has neither the `bytes ` prefix nor the `/<total>` suffix of the
+    // HTTP range header it resembles, and adding either is a 400.
+    out.content_range =
+        core::Optional<std::string>(Decimal(offset) + "-" + Decimal(end));
+    return out;
+}
+
+AcrRequestBody AcrRequestBody::Manifest(const std::vector<uint8_t>& bytes) {
+    AcrRequestBody out;
+    out.bytes = bytes;
+    out.content_type = snapshot::kOciImageManifestMediaType;
+    return out;
+}
 
 // ---- Docker credential loading --------------------------------------------
 
@@ -255,7 +302,8 @@ core::Expected<core::Unit, AcrClientError> AcrClient::ValidateHttpsUrl(
 
 core::Expected<AcrClient::HttpResponse, AcrClientError> AcrClient::Request(
     const std::string& method, const std::string& url,
-    const core::Optional<std::string>& auth_header) {
+    const core::Optional<std::string>& auth_header,
+    const core::Optional<AcrRequestBody>& body) {
     const core::Expected<core::Unit, AcrClientError> valid =
         ValidateHttpsUrl(url, "ACR registry request");
     if (!valid.ok()) return core::make_unexpected(valid.error());
@@ -264,6 +312,23 @@ core::Expected<AcrClient::HttpResponse, AcrClientError> AcrClient::Request(
     request.method = method;
     request.url = url;
     if (auth_header.has_value()) request.headers["Authorization"] = *auth_header;
+    if (body.has_value()) {
+        request.body = body->bytes;
+        request.headers["Content-Type"] = body->content_type;
+        if (body->content_range.has_value()) {
+            request.headers["Content-Range"] = *body->content_range;
+        }
+        // `Content-Length` is left to the transport, which sets it from the
+        // body size. Rust writes it explicitly because its client does not;
+        // writing it here as well would send the header twice.
+    } else if (method == "POST") {
+        // The bodyless `POST` that opens an upload session. libcurl sends no
+        // `Content-Length` for a custom method without a payload, and a
+        // registry behind a proxy answers that with `411 Length Required`.
+        // Rust's client emits `content-length: 0` for an empty body on a
+        // method that takes one, so this keeps the two equivalent on the wire.
+        request.headers["Content-Length"] = "0";
+    }
     request.timeout_secs = static_cast<long>((options_.timeout_ms + 999) / 1000);
     // Rust's redirect policy also pins same-origin and an https target. This
     // transport's own policy is what applies here; the difference is recorded
@@ -446,13 +511,14 @@ core::Expected<core::Optional<std::string>, AcrClientError> AcrClient::CachedAut
 }
 
 core::Expected<AcrClient::HttpResponse, AcrClientError> AcrClient::SendOnce(
-    const std::string& method, const std::string& url, const std::string& repository) {
+    const std::string& method, const std::string& url, const std::string& repository,
+    const core::Optional<AcrRequestBody>& body) {
     const core::Expected<core::Optional<std::string>, AcrClientError> cached =
         CachedAuthHeader(url, repository);
     if (!cached.ok()) return core::make_unexpected(cached.error());
 
     core::Expected<HttpResponse, AcrClientError> response =
-        Request(method, url, cached.value());
+        Request(method, url, cached.value(), body);
     if (!response.ok()) return response;
 
     if (StatusCode(response.value()) != 401) {
@@ -478,7 +544,10 @@ core::Expected<AcrClient::HttpResponse, AcrClientError> AcrClient::SendOnce(
         AuthHeader(url, repository, *challenge);
     if (!header.ok()) return core::make_unexpected(header.error());
 
-    response = Request(method, url, core::Optional<std::string>(header.value()));
+    // The body goes out again with the retry. Omitting it would turn an
+    // authenticated chunk upload into an empty one that the registry accepts,
+    // leaving a blob whose content does not match its digest.
+    response = Request(method, url, core::Optional<std::string>(header.value()), body);
     if (!response.ok()) return response;
     const int retried_status = StatusCode(response.value());
     if (retried_status == 401 || retried_status == 403) {
@@ -491,14 +560,18 @@ core::Expected<AcrClient::HttpResponse, AcrClientError> AcrClient::SendOnce(
 }
 
 core::Expected<AcrClient::HttpResponse, AcrClientError> AcrClient::SendWithRetries(
-    const std::string& method, const std::string& url, const std::string& repository) {
+    const std::string& method, const std::string& url, const std::string& repository,
+    const core::Optional<AcrRequestBody>& body) {
     core::Optional<AcrClientError> last_transient;
     int64_t backoff = options_.retry_initial_backoff_ms;
 
     // `0..=retry_count`, so the default of 2 is three attempts.
     for (int attempt = 0; attempt <= options_.retry_count; ++attempt) {
+        // Rust clones the body per attempt. Held by reference here instead,
+        // which has the same effect and does not copy a chunk-sized buffer
+        // once per retry.
         const core::Expected<HttpResponse, AcrClientError> response =
-            SendOnce(method, url, repository);
+            SendOnce(method, url, repository, body);
         if (response.ok()) {
             const int status = StatusCode(response.value());
             if (!IsRetryableStatus(status)) return response;
@@ -561,10 +634,238 @@ core::Expected<core::Unit, AcrClientError> AcrClient::DeleteManifestUrl(
     return core::make_unexpected(StatusError(status, "delete ACR image manifest"));
 }
 
+// ---- push half ------------------------------------------------------------
+
+core::Expected<core::Unit, AcrClientError> AcrClient::EnsureManifestAbsent(
+    const std::string& manifest_url, const std::string& repository, const std::string& tag) {
+    const core::Expected<HttpResponse, AcrClientError> response =
+        SendWithRetries("HEAD", manifest_url, repository);
+    if (!response.ok()) return core::make_unexpected(response.error());
+
+    const int status = StatusCode(response.value());
+    // 404 is the success case. Every other 2xx means something answers to the
+    // tag, which is refused rather than overwritten: a published tag is what a
+    // caller may already have pulled, and replacing its manifest silently
+    // changes what that reference means.
+    if (status == 404) return core::Unit();
+    if (status >= 200 && status < 300) {
+        return core::make_unexpected(AcrClientError::ManifestExists(tag));
+    }
+    return core::make_unexpected(StatusError(status, "check ACR manifest existence"));
+}
+
+core::Expected<bool, AcrClientError> AcrClient::BlobExists(const std::string& repo_blob_url,
+                                                           const std::string& repository,
+                                                           const std::string& digest) {
+    const std::string url = TrimTrailingSlashes(repo_blob_url) + "/" + digest;
+    const core::Expected<HttpResponse, AcrClientError> response =
+        SendWithRetries("HEAD", url, repository);
+    if (!response.ok()) return core::make_unexpected(response.error());
+
+    const int status = StatusCode(response.value());
+    if (status == 404) return false;
+    if (status >= 200 && status < 300) return true;
+    // Not treated as "absent": an error status says nothing about whether the
+    // blob is there, and guessing absent would re-upload a layer the registry
+    // already holds while hiding the failure.
+    return core::make_unexpected(StatusError(status, "check ACR blob existence"));
+}
+
+core::Expected<std::string, AcrClientError> AcrClient::StartBlobUpload(
+    const std::string& upload_url, const std::string& repository) {
+    const core::Expected<HttpResponse, AcrClientError> response =
+        SendWithRetries("POST", upload_url, repository);
+    if (!response.ok()) return core::make_unexpected(response.error());
+
+    const int status = StatusCode(response.value());
+    if (status != 202 && !(status >= 200 && status < 300)) {
+        return core::make_unexpected(StatusError(status, "start ACR blob upload"));
+    }
+    const core::Optional<std::string> location =
+        FindHeader(response.value().headers, "Location");
+    if (!location.has_value()) {
+        // There is nowhere to send the chunks. Falling back to `upload_url`
+        // would post them to the session-opening endpoint, which opens a new
+        // session per chunk and leaves them all incomplete.
+        return core::make_unexpected(
+            AcrClientError::Registry("ACR blob upload response missing Location header"));
+    }
+    return AbsolutizeLocation(upload_url, *location);
+}
+
+core::Expected<core::Unit, AcrClientError> AcrClient::CompleteBlobUpload(
+    const std::string& session_url, const std::string& repository,
+    const std::vector<uint8_t>& bytes, const std::string& digest) {
+    const std::string complete_url = AppendDigestQuery(session_url, digest);
+    const core::Expected<HttpResponse, AcrClientError> response = SendWithRetries(
+        "PUT", complete_url, repository,
+        core::Optional<AcrRequestBody>(AcrRequestBody::Blob(bytes)));
+    if (!response.ok()) return core::make_unexpected(response.error());
+
+    const int status = StatusCode(response.value());
+    if (status == 201 || (status >= 200 && status < 300)) return core::Unit();
+    return core::make_unexpected(StatusError(status, "complete ACR blob upload"));
+}
+
+core::Expected<core::Unit, AcrClientError> AcrClient::UploadBlob(
+    const std::string& upload_url, const std::string& repository, const std::string& path,
+    const std::string& digest) {
+    std::ifstream file(path.c_str(), std::ios::binary);
+    if (!file.good()) {
+        return core::make_unexpected(AcrClientError::Registry(
+            "open ACR blob '" + path + "': " + std::strerror(errno)));
+    }
+    struct stat info;
+    if (::stat(path.c_str(), &info) != 0) {
+        return core::make_unexpected(AcrClientError::Registry(
+            "stat ACR blob '" + path + "': " + std::strerror(errno)));
+    }
+    const uint64_t size = static_cast<uint64_t>(info.st_size);
+
+    const core::Expected<std::string, AcrClientError> session =
+        StartBlobUpload(upload_url, repository);
+    if (!session.ok()) return core::make_unexpected(session.error());
+    std::string session_url = session.value();
+
+    // Clamped to at least 1: a zero would make the loop read nothing and
+    // never advance past the first chunk.
+    const std::size_t chunk_size = options_.upload_chunk_size > 0
+                                       ? options_.upload_chunk_size
+                                       : static_cast<std::size_t>(1);
+    uint64_t offset = 0;
+    while (offset < size) {
+        const uint64_t remaining = size - offset;
+        const std::size_t count = remaining < static_cast<uint64_t>(chunk_size)
+                                      ? static_cast<std::size_t>(remaining)
+                                      : chunk_size;
+        std::vector<uint8_t> buffer(count);
+        file.read(reinterpret_cast<char*>(&buffer[0]), static_cast<std::streamsize>(count));
+        if (static_cast<std::size_t>(file.gcount()) != count) {
+            // Rust's `read_exact`. A short read means the file shrank under
+            // us, and sending the partial chunk would complete an upload
+            // whose content does not match the digest being claimed.
+            return core::make_unexpected(
+                AcrClientError::Registry("read ACR blob '" + path + "': unexpected end of file"));
+        }
+        const uint64_t end = offset + count - 1;
+
+        // A retried `PATCH` reuses the same session and byte range. OCI
+        // registries are expected to tolerate that idempotent retry; one that
+        // does not would need this path to restart the session from offset 0.
+        const core::Expected<HttpResponse, AcrClientError> response = SendWithRetries(
+            "PATCH", session_url, repository,
+            core::Optional<AcrRequestBody>(AcrRequestBody::BlobRange(buffer, offset, end)));
+        if (!response.ok()) return core::make_unexpected(response.error());
+
+        const int status = StatusCode(response.value());
+        if (status != 202 && !(status >= 200 && status < 300)) {
+            return core::make_unexpected(StatusError(status, "upload ACR blob chunk"));
+        }
+        // The session URL may move between chunks, and a registry that
+        // relocates it will not accept the old one again.
+        const core::Optional<std::string> location =
+            FindHeader(response.value().headers, "Location");
+        if (location.has_value()) {
+            const core::Expected<std::string, AcrClientError> moved =
+                AbsolutizeLocation(session_url, *location);
+            if (!moved.ok()) return core::make_unexpected(moved.error());
+            session_url = moved.value();
+        }
+        offset += count;
+    }
+
+    // The completing `PUT` carries no further bytes: everything went out as
+    // chunks, and repeating the tail here would append it twice.
+    return CompleteBlobUpload(session_url, repository, std::vector<uint8_t>(), digest);
+}
+
+core::Expected<std::pair<std::string, uint64_t>, AcrClientError>
+AcrClient::UploadBlobWithDescriptor(const std::string& upload_url,
+                                    const std::string& repo_blob_url,
+                                    const std::string& repository, const std::string& path,
+                                    const std::string& digest, uint64_t size) {
+    if (digest.empty()) {
+        // The digest is what the manifest will claim and nothing downstream
+        // re-derives it, so an empty one would publish a manifest pointing at
+        // `sha256:` and the layer would be unreachable.
+        return core::make_unexpected(
+            AcrClientError::Registry("ACR blob '" + path + "' is missing digest"));
+    }
+    if (size == 0) {
+        return core::make_unexpected(
+            AcrClientError::Registry("ACR blob '" + path + "' is empty"));
+    }
+    struct stat info;
+    if (::stat(path.c_str(), &info) != 0) {
+        return core::make_unexpected(AcrClientError::Registry(
+            "stat ACR blob '" + path + "': " + std::strerror(errno)));
+    }
+    const uint64_t source_size = static_cast<uint64_t>(info.st_size);
+    if (source_size != size) {
+        // Checked before uploading rather than after: a descriptor that
+        // disagrees with the file means one of the two is stale, and either
+        // way the manifest would describe a layer that is not what was sent.
+        return core::make_unexpected(AcrClientError::Registry(
+            "ACR blob descriptor size mismatch for '" + path + "': descriptor says " +
+            Decimal(size) + ", file has " + Decimal(source_size)));
+    }
+
+    const core::Expected<bool, AcrClientError> exists =
+        BlobExists(repo_blob_url, repository, digest);
+    if (!exists.ok()) return core::make_unexpected(exists.error());
+    // Content addressed, so a digest the registry already has needs no
+    // upload. This is what makes a re-publish of an unchanged layer free.
+    if (exists.value()) return std::make_pair(digest, size);
+
+    const core::Expected<core::Unit, AcrClientError> uploaded =
+        UploadBlob(upload_url, repository, path, digest);
+    if (!uploaded.ok()) return core::make_unexpected(uploaded.error());
+    return std::make_pair(digest, size);
+}
+
+core::Expected<core::Unit, AcrClientError> AcrClient::UploadBlobBytes(
+    const std::string& upload_url, const std::string& repository,
+    const std::vector<uint8_t>& bytes, const std::string& digest) {
+    const core::Expected<std::string, AcrClientError> session =
+        StartBlobUpload(upload_url, repository);
+    if (!session.ok()) return core::make_unexpected(session.error());
+    // No `PATCH` phase: the config blob is a few hundred bytes, and chunking
+    // something smaller than one chunk only adds a round trip.
+    return CompleteBlobUpload(session.value(), repository, bytes, digest);
+}
+
+core::Expected<std::string, AcrClientError> AcrClient::PutManifest(
+    const std::string& manifest_url, const std::string& repository,
+    const std::vector<uint8_t>& manifest_bytes) {
+    // Computed before the request, so a response without
+    // `Docker-Content-Digest` is answered rather than failed.
+    const std::string fallback_digest = core::Sha256Digest(
+        manifest_bytes.empty() ? static_cast<const void*>("") : &manifest_bytes[0],
+        manifest_bytes.size());
+
+    const core::Expected<HttpResponse, AcrClientError> response = SendWithRetries(
+        "PUT", manifest_url, repository,
+        core::Optional<AcrRequestBody>(AcrRequestBody::Manifest(manifest_bytes)));
+    if (!response.ok()) return core::make_unexpected(response.error());
+
+    const int status = StatusCode(response.value());
+    if (!(status == 201 || (status >= 200 && status < 300))) {
+        return core::make_unexpected(StatusError(status, "put ACR image manifest"));
+    }
+    // The registry's digest wins: that is the one it will answer to later.
+    // They differ only when the registry re-serialised the manifest, and in
+    // that case the local digest names nothing.
+    const core::Optional<std::string> reported =
+        FindHeader(response.value().headers, "Docker-Content-Digest");
+    return reported.has_value() ? *reported : fallback_digest;
+}
+
 // ---- AcrDiskImageExporter -------------------------------------------------
 
-AcrDiskImageExporter::AcrDiskImageExporter(const ClientBuilder& client_builder)
-    : client_builder_(client_builder) {}
+AcrDiskImageExporter::AcrDiskImageExporter(
+    const ClientBuilder& client_builder,
+    const overlaybd::OverlaybdCompactOutput& publish_compression)
+    : client_builder_(client_builder), publish_compression_(publish_compression) {}
 
 AcrDiskImageExporter::ClientBuilder AcrDiskImageExporter::DockerConfigClientBuilder(
     const AcrClientOptions& options) {
@@ -585,6 +886,210 @@ core::Expected<AcrClient*, AcrClientError> AcrDiskImageExporter::ClientForRegist
     const std::pair<std::map<std::string, AcrClient>::iterator, bool> inserted =
         clients_.insert(std::make_pair(registry, built.value()));
     return &inserted.first->second;
+}
+
+namespace {
+
+/// Rust `AcrDiskImageExporter::upload_local_delta`.
+///
+/// A free function rather than a method: the only thing it needs from the
+/// exporter is `publish_compression`, and taking that as an argument keeps
+/// `LocalSnapshotDelta` — declared in `acr_source_image.h`, which includes
+/// `acr.h` — out of the class declaration.
+RepositoryResult<PreparedLayerUpload> UploadLocalDelta(
+    AcrClient& client, const std::string& upload_url, const std::string& repo_blob_url,
+    const std::string& repository, const LocalSnapshotDelta& local,
+    const overlaybd::OverlaybdCompactOutput& publish_compression) {
+    std::string prepare_from = local.path;
+    core::Optional<std::string> trusted_digest;
+    uint64_t trusted_size = 0;
+    OwnedTempPath dense_temp;
+
+    if (local.descriptor.is_raw()) {
+        // Publish compression recontainerizes a raw delta as zfile, which
+        // changes the physical bytes; `PrepareLayerUpload` therefore re-hashes
+        // its output, and the digest and size below always describe the bytes
+        // that were uploaded. An input that is already zfile is passed
+        // through, so its descriptor stays valid.
+        trusted_digest = core::Optional<std::string>(local.descriptor.digest);
+        trusted_size = local.descriptor.size;
+    } else {
+        // `DenseOverlaybd`: the holes have to be materialised before anything
+        // can be hashed. The planner deliberately left this one undescribed,
+        // because hashing the sparse file would record a digest for bytes the
+        // registry never receives.
+        //
+        // Rust stages this in `NamedTempFile::new()`, i.e. `$TMPDIR`;
+        // `OwnedTempPath::Create` is the same placement and also gives the
+        // unlink-on-last-reference that `retain_source` relies on.
+        const core::Expected<OwnedTempPath, std::string> temp =
+            OwnedTempPath::Create("agentenv-acr-dense-delta-");
+        if (!temp.ok()) {
+            return core::make_unexpected(RepositoryError::Backend(
+                "create temp dense ACR delta for '" + local.path + "'", temp.error()));
+        }
+        dense_temp = temp.value();
+
+        const core::Expected<std::shared_ptr<storage::overlaybd::LocalFile>, std::string> dest =
+            storage::overlaybd::LocalFile::OpenRw(dense_temp.path(), false);
+        if (!dest.ok()) {
+            return core::make_unexpected(RepositoryError::Backend(
+                "dense-export overlaybd ACR delta '" + local.path + "'", dest.error()));
+        }
+        const core::Expected<core::Unit, std::string> written =
+            storage::overlaybd::WriteDenseLayerToFile(local.path, dest.value());
+        if (!written.ok()) {
+            return core::make_unexpected(RepositoryError::Backend(
+                "dense-export overlaybd ACR delta '" + local.path + "'", written.error()));
+        }
+        // Rust takes the descriptor `write_dense_overlaybd_layer_to_file`
+        // returns; it is the digest and size of exactly these dense bytes.
+        const core::Expected<core::FileDigest, std::string> descriptor =
+            core::DescribeFile(dense_temp.path());
+        if (!descriptor.ok()) {
+            return core::make_unexpected(RepositoryError::Backend(
+                "dense-export overlaybd ACR delta '" + local.path + "'", descriptor.error()));
+        }
+        prepare_from = dense_temp.path();
+        trusted_digest = core::Optional<std::string>(descriptor.value().sha256);
+        trusted_size = descriptor.value().size;
+    }
+
+    const RepositoryResult<PreparedLayerUpload> prepared =
+        PrepareLayerUpload(prepare_from, publish_compression, trusted_digest, trusted_size);
+    if (!prepared.ok()) return prepared;
+
+    PreparedLayerUpload upload = prepared.value();
+    if (dense_temp.valid()) {
+        // Rust `upload.retain_source(dense_temp)`. Without this the dense file
+        // is unlinked when `dense_temp` goes out of scope, and in the
+        // uncompressed case that file *is* what the upload reads. A
+        // recontainerized output owns its own temporary, which `RetainSource`
+        // deliberately does not displace.
+        upload.RetainSource(dense_temp);
+    }
+
+    const core::Expected<std::pair<std::string, uint64_t>, AcrClientError> uploaded =
+        client.UploadBlobWithDescriptor(upload_url, repo_blob_url, repository, upload.Path(),
+                                        upload.Digest(), upload.Size());
+    if (!uploaded.ok()) {
+        return core::make_unexpected(uploaded.error().ToRepositoryError());
+    }
+    return upload;
+}
+
+}  // namespace
+
+RepositoryResult<DiskImageExportOutcome> AcrDiskImageExporter::Export(
+    const core::SnapshotId& snapshot_id, const DiskImageSubject& subject,
+    const std::string& image_config_path,
+    const core::Optional<SnapshotOciConfigInput>& config, bool allow_loopback_http) {
+    const RepositoryResult<SourceRegistryImage> image =
+        LoadSourceRegistryImage(image_config_path, allow_loopback_http);
+    if (!image.ok()) return core::make_unexpected(image.error());
+    const SourceRegistryRepository& target = image.value().target;
+
+    // Before any upload: a tag rejected afterwards would leave the blobs
+    // pushed with no manifest naming them.
+    const std::string tag = SnapshotTag(snapshot_id, subject);
+    const RepositoryResult<core::Unit> valid_tag = ValidateSnapshotTag(tag);
+    if (!valid_tag.ok()) return core::make_unexpected(valid_tag.error());
+
+    const core::Expected<AcrClient*, AcrClientError> client =
+        ClientForRegistry(target.registry);
+    if (!client.ok()) return core::make_unexpected(client.error().ToRepositoryError());
+
+    const std::string manifest_url = target.ManifestUrl(tag);
+    const core::Expected<core::Unit, AcrClientError> absent =
+        client.value()->EnsureManifestAbsent(manifest_url, target.repository, tag);
+    if (!absent.ok()) return core::make_unexpected(absent.error().ToRepositoryError());
+
+    const std::string upload_url = target.UploadUrl();
+    std::vector<OciDescriptor> descriptors;
+    std::vector<OverlaybdLayerRef> committed_layers;
+    descriptors.reserve(image.value().layers.size());
+    committed_layers.reserve(image.value().layers.size());
+    // Rust returns these in `DiskImageExportOutcome::local_layers` for the
+    // post-commit P2P announcement, which is not ported. They are still held
+    // here, because each one owns the temporary file its upload read from and
+    // dropping them per iteration would be fine only as long as that stays
+    // true. Keeping them makes the lifetime independent of that detail.
+    std::vector<PreparedLayerUpload> local_layers;
+
+    for (std::vector<SourceRegistryLayer>::size_type i = 0; i < image.value().layers.size();
+         ++i) {
+        const SourceRegistryLayer& layer = image.value().layers[i];
+        std::string digest;
+        uint64_t size = 0;
+        if (layer.is_remote()) {
+            // Already in the registry, so publishing only has to name it.
+            digest = layer.digest;
+            size = layer.size;
+        } else {
+            const RepositoryResult<PreparedLayerUpload> uploaded =
+                UploadLocalDelta(*client.value(), upload_url, target.repo_blob_url,
+                                 target.repository, layer.local_delta, publish_compression_);
+            if (!uploaded.ok()) return core::make_unexpected(uploaded.error());
+            // The *uploaded* bytes, which is the whole point of routing
+            // through `PreparedLayerUpload`: a recontainerized delta no
+            // longer matches the planner's descriptor.
+            digest = uploaded.value().Digest();
+            size = uploaded.value().Size();
+            local_layers.push_back(uploaded.value());
+        }
+        descriptors.push_back(OciDescriptor::OverlaybdLayer(digest, size));
+        ExternalLayer external;
+        external.digest = digest;
+        external.repo_blob_url = target.repo_blob_url;
+        external.size = size;
+        committed_layers.push_back(OverlaybdLayerRef::External(external));
+    }
+
+    const OciConfigBlob config_blob =
+        config.has_value()
+            ? SnapshotOciConfigBlob(HostArchitectureForOci(), config->context,
+                                    config->raw_config)
+            : MinimalOciConfigBlob(HostArchitectureForOci());
+
+    // Content addressed like any other blob, so an unchanged configuration
+    // costs one `HEAD` on a re-publish.
+    const core::Expected<bool, AcrClientError> config_exists = client.value()->BlobExists(
+        target.repo_blob_url, target.repository, config_blob.digest);
+    if (!config_exists.ok()) {
+        return core::make_unexpected(config_exists.error().ToRepositoryError());
+    }
+    if (!config_exists.value()) {
+        const core::Expected<core::Unit, AcrClientError> uploaded =
+            client.value()->UploadBlobBytes(
+                upload_url, target.repository,
+                std::vector<uint8_t>(config_blob.bytes.begin(), config_blob.bytes.end()),
+                config_blob.digest);
+        if (!uploaded.ok()) return core::make_unexpected(uploaded.error().ToRepositoryError());
+    }
+
+    // Last, because the manifest is what makes the rest resolvable: until it
+    // lands the blobs are unreferenced, so a failure above leaves nothing a
+    // puller can see.
+    const std::string manifest = BuildOciImageManifest(
+        OciDescriptor::Config(config_blob.digest, config_blob.size), descriptors, tag);
+    const core::Expected<std::string, AcrClientError> manifest_digest =
+        client.value()->PutManifest(manifest_url, target.repository,
+                                    std::vector<uint8_t>(manifest.begin(), manifest.end()));
+    if (!manifest_digest.ok()) {
+        return core::make_unexpected(manifest_digest.error().ToRepositoryError());
+    }
+
+    DiskImageExportOutcome outcome;
+    outcome.layers = committed_layers;
+    PersistedDiskImagePublication publication;
+    publication.image_ref = target.ImageRef(tag);
+    publication.tag = tag;
+    // The registry's digest when it reported one -- that is what a rollback
+    // will aim its DELETE at.
+    publication.manifest_digest = manifest_digest.value();
+    publication.repo_blob_url = target.repo_blob_url;
+    outcome.publication = core::Optional<PersistedDiskImagePublication>(publication);
+    return outcome;
 }
 
 RepositoryResult<core::Unit> AcrDiskImageExporter::RollbackPublication(

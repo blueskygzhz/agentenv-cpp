@@ -7,8 +7,8 @@
 // naming them, so the next publish re-uploads them and nothing ever collects
 // the orphans.
 //
-// `AcrDiskImageExporter::RollbackPublication` — the other half of this Rust
-// module that is ported — lives in `acr.h`, next to the client it drives.
+// `AcrDiskImageExporter` — this module's `export` and `rollback_publication`
+// — lives in `acr.h` instead, next to the client both halves drive.
 #ifndef AGENTENV_SNAPSHOT_IMAGE_EXPORT_ACR_PUBLISHER_H_
 #define AGENTENV_SNAPSHOT_IMAGE_EXPORT_ACR_PUBLISHER_H_
 

@@ -3,13 +3,18 @@
 // src/snapshot/image_export/acr/publisher.rs — the registry client, limited to
 // what rolling a publication back needs.
 //
-// Scope, stated plainly: this is the *delete* half of the ACR exporter. Blob
-// upload and manifest assembly (`publisher.rs`, `manifest.rs`) are not here,
-// and neither is the policy that would select the exporter for a push in the
-// first place. Rolling back is what unblocks deleting a snapshot that was
-// published to a source registry, which is otherwise refused outright: a
-// "deleted" snapshot that stays published in the registry is the one failure
-// the caller cannot see.
+// Scope, stated plainly: `AcrClient` covers both halves of `client.rs` — the
+// manifest delete a rollback needs and the blob upload and manifest put a
+// publish needs — and `AcrDiskImageExporter` covers `publisher.rs`'s `export`
+// and `rollback_publication`. What is still absent is the *selection* above
+// it: nothing in this port decides that a given publish should go to ACR, so
+// `Export` has no production call site yet. That is `regctl`/`service` work,
+// not this file's.
+//
+// Rolling back is what unblocks deleting a snapshot that was published to a
+// source registry, which is otherwise refused outright: a "deleted" snapshot
+// that stays published in the registry is the one failure the caller cannot
+// see.
 //
 // `SourceRegistryRepository` is the exception: it belongs to `source_image.rs`
 // upstream but is shared with this half, which needs it to aim a DELETE. There
@@ -18,15 +23,21 @@
 #ifndef AGENTENV_SNAPSHOT_IMAGE_EXPORT_ACR_H_
 #define AGENTENV_SNAPSHOT_IMAGE_EXPORT_ACR_H_
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "agentenv/core/expected.h"
 #include "agentenv/core/json.h"
 #include "agentenv/core/optional.h"
+#include "agentenv/overlaybd/compact.h"
+#include "agentenv/snapshot/acr_manifest.h"
+#include "agentenv/snapshot/image_export/acr_publisher.h"
+#include "agentenv/snapshot/layers.h"
 #include "agentenv/snapshot/record.h"
 #include "agentenv/snapshot/repository/errors.h"
 #include "agentenv/storage/overlaybd/http_transport.h"
@@ -226,7 +237,60 @@ struct AcrClientOptions {
     int64_t retry_initial_backoff_ms = 500;
     /// Rust's `#[cfg(test)] allow_insecure_http`.
     bool allow_insecure_http = false;
+    /// Rust `DEFAULT_UPLOAD_CHUNK_SIZE` — bytes per `PATCH` of a blob upload.
+    ///
+    /// Each chunk is held in memory, so this is the upload's peak footprint
+    /// per concurrent blob. Clamped to at least 1 where it is used, because a
+    /// zero would make the upload loop never advance.
+    std::size_t upload_chunk_size = 8 * 1024 * 1024;
 };
+
+/// Rust `RequestBody` — the body of one registry request.
+///
+/// Three shapes upstream (`blob`, `blob_range`, `manifest`), which differ only
+/// in content type and whether a `Content-Range` is set, so they are one
+/// struct with factories here.
+///
+/// `Content-Length` is deliberately **not** carried: Rust writes it
+/// explicitly, but this port's transport derives it from the body size, and
+/// setting both would send the header twice.
+struct AcrRequestBody {
+    std::vector<uint8_t> bytes;
+    std::string content_type;
+    /// Rust's `Content-Range` for a chunked `PATCH`.
+    ///
+    /// The registry API's form is bare `"<start>-<end>"` — **no `bytes `
+    /// prefix and no `/<total>`**, unlike the HTTP range header it resembles.
+    core::Optional<std::string> content_range;
+
+    /// Rust `RequestBody::blob` — `application/octet-stream`, no range.
+    static AcrRequestBody Blob(const std::vector<uint8_t>& bytes);
+    /// Rust `RequestBody::blob_range` — one chunk of a chunked upload.
+    static AcrRequestBody BlobRange(const std::vector<uint8_t>& bytes, uint64_t offset,
+                                    uint64_t end);
+    /// Rust `RequestBody::manifest` — the OCI manifest media type.
+    static AcrRequestBody Manifest(const std::vector<uint8_t>& bytes);
+};
+
+/// Rust `append_digest_query` — the `?digest=` a blob upload is completed
+/// with.
+///
+/// Appends with `&` when the session URL already carries a query, which it
+/// does on most registries: the `Location` of an upload session is opaque and
+/// commonly contains one.
+///
+/// The digest is **not** percent-encoded, matching upstream. A digest is
+/// `sha256:<hex>`, and the colon is legal in a query value; encoding it would
+/// produce a URL some registries reject.
+std::string AppendDigestQuery(const std::string& url, const std::string& digest);
+
+/// Rust `absolutize_location` — resolve an upload session `Location` against
+/// the URL it came from.
+///
+/// A registry may answer with either an absolute URL or a path, and the path
+/// form has to be joined onto the request's origin rather than guessed at.
+core::Expected<std::string, AcrClientError> AbsolutizeLocation(const std::string& base_url,
+                                                                 const std::string& location);
 
 /// Rust `DEFAULT_TOKEN_TTL` / `TOKEN_EXPIRY_SKEW`.
 ///
@@ -287,18 +351,90 @@ class AcrClient {
     core::Expected<core::Unit, AcrClientError> DeleteManifestUrl(
         const std::string& manifest_digest_url, const std::string& repository);
 
+    // ---- push half (Rust `client.rs`) -----------------------------------
+
+    /// Rust `ensure_manifest_absent` — refuse to overwrite a published tag.
+    ///
+    /// Called *before* any blob is uploaded, so a re-publish under a tag that
+    /// already exists costs one `HEAD` rather than a full layer push. A `404`
+    /// is the success case; a `200` is `ManifestExists`, which the caller
+    /// surfaces as a conflict rather than a failure.
+    core::Expected<core::Unit, AcrClientError> EnsureManifestAbsent(
+        const std::string& manifest_url, const std::string& repository,
+        const std::string& tag);
+
+    /// Rust `blob_exists` — whether the registry already holds this blob.
+    ///
+    /// The deduplication that makes a re-publish cheap: layers are content
+    /// addressed, so a digest the registry already has needs no upload.
+    core::Expected<bool, AcrClientError> BlobExists(const std::string& repo_blob_url,
+                                                      const std::string& repository,
+                                                      const std::string& digest);
+
+    /// Rust `upload_blob_with_descriptor` — upload `path` unless the registry
+    /// already has `digest`, returning the descriptor that names it.
+    ///
+    /// Validates the descriptor against the file before uploading: an empty
+    /// digest, a zero size, or a size that disagrees with the file on disk is
+    /// refused. That check is the one that matters most here, because the
+    /// digest is what the manifest will claim and nothing downstream
+    /// re-derives it.
+    core::Expected<std::pair<std::string, uint64_t>, AcrClientError>
+    UploadBlobWithDescriptor(const std::string& upload_url, const std::string& repo_blob_url,
+                               const std::string& repository, const std::string& path,
+                               const std::string& digest, uint64_t size);
+
+    /// Rust `upload_blob_bytes` — a whole small blob in one `PUT`.
+    ///
+    /// Used for the config blob, which is a few hundred bytes. Skips the
+    /// `PATCH` phase entirely: chunking an object smaller than one chunk only
+    /// adds a round trip.
+    core::Expected<core::Unit, AcrClientError> UploadBlobBytes(
+        const std::string& upload_url, const std::string& repository,
+        const std::vector<uint8_t>& bytes, const std::string& digest);
+
+    /// Rust `put_manifest` — publish the manifest, returning its digest.
+    ///
+    /// Prefers the registry's `Docker-Content-Digest` over the locally
+    /// computed one, because that is the digest the registry will answer to
+    /// later; they agree unless the registry re-serialised the manifest. The
+    /// local digest is the fallback rather than the primary for the same
+    /// reason, and it is computed up front so a missing header is not an
+    /// error.
+    core::Expected<std::string, AcrClientError> PutManifest(
+        const std::string& manifest_url, const std::string& repository,
+        const std::vector<uint8_t>& manifest_bytes);
+
+    /// Rust `upload_blob` — the chunked upload itself.
+    ///
+    /// Public for tests; `UploadBlobWithDescriptor` is what callers want,
+    /// since it adds the existence check and the descriptor validation.
+    core::Expected<core::Unit, AcrClientError> UploadBlob(const std::string& upload_url,
+                                                            const std::string& repository,
+                                                            const std::string& path,
+                                                            const std::string& digest);
+
  private:
     typedef storage::overlaybd::http::Response HttpResponse;
 
-    core::Expected<HttpResponse, AcrClientError> SendWithRetries(const std::string& method,
-                                                                 const std::string& url,
-                                                                 const std::string& repository);
-    core::Expected<HttpResponse, AcrClientError> SendOnce(const std::string& method,
-                                                          const std::string& url,
-                                                          const std::string& repository);
+    /// Rust `start_blob_upload` — `POST` a session and return its `Location`.
+    core::Expected<std::string, AcrClientError> StartBlobUpload(const std::string& upload_url,
+                                                                  const std::string& repository);
+    /// Rust `complete_blob_upload` — `PUT ?digest=` with the trailing bytes.
+    core::Expected<core::Unit, AcrClientError> CompleteBlobUpload(
+        const std::string& session_url, const std::string& repository,
+        const std::vector<uint8_t>& bytes, const std::string& digest);
+
+    core::Expected<HttpResponse, AcrClientError> SendWithRetries(
+        const std::string& method, const std::string& url, const std::string& repository,
+        const core::Optional<AcrRequestBody>& body = core::Optional<AcrRequestBody>());
+    core::Expected<HttpResponse, AcrClientError> SendOnce(
+        const std::string& method, const std::string& url, const std::string& repository,
+        const core::Optional<AcrRequestBody>& body);
     core::Expected<HttpResponse, AcrClientError> Request(
         const std::string& method, const std::string& url,
-        const core::Optional<std::string>& auth_header);
+        const core::Optional<std::string>& auth_header,
+        const core::Optional<AcrRequestBody>& body);
     core::Expected<std::string, AcrClientError> AuthHeader(const std::string& registry_url,
                                                            const std::string& repository,
                                                            const std::string& challenge);
@@ -322,7 +458,24 @@ class AcrClient {
     std::map<std::string, CachedTokenEntry> token_cache_;
 };
 
-/// Rust `AcrDiskImageExporter::rollback_publication`, with its client cache.
+/// Rust `struct DiskImageExportOutcome`.
+///
+/// Rust also carries `local_layers: Vec<PreparedLayerUpload>`, the prepared
+/// upload files kept alive past the push for the post-commit P2P
+/// announcement. That transport is not ported, and every upload has already
+/// completed by the time `Export` returns, so the field is dropped rather
+/// than returned empty — an empty one would read as "nothing to announce"
+/// instead of "announcing is not a thing here". `Export` still holds the
+/// uploads for its own duration, because they own the temporary files.
+struct DiskImageExportOutcome {
+    std::vector<OverlaybdLayerRef> layers;
+    /// Always present from `Export`. Optional because upstream's exporter
+    /// interface allows a backend that publishes nothing to report so.
+    core::Optional<PersistedDiskImagePublication> publication;
+};
+
+/// Rust `AcrDiskImageExporter` — the publish and rollback halves, with its
+/// client cache.
 class AcrDiskImageExporter {
  public:
     /// Builds a client for one registry. Injected because the production
@@ -330,11 +483,55 @@ class AcrDiskImageExporter {
     typedef std::function<core::Expected<AcrClient, AcrClientError>(const std::string& registry)>
         ClientBuilder;
 
-    explicit AcrDiskImageExporter(const ClientBuilder& client_builder);
+    /// `publish_compression` defaults to `Raw()` — no compression.
+    ///
+    /// Upstream makes it a required argument of `new`. A default is allowed
+    /// here because `Raw()` is the *inert* direction: it uploads the bytes as
+    /// they are, which is the same deliberate inversion
+    /// `repository::PublishPolicy()` makes, and for the same reason — a
+    /// caller that has not said anything about compression must not get it
+    /// silently. (Contrast `MakeOssRepository`, where the config struct's own
+    /// default is `enabled = true`, so a defaulted argument there would
+    /// silently switch compression *on*.) The rollback-only call sites never
+    /// read this field at all.
+    explicit AcrDiskImageExporter(
+        const ClientBuilder& client_builder,
+        const overlaybd::OverlaybdCompactOutput& publish_compression =
+            overlaybd::OverlaybdCompactOutput::Raw());
 
     /// The production builder: Docker-config credentials over real HTTP.
     static ClientBuilder DockerConfigClientBuilder(
         const AcrClientOptions& options = AcrClientOptions());
+
+    /// Rust `AcrDiskImageExporter::export` — publish one disk image.
+    ///
+    /// The order is the substance:
+    ///
+    ///   1. **Plan the source image**, so an unmodelled layer shape fails
+    ///      before anything is uploaded.
+    ///   2. **Validate the tag**, for the same reason: a tag rejected after
+    ///      the blobs are pushed leaves them with no manifest naming them,
+    ///      and nothing collects the orphans. This one is unreachable in
+    ///      practice — every generated tag is legal by construction — so it
+    ///      is defence in depth against a future tag scheme rather than a
+    ///      live path.
+    ///   3. **`EnsureManifestAbsent`**, which turns a re-publish under a
+    ///      taken tag into one `HEAD` instead of a full layer push.
+    ///   4. **Upload the layers** — remote ones are only named, local deltas
+    ///      are recontainerized and pushed.
+    ///   5. **Upload the config blob**, unless the registry already has it.
+    ///   6. **Put the manifest** last, because it is what makes the whole
+    ///      thing resolvable: until it lands, the blobs are unreferenced and
+    ///      a failed export leaves nothing a puller can see.
+    ///
+    /// `allow_loopback_http` is handed to `LoadSourceRegistryImage`; see
+    /// `SourceRegistryRepository::Parse`.
+    repository::RepositoryResult<DiskImageExportOutcome> Export(
+        const core::SnapshotId& snapshot_id, const DiskImageSubject& subject,
+        const std::string& image_config_path,
+        const core::Optional<SnapshotOciConfigInput>& config =
+            core::Optional<SnapshotOciConfigInput>(),
+        bool allow_loopback_http = false);
 
     /// Rust `rollback_publication`.
     ///
@@ -350,6 +547,7 @@ class AcrDiskImageExporter {
     core::Expected<AcrClient*, AcrClientError> ClientForRegistry(const std::string& registry);
 
     ClientBuilder client_builder_;
+    overlaybd::OverlaybdCompactOutput publish_compression_;
     std::map<std::string, AcrClient> clients_;
 };
 

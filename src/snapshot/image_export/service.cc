@@ -14,7 +14,10 @@
 #include "agentenv/core/logging.h"
 #include "agentenv/snapshot/acr_manifest.h"
 #include "agentenv/snapshot/image_export/acr.h"
+#include "agentenv/snapshot/repository/backends.h"
 #include "agentenv/snapshot/repository/blobs.h"
+#include "agentenv/snapshot/repository/oss/client.h"
+#include "agentenv/snapshot/repository/posixfs/backend.h"
 
 namespace agentenv {
 namespace snapshot {
@@ -135,6 +138,113 @@ ManagedLayerLocator PosixManagedLayerLocator(const std::string& root) {
         // gigabytes, and `regctl` only needs something to read.
         return path;
     };
+}
+
+std::string ManagedLayerDownloadPath(const std::string& scratch_dir,
+                                     const std::string& digest) {
+    std::string name = digest;
+    for (std::string::size_type i = 0; i < name.size(); ++i) {
+        if (name[i] == ':' || name[i] == '/') name[i] = '_';
+    }
+    return scratch_dir + "/" + name + ".overlaybd.commit";
+}
+
+RepositoryResult<std::string> FinishManagedLayerDownload(
+    const ManagedLayer& layer, const std::string& destination,
+    const RepositoryResult<uint64_t>& downloaded) {
+    if (!downloaded.ok()) {
+        // `GetToFile` already reports an absent object as `ArtifactNotFound`;
+        // upstream reports it from here as `ManagedLayerNotFound`. Remapped so
+        // both arms answer identically -- a caller distinguishing "this layer
+        // is gone" from "the object store is broken" must not get a different
+        // kind depending on which backend holds the layer.
+        if (downloaded.error().kind == repository::RepositoryErrorKind::ArtifactNotFound) {
+            return core::make_unexpected(RepositoryError::ManagedLayerNotFound(layer.digest));
+        }
+        return core::make_unexpected(RepositoryError::Backend(
+            "download managed layer '" + layer.digest + "'", downloaded.error().ToString()));
+    }
+    // The same check the POSIX arm makes, for the same reason -- and here it
+    // also catches a truncated download, which is the likelier fault.
+    if (downloaded.value() != layer.size) {
+        return core::make_unexpected(RepositoryError::IntegrityMismatch(
+            "managed layer '" + layer.digest + "'", ToDecimal(layer.size),
+            ToDecimal(downloaded.value())));
+    }
+    return destination;
+}
+
+ManagedLayerLocator OssManagedLayerLocator(
+    const std::shared_ptr<repository::oss::OssClient>& client) {
+    return [client](const ManagedLayer& layer,
+                    const std::string& scratch_dir) -> RepositoryResult<std::string> {
+        const std::string destination = ManagedLayerDownloadPath(scratch_dir, layer.digest);
+        return FinishManagedLayerDownload(
+            layer, destination,
+            client->GetToFile(RootfsLayerKey(layer.digest).Path(), destination));
+    };
+}
+
+RepositoryResult<ConfiguredSnapshotImageService> ConfiguredSnapshotImageService::FromConfig(
+    const cfg::AppConfig& config, const std::string& regctl_binary) {
+    switch (config.snapshot.repository_backend) {
+        case cfg::SnapshotRepositoryBackendKind::PosixFs: {
+            if (!config.backend.posix_fs.has_value()) {
+                // Normalisation inserts a default section for this backend
+                // (`cfg.cc:578`), so reaching here means the config was never
+                // normalised. Reported rather than defaulted: guessing a
+                // snapshot store root would read layers from somewhere nobody
+                // chose.
+                return core::make_unexpected(RepositoryError::InvalidRequest(
+                    "backend.posix_fs config is required when repository_backend = posix_fs"));
+            }
+            // Rust `posix.snapshot_store.join("repository")` — the repository
+            // root, one level *below* the snapshot store. The locator resolves
+            // layers relative to it, so passing the store would look one
+            // directory too high and report every layer as missing.
+            const std::string root =
+                core::fs::Join(config.backend.posix_fs->snapshot_store, "repository");
+            // The catalog *and* artifact stores: `ExportRootfsImage` looks a
+            // record up through the catalog, and a repository built from the
+            // catalog alone answers `Unsupported` for its blob methods.
+            const std::shared_ptr<repository::SnapshotRepository> repository(
+                new repository::posixfs::PosixFsSnapshotRepository(
+                    std::shared_ptr<repository::posixfs::PosixFsCatalogStore>(
+                        new repository::posixfs::PosixFsCatalogStore(root)),
+                    std::shared_ptr<repository::posixfs::PosixFsArtifactStore>(
+                        new repository::posixfs::PosixFsArtifactStore(root))));
+            return ConfiguredSnapshotImageService(
+                repository, std::shared_ptr<repository::oss::OssClient>(),
+                PosixManagedLayerLocator(root), Regctl(regctl_binary));
+        }
+        case cfg::SnapshotRepositoryBackendKind::Oss: {
+            if (!config.backend.oss.has_value()) {
+                return core::make_unexpected(RepositoryError::InvalidRequest(
+                    "backend.oss config is required when repository_backend = oss"));
+            }
+            // One client, shared between the repository and the locator. Two
+            // built from the same config would each carry their own credential
+            // refresh state, so a rotation observed by one would leave the
+            // other signing with a stale token.
+            std::shared_ptr<repository::oss::OssClient> client;
+            const RepositoryResult<std::shared_ptr<repository::SnapshotRepository> > repository =
+                repository::MakeOssRepository(*config.backend.oss,
+                                             config.snapshot.publish_compression, &client);
+            if (!repository.ok()) return core::make_unexpected(repository.error());
+            // Deviation, named because the config field exists and nothing
+            // here reads it: upstream also derives a
+            // `SnapshotImageStoragePolicy` from `snapshot.image_publish.enabled`
+            // and hands it to `OssRepository::new`. That third argument is not
+            // ported, so the setting has no effect on this path. It selects
+            // where *image* artifacts are stored, which is not a decision this
+            // export makes -- it publishes to a registry either way.
+            return ConfiguredSnapshotImageService(repository.value(), client,
+                                                  OssManagedLayerLocator(client),
+                                                  Regctl(regctl_binary));
+        }
+    }
+    return core::make_unexpected(
+        RepositoryError::InvalidRequest("unknown snapshot.repository_backend"));
 }
 
 RepositoryResult<SnapshotImageResult> SnapshotImageService::ExportRootfsImage(

@@ -626,4 +626,121 @@ MT_TEST(a_backend_without_a_policy_override_publishes_raw) {
     MT_EXPECT_TRUE(cfg::SnapshotPublishCompressionConfig().enabled);
 }
 
+// ---- backend selection ---------------------------------------------------
+
+/// The declared backend selects the repository, **not** which sections are
+/// present.
+///
+/// This is the regression test for the bug the dispatcher was written to fix:
+/// config normalisation only auto-inserts `[backend.posix_fs]` when the
+/// backend is posix-fs, but an operator migrating a node to OSS ordinarily
+/// leaves the old section in place. The startup path used to branch on that
+/// section's presence, so such a node published to its local disk while its
+/// config said `oss`. Here both sections are present and the declared backend
+/// is OSS, which is exactly that configuration.
+MT_TEST(the_declared_backend_wins_over_a_leftover_posixfs_section) {
+    TempRoot root;
+    cfg::AppConfig config;
+    config.snapshot.repository_backend = cfg::SnapshotRepositoryBackendKind::Oss;
+    config.backend.oss = core::Optional<cfg::OssBackendConfig>(GoodConfig());
+    // The leftover section a migrated node still carries.
+    cfg::PosixFsBackendConfig posix;
+    posix.snapshot_store = root.path;
+    config.backend.posix_fs = core::Optional<cfg::PosixFsBackendConfig>(posix);
+
+    const RepositoryResult<std::shared_ptr<SnapshotRepository> > made =
+        MakeRepositoryFromConfig(config);
+    if (!shttp::Available()) {
+        // Without libcurl an OSS repository cannot be built at all, which is
+        // itself the right answer -- and still not a silent fall back to the
+        // posix-fs section.
+        MT_EXPECT_TRUE(!made.ok());
+        return;
+    }
+    MT_EXPECT_TRUE(made.ok());
+    if (!made.ok()) return;
+    // An OSS repository names managed layers by URL; the posix-fs one has no
+    // such URL, so this is what tells the two apart.
+    MT_EXPECT_TRUE(made.value()->ManagedLayersRepoBlobUrl().has_value());
+}
+
+/// posix-fs is selected when declared, and is *not* an OSS repository.
+MT_TEST(the_posixfs_backend_is_selected_when_declared) {
+    TempRoot root;
+    cfg::AppConfig config;
+    config.snapshot.repository_backend = cfg::SnapshotRepositoryBackendKind::PosixFs;
+    cfg::PosixFsBackendConfig posix;
+    posix.snapshot_store = root.path;
+    config.backend.posix_fs = core::Optional<cfg::PosixFsBackendConfig>(posix);
+    // An OSS section present but not declared must be ignored, the mirror of
+    // the test above.
+    config.backend.oss = core::Optional<cfg::OssBackendConfig>(GoodConfig());
+
+    const RepositoryResult<std::shared_ptr<SnapshotRepository> > made =
+        MakeRepositoryFromConfig(config);
+    MT_EXPECT_TRUE(made.ok());
+    if (!made.ok()) return;
+    MT_EXPECT_TRUE(!made.value()->ManagedLayersRepoBlobUrl().has_value());
+    // A real posix-fs repository serves records; the in-memory stub the old
+    // removed factory returned would too, so the URL check above is what
+    // distinguishes the backend and this confirms it is functional.
+    MT_EXPECT_TRUE(made.value()->List(SnapshotListFilter::MatchesAll()).ok());
+}
+
+/// A missing section for the declared backend is an error, not a silent
+/// switch to the other one.
+MT_TEST(a_missing_section_for_the_declared_backend_is_an_error) {
+    cfg::AppConfig oss_without_section;
+    oss_without_section.snapshot.repository_backend = cfg::SnapshotRepositoryBackendKind::Oss;
+    // Deliberately *with* a posix-fs section, so a fallback would succeed and
+    // this assertion is about refusing rather than about having no option.
+    cfg::PosixFsBackendConfig posix;
+    posix.snapshot_store = "/tmp/agentenv-unused";
+    oss_without_section.backend.posix_fs = core::Optional<cfg::PosixFsBackendConfig>(posix);
+
+    const RepositoryResult<std::shared_ptr<SnapshotRepository> > refused =
+        MakeRepositoryFromConfig(oss_without_section);
+    MT_EXPECT_TRUE(!refused.ok());
+    if (!refused.ok()) {
+        MT_EXPECT_TRUE(refused.error().kind == RepositoryErrorKind::InvalidRequest);
+        MT_EXPECT_TRUE(refused.error().ToString().find("backend.oss config is required") !=
+                       std::string::npos);
+    }
+
+    cfg::AppConfig posixfs_without_section;
+    posixfs_without_section.snapshot.repository_backend =
+        cfg::SnapshotRepositoryBackendKind::PosixFs;
+    const RepositoryResult<std::shared_ptr<SnapshotRepository> > also_refused =
+        MakeRepositoryFromConfig(posixfs_without_section);
+    MT_EXPECT_TRUE(!also_refused.ok());
+    if (!also_refused.ok()) {
+        MT_EXPECT_TRUE(also_refused.error().ToString().find(
+                           "backend.posix_fs config is required") != std::string::npos);
+    }
+}
+
+/// The compression switch reaches the repository through the dispatcher too,
+/// not only through `MakeOssRepository` called directly.
+MT_TEST(the_dispatcher_carries_the_compression_switch_through) {
+    cfg::AppConfig config;
+    config.snapshot.repository_backend = cfg::SnapshotRepositoryBackendKind::Oss;
+    config.backend.oss = core::Optional<cfg::OssBackendConfig>(GoodConfig());
+    config.snapshot.publish_compression.enabled = true;
+    config.snapshot.publish_compression.algorithm = cfg::OverlaybdCompressionAlgorithm::Zstd;
+    config.snapshot.publish_compression.workers = 5;
+
+    const RepositoryResult<std::shared_ptr<SnapshotRepository> > made =
+        MakeRepositoryFromConfig(config);
+    if (!shttp::Available()) {
+        MT_EXPECT_TRUE(!made.ok());
+        return;
+    }
+    MT_EXPECT_TRUE(made.ok());
+    if (!made.ok()) return;
+    const PublishPolicy policy = made.value()->GetPublishPolicy();
+    MT_EXPECT_TRUE(policy.compression.enabled);
+    MT_EXPECT_TRUE(policy.compression.algorithm == cfg::OverlaybdCompressionAlgorithm::Zstd);
+    MT_EXPECT_TRUE(policy.compression.workers == 5);
+}
+
 MT_MAIN

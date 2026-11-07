@@ -109,23 +109,25 @@ class PreparedLayerUpload {
 /// result is re-hashed instead — trusting it there would publish a digest for
 /// bytes that no longer exist.
 ///
-/// Four input shapes, three of which this port handles exactly:
+/// All four input shapes are handled:
 ///
 ///   * `Raw` mode — passthrough, whatever the input is.
 ///   * `ZFile` mode, input already zfile — passthrough, so the operation is
 ///     idempotent and a re-publish does not recompress.
 ///   * `ZFile` mode, input is not a layer at all — the probe fails, and that
-///     failure is returned rather than being treated as "not compressed".
-///   * `ZFile` mode, raw layer input — **not supported by this port**, see
-///     below.
+///     failure is returned rather than being treated as "not compressed". A
+///     file claiming to be a zfile whose header digest does not check out is
+///     an error for the same reason: uploading it as plain bytes would
+///     publish a corrupt layer.
+///   * `ZFile` mode, raw layer input — compacted into a temporary zfile via
+///     `overlaybd::CompactLayers`, and the *output* is what gets described.
 ///
-/// The raw→zfile branch needs the zfile *compression* writer
-/// (`ZFileCompactWriter` / `ZFileBuilder` / the compress-side `Compressor`),
-/// of which only the decode half is ported. It therefore returns
-/// `Unsupported` rather than silently falling back to the raw bytes: a silent
-/// fallback would upload uncompressed bytes while the caller still writes the
-/// `publish_compression` configuration it asked for, and the manifest's
-/// overlaybd blob annotations would claim to describe compressed content.
+/// In that last case the trusted descriptor is deliberately **not** carried
+/// across: it describes the raw source bytes, and these are the compressed
+/// ones. A manifest built from it would name a blob whose content does not
+/// hash to it — which no registry accepts and no puller can verify. The
+/// temporary is handed to the returned `PreparedLayerUpload`, so it outlives
+/// this call and is unlinked once the upload drops the last copy.
 repository::RepositoryResult<PreparedLayerUpload> PrepareLayerUpload(
     const std::string& source, const overlaybd::OverlaybdCompactOutput& mode,
     const core::Optional<std::string>& trusted_digest = core::Optional<std::string>(),
