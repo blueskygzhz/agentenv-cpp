@@ -452,4 +452,105 @@ MT_TEST(overlaybd_target_keeps_serving_when_a_swap_is_rejected) {
     RemoveTreeBestEffort(dir);
 }
 
+// ---- the startup pack recorder ---------------------------------------------
+
+MT_TEST(overlaybd_target_attaches_and_detaches_a_recorder) {
+    const std::string dir = MakeTempDir();
+    const std::shared_ptr<OverlaybdTarget> target = OpenTarget(dir, true);
+
+    MT_EXPECT_TRUE(!target->Recorder());
+
+    const std::shared_ptr<StartupPackRecorder> recorder(
+        new StartupPackRecorder(1u << 30, 1024));
+    target->SetRecorder(recorder);
+    MT_EXPECT_TRUE(target->Recorder() == recorder);
+
+    target->SetRecorder(std::shared_ptr<StartupPackRecorder>());
+    MT_EXPECT_TRUE(!target->Recorder());
+
+    RemoveTreeBestEffort(dir);
+}
+
+MT_TEST(a_swap_detaches_the_recorder) {
+    const std::string first_dir = MakeTempDir();
+    const std::string second_dir = MakeTempDir();
+    const std::shared_ptr<OverlaybdTarget> target = OpenTarget(first_dir, true);
+
+    const std::shared_ptr<StartupPackRecorder> recorder(
+        new StartupPackRecorder(1u << 30, 1024));
+    target->SetRecorder(recorder);
+
+    const std::shared_ptr<obd::ImageFile> replacement = OpenWritableImage(second_dir);
+    MT_EXPECT_TRUE(
+        target->SwapState(core::fs::Join(second_dir, "image.json"), replacement, true).ok());
+
+    // The recorder is per *image*: its bitmap is sized from the old image's
+    // virtual size and its page numbers index the old address space. Carrying
+    // it across would append the new image's pages to the old image's trace,
+    // which is worse than losing the recording -- the trace would look valid
+    // and describe pages the pack never contains.
+    MT_EXPECT_TRUE(!target->Recorder());
+
+    RemoveTreeBestEffort(first_dir);
+    RemoveTreeBestEffort(second_dir);
+}
+
+MT_TEST(a_rejected_swap_leaves_the_recorder_attached) {
+    const std::string dir = MakeTempDir();
+    const std::shared_ptr<OverlaybdTarget> target = OpenTarget(dir, true);
+
+    const std::shared_ptr<StartupPackRecorder> recorder(
+        new StartupPackRecorder(1u << 30, 1024));
+    target->SetRecorder(recorder);
+
+    // The device keeps serving the same image, so the recording it is in the
+    // middle of is still valid. Detaching on a failed swap would silently end
+    // a recording whose device never changed.
+    MT_EXPECT_TRUE(
+        !target->SwapState("other.json", std::shared_ptr<obd::ImageFile>(), true).ok());
+    MT_EXPECT_TRUE(target->Recorder() == recorder);
+
+    RemoveTreeBestEffort(dir);
+}
+
+MT_TEST(an_armed_target_records_the_pages_its_reads_touch) {
+    const std::string dir = MakeTempDir();
+    const std::shared_ptr<OverlaybdTarget> target = OpenTarget(dir, true);
+
+    RingBuffer rb = MakeRingBuffer(static_cast<std::size_t>(kBlk));
+    if (!rb.ok()) {
+        std::fprintf(stderr, "  (skipped: needs -DAGENTENV_WITH_LIBURING=ON)\n");
+        RemoveTreeBestEffort(dir);
+        return;
+    }
+
+    const std::shared_ptr<StartupPackRecorder> recorder(
+        new StartupPackRecorder(kDevSectors * 512, 1024));
+    target->SetRecorder(recorder);
+
+    // One block read at offset 0. The recorder must see the pages it covers,
+    // which is what proves the hot path is actually wired and not just
+    // reachable through `SetRecorder`.
+    const int32_t read = target->HandleIoRequest(
+        0, 0, Desc(abi::kIoOpRead, 0, kBlkInSectors), &rb.io, NULL, rb.ring.get());
+    MT_EXPECT_EQ(read, static_cast<int32_t>(kBlk));
+    MT_EXPECT_EQ(recorder->PageCount(), static_cast<std::size_t>(kBlk / 4096));
+    MT_EXPECT_TRUE(recorder->IsMarked(0));
+
+    // A write must not be recorded: the trace describes what the boot *reads*,
+    // and a page the guest wrote is one it did not need prefetched.
+    const std::size_t after_read = recorder->PageCount();
+    target->HandleIoRequest(0, 0, Desc(abi::kIoOpWrite, 8 * kBlkInSectors, kBlkInSectors),
+                            &rb.io, NULL, rb.ring.get());
+    MT_EXPECT_EQ(recorder->PageCount(), after_read);
+
+    // Detached: no further read is observed.
+    target->SetRecorder(std::shared_ptr<StartupPackRecorder>());
+    target->HandleIoRequest(0, 0, Desc(abi::kIoOpRead, 16 * kBlkInSectors, kBlkInSectors),
+                            &rb.io, NULL, rb.ring.get());
+    MT_EXPECT_EQ(recorder->PageCount(), after_read);
+
+    RemoveTreeBestEffort(dir);
+}
+
 MT_MAIN

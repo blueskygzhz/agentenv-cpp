@@ -116,21 +116,43 @@ core::Expected<core::Unit, std::string> OverlaybdTarget::SwapState(
     // serving rather than tearing down a working device.
     if (!next.ok()) return core::make_unexpected(next.error());
 
-    // Upstream also clears its per-image startup-pack recorder here, so a
-    // pooled device reused for another image cannot keep recording for the
-    // previous one. There is no recorder to clear: Rust's
-    // `impls::startup_pack_recorder` is not ported, and this target never
-    // arms one.
     {
         std::lock_guard<std::mutex> guard(state_mutex_);
         state_ = next.value();
     }
+    // The recorder is per *image*: its bitmap is sized from the old image's
+    // virtual size and its page numbers index the old address space. Carrying
+    // it across a swap would append the new image's pages to the old image's
+    // trace, which is worse than losing the recording -- the trace would look
+    // valid and describe pages the pack never contains.
+    //
+    // Cleared after the state is live, so no read can be observed against the
+    // new image by the old recorder.
+    SetRecorder(std::shared_ptr<StartupPackRecorder>());
     return core::Unit();
 }
 
 std::shared_ptr<const OverlaybdTarget::State> OverlaybdTarget::LoadState() const {
     std::lock_guard<std::mutex> guard(state_mutex_);
     return state_;
+}
+
+void OverlaybdTarget::SetRecorder(std::shared_ptr<StartupPackRecorder> recorder) {
+    // Swapped out under the lock and released after it. The outgoing recorder
+    // may be the last reference, and its destructor walks a bitmap that can
+    // be half a megabyte; holding the lock across that would stall every
+    // queue thread's read.
+    std::shared_ptr<StartupPackRecorder> previous;
+    {
+        std::lock_guard<std::mutex> guard(recorder_mutex_);
+        previous = recorder_;
+        recorder_ = recorder;
+    }
+}
+
+std::shared_ptr<StartupPackRecorder> OverlaybdTarget::Recorder() const {
+    std::lock_guard<std::mutex> guard(recorder_mutex_);
+    return recorder_;
 }
 
 std::string OverlaybdTarget::ImageConfigPath() const {
@@ -209,6 +231,26 @@ int32_t OverlaybdTarget::HandleIoRequest(uint16_t qid, uint16_t tag, const abi::
             }
             uint8_t* dst = buf->User()->Subslice(0, len);
             if (dst == NULL) return -EINVAL;
+
+            // Startup-pack recorder: observe at submission, which is
+            // approximately the guest's fault order, then let the guard settle
+            // the completion when this scope ends. Both must bracket the read
+            // itself -- the guard's latency measurement is the only input to
+            // the remote-bytes estimate.
+            //
+            // Loaded once into a local `shared_ptr`, so a detach landing
+            // mid-read cannot free the recorder this read is still counted by.
+            // Costs one mutex acquisition per read when no recording is
+            // armed, which is the common case; the alternative, an atomic
+            // flag checked first, would be a second source of truth for
+            // whether a recorder exists.
+            StartupPackReadGuard record_guard;
+            const std::shared_ptr<StartupPackRecorder> recorder = Recorder();
+            if (recorder) {
+                const bool touched_new = recorder->ObserveSubmit(offset, len);
+                record_guard.Arm(recorder, static_cast<uint64_t>(len), touched_new);
+            }
+
             const core::Expected<std::size_t, std::string> read =
                 state->image->ReadAtIntoWithCtx(ctx, offset, dst, len);
             if (!read.ok()) {

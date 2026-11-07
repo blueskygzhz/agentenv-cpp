@@ -281,27 +281,119 @@ MT_TEST(prefetch_startup_pack_never_fails_the_request) {
     MT_EXPECT_TRUE(answer.value().status == ud::DaemonResponse::Status::Ok);
 }
 
-MT_TEST(pack_recording_is_refused_by_name) {
+namespace {
+
+/// A `StartPackRecording` whose every parameter is valid, so each test can
+/// invalidate exactly one.
+ud::DaemonRequest StartRecording(const std::string& output) {
+    ud::DaemonRequest request;
+    request.kind = ud::DaemonRequest::Kind::StartPackRecording;
+    request.dev_id = 1;
+    request.output = output;
+    request.max_pages = 1024;
+    request.min_window_ms = 10;
+    request.quiet_ms = 5;
+    request.max_window_ms = 1000;
+    return request;
+}
+
+}  // namespace
+
+MT_TEST(start_pack_recording_rejects_a_window_that_cannot_record) {
+    Scratch scratch;
+    const std::unique_ptr<ud::DevicePlane> plane = RinglessPlane(scratch.dir, false);
+    const std::string output = scratch.dir + "/memory-startup.trace";
+
+    // Each of these would produce a recording that cannot work, and each is
+    // the caller's mistake rather than a transient failure -- so they are
+    // invalid requests, not internal errors, and a retry is pointless.
+    ud::DaemonRequest no_pages = StartRecording(output);
+    no_pages.max_pages = 0;
+    core::Expected<ud::DaemonResponse, ud::HandlerError> answer = plane->Handle(no_pages);
+    MT_EXPECT_TRUE(!answer.ok());
+    MT_EXPECT_TRUE(answer.error().kind == ud::HandlerError::kInvalidRequest);
+    MT_EXPECT_TRUE(Contains(answer.error().message, "max_pages"));
+
+    // Zero quiet would satisfy the quiet check on the very first tick, ending
+    // the window before the guest has faulted anything.
+    ud::DaemonRequest no_quiet = StartRecording(output);
+    no_quiet.quiet_ms = 0;
+    answer = plane->Handle(no_quiet);
+    MT_EXPECT_TRUE(!answer.ok());
+    MT_EXPECT_TRUE(Contains(answer.error().message, "quiet_ms"));
+
+    ud::DaemonRequest inverted = StartRecording(output);
+    inverted.min_window_ms = 2000;
+    inverted.max_window_ms = 1000;
+    answer = plane->Handle(inverted);
+    MT_EXPECT_TRUE(!answer.ok());
+    MT_EXPECT_TRUE(Contains(answer.error().message, "exceeds max_window_ms"));
+}
+
+MT_TEST(start_pack_recording_checks_the_output_dir_before_recording) {
+    Scratch scratch;
+    const std::unique_ptr<ud::DevicePlane> plane = RinglessPlane(scratch.dir, false);
+
+    // Checked up front, not at finalize: the window runs for seconds and the
+    // finalize is its last step, so a missing directory discovered there would
+    // waste the whole recording and the throwaway VM that produced it.
+    const ud::DaemonRequest request =
+        StartRecording(scratch.dir + "/no-such-dir/memory-startup.trace");
+    const core::Expected<ud::DaemonResponse, ud::HandlerError> answer =
+        plane->Handle(request);
+    MT_EXPECT_TRUE(!answer.ok());
+    MT_EXPECT_TRUE(answer.error().kind == ud::HandlerError::kInvalidRequest);
+    MT_EXPECT_TRUE(Contains(answer.error().message, "does not exist"));
+}
+
+MT_TEST(start_pack_recording_needs_a_dedicated_device) {
     Scratch scratch;
     const std::unique_ptr<ud::DevicePlane> plane = RinglessPlane(scratch.dir, true);
 
-    // The one request family still unported. It must be refused with the
-    // missing piece named, and must never answer success: arming nothing and
-    // then reporting a pack that does not exist is worse than refusing, since
-    // the caller would go looking for the artifact.
-    const ud::DaemonRequest::Kind recording[3] = {
-        ud::DaemonRequest::Kind::StartPackRecording,
-        ud::DaemonRequest::Kind::PackRecordingStatus,
-        ud::DaemonRequest::Kind::AbortPackRecording,
-    };
-    for (int i = 0; i < 3; ++i) {
-        ud::DaemonRequest request;
-        request.kind = recording[i];
-        request.dev_id = 1;
+    // Only the raw-create table is consulted, and that is the point: a
+    // recording VM gets a dedicated, non-shared device because a shared one --
+    // or the block-device page cache behind it -- would answer the guest's
+    // first faults without the read ever reaching the target, and those are
+    // the reads the trace is made of.
+    const ud::DaemonRequest request = StartRecording(scratch.dir + "/trace");
+    const core::Expected<ud::DaemonResponse, ud::HandlerError> answer =
+        plane->Handle(request);
+    MT_EXPECT_TRUE(!answer.ok());
+    MT_EXPECT_TRUE(answer.error().kind == ud::HandlerError::kInvalidRequest);
+    MT_EXPECT_TRUE(Contains(answer.error().message, "not found"));
+}
+
+MT_TEST(pack_recording_status_without_a_recording_is_an_invalid_request) {
+    Scratch scratch;
+    const std::unique_ptr<ud::DevicePlane> plane = RinglessPlane(scratch.dir, false);
+
+    ud::DaemonRequest request;
+    request.kind = ud::DaemonRequest::Kind::PackRecordingStatus;
+    request.dev_id = 4242;
+    const core::Expected<ud::DaemonResponse, ud::HandlerError> answer =
+        plane->Handle(request);
+    MT_EXPECT_TRUE(!answer.ok());
+    // The caller polls this, so "no recording" has to be a distinguishable
+    // answer rather than an internal error it would retry.
+    MT_EXPECT_TRUE(answer.error().kind == ud::HandlerError::kInvalidRequest);
+    MT_EXPECT_TRUE(Contains(answer.error().message, "no pack recording"));
+}
+
+MT_TEST(aborting_a_recording_that_does_not_exist_succeeds) {
+    Scratch scratch;
+    const std::unique_ptr<ud::DevicePlane> plane = RinglessPlane(scratch.dir, false);
+
+    // Abort is what a failed snapshot flow calls on its way out, and it runs
+    // whether or not arming ever got that far. Reporting an error would make
+    // every such cleanup log a failure it cannot act on.
+    ud::DaemonRequest request;
+    request.kind = ud::DaemonRequest::Kind::AbortPackRecording;
+    request.dev_id = 4242;
+    for (int i = 0; i < 2; ++i) {
         const core::Expected<ud::DaemonResponse, ud::HandlerError> answer =
             plane->Handle(request);
-        MT_EXPECT_TRUE(!answer.ok());
-        MT_EXPECT_TRUE(Contains(answer.error().message, "StartupPackRecorder"));
+        MT_EXPECT_TRUE(answer.ok());
+        MT_EXPECT_TRUE(answer.value().status == ud::DaemonResponse::Status::Ok);
     }
 }
 

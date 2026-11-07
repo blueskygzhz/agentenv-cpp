@@ -20,6 +20,7 @@
 #include "agentenv/storage/overlaybd/config.h"
 #include "agentenv/storage/overlaybd/download_gate.h"
 #include "agentenv/storage/overlaybd/image_helper.h"
+#include "agentenv/storage/overlaybd/startup_pack.h"
 #include "agentenv/storage/ublk/caps.h"
 #include "agentenv/storage/ublk/ctrl.h"
 
@@ -273,21 +274,11 @@ core::Expected<DaemonResponse, HandlerError> DevicePlane::Handle(
             return HandlePrefetchStartupPack(request);
 
         case DaemonRequest::Kind::StartPackRecording:
+            return HandleStartPackRecording(request);
         case DaemonRequest::Kind::PackRecordingStatus:
+            return HandlePackRecordingStatus(request.dev_id);
         case DaemonRequest::Kind::AbortPackRecording:
-            // The orchestration these need is here -- a per-device handle
-            // table and a window task -- but the thing being orchestrated is
-            // not: `ublk::OverlaybdTarget` has no recorder hook, because
-            // Rust's `StartupPackRecorder`
-            // (storage/ublk/src/impls/startup_pack_recorder.rs) and
-            // `OverlaybdTarget::set_recorder` are not ported. Answering
-            // success would arm nothing and then report a pack that does not
-            // exist, so this is refused by name.
-            return core::make_unexpected(HandlerError::Internal(
-                "startup pack recording is not ported in this build: it needs "
-                "ublk::StartupPackRecorder and OverlaybdTarget::SetRecorder from "
-                "storage/ublk/src/impls/startup_pack_recorder.rs. Every other device "
-                "operation is served."));
+            return HandleAbortPackRecording(request.dev_id);
 
         case DaemonRequest::Kind::Shutdown:
             // `ServeConnection` answers this itself; reaching here means the
@@ -689,6 +680,16 @@ core::Expected<DaemonResponse, HandlerError> DevicePlane::HandleCreateRuntimeDev
 core::Expected<DaemonResponse, HandlerError> DevicePlane::HandleDelete(
     const DaemonRequest& request) {
     const uint32_t dev_id = request.dev_id;
+
+    // Before the device leaves the table. The window thread holds a reference
+    // to this device's target and would keep observing reads -- and could
+    // finalize against an image whose device is being torn down -- so the
+    // recording has to be stopped and joined first.
+    //
+    // Deliberately not conditional on the device existing: the recording is
+    // what owns the output files, and a delete for an already-gone device
+    // still has to clean them up.
+    AbortRecordingHandle(TakeRecording(dev_id));
 
     DetachedDevice detached;
     {
@@ -1478,6 +1479,346 @@ core::Expected<DaemonResponse, HandlerError> DevicePlane::HandlePrefetchStartupP
 }
 
 // ---------------------------------------------------------------------------
+// Startup pack recording
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<DevicePlane::PackRecordingHandle> DevicePlane::TakeRecording(
+    uint32_t dev_id) {
+    std::lock_guard<std::mutex> guard(recordings_mutex_);
+    std::map<uint32_t, std::shared_ptr<PackRecordingHandle> >::iterator it =
+        pack_recordings_.find(dev_id);
+    if (it == pack_recordings_.end()) return std::shared_ptr<PackRecordingHandle>();
+    const std::shared_ptr<PackRecordingHandle> handle = it->second;
+    pack_recordings_.erase(it);
+    return handle;
+}
+
+void DevicePlane::DetachRecorderFrom(uint32_t dev_id) {
+    // The target handle is copied out under the lock and used after it: the
+    // detach itself takes the target's own recorder mutex, and nesting the two
+    // would put `table_mutex_` on the wrong side of a lock the read path holds.
+    std::shared_ptr<ublk::OverlaybdTarget> target;
+    {
+        std::lock_guard<std::mutex> guard(table_mutex_);
+        std::map<uint32_t, ManagedDevice>::iterator managed = devices_.find(dev_id);
+        if (managed != devices_.end()) {
+            target = managed->second.target;
+        } else {
+            std::map<uint32_t, ActiveDevice>::iterator exclusive =
+                active_exclusive_.find(dev_id);
+            if (exclusive != active_exclusive_.end()) {
+                target = exclusive->second.target;
+            } else {
+                std::map<uint32_t, SharedKey>::iterator reverse =
+                    shared_by_dev_id_.find(dev_id);
+                if (reverse != shared_by_dev_id_.end()) {
+                    std::map<SharedKey, ActiveDevice>::iterator shared =
+                        active_shared_.find(reverse->second);
+                    if (shared != active_shared_.end()) target = shared->second.target;
+                }
+            }
+        }
+    }
+    if (target) target->SetRecorder(std::shared_ptr<ublk::StartupPackRecorder>());
+}
+
+void DevicePlane::AbortRecordingHandle(
+    const std::shared_ptr<PackRecordingHandle>& handle) {
+    if (!handle) return;
+
+    // Set before the join, so a window thread that is about to finalize sees
+    // it and bails before the rename rather than publishing a trace this call
+    // is on its way to delete.
+    handle->cancelled.store(true);
+
+    // Rust aborts the task and then takes a `finalize_gate` so file removal
+    // cannot race an in-flight rename. A join subsumes both: it returns only
+    // once the window thread has left `Finalize`, so by the time the removals
+    // below run there is nothing in flight. That is why no gate is ported --
+    // `task.abort()` does not wait, and a join does.
+    if (handle->window.joinable()) handle->window.join();
+
+    bool done = false;
+    {
+        std::lock_guard<std::mutex> guard(handle->state_mutex);
+        done = handle->state.kind == PackRecordingState::Kind::Done;
+    }
+
+    // The tmp file always goes: either the finalize never got to the rename,
+    // or it did and the tmp name no longer exists.
+    (void)core::fs::RemoveFile(ublk::TmpPackPath(handle->output));
+    // The output only goes when this recording did not complete. A pack that
+    // finished *before* the cancel arrived is a valid artifact someone may
+    // already be consuming, and deleting it would turn a late abort into data
+    // loss.
+    if (!done) {
+        (void)core::fs::RemoveFile(handle->output);
+    }
+}
+
+void DevicePlane::AbortAllRecordings() {
+    std::vector<std::shared_ptr<PackRecordingHandle> > handles;
+    {
+        std::lock_guard<std::mutex> guard(recordings_mutex_);
+        for (std::map<uint32_t, std::shared_ptr<PackRecordingHandle> >::iterator it =
+                 pack_recordings_.begin();
+             it != pack_recordings_.end(); ++it) {
+            handles.push_back(it->second);
+        }
+        pack_recordings_.clear();
+    }
+    // Joined outside the lock, one at a time: each is bounded by one tick plus
+    // one finalize, and a connection thread must not block on the table lock
+    // for the sum of them.
+    for (std::size_t i = 0; i < handles.size(); ++i) {
+        AbortRecordingHandle(handles[i]);
+    }
+}
+
+core::Expected<DaemonResponse, HandlerError> DevicePlane::HandleStartPackRecording(
+    const DaemonRequest& request) {
+    const uint32_t dev_id = request.dev_id;
+
+    // A finished handle is replaced; a live one is never interrupted. Arming
+    // twice would detach the first recorder mid-window and leave its output
+    // half-written, and the caller has no way to tell that happened.
+    {
+        std::shared_ptr<PackRecordingHandle> existing;
+        {
+            std::lock_guard<std::mutex> guard(recordings_mutex_);
+            std::map<uint32_t, std::shared_ptr<PackRecordingHandle> >::iterator it =
+                pack_recordings_.find(dev_id);
+            if (it != pack_recordings_.end()) {
+                if (!it->second->Finished()) {
+                    std::ostringstream why;
+                    why << "pack recording already active on device " << dev_id;
+                    return core::make_unexpected(HandlerError::InvalidRequest(why.str()));
+                }
+                existing = it->second;
+                pack_recordings_.erase(it);
+            }
+        }
+        // The superseded handle's thread has already settled, so this only
+        // reaps it. Done outside the lock all the same, since `join` is here.
+        if (existing && existing->window.joinable()) existing->window.join();
+    }
+
+    if (request.max_pages == 0) {
+        return core::make_unexpected(HandlerError::InvalidRequest("max_pages must be > 0"));
+    }
+    if (request.quiet_ms == 0) {
+        // Zero would make the quiet check pass on the first tick, ending the
+        // window before the guest has faulted anything.
+        return core::make_unexpected(HandlerError::InvalidRequest("quiet_ms must be > 0"));
+    }
+    if (request.min_window_ms > request.max_window_ms) {
+        std::ostringstream why;
+        why << "min_window_ms " << request.min_window_ms << " exceeds max_window_ms "
+            << request.max_window_ms;
+        return core::make_unexpected(HandlerError::InvalidRequest(why.str()));
+    }
+
+    const core::Optional<std::string> parent = core::fs::Parent(request.output);
+    if (!parent.has_value()) {
+        return core::make_unexpected(
+            HandlerError::InvalidRequest("pack output " + request.output +
+                                         " has no parent dir"));
+    }
+    // Checked now rather than at finalize: the window runs for seconds and
+    // the finalize is the last step, so a missing directory discovered there
+    // would waste the whole recording and the throwaway VM that produced it.
+    if (!core::fs::Exists(*parent)) {
+        return core::make_unexpected(
+            HandlerError::InvalidRequest("pack output dir " + *parent + " does not exist"));
+    }
+
+    // Only `devices_`, and deliberately. A recording VM is given a dedicated,
+    // non-shared device for this exact reason: a shared device -- or the
+    // block-device page cache behind one -- would answer the guest's first
+    // faults without the read ever reaching this target, and those are the
+    // reads the trace is made of. A pooled device reaching here means the
+    // caller built the wrong kind, which is worth saying.
+    std::shared_ptr<ublk::OverlaybdTarget> target;
+    std::shared_ptr<overlaybd::ImageFile> image;
+    {
+        std::lock_guard<std::mutex> guard(table_mutex_);
+        std::map<uint32_t, ManagedDevice>::iterator managed = devices_.find(dev_id);
+        if (managed != devices_.end()) {
+            target = managed->second.target;
+            image = managed->second.image;
+        }
+    }
+    if (!target || !image) {
+        std::ostringstream why;
+        why << "device " << dev_id << " not found";
+        return core::make_unexpected(HandlerError::InvalidRequest(why.str()));
+    }
+
+    PackRecordingParams params;
+    params.output = request.output;
+    // Clamped to the trace format's own cap, so a caller asking for more
+    // cannot produce a trace the decoder would reject.
+    params.max_pages = request.max_pages < overlaybd::startup::kMaxPackPages
+                           ? static_cast<std::size_t>(request.max_pages)
+                           : static_cast<std::size_t>(overlaybd::startup::kMaxPackPages);
+    params.min_window_nanos = request.min_window_ms * 1000000ull;
+    params.quiet_nanos = request.quiet_ms * 1000000ull;
+    params.max_window_nanos = request.max_window_ms * 1000000ull;
+
+    const uint64_t mem_virtual_size = image->SizeBytes();
+    const std::shared_ptr<ublk::StartupPackRecorder> recorder(
+        new ublk::StartupPackRecorder(mem_virtual_size, params.max_pages));
+
+    // Armed before the handle is published and before the window starts: the
+    // caller arms this *before* loading the snapshot, so every read from here
+    // on -- Firecracker's load-time reads included -- has to be observed.
+    target->SetRecorder(recorder);
+
+    const std::shared_ptr<PackRecordingHandle> handle(new PackRecordingHandle());
+    handle->output = params.output;
+
+    AGENTENV_INFO("dev " << dev_id << ": startup pack recording armed output="
+                         << params.output << " mem_virtual_size=" << mem_virtual_size
+                         << " max_pages=" << params.max_pages);
+
+    try {
+        handle->window = std::thread(&DevicePlane::PackRecordingWindow, this, recorder,
+                                     target, params, handle);
+    } catch (const std::system_error& err) {
+        // Detached again, or the device would keep recording into a window
+        // nobody will ever close or finalize.
+        target->SetRecorder(std::shared_ptr<ublk::StartupPackRecorder>());
+        return core::make_unexpected(HandlerError::Internal(
+            std::string("start pack recording window thread: ") + err.what()));
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(recordings_mutex_);
+        pack_recordings_[dev_id] = handle;
+    }
+
+    DaemonResponse out;
+    out.status = DaemonResponse::Status::Ok;
+    return out;
+}
+
+core::Expected<DaemonResponse, HandlerError> DevicePlane::HandlePackRecordingStatus(
+    uint32_t dev_id) {
+    std::shared_ptr<PackRecordingHandle> handle;
+    {
+        std::lock_guard<std::mutex> guard(recordings_mutex_);
+        std::map<uint32_t, std::shared_ptr<PackRecordingHandle> >::iterator it =
+            pack_recordings_.find(dev_id);
+        if (it != pack_recordings_.end()) handle = it->second;
+    }
+    if (!handle) {
+        // Not an internal error: the caller polls this, and "no recording"
+        // is a legitimate answer to a poll for a device whose recording was
+        // already aborted or never armed.
+        std::ostringstream why;
+        why << "no pack recording on device " << dev_id;
+        return core::make_unexpected(HandlerError::InvalidRequest(why.str()));
+    }
+
+    DaemonResponse out;
+    out.status = DaemonResponse::Status::PackRecording;
+    {
+        std::lock_guard<std::mutex> guard(handle->state_mutex);
+        out.state = handle->state;
+    }
+    return out;
+}
+
+core::Expected<DaemonResponse, HandlerError> DevicePlane::HandleAbortPackRecording(
+    uint32_t dev_id) {
+    const std::shared_ptr<PackRecordingHandle> handle = TakeRecording(dev_id);
+    if (!handle) {
+        // Answered `Ok`, matching Rust: abort is what a failed snapshot flow
+        // calls on its way out, and it must be safe to call for a device whose
+        // recording already finished or was never armed.
+        DaemonResponse out;
+        out.status = DaemonResponse::Status::Ok;
+        return out;
+    }
+
+    // Detached first, so no further read is observed while the window is
+    // being torn down. The window thread detaches too; both are idempotent.
+    DetachRecorderFrom(dev_id);
+    AbortRecordingHandle(handle);
+
+    AGENTENV_INFO("dev " << dev_id << ": startup pack recording aborted");
+    DaemonResponse out;
+    out.status = DaemonResponse::Status::Ok;
+    return out;
+}
+
+void DevicePlane::PackRecordingWindow(std::shared_ptr<ublk::StartupPackRecorder> recorder,
+                                      std::shared_ptr<ublk::OverlaybdTarget> target,
+                                      PackRecordingParams params,
+                                      std::shared_ptr<PackRecordingHandle> handle) {
+    // Rust `PACK_RECORDING_TICK`.
+    const uint64_t kTickMicros = 100 * 1000;
+
+    ublk::RecordingVerdict verdict = ublk::RecordingVerdict::Continue;
+    for (;;) {
+        ::usleep(static_cast<useconds_t>(kTickMicros));
+        // Cooperative, where Rust uses `task.abort()`. The cost is up to one
+        // tick of latency on an abort; the benefit is that the cancellation
+        // point is a known place rather than any await, so the detach and the
+        // state write below cannot be skipped half-done.
+        if (handle->cancelled.load() || stopping_.load()) {
+            target->SetRecorder(std::shared_ptr<ublk::StartupPackRecorder>());
+            return;
+        }
+        verdict = recorder->Verdict(params.min_window_nanos, params.quiet_nanos,
+                                    params.max_window_nanos);
+        if (verdict != ublk::RecordingVerdict::Continue) break;
+    }
+
+    // Detached before finalizing, so the page list cannot grow while it is
+    // being encoded -- the trace's page count would then disagree with the
+    // offsets written after it.
+    target->SetRecorder(std::shared_ptr<ublk::StartupPackRecorder>());
+
+    PackRecordingState settled;
+    if (verdict == ublk::RecordingVerdict::Fail) {
+        // `Verdict` does not produce this today, upstream included. Handled
+        // rather than asserted so adding a quality guard stays a one-line
+        // change in the recorder.
+        AGENTENV_WARN("startup pack recording aborted by guard");
+        settled.kind = PackRecordingState::Kind::Failed;
+        settled.reason = "recording rejected by quality guard";
+    } else {
+        const core::Expected<ublk::FinalizeOutcome, std::string> outcome =
+            recorder->Finalize(params.output, handle->cancelled);
+        if (outcome.ok()) {
+            AGENTENV_INFO("startup pack recorded output=" << params.output << " pages="
+                          << outcome.value().pages << " bytes=" << outcome.value().bytes
+                          << " remote_bytes=" << outcome.value().remote_bytes
+                          << " skipped_high_pages=" << outcome.value().skipped_high_pages);
+            settled.kind = PackRecordingState::Kind::Done;
+            settled.pages = outcome.value().pages;
+            settled.bytes = outcome.value().bytes;
+            settled.remote_bytes = outcome.value().remote_bytes;
+            settled.path = params.output;
+        } else {
+            AGENTENV_WARN("startup pack packaging failed: " << outcome.error());
+            // The tmp file is this thread's to clean when it failed on its
+            // own; the abort path only owns it once a cancel is in play.
+            (void)core::fs::RemoveFile(ublk::TmpPackPath(params.output));
+            settled.kind = PackRecordingState::Kind::Failed;
+            settled.reason = outcome.error();
+        }
+    }
+
+    // Published last. `PackRecordingStatus` reads this, and the caller treats
+    // anything other than `Recording` as "the artifact question is settled",
+    // so it must not be visible before the file is in place.
+    std::lock_guard<std::mutex> guard(handle->state_mutex);
+    handle->state = settled;
+}
+
+// ---------------------------------------------------------------------------
 // Shutdown
 // ---------------------------------------------------------------------------
 
@@ -1487,6 +1828,12 @@ void DevicePlane::StopAllDevices() {
         std::lock_guard<std::mutex> guard(refill_mutex_);
         if (refill_thread_.joinable()) refill_thread_.join();
     }
+
+    // Before the devices go. Every window thread holds a `shared_ptr` to a
+    // target, so a device stopped underneath a live recording would be kept
+    // alive by it; and a recording left running past shutdown would have no
+    // one to report its result to.
+    AbortAllRecordings();
 
     // Everything is moved out of the maps first, under one lock, so a request
     // racing shutdown either finds its device or does not -- it never finds a

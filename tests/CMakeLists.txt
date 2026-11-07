@@ -200,6 +200,9 @@ agentenv_add_test(test_ublk_daemon_server  test_ublk_daemon_server.cc  agentenv-
 # and the best-effort paths, which is where a host with no ublk is either
 # reported honestly or hidden.
 agentenv_add_test(test_ublk_daemon_device_plane test_ublk_daemon_device_plane.cc agentenv-ublk-daemon-device-plane)
+# Rust: storage/ublk/src/impls/startup_pack_recorder.rs — needs no kernel: the
+# recorder is fed offsets and produces a log and a trace file.
+agentenv_add_test(test_ublk_startup_pack_recorder test_ublk_startup_pack_recorder.cc agentenv-ublk)
 agentenv_add_test(test_lsmt                test_lsmt.cc                agentenv-overlaybd)
 agentenv_add_test(test_lsmt_bptree         test_lsmt_bptree.cc         agentenv-overlaybd)
 agentenv_add_test(test_scheduler           test_scheduler.cc           agentenv-scheduler-internal)

@@ -11,6 +11,9 @@ add_library(agentenv-ublk STATIC
     # Rust: src/impls/overlaybd_target.rs — the real data plane. `impls.cc`
     # only has the zero-serving placeholder, against the superseded interface.
     overlaybd_target.cc
+    # Rust: src/impls/startup_pack_recorder.rs — the first-touch recorder the
+    # overlaybd target feeds while a throwaway VM re-resumes a new snapshot.
+    startup_pack_recorder.cc
 )
 target_include_directories(agentenv-ublk PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # agentenv-overlaybd for the image stack the overlaybd target serves. Not a

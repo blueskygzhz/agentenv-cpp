@@ -245,6 +245,49 @@ class DevicePlane : public DeviceHandler {
     /// different io pools, so one device cannot serve both.
     typedef std::pair<std::string, std::string> SharedKey;
 
+    /// Rust `PackRecordingParams` — one recording's window and output.
+    struct PackRecordingParams {
+        std::string output;
+        std::size_t max_pages;
+        uint64_t min_window_nanos;
+        uint64_t quiet_nanos;
+        uint64_t max_window_nanos;
+
+        PackRecordingParams()
+            : max_pages(0), min_window_nanos(0), quiet_nanos(0), max_window_nanos(0) {}
+    };
+
+    /// Rust `PackRecordingHandle` — one startup pack recording attached to a
+    /// device.
+    ///
+    /// Held in a `shared_ptr` so the window thread and the abort path can both
+    /// reach the state without the table lock being held across either.
+    struct PackRecordingHandle {
+        /// Final pack output path (the `memory-startup.pack` artifact).
+        std::string output;
+        /// Guarded by `state_mutex`: written by the window thread when it
+        /// settles, read by `PackRecordingStatus` from a connection thread.
+        std::mutex state_mutex;
+        PackRecordingState state;
+        /// Set by abort, delete and shutdown. `Finalize` checks it before the
+        /// rename, so a cancelled pack never lands at `output`.
+        std::atomic<bool> cancelled;
+        std::thread window;
+
+        PackRecordingHandle() : cancelled(false) {
+            state.kind = PackRecordingState::Kind::Recording;
+        }
+
+        bool Finished() {
+            std::lock_guard<std::mutex> guard(state_mutex);
+            return state.kind != PackRecordingState::Kind::Recording;
+        }
+
+     private:
+        PackRecordingHandle(const PackRecordingHandle&);
+        PackRecordingHandle& operator=(const PackRecordingHandle&);
+    };
+
     /// A device plus everything that has to be released with it, moved out of
     /// a map before the long teardown runs so no lock is held across it.
     struct DetachedDevice {
@@ -280,6 +323,36 @@ class DevicePlane : public DeviceHandler {
                                                                   uint64_t new_sectors);
     core::Expected<DaemonResponse, HandlerError> HandlePrefetchStartupPack(
         const DaemonRequest& request);
+    core::Expected<DaemonResponse, HandlerError> HandleStartPackRecording(
+        const DaemonRequest& request);
+    core::Expected<DaemonResponse, HandlerError> HandlePackRecordingStatus(uint32_t dev_id);
+    core::Expected<DaemonResponse, HandlerError> HandleAbortPackRecording(uint32_t dev_id);
+
+    // ---- pack recording --------------------------------------------------
+
+    /// Rust `pack_recording_window` — the task that polls the verdict, detaches
+    /// the recorder and finalizes.
+    void PackRecordingWindow(std::shared_ptr<ublk::StartupPackRecorder> recorder,
+                             std::shared_ptr<ublk::OverlaybdTarget> target,
+                             PackRecordingParams params,
+                             std::shared_ptr<PackRecordingHandle> handle);
+
+    /// Rust `abort_pack_recording_handle` — cancel one recording and remove
+    /// its files deterministically.
+    ///
+    /// Must be called with no plane lock held: it joins the window thread,
+    /// which can be inside a finalize.
+    void AbortRecordingHandle(const std::shared_ptr<PackRecordingHandle>& handle);
+
+    /// Takes the handle for `dev_id` out of the table, if any. The caller
+    /// aborts it after releasing the lock.
+    std::shared_ptr<PackRecordingHandle> TakeRecording(uint32_t dev_id);
+
+    /// Rust `abort_all_pack_recordings`.
+    void AbortAllRecordings();
+
+    /// Detaches the recorder from whichever table holds `dev_id`.
+    void DetachRecorderFrom(uint32_t dev_id);
 
     // ---- device lifecycle ------------------------------------------------
 
@@ -391,6 +464,15 @@ class DevicePlane : public DeviceHandler {
 
     std::mutex startup_pack_mutex_;
     std::vector<overlaybd::StartupPackHandle> startup_pack_handles_;
+
+    /// Rust `pack_recordings: Arc<DashMap<u32, Arc<PackRecordingHandle>>>`.
+    ///
+    /// Its own lock, not `table_mutex_`: aborting a recording joins a thread
+    /// that may be finalizing, and that must not be done while holding the
+    /// lock every other device request needs. `HandleDelete` takes the two in
+    /// sequence, never nested.
+    std::mutex recordings_mutex_;
+    std::map<uint32_t, std::shared_ptr<PackRecordingHandle> > pack_recordings_;
 };
 
 /// The `sqe128` io_uring every ublk control command is submitted on.

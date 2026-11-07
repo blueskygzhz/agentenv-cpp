@@ -14,6 +14,7 @@
 #include "agentenv/storage/overlaybd/image_service.h"
 #include "agentenv/storage/ublk/ctrl.h"
 #include "agentenv/storage/ublk/dev.h"
+#include "agentenv/storage/ublk/startup_pack_recorder.h"
 
 namespace agentenv {
 namespace storage {
@@ -74,6 +75,23 @@ class OverlaybdTarget : public UblkTarget {
         const std::string& image_config_path,
         std::shared_ptr<overlaybd::ImageFile> image, bool discard_supported);
 
+    /// Rust `set_recorder` — attach, or detach with a null pointer, a
+    /// startup-pack first-touch recorder.
+    ///
+    /// Separate from the state swap, and deliberately so: a recording is
+    /// armed and detached while the device keeps serving the same image, so
+    /// folding it into `State` would mean rebuilding the capacity and
+    /// block-size snapshot to start a recording.
+    ///
+    /// Upstream stores it in an `ArcSwapOption`; here it is a `shared_ptr`
+    /// under its own mutex. The mutex is separate from `state_mutex_` because
+    /// the read path takes both per request, and sharing one would make
+    /// arming a recording contend with every in-flight read's state load.
+    void SetRecorder(std::shared_ptr<StartupPackRecorder> recorder);
+
+    /// The live recorder, or null. For the window task and the tests.
+    std::shared_ptr<StartupPackRecorder> Recorder() const;
+
     /// The config path of the live state. For logging and tests.
     std::string ImageConfigPath() const;
     /// The live capacity, in 512-byte-or-larger logical sectors.
@@ -127,6 +145,9 @@ class OverlaybdTarget : public UblkTarget {
 
     mutable std::mutex state_mutex_;
     std::shared_ptr<const State> state_;
+
+    mutable std::mutex recorder_mutex_;
+    std::shared_ptr<StartupPackRecorder> recorder_;
 };
 
 }  // namespace ublk
