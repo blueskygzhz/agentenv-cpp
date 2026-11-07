@@ -84,21 +84,31 @@ bool ParseUrl(const std::string& text, ParsedUrl* out) {
                                             : rest.substr(path_at);
     if (!out->path.empty() && out->path[0] != '/') out->path = std::string();
     if (authority.empty()) return false;
-    // Userinfo is not accepted: a URL carrying credentials would put them in
-    // the registry string this module caches and logs.
-    if (authority.find('@') != std::string::npos) return false;
 
-    const std::string::size_type colon = authority.rfind(':');
+    // Userinfo is dropped, not rejected. Rust reaches the authority through
+    // `Url::host_str()`, which returns the host alone, and rebuilds
+    // `repo_blob_url` from the parsed registry — so credentials embedded in a
+    // recorded `repoBlobUrl` never reach the string that gets cached or
+    // logged, and the publication still resolves. Refusing here instead would
+    // fail the whole export or, worse, the rollback inside a snapshot delete,
+    // leaving a "deleted" snapshot published in the registry.
+    const std::string::size_type userinfo_end = authority.rfind('@');
+    const std::string host_port = userinfo_end == std::string::npos
+                                      ? authority
+                                      : authority.substr(userinfo_end + 1);
+    if (host_port.empty()) return false;
+
+    const std::string::size_type colon = host_port.rfind(':');
     if (colon == std::string::npos) {
-        out->host = ToLowerAscii(authority);
+        out->host = ToLowerAscii(host_port);
     } else {
-        const std::string digits = authority.substr(colon + 1);
+        const std::string digits = host_port.substr(colon + 1);
         if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) {
             return false;
         }
         const unsigned long value = std::strtoul(digits.c_str(), NULL, 10);
         if (value == 0 || value > 65535) return false;
-        out->host = ToLowerAscii(authority.substr(0, colon));
+        out->host = ToLowerAscii(host_port.substr(0, colon));
         out->port = core::Optional<uint16_t>(static_cast<uint16_t>(value));
     }
     return !out->host.empty();
@@ -185,6 +195,33 @@ RepositoryResult<SourceRegistryRepository> SourceRegistryRepository::Parse(
     // `snapshot_managed_publication_for_target`.
     out.repo_blob_url = url.scheme + "://" + registry + TrimTrailing(url.path, '/');
     return out;
+}
+
+std::string SourceRegistryRepository::ImageRef(const std::string& tag) const {
+    return registry + "/" + repository + ":" + tag;
+}
+
+namespace {
+
+/// Rust `registry_api_url` — recovers the scheme from `repo_blob_url` rather
+/// than hardcoding https, so a loopback HTTP source keeps speaking HTTP for
+/// the upload and manifest calls instead of switching protocol mid-publish.
+std::string RegistryApiUrl(const SourceRegistryRepository& source) {
+    const std::string::size_type separator = source.repo_blob_url.find("://");
+    const std::string scheme = separator == std::string::npos
+                                   ? std::string("https")
+                                   : source.repo_blob_url.substr(0, separator);
+    return scheme + "://" + source.registry;
+}
+
+}  // namespace
+
+std::string SourceRegistryRepository::UploadUrl() const {
+    return RegistryApiUrl(*this) + "/v2/" + repository + "/blobs/uploads/";
+}
+
+std::string SourceRegistryRepository::ManifestUrl(const std::string& tag) const {
+    return RegistryApiUrl(*this) + "/v2/" + repository + "/manifests/" + tag;
 }
 
 // ---- AcrClientError -------------------------------------------------------

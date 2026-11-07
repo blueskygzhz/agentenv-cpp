@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: MIT
-// Rust: src/snapshot/image_export/target.rs and the
-// `SourceRegistryRepository` half of
-// src/snapshot/repository/backends/common/acr/source_image.rs.
+// Rust: src/snapshot/image_export/target.rs
 #include <string>
 #include <vector>
 
 #include "agentenv/snapshot/image_export_target.h"
-#include "agentenv/snapshot/source_registry.h"
 #include "microtest.h"
 
 namespace {
@@ -64,85 +61,11 @@ snapshot::PersistedDiskImagePublication Publication(const std::string& tag,
 
 }  // namespace
 
-// ---------------------------------------------------------------------------
-// SourceRegistryRepository
-// ---------------------------------------------------------------------------
-
-MT_TEST(source_registry_parses_the_expected_shape) {
-    const repository::RepositoryResult<snapshot::SourceRegistryRepository> source =
-        snapshot::SourceRegistryRepository::Parse(
-            "https://registry.example/v2/ns/app/blobs");
-    MT_EXPECT_TRUE(source.ok());
-    MT_EXPECT_EQ(source.value().registry, std::string("registry.example"));
-    // Everything between `v2` and `blobs`, so a nested path survives.
-    MT_EXPECT_EQ(source.value().repository, std::string("ns/app"));
-    MT_EXPECT_EQ(source.value().repo_blob_url,
-                 std::string("https://registry.example/v2/ns/app/blobs"));
-}
-
-MT_TEST(source_registry_normalizes_the_default_https_port) {
-    // Two spellings of one registry must normalise together, or a snapshot
-    // would be published twice.
-    const snapshot::SourceRegistryRepository with_port =
-        snapshot::SourceRegistryRepository::Parse(
-            "https://registry.example:443/v2/app/blobs")
-            .value();
-    const snapshot::SourceRegistryRepository without_port =
-        snapshot::SourceRegistryRepository::Parse("https://registry.example/v2/app/blobs")
-            .value();
-    MT_EXPECT_TRUE(with_port == without_port);
-
-    // Any other port is significant and is kept.
-    MT_EXPECT_EQ(snapshot::SourceRegistryRepository::Parse(
-                     "https://registry.example:5000/v2/app/blobs")
-                     .value()
-                     .registry,
-                 std::string("registry.example:5000"));
-}
-
-MT_TEST(source_registry_requires_https_except_on_loopback) {
-    // Plain HTTP would send the bearer token in the clear.
-    const repository::RepositoryResult<snapshot::SourceRegistryRepository> insecure =
-        snapshot::SourceRegistryRepository::Parse("http://registry.example/v2/app/blobs");
-    MT_EXPECT_TRUE(!insecure.ok());
-    MT_EXPECT_TRUE(insecure.error().message.find("must use https") != std::string::npos);
-
-    // Loopback is allowed so tests can run against a local registry.
-    MT_EXPECT_TRUE(
-        snapshot::SourceRegistryRepository::Parse("http://127.0.0.1:5000/v2/app/blobs").ok());
-    MT_EXPECT_TRUE(
-        snapshot::SourceRegistryRepository::Parse("http://localhost:5000/v2/app/blobs").ok());
-}
-
-MT_TEST(source_registry_rejects_a_wrong_path_shape) {
-    const char* const rejected[] = {
-        "https://registry.example/app/blobs",     // no /v2
-        "https://registry.example/v2/app",        // no /blobs
-        "https://registry.example/v2/blobs",      // empty repository
-        "https://registry.example/v2",
-        "not-a-url",
-    };
-    for (std::size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); ++i) {
-        MT_EXPECT_TRUE(!snapshot::SourceRegistryRepository::Parse(rejected[i]).ok());
-    }
-}
-
-MT_TEST(source_registry_builds_api_urls_from_the_original_scheme) {
-    const snapshot::SourceRegistryRepository https =
-        snapshot::SourceRegistryRepository::Parse("https://registry.example/v2/ns/app/blobs")
-            .value();
-    MT_EXPECT_EQ(https.ImageRef("v1"), std::string("registry.example/ns/app:v1"));
-    MT_EXPECT_EQ(https.UploadUrl(),
-                 std::string("https://registry.example/v2/ns/app/blobs/uploads/"));
-    MT_EXPECT_EQ(https.ManifestUrl("v1"),
-                 std::string("https://registry.example/v2/ns/app/manifests/v1"));
-
-    // A loopback HTTP source must not silently switch to HTTPS for the API.
-    const snapshot::SourceRegistryRepository http =
-        snapshot::SourceRegistryRepository::Parse("http://127.0.0.1:5000/v2/app/blobs")
-            .value();
-    MT_EXPECT_TRUE(http.UploadUrl().compare(0, 5, "http:") == 0);
-}
+// `SourceRegistryRepository` is one type, defined by
+// src/snapshot/image_export/acr/source_image.rs and tested in
+// test_snapshot_acr.cc. It is deliberately not re-tested here: a second copy
+// of these assertions is how the second copy of the *type* survived, and with
+// it a production loopback-HTTP hole this file's own test used to pin open.
 
 // ---------------------------------------------------------------------------
 // SnapshotImageTarget::Parse

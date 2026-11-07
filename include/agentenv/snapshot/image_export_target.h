@@ -61,14 +61,21 @@ struct SnapshotImageTarget {
 };
 
 /// Rust `resolve_snapshot_image_target`.
+///
+/// `allow_loopback_http` is threaded through to
+/// `image_export::SourceRegistryRepository::Parse`, which is where Rust's
+/// `cfg!(test)` loopback exemption lives. Production must pass false: a
+/// recorded `http://127.0.0.1/...` source is refused upstream, and accepting
+/// it here would let inference aim a publish at a plaintext registry.
 core::Expected<SnapshotImageTarget, SnapshotImageTargetError> ResolveSnapshotImageTarget(
     const core::SnapshotId& snapshot_id, const CommittedSnapshot& committed,
     const core::Optional<std::string>& target_repository,
-    const core::Optional<std::string>& tag);
+    const core::Optional<std::string>& tag, bool allow_loopback_http = false);
 
 /// Rust `snapshot_managed_publication_for_target`.
 core::Optional<PersistedDiskImagePublication> SnapshotManagedPublicationForTarget(
-    const CommittedSnapshot& committed, const SnapshotImageTarget& target);
+    const CommittedSnapshot& committed, const SnapshotImageTarget& target,
+    bool allow_loopback_http = false);
 
 /// Rust `valid_repository` — non-empty, `/`-separated lowercase components.
 bool IsValidRepository(const std::string& repository);

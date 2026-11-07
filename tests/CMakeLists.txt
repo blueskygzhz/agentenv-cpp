@@ -107,6 +107,14 @@ agentenv_add_test(test_snapshot_publish    test_snapshot_publish.cc    agentenv-
 # Rust: src/snapshot/image_export/acr/{source_image,client,publisher}.rs — the
 # manifest-delete half a snapshot delete needs.
 agentenv_add_test(test_snapshot_acr        test_snapshot_acr.cc        agentenv-snapshot)
+# Rust: src/snapshot/image_export/acr/source_image.rs — the reuse-remote versus
+# upload-local plan a push is built from.
+agentenv_add_test(test_snapshot_acr_source_image test_snapshot_acr_source_image.cc
+                  agentenv-snapshot)
+# Rust: src/snapshot/image_export/acr/publisher.rs — the tag layer that decides
+# what a snapshot is published as, checked before any blob is uploaded.
+agentenv_add_test(test_snapshot_acr_publisher test_snapshot_acr_publisher.cc
+                  agentenv-snapshot)
 # Rust: src/snapshot/image_export/regctl.rs — driven against a real fake
 # `regctl` script, so the fork/pipe half of `BlobPipe` is actually exercised.
 agentenv_add_test(test_snapshot_regctl     test_snapshot_regctl.cc     agentenv-snapshot)
@@ -150,7 +158,15 @@ agentenv_add_test(test_record_catalog   test_record_catalog.cc   agentenv-snapsh
 # Rust: src/repository/backends/oss/lease.rs — the append-only lease.
 agentenv_add_test(test_oss_lease        test_oss_lease.cc        agentenv-snapshot agentenv-volume-record agentenv-cfg)
 # Rust: src/image/local_layer.rs
-agentenv_add_test(test_image_local_layer   test_image_local_layer.cc   agentenv-image)
+#
+# Links `agentenv-image-local-layer`, not `agentenv-image`. That library exists
+# only to keep these predicates reachable from `agentenv-snapshot` without
+# pulling in all of `agentenv-image` (which depends back on
+# `agentenv-snapshot-record`), so its whole value is that it links against
+# nothing but core and overlaybd. Testing through `agentenv-image` would still
+# pass if `local_layer.cc` grew a dependency on the rest of that library, and
+# the breakage would surface as a link failure in `agentenv-snapshot` instead.
+agentenv_add_test(test_image_local_layer   test_image_local_layer.cc   agentenv-image-local-layer)
 agentenv_add_test(test_image_commit_index  test_image_commit_index.cc  agentenv-image)
 agentenv_add_test(test_image_cache     test_image_cache.cc    agentenv-image)
 # Rust: the `ImageCacheMetadataStore` tests in src/image/cache/graph.rs.

@@ -1,6 +1,5 @@
 add_library(agentenv-snapshot STATIC
     acr_manifest.cc
-    source_registry.cc
     image_export_target.cc
     artifact_cache.cc
     p2p.cc
@@ -12,6 +11,12 @@ add_library(agentenv-snapshot STATIC
     # Rust: the pure helpers of src/snapshot/image_export/acr/{client.rs,
     # source_image.rs} — URL shapes, auth challenges, Docker credentials.
     image_export/acr_parse.cc
+    # Rust: src/snapshot/image_export/acr/source_image.rs — read `image.json`
+    # and decide, per lower, reuse-remote-blob versus upload-local-delta.
+    image_export/acr_source_image.cc
+    # Rust: src/snapshot/image_export/acr/publisher.rs — the tag layer, which
+    # runs before any blob is uploaded.
+    image_export/acr_publisher.cc
     # Rust: src/snapshot/image_export/acr/{client.rs,publisher.rs}, the
     # manifest-delete half: what rolling a publication back needs.
     image_export/acr_client.cc

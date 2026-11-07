@@ -42,6 +42,38 @@ MT_TEST(runtime_generated_delta_matches_on_the_file_name_only) {
     MT_EXPECT_TRUE(!RootfsLayerIsRuntimeGeneratedDelta("/a/b/old-snapshot.commit"));
 }
 
+MT_TEST(runtime_generated_delta_normalizes_the_path_the_way_rust_does) {
+    // No Rust counterpart as a test, but these are Rust `Path::file_name`
+    // answers, and the predicate is only as aligned as that call is. A config
+    // whose `file=` carries any of these spellings must be classified the same
+    // on both sides, or one implementation publishes a sandbox's rootfs delta
+    // and the other refuses the capture outright.
+
+    // Trailing separators are not components: Rust's `/usr/bin/` names `bin`.
+    MT_EXPECT_TRUE(RootfsLayerIsRuntimeGeneratedDelta("/a/b/snapshot.commit/"));
+    MT_EXPECT_TRUE(RootfsLayerIsRuntimeGeneratedDelta("/a/b/snapshot.commit///"));
+    // Neither is a trailing `.`, which Rust's component iterator drops
+    // entirely: `foo.txt/.` and `foo.txt/.//` both name `foo.txt`.
+    MT_EXPECT_TRUE(RootfsLayerIsRuntimeGeneratedDelta("/a/b/snapshot.commit/."));
+    MT_EXPECT_TRUE(RootfsLayerIsRuntimeGeneratedDelta("/a/b/snapshot.commit/.//"));
+    MT_EXPECT_TRUE(RootfsLayerIsRuntimeGeneratedDelta("/a/b/snapshot.commit/./."));
+    MT_EXPECT_TRUE(RootfsLayerIsRuntimeGeneratedDelta("managed-base.commit/."));
+
+    // A trailing `..` is a different matter: it names the parent, not the
+    // file, so Rust answers `None` and the path is not a layer. Stripping it
+    // like `.` would let `snapshot.commit/..` -- which addresses the
+    // *directory above* -- be treated as the layer itself.
+    MT_EXPECT_TRUE(!RootfsLayerIsRuntimeGeneratedDelta("/a/b/snapshot.commit/.."));
+    MT_EXPECT_TRUE(!RootfsLayerIsRuntimeGeneratedDelta("snapshot.commit/.."));
+
+    // `.` resolving away to nothing but the root is still no file name.
+    MT_EXPECT_TRUE(!RootfsLayerIsRuntimeGeneratedDelta("/."));
+    MT_EXPECT_TRUE(!RootfsLayerIsRuntimeGeneratedDelta("."));
+    MT_EXPECT_TRUE(!RootfsLayerIsRuntimeGeneratedDelta(".."));
+    // And an interior `.` still leaves the real final component.
+    MT_EXPECT_TRUE(RootfsLayerIsRuntimeGeneratedDelta("/a/./snapshot.commit"));
+}
+
 MT_TEST(layer_config_from_local_layer_sets_only_file_digest_and_size) {
     LocalLayer layer;
     layer.path = "/var/lib/agentenv/layers/abc/snapshot.commit";

@@ -61,6 +61,21 @@ bool IsFile(const std::string& path) {
     return !path.empty() && Stat(path, &st) && S_ISREG(st.st_mode);
 }
 
+Expected<std::string, std::string> Canonicalize(const std::string& path) {
+    // Rust refuses an empty path with ENOENT rather than resolving the cwd;
+    // `realpath("")` does the same, but asking explicitly keeps the error
+    // message naming the empty input instead of the current directory.
+    if (path.empty()) return make_unexpected(Errno("canonicalize", path, ENOENT));
+    // The null-buffer form allocates exactly what is needed, so a path longer
+    // than PATH_MAX fails with ENAMETOOLONG rather than overflowing a fixed
+    // buffer.
+    char* resolved = ::realpath(path.c_str(), NULL);
+    if (resolved == NULL) return make_unexpected(Errno("canonicalize", path, errno));
+    const std::string out(resolved);
+    ::free(resolved);
+    return out;
+}
+
 Optional<std::string> Parent(const std::string& path) {
     if (path.empty() || path == "/") return Optional<std::string>();
     // Ignore a trailing slash, as Rust's `Path::parent` does.
@@ -75,7 +90,26 @@ Optional<std::string> Parent(const std::string& path) {
 Optional<std::string> FileName(const std::string& path) {
     if (path.empty() || path == "/") return Optional<std::string>();
     std::size_t end = path.size();
-    while (end > 1 && path[end - 1] == '/') --end;
+    for (;;) {
+        // A trailing separator is not a component: Rust's `/usr/bin/` names
+        // `bin`.
+        while (end > 1 && path[end - 1] == '/') --end;
+        // Neither is a trailing `.`. Rust's component iterator drops `CurDir`
+        // entirely, so `foo.txt/.` and `foo.txt/.//` both name `foo.txt`.
+        // Looping, because `.` components can repeat.
+        //
+        // A trailing `..` is deliberately *not* stripped: Rust answers `None`
+        // for `foo.txt/..`, since the final component names the parent rather
+        // than a file. That falls out of the `name == ".."` check below.
+        if (end >= 2 && path[end - 1] == '.' && path[end - 2] == '/') {
+            end -= 2;
+            // Nothing but the root was left ("/." or "/.//"), which has no
+            // file name.
+            if (end == 0) return Optional<std::string>();
+            continue;
+        }
+        break;
+    }
     const std::size_t slash = path.rfind('/', end - 1);
     const std::size_t begin = slash == std::string::npos ? 0 : slash + 1;
     if (begin >= end) return Optional<std::string>();

@@ -1,0 +1,89 @@
+// SPDX-License-Identifier: MIT
+// Rust: src/snapshot/image_export/acr/publisher.rs — the tag layer.
+//
+// Decides the OCI tag a snapshot is published under, and refuses one the
+// registry would not accept. This runs *before* any blob is uploaded, which is
+// the point: a tag rejected late would leave the blobs pushed and no manifest
+// naming them, so the next publish re-uploads them and nothing ever collects
+// the orphans.
+//
+// `AcrDiskImageExporter::RollbackPublication` — the other half of this Rust
+// module that is ported — lives in `acr.h`, next to the client it drives.
+#ifndef AGENTENV_SNAPSHOT_IMAGE_EXPORT_ACR_PUBLISHER_H_
+#define AGENTENV_SNAPSHOT_IMAGE_EXPORT_ACR_PUBLISHER_H_
+
+#include <string>
+
+#include "agentenv/core/expected.h"
+#include "agentenv/core/identity.h"
+#include "agentenv/snapshot/repository/errors.h"
+
+namespace agentenv {
+namespace snapshot {
+namespace image_export {
+
+/// Rust `enum DiskImageSubject` — which disk of a sandbox is being published.
+struct DiskImageSubject {
+    enum class Kind { Rootfs, AttachedDrive };
+
+    Kind kind = Kind::Rootfs;
+    /// `AttachedDrive` only.
+    std::string drive_id;
+
+    DiskImageSubject() {}
+
+    static DiskImageSubject Rootfs() {
+        DiskImageSubject out;
+        out.kind = Kind::Rootfs;
+        return out;
+    }
+    static DiskImageSubject AttachedDrive(const std::string& drive_id) {
+        DiskImageSubject out;
+        out.kind = Kind::AttachedDrive;
+        out.drive_id = drive_id;
+        return out;
+    }
+
+    bool is_rootfs() const { return kind == Kind::Rootfs; }
+
+    /// Rust `log_label`.
+    const char* LogLabel() const {
+        return kind == Kind::Rootfs ? "rootfs" : "attached_drive";
+    }
+
+    bool operator==(const DiskImageSubject& o) const {
+        if (kind != o.kind) return false;
+        return kind == Kind::Rootfs || drive_id == o.drive_id;
+    }
+    bool operator!=(const DiskImageSubject& o) const { return !(*this == o); }
+};
+
+/// Rust `sanitize_drive_tag_component`.
+///
+/// A drive id is operator-supplied and may contain anything; an OCI tag may
+/// not. Every disallowed character becomes `-`, and a 12-hex-digit prefix of
+/// the id's SHA-256 is appended.
+///
+/// **The hash is what makes the result injective, and it is computed over the
+/// original id, not the sanitised one.** Sanitising alone collapses `data:1`
+/// and `data/1` onto `data-1`, and truncating to 32 characters collapses every
+/// id sharing a long prefix. Two drives of one snapshot would then publish to
+/// the same tag, and the second would overwrite the first.
+std::string SanitizeDriveTagComponent(const std::string& drive_id);
+
+/// Rust `snapshot_tag` — the rootfs tag, with a per-drive suffix for an
+/// attached drive.
+std::string SnapshotTag(const core::SnapshotId& snapshot_id,
+                        const DiskImageSubject& subject);
+
+/// Rust `validate_snapshot_tag`.
+///
+/// An OCI tag is at most 128 characters, starts with an alphanumeric or `_`,
+/// and continues with alphanumerics or `_`, `.`, `-`. Notably `-` may not
+/// *lead*, which is why the start and continuation rules differ.
+repository::RepositoryResult<core::Unit> ValidateSnapshotTag(const std::string& tag);
+
+}  // namespace image_export
+}  // namespace snapshot
+}  // namespace agentenv
+#endif  // AGENTENV_SNAPSHOT_IMAGE_EXPORT_ACR_PUBLISHER_H_

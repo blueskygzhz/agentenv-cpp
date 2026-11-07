@@ -38,6 +38,16 @@ bool IsDir(const std::string& path);
 /// Rust `Path::is_file`.
 bool IsFile(const std::string& path);
 
+/// Rust `fs::canonicalize` — `realpath(3)`: an absolute path with every
+/// symlink and `.`/`..` resolved.
+///
+/// Unlike `LexicallyNormalizePath` this touches the filesystem and therefore
+/// *fails when the path does not exist*. That is the point at the call sites
+/// that use it: a canonicalized path is proof the file was there, and
+/// resolving symlinks is what stops two spellings of one delta from being
+/// planned as two separate uploads.
+Expected<std::string, std::string> Canonicalize(const std::string& path);
+
 /// Rust `Path::parent` — absent for "/" and for a bare file name.
 Optional<std::string> Parent(const std::string& path);
 /// Rust `Path::file_name`.

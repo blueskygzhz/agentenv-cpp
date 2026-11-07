@@ -4,11 +4,17 @@
 
 #include <cctype>
 #include <set>
+#include <utility>
 
-#include "agentenv/snapshot/source_registry.h"
+#include "agentenv/snapshot/image_export/acr.h"
 
 namespace agentenv {
 namespace snapshot {
+
+// Rust `target.rs` imports this from `image_export::acr`; there is exactly one
+// such type upstream, and the normalisation it performs is what lets an
+// inferred target and a recorded publication compare equal.
+using image_export::SourceRegistryRepository;
 
 
 namespace {
@@ -74,18 +80,26 @@ core::Optional<PersistedDiskImagePublication> CanonicalRootfsPublication(
     return core::Optional<PersistedDiskImagePublication>();
 }
 
-/// Rust `infer_repository_from_blob_urls` — collects into a `BTreeSet`, so
-/// exactly one distinct location must remain.
-core::Expected<SourceRegistryRepository, SnapshotImageTargetError>
-InferRepositoryFromBlobUrls(const std::vector<std::string>& repo_blob_urls) {
-    std::set<SourceRegistryRepository> locations;
+/// Rust `infer_repository_from_blob_urls` — collects into a
+/// `BTreeSet<(String, String)>`, so exactly one distinct location must remain.
+///
+/// The set key is the `(registry, repository)` pair, not the whole parsed
+/// struct: upstream drops `repo_blob_url` before collecting, so two layers
+/// whose URLs normalise to one registry and repository but differ in path
+/// count as *one* location. Keying by the struct would see two and refuse to
+/// infer.
+core::Expected<std::pair<std::string, std::string>, SnapshotImageTargetError>
+InferRepositoryFromBlobUrls(const std::vector<std::string>& repo_blob_urls,
+                            bool allow_loopback_http) {
+    std::set<std::pair<std::string, std::string> > locations;
     for (std::size_t i = 0; i < repo_blob_urls.size(); ++i) {
         const repository::RepositoryResult<SourceRegistryRepository> source =
-            SourceRegistryRepository::Parse(repo_blob_urls[i]);
+            SourceRegistryRepository::Parse(repo_blob_urls[i], allow_loopback_http);
         if (!source.ok()) {
             return core::make_unexpected(CannotInfer(source.error().ToString()));
         }
-        locations.insert(source.value());
+        locations.insert(
+            std::make_pair(source.value().registry, source.value().repository));
     }
 
     if (locations.size() != 1) {
@@ -195,7 +209,7 @@ std::string SnapshotImageTarget::ImageRef() const {
 core::Expected<SnapshotImageTarget, SnapshotImageTargetError> ResolveSnapshotImageTarget(
     const core::SnapshotId& snapshot_id, const CommittedSnapshot& committed,
     const core::Optional<std::string>& target_repository,
-    const core::Optional<std::string>& tag) {
+    const core::Optional<std::string>& tag, bool allow_loopback_http) {
     if (target_repository.has_value()) {
         return SnapshotImageTarget::Parse(*target_repository, tag);
     }
@@ -220,13 +234,13 @@ core::Expected<SnapshotImageTarget, SnapshotImageTargetError> ResolveSnapshotIma
         }
     }
 
-    const core::Expected<SourceRegistryRepository, SnapshotImageTargetError> inferred =
-        InferRepositoryFromBlobUrls(candidates);
+    const core::Expected<std::pair<std::string, std::string>, SnapshotImageTargetError>
+        inferred = InferRepositoryFromBlobUrls(candidates, allow_loopback_http);
     if (!inferred.ok()) return core::make_unexpected(inferred.error());
 
     SnapshotImageTarget target;
-    target.registry = inferred.value().registry;
-    target.repository = inferred.value().repository;
+    target.registry = inferred.value().first;
+    target.repository = inferred.value().second;
     if (tag.has_value()) {
         const core::Expected<std::string, SnapshotImageTargetError> validated =
             ValidatedTag(tag);
@@ -241,14 +255,15 @@ core::Expected<SnapshotImageTarget, SnapshotImageTargetError> ResolveSnapshotIma
 }
 
 core::Optional<PersistedDiskImagePublication> SnapshotManagedPublicationForTarget(
-    const CommittedSnapshot& committed, const SnapshotImageTarget& target) {
+    const CommittedSnapshot& committed, const SnapshotImageTarget& target,
+    bool allow_loopback_http) {
     const std::string image_ref = target.ImageRef();
     for (std::size_t i = 0; i < committed.disk_publications.size(); ++i) {
         const PersistedDiskImagePublication& publication = committed.disk_publications[i];
         if (publication.tag != target.tag) continue;
 
         const repository::RepositoryResult<SourceRegistryRepository> source =
-            SourceRegistryRepository::Parse(publication.repo_blob_url);
+            SourceRegistryRepository::Parse(publication.repo_blob_url, allow_loopback_http);
         if (source.ok()) {
             // Compare the normalised registry/repository rather than the raw
             // strings, so `:443` and a case difference still match.

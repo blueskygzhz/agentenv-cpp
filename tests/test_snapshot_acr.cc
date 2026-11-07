@@ -102,11 +102,55 @@ MT_TEST(acr_parse_requires_v2_blobs_shape) {
     MT_EXPECT_TRUE(!SourceRegistryRepository::Parse("not a url").ok());
 }
 
-/// Userinfo is refused rather than dropped: the registry string is cached and
-/// logged, and a password must not travel in it.
-MT_TEST(acr_parse_rejects_userinfo) {
-    MT_EXPECT_TRUE(
-        !SourceRegistryRepository::Parse("https://user:pw@reg.example.com/v2/app/blobs").ok());
+/// Userinfo is dropped, not refused — Rust reaches the authority through
+/// `Url::host_str()`, which never includes it, and rebuilds `repo_blob_url`
+/// from the parsed registry. So the credential cannot reach the string that is
+/// cached and logged, *and* a recorded URL carrying one still resolves.
+/// Refusing instead would fail the rollback inside a snapshot delete, leaving
+/// a "deleted" snapshot published in the registry.
+MT_TEST(acr_parse_drops_userinfo_instead_of_refusing_it) {
+    const RepositoryResult<SourceRegistryRepository> parsed =
+        SourceRegistryRepository::Parse("https://user:pw@reg.example.com/v2/app/blobs");
+    MT_EXPECT_TRUE(parsed.ok());
+    MT_EXPECT_EQ(parsed.value().registry, std::string("reg.example.com"));
+    MT_EXPECT_EQ(parsed.value().repo_blob_url,
+                 std::string("https://reg.example.com/v2/app/blobs"));
+    // It normalises onto the same source as the credential-free spelling, so
+    // one image is not published twice.
+    MT_EXPECT_TRUE(parsed.value() ==
+                   SourceRegistryRepository::Parse("https://reg.example.com/v2/app/blobs")
+                       .value());
+
+    // The port still parses when userinfo precedes it, which it would not if
+    // the port were split off the whole authority.
+    const RepositoryResult<SourceRegistryRepository> with_port =
+        SourceRegistryRepository::Parse("https://user:pw@reg.example.com:5000/v2/app/blobs");
+    MT_EXPECT_TRUE(with_port.ok());
+    MT_EXPECT_EQ(with_port.value().registry, std::string("reg.example.com:5000"));
+
+    // `RegistryHost` goes through the same parse, so the challenge cache key
+    // cannot carry a secret either.
+    MT_EXPECT_EQ(*RegistryHost("https://user:pw@reg.example.com/v2/app"),
+                 std::string("reg.example.com"));
+}
+
+/// The scheme for the API calls is recovered from `repo_blob_url` rather than
+/// hardcoded, so a loopback HTTP source does not switch protocol mid-publish.
+MT_TEST(acr_source_registry_builds_api_urls_from_the_original_scheme) {
+    const SourceRegistryRepository https =
+        SourceRegistryRepository::Parse("https://registry.example/v2/ns/app/blobs").value();
+    MT_EXPECT_EQ(https.ImageRef("v1"), std::string("registry.example/ns/app:v1"));
+    MT_EXPECT_EQ(https.UploadUrl(),
+                 std::string("https://registry.example/v2/ns/app/blobs/uploads/"));
+    MT_EXPECT_EQ(https.ManifestUrl("v1"),
+                 std::string("https://registry.example/v2/ns/app/manifests/v1"));
+
+    const SourceRegistryRepository http =
+        SourceRegistryRepository::Parse("http://127.0.0.1:5000/v2/app/blobs", true).value();
+    MT_EXPECT_EQ(http.UploadUrl(),
+                 std::string("http://127.0.0.1:5000/v2/app/blobs/uploads/"));
+    MT_EXPECT_EQ(http.ManifestUrl("v1"),
+                 std::string("http://127.0.0.1:5000/v2/app/manifests/v1"));
 }
 
 MT_TEST(acr_registry_host_and_challenge_cache_key) {

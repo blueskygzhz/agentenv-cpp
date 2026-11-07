@@ -3,13 +3,18 @@
 // src/snapshot/image_export/acr/publisher.rs — the registry client, limited to
 // what rolling a publication back needs.
 //
-// Scope, stated plainly: this is the *delete* half of the ACR exporter. The
-// push half (`export`, blob upload, manifest assembly — some 3,000 further
-// lines) is not here, and neither is the policy that would select the exporter
-// for a push in the first place. Rolling back is what unblocks deleting a
-// snapshot that was published to a source registry, which is otherwise
-// refused outright: a "deleted" snapshot that stays published in the registry
-// is the one failure the caller cannot see.
+// Scope, stated plainly: this is the *delete* half of the ACR exporter. Blob
+// upload and manifest assembly (`publisher.rs`, `manifest.rs`) are not here,
+// and neither is the policy that would select the exporter for a push in the
+// first place. Rolling back is what unblocks deleting a snapshot that was
+// published to a source registry, which is otherwise refused outright: a
+// "deleted" snapshot that stays published in the registry is the one failure
+// the caller cannot see.
+//
+// `SourceRegistryRepository` is the exception: it belongs to `source_image.rs`
+// upstream but is shared with this half, which needs it to aim a DELETE. There
+// is one of it, as upstream has — see `acr_source_image.h` for the rest of
+// that module.
 #ifndef AGENTENV_SNAPSHOT_IMAGE_EXPORT_ACR_H_
 #define AGENTENV_SNAPSHOT_IMAGE_EXPORT_ACR_H_
 
@@ -56,6 +61,22 @@ struct SourceRegistryRepository {
     /// so the production call sites can be *seen* to pass false.
     static repository::RepositoryResult<SourceRegistryRepository> Parse(
         const std::string& repo_blob_url, bool allow_loopback_http = false);
+
+    /// Rust `image_ref`.
+    std::string ImageRef(const std::string& tag) const;
+
+    /// Rust `upload_url`.
+    std::string UploadUrl() const;
+
+    /// Rust `manifest_url`.
+    std::string ManifestUrl(const std::string& tag) const;
+
+    /// Rust derives `PartialEq, Eq`.
+    bool operator==(const SourceRegistryRepository& o) const {
+        return registry == o.registry && repository == o.repository &&
+               repo_blob_url == o.repo_blob_url;
+    }
+    bool operator!=(const SourceRegistryRepository& o) const { return !(*this == o); }
 };
 
 /// Rust `enum AcrClientError`.
