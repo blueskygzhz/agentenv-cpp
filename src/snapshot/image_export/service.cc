@@ -228,16 +228,15 @@ RepositoryResult<ConfiguredSnapshotImageService> ConfiguredSnapshotImageService:
             // other signing with a stale token.
             std::shared_ptr<repository::oss::OssClient> client;
             const RepositoryResult<std::shared_ptr<repository::SnapshotRepository> > repository =
-                repository::MakeOssRepository(*config.backend.oss,
-                                             config.snapshot.publish_compression, &client);
+                repository::MakeOssRepository(
+                    *config.backend.oss, config.snapshot.publish_compression,
+                    repository::SnapshotImageStorageFor(config), &client);
             if (!repository.ok()) return core::make_unexpected(repository.error());
-            // Deviation, named because the config field exists and nothing
-            // here reads it: upstream also derives a
-            // `SnapshotImageStoragePolicy` from `snapshot.image_publish.enabled`
-            // and hands it to `OssRepository::new`. That third argument is not
-            // ported, so the setting has no effect on this path. It selects
-            // where *image* artifacts are stored, which is not a decision this
-            // export makes -- it publishes to a registry either way.
+            // The image-storage policy is passed through to the repository, as
+            // upstream does, but it does not change what *this* path does: a
+            // standalone image export publishes to the target registry either
+            // way. It matters to the publish path (`snapshot/store.cc`), which
+            // reads it off the repository this returns.
             return ConfiguredSnapshotImageService(repository.value(), client,
                                                   OssManagedLayerLocator(client),
                                                   Regctl(regctl_binary));

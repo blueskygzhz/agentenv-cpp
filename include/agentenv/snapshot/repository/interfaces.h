@@ -88,18 +88,22 @@ struct SnapshotListFilter {
 /// Rust `PublishPolicy` — how snapshots and volumes are published into one
 /// repository.
 ///
-/// **Only `compression` is ported.** Rust also carries `image_storage`
-/// (`SnapshotImageStoragePolicy`), whose single consumer is the branch in
-/// `store_snapshot` that builds an `AcrDiskImageExporter` for the
-/// `SourceRegistry` case. That exporter's publish half does not exist here
-/// (see the note on `StoredSnapshot::disk_publications` in `store.h`), so the
-/// field would be read by nothing. Carrying it anyway would be worse than
-/// omitting it: a dead field that *looks* like a supported switch invites a
-/// caller to set `SourceRegistry` and silently get object storage. When the
-/// ACR publish half lands, this is where the field goes back.
+/// Both fields are ported. `image_storage`'s single consumer is the branch in
+/// `StoreSnapshot` that selects an `AcrDiskImageExporter` for the
+/// `SourceRegistry` case (`store.cc`, Rust `store_disk_image`).
 struct PublishPolicy {
     /// Recontainerizes raw local layers as zfile before they are stored.
     cfg::SnapshotPublishCompressionConfig compression;
+
+    /// Whether disk images go to their source registry or to managed layers.
+    ///
+    /// Only the OSS backend ever reports `SourceRegistry`, here and upstream
+    /// alike: it is the one backend that overrides the policy, and the one
+    /// `snapshot.image_publish.enabled` is wired to
+    /// (`snapshot/backends/mod.rs:90-94`). Every other backend inherits the
+    /// default below, so a posix-fs node stores managed layers no matter what
+    /// `image_publish` says — which is upstream's behaviour, not a port gap.
+    cfg::SnapshotImageStoragePolicy image_storage;
 
     /// Rust `impl Default for PublishPolicy` — raw layers.
     ///
@@ -113,7 +117,14 @@ struct PublishPolicy {
     /// never consulted. Defaulting the member instead would turn every such
     /// backend -- posix-fs and in-memory, i.e. every production repository in
     /// this tree today -- from passthrough into lz4 compression.
-    PublishPolicy() { compression.enabled = false; }
+    ///
+    /// `image_storage` is set explicitly for the same reason the enum has no
+    /// defaulted member: `ObjectStorage` is the inert direction (store the
+    /// layers here), and a backend that has not been told to publish to a
+    /// source registry must not start doing it.
+    PublishPolicy() : image_storage(cfg::SnapshotImageStoragePolicy::ObjectStorage) {
+        compression.enabled = false;
+    }
 };
 
 /// Rust trait `SnapshotRepository`, which has since become `Repository`.

@@ -7,6 +7,7 @@
 #include "agentenv/sandbox/manifest.h"
 #include "agentenv/snapshot/record.h"
 #include "agentenv/snapshot/repository/interfaces.h"
+#include "agentenv/snapshot/store.h"
 
 namespace agentenv {
 namespace snapshot {
@@ -52,6 +53,16 @@ struct SnapshotPublication {
 repository::RepositoryResult<SnapshotPublication> Publish(
     repository::SnapshotRepository& repository, const SnapshotPublishMetadata& metadata,
     const sandbox::SandboxSnapshotManifest& manifest);
+
+/// `Publish` with the source-registry exporter injected, for the same reason
+/// `StoreSnapshot` has the overload: the exporter is the one step that talks to
+/// a registry, and the publish sequence around it cannot otherwise be tested.
+///
+/// The policy still decides whether it is used at all.
+repository::RepositoryResult<SnapshotPublication> Publish(
+    repository::SnapshotRepository& repository, const SnapshotPublishMetadata& metadata,
+    const sandbox::SandboxSnapshotManifest& manifest,
+    const SourceRegistryExporter& exporter);
 
 }  // namespace snapshot
 }  // namespace agentenv

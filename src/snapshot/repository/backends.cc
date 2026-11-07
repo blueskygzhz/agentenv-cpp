@@ -146,9 +146,16 @@ InMemorySnapshotRepository::MarkBuildError(const core::SnapshotId& id,
 // to supply the catalog *and* artifact stores it needs. A factory that cannot
 // take those is not a factory for this backend.
 
+cfg::SnapshotImageStoragePolicy SnapshotImageStorageFor(const cfg::AppConfig& config) {
+    return config.snapshot.image_publish.enabled
+               ? cfg::SnapshotImageStoragePolicy::SourceRegistry
+               : cfg::SnapshotImageStoragePolicy::ObjectStorage;
+}
+
 RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeOssRepository(
     const cfg::OssBackendConfig& config,
     const cfg::SnapshotPublishCompressionConfig& publish_compression,
+    cfg::SnapshotImageStoragePolicy image_storage,
     std::shared_ptr<oss::OssClient>* client_out) {
     // Rust `OssRepository::from_config`: normalise, then connect. Validation
     // first, so an incomplete section is reported as itself rather than as a
@@ -172,6 +179,7 @@ RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeOssRepository(
     // change under a publish already in flight.
     PublishPolicy policy;
     policy.compression = publish_compression;
+    policy.image_storage = image_storage;
 
     // Handed out only after every fallible step above succeeded, so a caller
     // that ignores the error cannot end up holding a client built over a
@@ -208,7 +216,10 @@ RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeRepositoryFromConfig(
                 return core::make_unexpected(RepositoryError::InvalidRequest(
                     "backend.oss config is required when repository_backend = oss"));
             }
-            return MakeOssRepository(*config.backend.oss, config.snapshot.publish_compression);
+            // Rust `backends/mod.rs:90-94` derives the policy from
+            // `snapshot.image_publish.enabled`, and only on this backend.
+            return MakeOssRepository(*config.backend.oss, config.snapshot.publish_compression,
+                                     SnapshotImageStorageFor(config));
         }
     }
     // Unreachable for the two declared kinds; present because a `switch` over

@@ -123,13 +123,19 @@ struct Fixture {
     std::shared_ptr<oss::OssSnapshotRepository> repository;
     TempDir dir;
 
-    Fixture() {
+    /// `image_storage` defaults to the repository's own default
+    /// (`ObjectStorage`), so a test that is not about the source-registry arm
+    /// gets managed layers without saying so.
+    explicit Fixture(cfg::SnapshotImageStoragePolicy image_storage =
+                         cfg::SnapshotImageStoragePolicy::ObjectStorage) {
         const RepositoryResult<oss::OssClient*> client =
             oss::OssClient::NewWithTransport(Normalized(GoodConfig()), server.Fn());
         MT_EXPECT_TRUE(client.ok());
+        PublishPolicy policy;
+        policy.image_storage = image_storage;
         repository.reset(new oss::OssSnapshotRepository(
             std::shared_ptr<oss::OssClient>(client.ok() ? client.value() : 0),
-            std::shared_ptr<oss::ObjectUploader>(new StubUploader(&server))));
+            std::shared_ptr<oss::ObjectUploader>(new StubUploader(&server)), policy));
     }
 
     SnapshotRepository& Repo() { return *repository; }
@@ -197,6 +203,73 @@ sandbox::ExtraDrive Drive(const std::string& id, uint64_t virtual_size,
 
 bool Contains(const std::string& haystack, const std::string& needle) {
     return haystack.find(needle) != std::string::npos;
+}
+
+/// The managed-layer location the OSS fixture reports, which is what a remote
+/// lower has to match for the fallback to be allowed.
+const char* kManagedLayers = "s3://agentenv/managed-layers";
+
+/// One recorded call to the injected exporter.
+struct ExportCall {
+    image_export::DiskImageSubject subject;
+    std::string image_config_path;
+    bool had_config;
+};
+
+/// A `SourceRegistryExporter` that records what it was asked to publish and
+/// answers from a script, plus the rollbacks it was later asked for.
+///
+/// Shared through a `shared_ptr` because the functors outlive the expression
+/// that builds them and both halves must see the same recording.
+struct FakeExporter {
+    std::vector<ExportCall> calls;
+    std::vector<PersistedDiskImagePublication> rollbacks;
+    /// Returned in order, one per call; the last repeats once exhausted.
+    std::vector<RepositoryResult<image_export::DiskImageExportOutcome> > script;
+    bool rollback_fails = false;
+};
+
+/// A successful outcome naming one external layer plus a publication.
+RepositoryResult<image_export::DiskImageExportOutcome> Published(const std::string& tag) {
+    image_export::DiskImageExportOutcome outcome;
+    ExternalLayer layer;
+    layer.digest = "sha256:published-" + tag;
+    layer.repo_blob_url = "https://registry.example.com/v2/app/blobs";
+    layer.size = 7;
+    outcome.layers.push_back(OverlaybdLayerRef::External(layer));
+    PersistedDiskImagePublication publication;
+    publication.image_ref = "registry.example.com/app:" + tag;
+    publication.tag = tag;
+    publication.manifest_digest = "sha256:manifest-" + tag;
+    publication.repo_blob_url = "https://registry.example.com/v2/app/blobs";
+    outcome.publication = core::Optional<PersistedDiskImagePublication>(publication);
+    return outcome;
+}
+
+SourceRegistryExporter Exporter(const std::shared_ptr<FakeExporter>& fake) {
+    SourceRegistryExporter out;
+    out.publish = [fake](const core::SnapshotId&, const image_export::DiskImageSubject& subject,
+                         const std::string& image_config_path,
+                         const core::Optional<SnapshotOciConfigInput>& config) {
+        ExportCall call = {subject, image_config_path, config.has_value()};
+        fake->calls.push_back(call);
+        const std::size_t index = fake->calls.size() - 1;
+        MT_EXPECT_TRUE(!fake->script.empty());
+        if (fake->script.empty()) {
+            return RepositoryResult<image_export::DiskImageExportOutcome>(
+                core::make_unexpected(RepositoryError::Backend("no script")));
+        }
+        return fake->script[index < fake->script.size() ? index : fake->script.size() - 1];
+    };
+    out.rollback = [fake](const PersistedDiskImagePublication& publication) {
+        fake->rollbacks.push_back(publication);
+        if (fake->rollback_fails) {
+            return RepositoryResult<core::Unit>(
+                core::make_unexpected(RepositoryError::Backend("rollback refused")));
+        }
+        return RepositoryResult<core::Unit>(core::Unit());
+    };
+    return out;
 }
 
 }  // namespace
@@ -530,6 +603,350 @@ MT_TEST(an_attached_drives_mount_path_falls_back_to_the_default_when_unusable) {
     MT_EXPECT_TRUE(stored.ok() &&
                    stored.value().attached_drives[0].mount_path ==
                        sandbox::ExtraDrive::DefaultMountPath("data"));
+}
+
+// ---- store_disk_image: the exporter selection ----------------------------
+
+/// The policy decides, not the availability of an exporter.
+///
+/// This is the property the whole selection rests on, and the one that would
+/// break silently: a repository that stores managed layers must never reach
+/// the registry, even when a perfectly good exporter is in hand. Asserted by
+/// handing one in and requiring that it was *not* called.
+MT_TEST(object_storage_policy_never_reaches_the_exporter) {
+    Fixture f(cfg::SnapshotImageStoragePolicy::ObjectStorage);
+    const std::shared_ptr<FakeExporter> fake(new FakeExporter());
+    fake->script.push_back(Published("rootfs"));
+
+    const RepositoryResult<StoredSnapshot> stored =
+        StoreSnapshot(f.Repo(), f.Metadata(), f.Manifest(), Exporter(fake));
+    MT_EXPECT_TRUE(stored.ok());
+    MT_EXPECT_TRUE(fake->calls.empty());
+    // Managed layers instead, so the bytes landed here.
+    MT_EXPECT_TRUE(stored.ok() && stored.value().rootfs_layers.size() == 1);
+    MT_EXPECT_TRUE(stored.ok() && stored.value().rootfs_layers[0].is_managed());
+    MT_EXPECT_TRUE(stored.ok() && stored.value().disk_publications.empty());
+}
+
+/// The source-registry policy publishes, and the publication reaches the
+/// caller rather than being dropped on the floor.
+MT_TEST(source_registry_policy_publishes_and_returns_the_publication) {
+    Fixture f(cfg::SnapshotImageStoragePolicy::SourceRegistry);
+    const std::shared_ptr<FakeExporter> fake(new FakeExporter());
+    fake->script.push_back(Published("rootfs"));
+
+    const RepositoryResult<StoredSnapshot> stored =
+        StoreSnapshot(f.Repo(), f.Metadata(), f.Manifest(), Exporter(fake));
+    MT_EXPECT_TRUE(stored.ok());
+    MT_EXPECT_TRUE(fake->calls.size() == 1);
+    // The layers are the exporter's, not locally stored ones.
+    MT_EXPECT_TRUE(stored.ok() && stored.value().rootfs_layers.size() == 1);
+    MT_EXPECT_TRUE(stored.ok() && stored.value().rootfs_layers[0].is_external());
+    MT_EXPECT_TRUE(stored.ok() && stored.value().disk_publications.size() == 1);
+    MT_EXPECT_TRUE(stored.ok() &&
+                   stored.value().disk_publications[0].tag == "rootfs");
+}
+
+/// The rootfs publishes *with* a config and a drive publishes *without* one,
+/// and a drive's subject carries its id.
+///
+/// Both halves matter. A drive that published the rootfs' effective runtime
+/// config would describe the wrong image, and a subject that lost the drive id
+/// would make every drive of one snapshot publish under the rootfs tag --
+/// overwriting each other.
+MT_TEST(the_subject_and_config_differ_between_the_rootfs_and_a_drive) {
+    Fixture f(cfg::SnapshotImageStoragePolicy::SourceRegistry);
+    const std::shared_ptr<FakeExporter> fake(new FakeExporter());
+    fake->script.push_back(Published("rootfs"));
+    fake->script.push_back(Published("drive"));
+
+    const std::string lower = f.dir.At("drive.commit");
+    WriteFile(lower, "drive-bytes");
+    const std::string config = f.dir.At("drive-image.json");
+    WriteFile(config, LocalLowerConfig(lower, "sha256:drive", 11));
+    std::vector<sandbox::ExtraDrive> drives;
+    drives.push_back(Drive("data", 4096, config));
+
+    const RepositoryResult<StoredSnapshot> stored =
+        StoreSnapshot(f.Repo(), f.Metadata(), f.Manifest(drives), Exporter(fake));
+    MT_EXPECT_TRUE(stored.ok());
+    MT_EXPECT_TRUE(fake->calls.size() == 2);
+    if (fake->calls.size() != 2) return;
+
+    MT_EXPECT_TRUE(fake->calls[0].subject.is_rootfs());
+    MT_EXPECT_TRUE(fake->calls[0].had_config);
+    MT_EXPECT_TRUE(!fake->calls[1].subject.is_rootfs());
+    MT_EXPECT_TRUE(fake->calls[1].subject.drive_id == "data");
+    MT_EXPECT_TRUE(!fake->calls[1].had_config);
+    // Each publishes its own image config, not the other's.
+    MT_EXPECT_TRUE(fake->calls[1].image_config_path == config);
+    MT_EXPECT_TRUE(fake->calls[0].image_config_path != config);
+
+    // Rootfs first, then the drive: `DeleteSnapshot` unwinds this in reverse.
+    MT_EXPECT_TRUE(stored.value().disk_publications.size() == 2);
+    MT_EXPECT_TRUE(stored.value().disk_publications[0].tag == "rootfs");
+    MT_EXPECT_TRUE(stored.value().disk_publications[1].tag == "drive");
+}
+
+// ---- store_disk_image: the fallback --------------------------------------
+
+/// `Unsupported` falls back to managed layers when nothing would be mixed.
+MT_TEST(an_unsupported_image_shape_falls_back_to_managed_layers) {
+    Fixture f(cfg::SnapshotImageStoragePolicy::SourceRegistry);
+    const std::shared_ptr<FakeExporter> fake(new FakeExporter());
+    fake->script.push_back(core::make_unexpected(
+        RepositoryError::Unsupported("descriptorless lower")));
+
+    const RepositoryResult<StoredSnapshot> stored =
+        StoreSnapshot(f.Repo(), f.Metadata(), f.Manifest(), Exporter(fake));
+    MT_EXPECT_TRUE(stored.ok());
+    MT_EXPECT_TRUE(fake->calls.size() == 1);
+    // Stored here instead, and nothing was published.
+    MT_EXPECT_TRUE(stored.ok() && stored.value().rootfs_layers.size() == 1);
+    MT_EXPECT_TRUE(stored.ok() && stored.value().rootfs_layers[0].is_managed());
+    MT_EXPECT_TRUE(stored.ok() && stored.value().disk_publications.empty());
+}
+
+/// Only `Unsupported` falls back. Every other error propagates.
+///
+/// The distinction is the point: `Unsupported` is a statement about the
+/// image's shape, which storing it locally answers. A refused auth or a failed
+/// upload is a statement about *this attempt*, and falling back would turn a
+/// misconfigured registry into a silent no-op -- the operator asked to publish
+/// and would be told it worked.
+MT_TEST(a_transport_error_does_not_fall_back) {
+    Fixture f(cfg::SnapshotImageStoragePolicy::SourceRegistry);
+    const std::shared_ptr<FakeExporter> fake(new FakeExporter());
+    fake->script.push_back(
+        core::make_unexpected(RepositoryError::Backend("push layer", "401 unauthorized")));
+
+    const RepositoryResult<StoredSnapshot> stored =
+        StoreSnapshot(f.Repo(), f.Metadata(), f.Manifest(), Exporter(fake));
+    MT_EXPECT_TRUE(!stored.ok());
+    MT_EXPECT_TRUE(!stored.ok() && stored.error().kind == RepositoryErrorKind::Backend);
+    MT_EXPECT_TRUE(!stored.ok() && Contains(stored.error().ToString(), "401 unauthorized"));
+}
+
+/// A remote lower pointing outside this repository refuses the fallback.
+///
+/// Storing the local lowers here while leaving that one where it is would
+/// leave the image half in this bucket and half in a registry nothing here
+/// manages: deleting the snapshot would orphan the other half, and a restore
+/// would depend on a source no one on this node can keep alive.
+MT_TEST(a_foreign_remote_lower_refuses_the_fallback) {
+    Fixture f(cfg::SnapshotImageStoragePolicy::SourceRegistry);
+    const std::shared_ptr<FakeExporter> fake(new FakeExporter());
+    fake->script.push_back(
+        core::make_unexpected(RepositoryError::Unsupported("unmodelled layer")));
+
+    // The rootfs image config's lower lives in someone else's registry.
+    const std::string rootfs_config = f.dir.At("rootfs-image.json");
+    sandbox::SandboxSnapshotManifest manifest = f.Manifest();
+    WriteFile(rootfs_config,
+              RemoteLowerConfig("https://elsewhere.example.com/v2/app/blobs",
+                                "sha256:foreign", 9));
+
+    const RepositoryResult<StoredSnapshot> stored =
+        StoreSnapshot(f.Repo(), f.Metadata(), manifest, Exporter(fake));
+    MT_EXPECT_TRUE(!stored.ok());
+    MT_EXPECT_TRUE(!stored.ok() && stored.error().kind == RepositoryErrorKind::Unsupported);
+    // The original reason is kept, wrapped rather than replaced: without it
+    // the operator cannot tell which layer shape was refused.
+    MT_EXPECT_TRUE(!stored.ok() &&
+                   Contains(stored.error().ToString(), "remote-backed disk image"));
+    MT_EXPECT_TRUE(!stored.ok() && Contains(stored.error().ToString(), "unmodelled layer"));
+}
+
+/// A remote lower that already lives in *this* repository allows the fallback.
+///
+/// This is the other side of the test above, and it is what keeps the guard
+/// from refusing every remote lower outright: a lower already in this bucket
+/// mixes nothing, so storing the rest here yields one coherent image.
+MT_TEST(a_remote_lower_in_this_repository_allows_the_fallback) {
+    Fixture f(cfg::SnapshotImageStoragePolicy::SourceRegistry);
+    const std::shared_ptr<FakeExporter> fake(new FakeExporter());
+    fake->script.push_back(
+        core::make_unexpected(RepositoryError::Unsupported("unmodelled layer")));
+
+    sandbox::SandboxSnapshotManifest manifest = f.Manifest();
+    WriteFile(f.dir.At("rootfs-image.json"),
+              RemoteLowerConfig(kManagedLayers, "sha256:ours", 9));
+
+    const RepositoryResult<StoredSnapshot> stored =
+        StoreSnapshot(f.Repo(), f.Metadata(), manifest, Exporter(fake));
+    MT_EXPECT_TRUE(stored.ok());
+    MT_EXPECT_TRUE(stored.ok() && stored.value().rootfs_layers.size() == 1);
+    // Left as the external reference it already was.
+    MT_EXPECT_TRUE(stored.ok() && stored.value().rootfs_layers[0].is_external());
+    MT_EXPECT_TRUE(stored.ok() && stored.value().disk_publications.empty());
+}
+
+// ---- the cleanup rolls publications back ---------------------------------
+
+/// A publish that dies partway rolls back what it already published.
+///
+/// Rust keeps its `LayerStore` alive past the `match` so the error arm can
+/// reach `store.disk_publications`; this port threads a partial result out for
+/// the same reason. Without it the rootfs image stays in the registry with no
+/// record naming it, which is the one leak nothing later can find.
+MT_TEST(a_failure_after_publishing_rolls_the_publication_back) {
+    Fixture f(cfg::SnapshotImageStoragePolicy::SourceRegistry);
+    const std::shared_ptr<FakeExporter> fake(new FakeExporter());
+    fake->script.push_back(Published("rootfs"));
+    // The drive's export fails in a way that does not fall back.
+    fake->script.push_back(
+        core::make_unexpected(RepositoryError::Backend("push drive", "503")));
+
+    const std::string lower = f.dir.At("drive.commit");
+    WriteFile(lower, "drive-bytes");
+    const std::string config = f.dir.At("drive-image.json");
+    WriteFile(config, LocalLowerConfig(lower, "sha256:drive", 11));
+    std::vector<sandbox::ExtraDrive> drives;
+    drives.push_back(Drive("data", 4096, config));
+
+    const RepositoryResult<StoredSnapshot> stored =
+        StoreSnapshot(f.Repo(), f.Metadata(), f.Manifest(drives), Exporter(fake));
+    MT_EXPECT_TRUE(!stored.ok());
+    // The rootfs publication was undone, and it is the one that was made.
+    MT_EXPECT_TRUE(fake->rollbacks.size() == 1);
+    MT_EXPECT_TRUE(fake->rollbacks.size() == 1 && fake->rollbacks[0].tag == "rootfs");
+    // The caller still sees the original cause, not a rollback detail.
+    MT_EXPECT_TRUE(!stored.ok() && Contains(stored.error().ToString(), "503"));
+}
+
+/// A rollback that itself fails is logged and stepped over.
+///
+/// The store error is what the caller must see: it is the actionable cause,
+/// and a registry that is down must not also mask it.
+MT_TEST(a_failing_rollback_does_not_replace_the_store_error) {
+    Fixture f(cfg::SnapshotImageStoragePolicy::SourceRegistry);
+    const std::shared_ptr<FakeExporter> fake(new FakeExporter());
+    fake->rollback_fails = true;
+    fake->script.push_back(Published("rootfs"));
+    fake->script.push_back(
+        core::make_unexpected(RepositoryError::Backend("push drive", "503")));
+
+    const std::string lower = f.dir.At("drive.commit");
+    WriteFile(lower, "drive-bytes");
+    const std::string config = f.dir.At("drive-image.json");
+    WriteFile(config, LocalLowerConfig(lower, "sha256:drive", 11));
+    std::vector<sandbox::ExtraDrive> drives;
+    drives.push_back(Drive("data", 4096, config));
+
+    const RepositoryResult<StoredSnapshot> stored =
+        StoreSnapshot(f.Repo(), f.Metadata(), f.Manifest(drives), Exporter(fake));
+    MT_EXPECT_TRUE(!stored.ok());
+    MT_EXPECT_TRUE(fake->rollbacks.size() == 1);
+    MT_EXPECT_TRUE(!stored.ok() && Contains(stored.error().ToString(), "503"));
+    MT_EXPECT_TRUE(!stored.ok() &&
+                   !Contains(stored.error().ToString(), "rollback refused"));
+}
+
+/// A cleanup that itself fails is logged, never returned.
+///
+/// The store error is the actionable cause and the only one the caller can do
+/// anything about. Returning the cleanup error instead would report "could not
+/// delete blobs" for a publish that actually failed because the registry
+/// refused it, pointing every investigation at the wrong subsystem.
+MT_TEST(a_failing_blob_cleanup_does_not_replace_the_store_error) {
+    Fixture f(cfg::SnapshotImageStoragePolicy::SourceRegistry);
+    const std::shared_ptr<FakeExporter> fake(new FakeExporter());
+    // The rootfs succeeds and the drive fails, so the store gets far enough to
+    // have written blobs -- without that the cleanup has nothing to delete,
+    // never issues a DELETE, and cannot fail at all.
+    fake->script.push_back(Published("rootfs"));
+    fake->script.push_back(
+        core::make_unexpected(RepositoryError::Backend("push drive", "registry refused")));
+
+    const std::string lower = f.dir.At("drive.commit");
+    WriteFile(lower, "drive-bytes");
+    const std::string config = f.dir.At("drive-image.json");
+    WriteFile(config, LocalLowerConfig(lower, "sha256:drive", 11));
+    std::vector<sandbox::ExtraDrive> drives;
+    drives.push_back(Drive("data", 4096, config));
+    const sandbox::SandboxSnapshotManifest manifest = f.Manifest(drives);
+
+    // Built after the manifest, so the fixture's own writes still land.
+    f.server.fail_delete = true;
+
+    const RepositoryResult<StoredSnapshot> stored =
+        StoreSnapshot(f.Repo(), f.Metadata(), manifest, Exporter(fake));
+    MT_EXPECT_TRUE(!stored.ok());
+    // The store's own cause survives ...
+    MT_EXPECT_TRUE(!stored.ok() && Contains(stored.error().ToString(), "registry refused"));
+    // ... and the cleanup's failure did happen, but was not what came back.
+    MT_EXPECT_TRUE(!stored.ok() && !Contains(stored.error().ToString(), "500"));
+    // The blobs are still there, which is what made the cleanup fail.
+    MT_EXPECT_TRUE(f.HasBlob(SnapshotFile::VmState));
+}
+
+/// A commit that fails rolls the publications back too.
+///
+/// This is the one leak that nothing later could repair: the record is what
+/// names a publication, so a commit that never lands leaves the image in the
+/// registry with no way to find it again. Upstream passes
+/// `&disk_publications` to its cleanup for exactly this.
+MT_TEST(a_failed_commit_rolls_the_publications_back) {
+    Fixture f(cfg::SnapshotImageStoragePolicy::SourceRegistry);
+    const std::shared_ptr<FakeExporter> fake(new FakeExporter());
+    fake->script.push_back(Published("rootfs"));
+
+    SnapshotPublishMetadata metadata = f.Metadata();
+    const core::Expected<SnapshotAlias, std::string> alias = SnapshotAlias::Parse("base");
+    MT_EXPECT_TRUE(alias.ok());
+    metadata.alias = core::Optional<SnapshotAlias>(alias.value());
+
+    // The same race as above: a competing snapshot claims the alias after the
+    // early check and before the commit, so the store step succeeds -- and
+    // publishes -- and only the commit fails.
+    const char* kOther = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+    f.server.before_put = [&f, kOther]() {
+        SnapshotRecord owner;
+        owner.id = Id(kOther);
+        owner.source = SnapshotSource::Template(TemplateBuildInfo());
+        f.server.Seed(DocumentKey::SnapshotRecord(Id(kOther)).Path(),
+                      owner.ToJson().ToStringPretty());
+        f.server.Seed(DocumentKey::SnapshotAlias(SnapshotAlias::Parse("base").value()).Path(),
+                      core::Json(std::string(kOther)).ToString());
+    };
+
+    const RepositoryResult<SnapshotPublication> published =
+        Publish(f.Repo(), metadata, f.Manifest(), Exporter(fake));
+    MT_EXPECT_TRUE(!published.ok());
+    // The publish happened, so there was something to undo ...
+    MT_EXPECT_TRUE(fake->calls.size() == 1);
+    // ... and it was undone.
+    MT_EXPECT_TRUE(fake->rollbacks.size() == 1);
+    MT_EXPECT_TRUE(fake->rollbacks.size() == 1 && fake->rollbacks[0].tag == "rootfs");
+}
+
+/// `Publish` carries the publications into the committed record.
+///
+/// The record is the only thing that names them, so a publication that does
+/// not reach it can never be rolled back -- the delete path reads exactly this
+/// field.
+MT_TEST(publish_commits_the_publications_into_the_record) {
+    Fixture f(cfg::SnapshotImageStoragePolicy::SourceRegistry);
+    const std::shared_ptr<FakeExporter> fake(new FakeExporter());
+    fake->script.push_back(Published("rootfs"));
+
+    const RepositoryResult<SnapshotPublication> published =
+        Publish(f.Repo(), f.Metadata(), f.Manifest(), Exporter(fake));
+    MT_EXPECT_TRUE(published.ok());
+    MT_EXPECT_TRUE(published.ok() && published.value().record.committed.has_value() &&
+                   published.value().record.committed->disk_publications.size() == 1);
+
+    // Read back through the record's own serialisation, which is what a
+    // delete on another node would see.
+    const core::Optional<SnapshotRecord> reread = f.Stored();
+    MT_EXPECT_TRUE(reread.has_value());
+    MT_EXPECT_TRUE(reread.has_value() && reread->committed.has_value());
+    MT_EXPECT_TRUE(reread.has_value() && reread->committed.has_value() &&
+                   reread->committed->disk_publications.size() == 1);
+    MT_EXPECT_TRUE(reread.has_value() && reread->committed.has_value() &&
+                   reread->committed->disk_publications.size() == 1 &&
+                   reread->committed->disk_publications[0].manifest_digest ==
+                       "sha256:manifest-rootfs");
 }
 
 MT_MAIN

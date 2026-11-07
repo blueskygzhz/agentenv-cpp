@@ -81,6 +81,16 @@ RepositoryResult<core::Unit> EnsureNotCommitted(SnapshotRepository& repository,
 RepositoryResult<SnapshotPublication> Publish(
     SnapshotRepository& repository, const SnapshotPublishMetadata& metadata,
     const sandbox::SandboxSnapshotManifest& manifest) {
+    return Publish(repository, metadata, manifest,
+                   AcrSourceRegistryExporter(
+                       overlaybd::OverlaybdCompactOutput::FromPublishCompressionConfig(
+                           repository.GetPublishPolicy().compression)));
+}
+
+RepositoryResult<SnapshotPublication> Publish(
+    SnapshotRepository& repository, const SnapshotPublishMetadata& metadata,
+    const sandbox::SandboxSnapshotManifest& manifest,
+    const SourceRegistryExporter& exporter) {
     const RepositoryResult<core::Unit> drives = ValidateAttachedDrives(manifest);
     if (!drives.ok()) return core::make_unexpected(drives.error());
 
@@ -95,7 +105,7 @@ RepositoryResult<SnapshotPublication> Publish(
     }
 
     const RepositoryResult<StoredSnapshot> stored =
-        StoreSnapshot(repository, metadata, manifest);
+        StoreSnapshot(repository, metadata, manifest, exporter);
     if (!stored.ok()) return core::make_unexpected(stored.error());
 
     CommittedSnapshot committed;
@@ -109,10 +119,17 @@ RepositoryResult<SnapshotPublication> Publish(
     committed.attached_drives = stored.value().attached_drives;
     committed.volume_snapshots = metadata.volume_snapshots;
     committed.memory_layers = stored.value().memory_layers;
-    // Attached later by the startup-manifest continuation, which is why this
-    // is absent rather than built here: the pack is produced after the record
-    // is committed, so a publish that failed would otherwise have to undo it.
-    // `disk_publications` stays empty for the reason given in `store.h`.
+    // The source-registry publications, in creation order. Empty unless the
+    // repository's policy is `SourceRegistry`.
+    //
+    // These have to reach the record: it is the only thing that names them, so
+    // a publication committed without one could never be rolled back — see
+    // `record_catalog`'s delete path, which reads exactly this field.
+    committed.disk_publications = stored.value().disk_publications;
+    // The startup manifest is attached later by its continuation, which is why
+    // it is absent rather than built here: the pack is produced after the
+    // record is committed, so a publish that failed would otherwise have to
+    // undo it.
 
     const RepositoryResult<SnapshotRecord> record =
         repository::record_catalog::Commit(repository, metadata, committed);
@@ -123,7 +140,12 @@ RepositoryResult<SnapshotPublication> Publish(
         return publication;
     }
 
-    const RepositoryResult<core::Unit> cleanup = DeleteSnapshot(repository, metadata.id);
+    // Rust `delete_snapshot(repository, &metadata.id, &disk_publications)` —
+    // the publications go too. The commit is what would have named them, so
+    // once it fails nothing else ever can: leaving them would strand the
+    // images in the registry permanently.
+    const RepositoryResult<core::Unit> cleanup = DeleteSnapshot(
+        repository, metadata.id, committed.disk_publications, exporter.rollback);
     if (!cleanup.ok()) {
         // Logged, not returned: the caller must see the commit error, which is
         // the actionable cause.

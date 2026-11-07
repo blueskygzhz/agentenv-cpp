@@ -75,10 +75,32 @@ class InMemorySnapshotRepository : public SnapshotRepository {
 /// client**, not a second one built from the same config: two would each
 /// carry their own credential refresh and connection state, so a token
 /// rotation observed by one would leave the other signing with a stale one.
+/// `image_storage` is the other half of the policy, and is **required** for
+/// the same reason `publish_compression` is: it decides whether a published
+/// disk image goes to its source registry or becomes a managed layer in this
+/// bucket, so a caller that has not named it has not decided what this
+/// repository publishes. See `SnapshotImageStorageFor`.
 RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeOssRepository(
     const cfg::OssBackendConfig& config,
     const cfg::SnapshotPublishCompressionConfig& publish_compression,
+    cfg::SnapshotImageStoragePolicy image_storage,
     std::shared_ptr<oss::OssClient>* client = 0);
+
+/// Rust `snapshot/backends/mod.rs:90-94` — the image-storage policy a node's
+/// config asks for.
+///
+/// `snapshot.image_publish.enabled` is the operator's switch, and this is the
+/// whole of its meaning. Exposed rather than inlined into
+/// `MakeRepositoryFromConfig` because it is the one *decision* in that branch
+/// and is otherwise only reachable by constructing a live OSS client, which a
+/// test cannot do without a bucket.
+///
+/// **Reading it does not mean a node honours it.** Only the OSS backend
+/// carries the policy, so on posix-fs this value is computed and then
+/// discarded — which is upstream's shape too (`mod.rs` derives it inside the
+/// `Oss` arm alone). An operator who sets `image_publish = true` on a
+/// posix-fs node gets managed layers, here and in Rust.
+cfg::SnapshotImageStoragePolicy SnapshotImageStorageFor(const cfg::AppConfig& config);
 
 /// Rust `build_snapshot_backend_from_config` (`snapshot/backends/mod.rs:57`)
 /// — the repository the node runs on, selected by

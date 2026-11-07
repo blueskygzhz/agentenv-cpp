@@ -13,9 +13,13 @@
 #define AGENTENV_SNAPSHOT_IMAGE_EXPORT_ACR_PUBLISHER_H_
 
 #include <string>
+#include <vector>
 
 #include "agentenv/core/expected.h"
 #include "agentenv/core/identity.h"
+#include "agentenv/core/optional.h"
+#include "agentenv/snapshot/layers.h"
+#include "agentenv/snapshot/record.h"
 #include "agentenv/snapshot/repository/errors.h"
 
 namespace agentenv {
@@ -82,6 +86,28 @@ std::string SnapshotTag(const core::SnapshotId& snapshot_id,
 /// and continues with alphanumerics or `_`, `.`, `-`. Notably `-` may not
 /// *lead*, which is why the start and continuation rules differ.
 repository::RepositoryResult<core::Unit> ValidateSnapshotTag(const std::string& tag);
+
+/// Rust `struct DiskImageExportOutcome`.
+///
+/// Rust also carries `local_layers: Vec<PreparedLayerUpload>`, the prepared
+/// upload files kept alive past the push for the post-commit P2P
+/// announcement. That transport is not ported, and every upload has already
+/// completed by the time `Export` returns, so the field is dropped rather
+/// than returned empty — an empty one would read as "nothing to announce"
+/// instead of "announcing is not a thing here". `Export` still holds the
+/// uploads for its own duration, because they own the temporary files.
+///
+/// Declared in this header rather than next to `AcrDiskImageExporter` in
+/// `acr.h` so that `store.h` can name it in `DiskImageExport` without
+/// pulling the HTTP transport into every translation unit that stores a
+/// snapshot. Its two fields need only `layers.h` and `record.h`, which
+/// `store.h` already includes.
+struct DiskImageExportOutcome {
+    std::vector<OverlaybdLayerRef> layers;
+    /// Always present from `Export`. Optional because upstream's exporter
+    /// interface allows a backend that publishes nothing to report so.
+    core::Optional<PersistedDiskImagePublication> publication;
+};
 
 }  // namespace image_export
 }  // namespace snapshot

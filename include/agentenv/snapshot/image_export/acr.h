@@ -6,10 +6,15 @@
 // Scope, stated plainly: `AcrClient` covers both halves of `client.rs` — the
 // manifest delete a rollback needs and the blob upload and manifest put a
 // publish needs — and `AcrDiskImageExporter` covers `publisher.rs`'s `export`
-// and `rollback_publication`. What is still absent is the *selection* above
-// it: nothing in this port decides that a given publish should go to ACR, so
-// `Export` has no production call site yet. That is `regctl`/`service` work,
-// not this file's.
+// and `rollback_publication`. The *selection* above it is ported too, but it
+// does not live here: upstream decides in `store.rs::store_disk_image`, from
+// `publish_policy().image_storage`, and so does this port (see `store.h`).
+//
+// An earlier version of this comment claimed the missing selection was
+// "`regctl`/`service` work". It was not: `SnapshotImageService` is a separate
+// user-facing operation (export one snapshot to an arbitrary registry through
+// `regctl`), not an alternative the publish path chooses between. Nothing ever
+// picked between `regctl` and ACR.
 //
 // Rolling back is what unblocks deleting a snapshot that was published to a
 // source registry, which is otherwise refused outright: a "deleted" snapshot
@@ -458,21 +463,8 @@ class AcrClient {
     std::map<std::string, CachedTokenEntry> token_cache_;
 };
 
-/// Rust `struct DiskImageExportOutcome`.
-///
-/// Rust also carries `local_layers: Vec<PreparedLayerUpload>`, the prepared
-/// upload files kept alive past the push for the post-commit P2P
-/// announcement. That transport is not ported, and every upload has already
-/// completed by the time `Export` returns, so the field is dropped rather
-/// than returned empty — an empty one would read as "nothing to announce"
-/// instead of "announcing is not a thing here". `Export` still holds the
-/// uploads for its own duration, because they own the temporary files.
-struct DiskImageExportOutcome {
-    std::vector<OverlaybdLayerRef> layers;
-    /// Always present from `Export`. Optional because upstream's exporter
-    /// interface allows a backend that publishes nothing to report so.
-    core::Optional<PersistedDiskImagePublication> publication;
-};
+// `DiskImageExportOutcome` is declared in `acr_publisher.h` (included above),
+// so `store.h` can name it without this file's HTTP transport.
 
 /// Rust `AcrDiskImageExporter` — the publish and rollback halves, with its
 /// client cache.

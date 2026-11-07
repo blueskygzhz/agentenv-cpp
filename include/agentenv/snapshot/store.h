@@ -13,8 +13,12 @@
 #include <vector>
 
 #include "agentenv/core/identity.h"
+#include "agentenv/core/optional.h"
+#include "agentenv/overlaybd/compact.h"
 #include "agentenv/sandbox/manifest.h"
+#include "agentenv/snapshot/acr_manifest.h"
 #include "agentenv/snapshot/drive.h"
+#include "agentenv/snapshot/image_export/acr_publisher.h"
 #include "agentenv/snapshot/layers.h"
 #include "agentenv/snapshot/record.h"
 #include "agentenv/snapshot/repository/interfaces.h"
@@ -45,36 +49,22 @@ struct StoredSnapshot {
     std::vector<OverlaybdLayerRef> rootfs_layers;
     std::vector<ManagedLayer> memory_layers;
     std::vector<CommittedAttachedDrive> attached_drives;
-    /// Rust also carries `disk_publications` (source-registry exports) and
-    /// `local_layers` (the exact files kept alive for post-commit P2P
-    /// announcement). Both are absent here, and neither is a dropped field:
-    ///
-    ///   * `disk_publications` can only be produced by `AcrDiskImageExporter`,
-    ///     which the policy that selects it (`publish_policy().image_storage ==
-    ///     SourceRegistry`) does not exist to select in this port — so the
-    ///     vector is unconditionally empty rather than unported.
-    ///   * `local_layers` exists to feed P2P publication, whose transport is
-    ///     not ported either.
-    ///
-    /// Adding empty fields for them would imply this port *can* produce them.
-};
 
-/// Rust `store_snapshot` — stores one captured snapshot's files and layers.
-///
-/// On failure it removes what it stored, *except* shared content-addressed
-/// layers: those are keyed by digest and another snapshot may already
-/// reference the identical bytes, so deleting them here would corrupt an
-/// unrelated snapshot. The cleanup failure is logged rather than returned,
-/// because the caller must see the original error.
-///
-/// Order matters and is upstream's: the rootfs and memory layers first, then
-/// the VM state blob, then the serialised manifest, then the attached drives.
-/// The manifest is what a restore reads to find everything else, so it is
-/// written after the artifacts it names — a manifest pointing at a layer that
-/// is not there yet is exactly what a crash between the two would leave.
-repository::RepositoryResult<StoredSnapshot> StoreSnapshot(
-    repository::SnapshotRepository& repository, const SnapshotPublishMetadata& metadata,
-    const sandbox::SandboxSnapshotManifest& manifest);
+    /// The source-registry publications made for this snapshot, in the order
+    /// they were created — rootfs first, then one per attached drive.
+    ///
+    /// Empty unless the repository's `GetPublishPolicy().image_storage` is
+    /// `SourceRegistry`, which only the OSS backend ever reports. The order is
+    /// load-bearing: `DeleteSnapshot` unwinds it in reverse.
+    std::vector<PersistedDiskImagePublication> disk_publications;
+
+    /// Rust also carries `local_layers` (the exact files kept alive for
+    /// post-commit P2P announcement). It is absent here rather than returned
+    /// empty, because it exists to feed P2P publication, whose transport is
+    /// not ported -- and an empty vector would read as "nothing to announce"
+    /// instead of "announcing is not a thing here". See the same note on
+    /// `image_export::DiskImageExportOutcome`.
+};
 
 /// Rolls one source-registry publication back. Rust calls
 /// `AcrDiskImageExporter::rollback_publication` directly; here it is a functor
@@ -87,6 +77,89 @@ typedef std::function<repository::RepositoryResult<core::Unit>(
 /// The production rollback: `image_export::AcrDiskImageExporter` over
 /// Docker-config credentials and real HTTPS.
 PublicationRollback AcrPublicationRollback();
+
+/// Publishes one disk image to its source registry — Rust
+/// `AcrDiskImageExporter::export`.
+///
+/// The `Optional<SnapshotOciConfigInput>` argument is upstream's `config:
+/// Option<..>`: present for the rootfs (which publishes the effective runtime
+/// config) and absent for an attached drive (whose build-time config the
+/// runtime resolver regenerates).
+typedef std::function<repository::RepositoryResult<image_export::DiskImageExportOutcome>(
+    const core::SnapshotId& snapshot_id, const image_export::DiskImageSubject& subject,
+    const std::string& image_config_path,
+    const core::Optional<SnapshotOciConfigInput>& config)>
+    DiskImageExport;
+
+/// The two halves of `AcrDiskImageExporter` that a publish needs, injected
+/// together.
+///
+/// They are bundled rather than passed as two arguments because upstream has
+/// **one** object here: `LayerStore` publishes with
+/// `AcrDiskImageExporter::export`, and the cleanup on failure rolls the
+/// already-made publications back through `rollback_publication` on an
+/// exporter of the same kind. Splitting them into independent parameters would
+/// let a caller supply a publisher with no matching rollback, and the failure
+/// that produces is silent: a publish that dies partway would leave its
+/// earlier publications in the registry with nothing naming them.
+struct SourceRegistryExporter {
+    DiskImageExport publish;
+    PublicationRollback rollback;
+};
+
+/// The production exporter: `image_export::AcrDiskImageExporter` over
+/// Docker-config credentials and real HTTPS.
+///
+/// `publish_compression` is **required**, matching Rust's
+/// `AcrDiskImageExporter::new(self.compression)` — and unlike the exporter
+/// class's own constructor default. Here the value is always available (it is
+/// the repository's own `GetPublishPolicy().compression`), so defaulting it
+/// could only ever mean "silently upload raw bytes where the operator asked
+/// for zfile", which is the publish format changing behind their back.
+///
+/// The rollback half deliberately does **not** carry the compression: a
+/// rollback only deletes a manifest by digest, and upstream likewise builds
+/// its rollback exporter with `OverlaybdCompactOutput::Raw`.
+SourceRegistryExporter AcrSourceRegistryExporter(
+    const overlaybd::OverlaybdCompactOutput& publish_compression);
+
+/// Rust `store_snapshot` — stores one captured snapshot's files and layers.
+///
+/// On failure it removes what it stored, *except* shared content-addressed
+/// layers: those are keyed by digest and another snapshot may already
+/// reference the identical bytes, so deleting them here would corrupt an
+/// unrelated snapshot. The cleanup failure is logged rather than returned,
+/// because the caller must see the original error.
+///
+/// **The cleanup also rolls back any publication already made**, which is why
+/// a partial `StoredSnapshot` has to survive the error (Rust keeps `store`
+/// alive past the `match` for exactly this). A snapshot that published its
+/// rootfs and then failed on its second drive would otherwise leave the
+/// rootfs image in the registry, referenced by no record.
+///
+/// Order matters and is upstream's: the rootfs and memory layers first, then
+/// the VM state blob, then the serialised manifest, then the attached drives.
+/// The manifest is what a restore reads to find everything else, so it is
+/// written after the artifacts it names — a manifest pointing at a layer that
+/// is not there yet is exactly what a crash between the two would leave.
+///
+/// This overload supplies the production ACR exporter, built over the
+/// repository's own `GetPublishPolicy().compression`.
+repository::RepositoryResult<StoredSnapshot> StoreSnapshot(
+    repository::SnapshotRepository& repository, const SnapshotPublishMetadata& metadata,
+    const sandbox::SandboxSnapshotManifest& manifest);
+
+/// `StoreSnapshot` with the source-registry exporter injected.
+///
+/// Rust `LayerStore::store_snapshot` builds the exporter itself, guarded by
+/// the policy. The guard stays here — `exporter.publish` is consulted **only**
+/// when `GetPublishPolicy().image_storage == SourceRegistry` — so passing one
+/// does not force a publish to the registry. A node whose policy says
+/// `ObjectStorage` never calls it, exactly as upstream never constructs one.
+repository::RepositoryResult<StoredSnapshot> StoreSnapshot(
+    repository::SnapshotRepository& repository, const SnapshotPublishMetadata& metadata,
+    const sandbox::SandboxSnapshotManifest& manifest,
+    const SourceRegistryExporter& exporter);
 
 /// Rust `delete_snapshot` — rolls the publications back, then removes the
 /// snapshot's files.

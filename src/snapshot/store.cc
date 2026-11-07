@@ -385,23 +385,132 @@ RepositoryResult<core::Unit> ValidateImageConfigs(
     return core::Unit();
 }
 
+/// Rust `fallback_would_mix_sources`.
+///
+/// True when at least one lower of this image is remote and does *not* live in
+/// this repository's managed-layer location.
+///
+/// This guards the fallback, and the question it asks is narrower than it
+/// looks. Falling back means storing the image's local lowers here while
+/// leaving its remote lowers named where they are. That is fine when the
+/// remote ones already point at this repository — the result is one coherent
+/// image. It is not fine when they point somewhere else: the stored image
+/// would then be half in this repository and half in a registry that nothing
+/// in this node's lifecycle manages, so deleting the snapshot would leave the
+/// other half dangling and a restore would depend on a source no one here can
+/// keep alive.
+///
+/// An empty `managed_layers_repo_blob_url` (every backend but OSS) makes
+/// `SameRepoBlobUrl` false for any remote lower, so *any* remote lower
+/// refuses the fallback. That is upstream's behaviour and the conservative
+/// direction: a backend that cannot say where its managed layers live cannot
+/// claim a remote lower is one of them.
+RepositoryResult<bool> FallbackWouldMixSources(const std::string& image_config_path,
+                                               const std::string& managed_layers_repo_blob_url) {
+    const core::Expected<obd::ImageConfig, std::string> image_config =
+        obd::LoadImageConfig(image_config_path);
+    if (!image_config.ok()) {
+        return core::make_unexpected(RepositoryError::Backend(
+            "load overlaybd image config '" + image_config_path + "'", image_config.error()));
+    }
+    for (std::size_t i = 0; i < image_config.value().lowers.size(); ++i) {
+        const obd::LayerConfig& layer = image_config.value().lowers[i];
+        if (!layer.file.empty()) continue;
+        if (!SameRepoBlobUrl(layer.EffectiveRepoBlobUrl(image_config.value().repo_blob_url),
+                             managed_layers_repo_blob_url)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Rust `LayerStore::store_disk_image` — publishes a disk image to its source
+/// registry when the policy asks for it, otherwise (or when the registry
+/// cannot take it) stores its local layers here.
+///
+/// The fallback is only taken for `Unsupported`, never for any other error.
+/// That distinction is the whole design: `Unsupported` means "this image's
+/// shape is not something the registry path models", which is a statement
+/// about the image and is answered by storing it locally instead. Every other
+/// error — a refused auth, a failed upload, a broken connection — is a
+/// statement about *this attempt*, and silently storing locally would convert
+/// an operator's `image_publish = true` into a quiet no-op precisely when the
+/// registry is misconfigured.
+RepositoryResult<std::vector<OverlaybdLayerRef> > StoreDiskImage(
+    SnapshotRepository& repository, const DiskImageExport* exporter,
+    const core::SnapshotId& id, const image_export::DiskImageSubject& subject,
+    const std::string& image_config_path,
+    const core::Optional<SnapshotOciConfigInput>& config,
+    std::vector<PersistedDiskImagePublication>* publications) {
+    const LayerRole role =
+        subject.is_rootfs() ? LayerRole::Rootfs : LayerRole::AttachedDrive;
+    if (exporter == NULL) {
+        return StoreDiskLayers(repository, image_config_path, role, false);
+    }
+
+    const RepositoryResult<image_export::DiskImageExportOutcome> outcome =
+        (*exporter)(id, subject, image_config_path, config);
+    if (outcome.ok()) {
+        // Rust `self.disk_publications.extend(outcome.publication)` — an
+        // `Option` extends by zero or one element.
+        if (outcome.value().publication.has_value()) {
+            publications->push_back(*outcome.value().publication);
+        }
+        return outcome.value().layers;
+    }
+    if (outcome.error().kind != repository::RepositoryErrorKind::Unsupported) {
+        return core::make_unexpected(outcome.error());
+    }
+
+    const std::string& feature = outcome.error().message;
+    const core::Optional<std::string> managed_url = repository.ManagedLayersRepoBlobUrl();
+    // Rust `.as_deref().unwrap_or("")`.
+    const RepositoryResult<bool> would_mix = FallbackWouldMixSources(
+        image_config_path, managed_url.has_value() ? *managed_url : std::string());
+    if (!would_mix.ok()) return core::make_unexpected(would_mix.error());
+    if (would_mix.value()) {
+        return core::make_unexpected(RepositoryError::Unsupported(
+            "source-registry export is unsupported for this remote-backed disk image: " +
+            feature));
+    }
+    AGENTENV_INFO("falling back to managed disk image layers for snapshot "
+                  << id.ToString() << " " << subject.LogLabel() << ": " << feature);
+    return StoreDiskLayers(repository, image_config_path, role, false);
+}
+
 /// Rust `LayerStore::store_snapshot`.
-RepositoryResult<StoredSnapshot> StoreSnapshotInner(
+///
+/// Writes into `*out` as it goes instead of returning a `StoredSnapshot`, so
+/// the caller can roll back the publications made before a mid-way failure.
+RepositoryResult<core::Unit> StoreSnapshotInner(
     SnapshotRepository& repository, const SnapshotPublishMetadata& metadata,
-    const sandbox::SandboxSnapshotManifest& manifest) {
+    const sandbox::SandboxSnapshotManifest& manifest, const DiskImageExport& exporter,
+    StoredSnapshot* out) {
     const RepositoryResult<core::Unit> valid = ValidateImageConfigs(manifest);
     if (!valid.ok()) return core::make_unexpected(valid.error());
 
-    StoredSnapshot stored;
+    StoredSnapshot& stored = *out;
 
-    // Rust selects an `AcrDiskImageExporter` here when
-    // `publish_policy().image_storage == SourceRegistry`, and falls back to
-    // local layers when the registry refuses. No publish policy exists in this
-    // port, so the exporter is never selected and `store_disk_image` is always
-    // its fallback arm — which is this call. `fallback_would_mix_sources` is
-    // likewise unreachable: it only guards that fallback.
-    const RepositoryResult<std::vector<OverlaybdLayerRef> > rootfs_layers = StoreDiskLayers(
-        repository, manifest.rootfs.image_config_path, LayerRole::Rootfs, false);
+    // Rust: `matches!(self.image_storage, SourceRegistry).then(|| ..)`. The
+    // policy decides, not the presence of an exporter: a caller may always
+    // hand one in, and a repository that stores its images as managed layers
+    // still never reaches it.
+    //
+    // An unset functor is treated as no exporter too, so a caller that builds
+    // a `SourceRegistryExporter` by hand and leaves `publish` empty gets
+    // managed layers rather than a bad call through an empty `std::function`.
+    const bool to_source_registry = repository.GetPublishPolicy().image_storage ==
+                                    cfg::SnapshotImageStoragePolicy::SourceRegistry;
+    const DiskImageExport* selected = (to_source_registry && exporter) ? &exporter : NULL;
+
+    // Rootfs is exported with the effective runtime config.
+    const SnapshotOciConfigInput rootfs_config_value = {metadata.context,
+                                                        metadata.image_configs.RootfsConfig()};
+    const RepositoryResult<std::vector<OverlaybdLayerRef> > rootfs_layers = StoreDiskImage(
+        repository, selected, metadata.id, image_export::DiskImageSubject::Rootfs(),
+        manifest.rootfs.image_config_path,
+        core::Optional<SnapshotOciConfigInput>(rootfs_config_value),
+        &stored.disk_publications);
     if (!rootfs_layers.ok()) return core::make_unexpected(rootfs_layers.error());
     stored.rootfs_layers = rootfs_layers.value();
 
@@ -427,9 +536,13 @@ RepositoryResult<StoredSnapshot> StoreSnapshotInner(
     for (std::size_t i = 0; i < manifest.attached_drives.size(); ++i) {
         const sandbox::SnapshotAttachedDriveArtifacts& drive = manifest.attached_drives[i];
         // Only logical layers are committed; the build-time image config is
-        // regenerated by the runtime resolver.
-        const RepositoryResult<std::vector<OverlaybdLayerRef> > layers = StoreDiskLayers(
-            repository, drive.image_config_path, LayerRole::AttachedDrive, false);
+        // regenerated by the runtime resolver — hence the absent config, as
+        // upstream passes `None` here.
+        const RepositoryResult<std::vector<OverlaybdLayerRef> > layers = StoreDiskImage(
+            repository, selected, metadata.id,
+            image_export::DiskImageSubject::AttachedDrive(drive.drive_id),
+            drive.image_config_path, core::Optional<SnapshotOciConfigInput>(),
+            &stored.disk_publications);
         if (!layers.ok()) return core::make_unexpected(layers.error());
 
         CommittedAttachedDrive committed;
@@ -450,7 +563,7 @@ RepositoryResult<StoredSnapshot> StoreSnapshotInner(
         committed.sub_path = drive.sub_path;
         stored.attached_drives.push_back(committed);
     }
-    return stored;
+    return core::Unit();
 }
 
 }  // namespace
@@ -498,24 +611,60 @@ RepositoryResult<core::Unit> DeleteSnapshot(SnapshotRepository& repository,
                           PublicationRollback());
 }
 
+SourceRegistryExporter AcrSourceRegistryExporter(
+    const overlaybd::OverlaybdCompactOutput& publish_compression) {
+    // One exporter for both halves, as upstream has: a publish and the
+    // rollback that may have to undo it share the per-registry client cache,
+    // and a snapshot's publications are usually all in one registry.
+    const std::shared_ptr<image_export::AcrDiskImageExporter> exporter(
+        new image_export::AcrDiskImageExporter(
+            image_export::AcrDiskImageExporter::DockerConfigClientBuilder(),
+            publish_compression));
+    SourceRegistryExporter out;
+    out.publish = [exporter](const core::SnapshotId& id,
+                             const image_export::DiskImageSubject& subject,
+                             const std::string& image_config_path,
+                             const core::Optional<SnapshotOciConfigInput>& config) {
+        return exporter->Export(id, subject, image_config_path, config);
+    };
+    out.rollback = [exporter](const PersistedDiskImagePublication& publication) {
+        return exporter->RollbackPublication(publication);
+    };
+    return out;
+}
+
 RepositoryResult<StoredSnapshot> StoreSnapshot(
     SnapshotRepository& repository, const SnapshotPublishMetadata& metadata,
-    const sandbox::SandboxSnapshotManifest& manifest) {
-    const RepositoryResult<StoredSnapshot> stored =
-        StoreSnapshotInner(repository, metadata, manifest);
-    if (stored.ok()) return stored;
+    const sandbox::SandboxSnapshotManifest& manifest,
+    const SourceRegistryExporter& exporter) {
+    // Rust keeps its `LayerStore` alive past the `match`, so the publications
+    // it already made are still reachable in the error arm. This port has to
+    // say that explicitly: `partial` is filled in as the store progresses and
+    // is what the cleanup below rolls back.
+    StoredSnapshot partial;
+    const RepositoryResult<core::Unit> stored =
+        StoreSnapshotInner(repository, metadata, manifest, exporter.publish, &partial);
+    if (stored.ok()) return partial;
 
     // Remove what was stored. Shared content-addressed layers stay: they are
     // keyed by digest, so another snapshot may already reference the identical
     // bytes and deleting them here would corrupt an unrelated snapshot.
-    const RepositoryResult<core::Unit> cleanup = DeleteSnapshot(repository, metadata.id);
+    const RepositoryResult<core::Unit> cleanup =
+        DeleteSnapshot(repository, metadata.id, partial.disk_publications, exporter.rollback);
     if (!cleanup.ok()) {
         // Logged, not returned: the caller must see the store failure, which
         // is the actionable cause.
         AGENTENV_WARN("failed to roll back snapshot files after store failure "
                       << metadata.id.ToString() << ": " << cleanup.error().ToString());
     }
-    return stored;
+    return core::make_unexpected(stored.error());
+}
+
+RepositoryResult<StoredSnapshot> StoreSnapshot(
+    SnapshotRepository& repository, const SnapshotPublishMetadata& metadata,
+    const sandbox::SandboxSnapshotManifest& manifest) {
+    return StoreSnapshot(repository, metadata, manifest,
+                         AcrSourceRegistryExporter(PublishCompression(repository)));
 }
 
 RepositoryResult<std::vector<OverlaybdLayerRef> > StoreVolumeLayers(

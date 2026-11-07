@@ -549,17 +549,23 @@ cfg::SnapshotPublishCompressionConfig NoCompression() {
     return config;
 }
 
+/// Managed layers -- the inert direction, so a test that is not about the
+/// image-storage policy is not silently publishing to a registry.
+cfg::SnapshotImageStoragePolicy ManagedLayers() {
+    return cfg::SnapshotImageStoragePolicy::ObjectStorage;
+}
+
 MT_TEST(the_factory_refuses_an_incomplete_backend_section) {
     cfg::OssBackendConfig blank;
     const RepositoryResult<std::shared_ptr<SnapshotRepository> > made =
-        MakeOssRepository(blank, NoCompression());
+        MakeOssRepository(blank, NoCompression(), ManagedLayers());
     MT_EXPECT_TRUE(!made.ok());
     MT_EXPECT_TRUE(!made.ok() && made.error().kind == RepositoryErrorKind::InvalidRequest);
 
     cfg::OssBackendConfig process = GoodConfig();
     process.credential_process = core::Optional<std::string>("/usr/bin/aliyun-cred");
     const RepositoryResult<std::shared_ptr<SnapshotRepository> > refused =
-        MakeOssRepository(process, NoCompression());
+        MakeOssRepository(process, NoCompression(), ManagedLayers());
     MT_EXPECT_TRUE(!refused.ok() && refused.error().kind == RepositoryErrorKind::Unsupported);
 }
 
@@ -568,7 +574,7 @@ MT_TEST(the_factory_refuses_an_incomplete_backend_section) {
 // correctly refuses to build something that could never send a request.
 MT_TEST(the_factory_builds_a_repository_from_a_complete_section) {
     const RepositoryResult<std::shared_ptr<SnapshotRepository> > made =
-        MakeOssRepository(GoodConfig(), NoCompression());
+        MakeOssRepository(GoodConfig(), NoCompression(), ManagedLayers());
     if (!shttp::Available()) {
         MT_EXPECT_TRUE(!made.ok() && made.error().kind == RepositoryErrorKind::Unsupported);
         return;
@@ -595,7 +601,7 @@ MT_TEST(the_factory_carries_the_compression_switch_into_the_publish_policy) {
     configured.workers = 3;
 
     const RepositoryResult<std::shared_ptr<SnapshotRepository> > made =
-        MakeOssRepository(GoodConfig(), configured);
+        MakeOssRepository(GoodConfig(), configured, ManagedLayers());
     if (!shttp::Available()) {
         MT_EXPECT_TRUE(!made.ok());
         return;
@@ -607,6 +613,56 @@ MT_TEST(the_factory_carries_the_compression_switch_into_the_publish_policy) {
     MT_EXPECT_TRUE(policy.compression.enabled);
     MT_EXPECT_TRUE(policy.compression.algorithm == cfg::OverlaybdCompressionAlgorithm::Zstd);
     MT_EXPECT_TRUE(policy.compression.workers == 3);
+}
+
+/// The image-storage switch reaches the policy too, and is independent of the
+/// compression one.
+///
+/// Both are asserted in one repository because the bug this guards is carrying
+/// one field across while dropping the other: a repository built with
+/// compression configured and `SourceRegistry` requested must report both, not
+/// whichever the constructor happened to copy.
+MT_TEST(the_factory_carries_the_image_storage_switch_into_the_publish_policy) {
+    const RepositoryResult<std::shared_ptr<SnapshotRepository> > made = MakeOssRepository(
+        GoodConfig(), NoCompression(), cfg::SnapshotImageStoragePolicy::SourceRegistry);
+    if (!shttp::Available()) {
+        MT_EXPECT_TRUE(!made.ok());
+        return;
+    }
+    MT_EXPECT_TRUE(made.ok());
+    if (!made.ok()) return;
+
+    const PublishPolicy policy = made.value()->GetPublishPolicy();
+    MT_EXPECT_TRUE(policy.image_storage == cfg::SnapshotImageStoragePolicy::SourceRegistry);
+    // The other field is untouched by it.
+    MT_EXPECT_TRUE(!policy.compression.enabled);
+
+    const RepositoryResult<std::shared_ptr<SnapshotRepository> > managed =
+        MakeOssRepository(GoodConfig(), NoCompression(), ManagedLayers());
+    MT_EXPECT_TRUE(managed.ok());
+    MT_EXPECT_TRUE(managed.ok() &&
+                   managed.value()->GetPublishPolicy().image_storage ==
+                       cfg::SnapshotImageStoragePolicy::ObjectStorage);
+}
+
+/// Rust `backends/mod.rs:90-94` — `snapshot.image_publish.enabled` is the
+/// operator's switch, and the default is managed layers.
+///
+/// Pinned as its own test because this is the only place the config field is
+/// interpreted, and the direction is easy to invert silently: a node that has
+/// said nothing must not start publishing to a source registry.
+MT_TEST(the_image_storage_policy_follows_the_image_publish_switch) {
+    cfg::AppConfig config;
+    MT_EXPECT_TRUE(SnapshotImageStorageFor(config) ==
+                   cfg::SnapshotImageStoragePolicy::ObjectStorage);
+
+    config.snapshot.image_publish.enabled = true;
+    MT_EXPECT_TRUE(SnapshotImageStorageFor(config) ==
+                   cfg::SnapshotImageStoragePolicy::SourceRegistry);
+
+    config.snapshot.image_publish.enabled = false;
+    MT_EXPECT_TRUE(SnapshotImageStorageFor(config) ==
+                   cfg::SnapshotImageStoragePolicy::ObjectStorage);
 }
 
 /// A repository that does not override the policy publishes raw.

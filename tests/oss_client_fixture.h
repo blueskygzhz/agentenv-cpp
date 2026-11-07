@@ -162,6 +162,8 @@ struct StubObjectServer {
     uint64_t next_version = 1;
     /// Runs before a PUT is evaluated — the seam a competing writer uses.
     std::function<void()> before_put;
+    /// When set, every DELETE answers 500.
+    bool fail_delete = false;
     std::vector<shttp::Request> requests;
 
     std::string Etag() {
@@ -258,6 +260,13 @@ struct StubObjectServer {
                 return r;
             }
             if (request.method == "DELETE") {
+                // The seam a test uses to make a *cleanup* fail, which is the
+                // only way to reach the paths that must log such a failure
+                // rather than return it.
+                if (fail_delete) {
+                    r.status = 500;
+                    return r;
+                }
                 bodies.erase(key);
                 etags.erase(key);
                 r.status = 204;
