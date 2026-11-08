@@ -25,17 +25,63 @@
 #include "agentenv/api/impls.h"
 #include "orchestrator_fakes.h"
 #include "snapshot_resolver_fakes.h"
+#include "volume_fakes.h"
 
 using namespace agentenv;       // NOLINT
 using namespace agentenv::api;  // NOLINT
 using agentenv::testing::Fixture;
 using agentenv::testing::SnapshotSourceFixture;
+using agentenv::testing::VolumeFixture;
 
 namespace {
 
 ApiImpl MakeImpl(Fixture& f, SnapshotSourceFixture& snap) {
     return ApiImpl(f.orch, std::shared_ptr<volume::VolumeManager>(),
                    std::shared_ptr<image::ImageResolver>(), snap.repository, snap.resolver);
+}
+
+/// Resolves any reference to one fixed overlaybd config.
+///
+/// Deliberately minimal: `attachedDrives` on the snapshot route only needs the
+/// `overlaybd_config_path`, because upstream's snapshot arm maps the resolved
+/// specs to `.drive` and -- unlike the cold arm -- never builds `ImageConfigs`
+/// from them. Keeping the base context empty makes a test that starts reading
+/// it fail rather than quietly inherit a cold-path assumption.
+class StubImageResolver : public image::ImageResolver {
+ public:
+    int                               calls = 0;
+    core::Optional<image::ImageError> failure;
+
+    core::Expected<image::ResolvedBlockImage, image::ImageError> Resolve(
+        const std::string& image_ref) override {
+        ++calls;
+        if (failure.has_value()) return core::make_unexpected(*failure);
+        image::ResolvedBlockImage resolved;
+        resolved.image_ref             = image_ref;
+        resolved.overlaybd_config_path = "/var/lib/agentenv/images/data/image.json";
+        return resolved;
+    }
+
+    const std::string& DefaultImage() const override { return default_image_; }
+
+ private:
+    std::string default_image_ = "ubuntu:24.04";
+};
+
+/// One attached drive, mounted where the caller asks (or at the per-drive
+/// default when `mount_path` is empty).
+AttachedDriveRequest Drive(const std::string& drive_id, const std::string& mount_path) {
+    AttachedDriveRequest drive;
+    drive.drive_id     = drive_id;
+    drive.source_image = "registry.example.com/data:v1";
+    if (!mount_path.empty()) {
+        drive.mount_path = core::Optional<std::string>(mount_path);
+    }
+    return drive;
+}
+
+void SetDrives(CreateSandboxReq* req, const std::vector<AttachedDriveRequest>& drives) {
+    req->attached_drives = core::Optional<std::vector<AttachedDriveRequest> >(drives);
 }
 
 CreateSandboxReq RequestFor(const std::string& template_id) {
@@ -328,6 +374,239 @@ MT_TEST(free_drive_slots_saturates_rather_than_wrapping) {
     MT_EXPECT_EQ(manifest.EffectivePhysicalExtraDriveCount(),
                  static_cast<std::size_t>(0));
     MT_EXPECT_EQ(manifest.FreeDriveSlots(), static_cast<std::size_t>(0));
+}
+
+// ---- attachedDrives --------------------------------------------------------
+//
+// `ResolveAttachedDrives` was ported and unit-tested and had no production
+// caller at all, because neither create DTO carried the field. Everything
+// below is the chain between the body and the launch config.
+
+MT_TEST(attached_drives_reach_the_launch_config) {
+    Fixture f;
+    SnapshotSourceFixture snap;
+    std::shared_ptr<StubImageResolver> images(new StubImageResolver());
+    ApiImpl impl(f.orch, std::shared_ptr<volume::VolumeManager>(), images, snap.repository,
+                 snap.resolver);
+
+    CreateSandboxReq req = RequestFor(snap.template_id());
+    std::vector<AttachedDriveRequest> drives;
+    drives.push_back(Drive("data", "/mnt/data"));
+    drives.push_back(Drive("logs", std::string()));
+    SetDrives(&req, drives);
+
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateSandbox(req);
+    MT_EXPECT_TRUE(created.ok());
+    if (!created.ok()) return;
+    MT_EXPECT_EQ(images->calls, 2);
+
+    // On `request.extra_drives`, which is where a snapshot launch takes
+    // drives added to an already-built VM -- the cold route's image source is
+    // the other half of that split.
+    const std::vector<sandbox::ExtraDrive>& attached =
+        f.factory->last_launch_config.extra_drives;
+    MT_EXPECT_EQ(attached.size(), static_cast<std::size_t>(2));
+    if (attached.size() != 2) return;
+    // In request order, and with the resolved image config path: the drive ids
+    // alone would pass even if the two had been swapped or left unresolved.
+    MT_EXPECT_EQ(attached[0].drive_id, std::string("data"));
+    MT_EXPECT_EQ(attached[0].mount_path, std::string("/mnt/data"));
+    MT_EXPECT_EQ(attached[0].image_config_path,
+                 std::string("/var/lib/agentenv/images/data/image.json"));
+    MT_EXPECT_EQ(attached[1].drive_id, std::string("logs"));
+    // An omitted `mountPath` takes the per-drive default rather than empty.
+    MT_EXPECT_EQ(attached[1].mount_path, sandbox::ExtraDrive::DefaultMountPath("logs"));
+    // Read-only unless the body says otherwise (Rust `unwrap_or(true)`).
+    MT_EXPECT_TRUE(attached[0].read_only);
+    // Not volumes: these occupy reserved slots but are not volume-bound, and
+    // `PrepareResumeDrives` reads exactly this bit to decide Fresh vs Resume.
+    MT_EXPECT_TRUE(!attached[0].IsVolume());
+}
+
+MT_TEST(attaching_drives_without_an_image_resolver_is_a_501) {
+    // `MakeImpl` has no resolver, which is this bundle's normal state on a
+    // node whose snapshot backend is not posix-fs. Upstream always has one, so
+    // this status is a porting divergence and is reported rather than ignored:
+    // resolving to nothing would boot a guest missing the disk it asked for.
+    Fixture f;
+    SnapshotSourceFixture snap;
+    ApiImpl impl = MakeImpl(f, snap);
+
+    CreateSandboxReq req = RequestFor(snap.template_id());
+    std::vector<AttachedDriveRequest> drives;
+    drives.push_back(Drive("data", "/mnt/data"));
+    SetDrives(&req, drives);
+
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateSandbox(req);
+    MT_EXPECT_TRUE(!created.ok());
+    if (created.ok()) return;
+    MT_EXPECT_EQ(created.error().code, 501);
+    MT_EXPECT_EQ(f.factory->build_from_snapshot_calls, 0);
+
+    // A present-but-empty list needs no resolver and still launches: there is
+    // nothing to resolve, and refusing it would make `[]` mean "unsupported"
+    // instead of "no drives".
+    CreateSandboxReq empty = RequestFor(snap.template_id());
+    SetDrives(&empty, std::vector<AttachedDriveRequest>());
+    MT_EXPECT_TRUE(impl.CreateSandbox(empty).ok());
+}
+
+MT_TEST(attached_drives_count_against_the_free_slots) {
+    // Rust `attached_drives.len() + volume_mounts.len()`. This port counted
+    // only the volumes, so a request could claim more slots than the capture
+    // reserved and fail at bind time instead of here.
+    Fixture f;
+    SnapshotSourceFixture snap;
+    snap.resolver->manifest.volume_drive_slots = 1;
+    std::shared_ptr<StubImageResolver> images(new StubImageResolver());
+    ApiImpl impl(f.orch, std::shared_ptr<volume::VolumeManager>(), images, snap.repository,
+                 snap.resolver);
+
+    CreateSandboxReq req = RequestFor(snap.template_id());
+    std::vector<AttachedDriveRequest> drives;
+    drives.push_back(Drive("data", "/mnt/data"));
+    drives.push_back(Drive("logs", "/mnt/logs"));
+    SetDrives(&req, drives);
+
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateSandbox(req);
+    MT_EXPECT_TRUE(!created.ok());
+    if (created.ok()) return;
+    MT_EXPECT_EQ(created.error().code, 400);
+    MT_EXPECT_TRUE(created.error().message.find("free drive slots") != std::string::npos);
+    // Refused before any registry work, as upstream orders it.
+    MT_EXPECT_EQ(images->calls, 0);
+    MT_EXPECT_EQ(f.factory->build_from_snapshot_calls, 0);
+
+    // One drive fits the one slot.
+    CreateSandboxReq one = RequestFor(snap.template_id());
+    std::vector<AttachedDriveRequest> single;
+    single.push_back(Drive("data", "/mnt/data"));
+    SetDrives(&one, single);
+    MT_EXPECT_TRUE(impl.CreateSandbox(one).ok());
+}
+
+MT_TEST(explicit_attached_drives_are_refused_for_a_capture_that_has_filesystems) {
+    // Rust `check_snapshot_attached_drives`, which was never ported. The
+    // condition is a disjunction: omitting the field restores the captured
+    // drives *and* the captured volumes, so an explicit list contradicts
+    // either one.
+    Fixture f;
+    SnapshotSourceFixture snap;
+    snapshot::SnapshotVolume captured;
+    captured.mount_path = "/mnt/captured";
+    captured.size_mb    = 1024;
+    snap.repository->record->committed->volume_snapshots.push_back(captured);
+    std::shared_ptr<StubImageResolver> images(new StubImageResolver());
+    ApiImpl impl(f.orch, std::shared_ptr<volume::VolumeManager>(), images, snap.repository,
+                 snap.resolver);
+
+    CreateSandboxReq req = RequestFor(snap.template_id());
+    std::vector<AttachedDriveRequest> drives;
+    drives.push_back(Drive("data", "/mnt/data"));
+    SetDrives(&req, drives);
+
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateSandbox(req);
+    MT_EXPECT_TRUE(!created.ok());
+    if (created.ok()) return;
+    MT_EXPECT_EQ(created.error().code, 400);
+    MT_EXPECT_TRUE(created.error().message.find("omit attachedDrives") != std::string::npos);
+
+    // Presence, not emptiness: `[]` says "this sandbox has no attached
+    // drives", which still contradicts a capture that recorded some.
+    CreateSandboxReq empty = RequestFor(snap.template_id());
+    SetDrives(&empty, std::vector<AttachedDriveRequest>());
+    const core::Expected<CreateSandboxResp, ApiError> emptied = impl.CreateSandbox(empty);
+    MT_EXPECT_TRUE(!emptied.ok());
+    if (emptied.ok()) return;
+    MT_EXPECT_EQ(emptied.error().code, 400);
+
+    // The other half of the disjunction on its own: a capture with no volumes
+    // but with attached drives. Without it, a condition testing only
+    // `volume_snapshots` would pass every assertion above.
+    SnapshotSourceFixture drives_only;
+    snapshot::CommittedAttachedDrive recorded;
+    recorded.drive_id = "captured";
+    drives_only.repository->record->committed->attached_drives.push_back(recorded);
+    ApiImpl drives_impl(f.orch, std::shared_ptr<volume::VolumeManager>(), images,
+                        drives_only.repository, drives_only.resolver);
+    CreateSandboxReq on_drives = RequestFor(drives_only.template_id());
+    SetDrives(&on_drives, drives);
+    const core::Expected<CreateSandboxResp, ApiError> refused =
+        drives_impl.CreateSandbox(on_drives);
+    MT_EXPECT_TRUE(!refused.ok());
+    if (refused.ok()) return;
+    MT_EXPECT_EQ(refused.error().code, 400);
+
+    // Omitting the field is the restore path, and that one launches.
+    MT_EXPECT_TRUE(impl.CreateSandbox(RequestFor(snap.template_id())).ok());
+}
+
+MT_TEST(an_attached_drive_overlapping_a_volume_mount_is_a_400) {
+    // Rust `check_attached_drive_overlap`, also never ported. Either nesting
+    // shadows a filesystem, so both directions are refused.
+    Fixture f;
+    VolumeFixture vf;
+    const volume::VolumeRecord volume = vf.PublishedVolume();
+    std::shared_ptr<StubImageResolver> images(new StubImageResolver());
+
+    const char* const cases[] = {"/mnt/data", "/mnt/data/inner", "/mnt"};
+    for (std::size_t i = 0; i < 3; ++i) {
+        SnapshotSourceFixture snap;
+        ApiImpl impl(f.orch, vf.manager, images, snap.repository, snap.resolver);
+
+        CreateSandboxReq req = RequestFor(snap.template_id());
+        std::vector<AttachedDriveRequest> drives;
+        drives.push_back(Drive("data", "/mnt/data"));
+        SetDrives(&req, drives);
+        std::vector<SandboxVolumeMountModel> models;
+        SandboxVolumeMountModel mount;
+        mount.path = cases[i];
+        mount.name = volume.id;
+        models.push_back(mount);
+        req.volume_mounts = core::Optional<std::vector<SandboxVolumeMountModel> >(models);
+
+        const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateSandbox(req);
+        MT_EXPECT_TRUE(!created.ok());
+        if (created.ok()) return;
+        MT_EXPECT_EQ(created.error().code, 400);
+        MT_EXPECT_TRUE(created.error().message.find("overlaps volume mount path") !=
+                       std::string::npos);
+        // Refused before the volume was leased. A 400 raised after
+        // `PrepareVolumeMounts` would leave a `pending-` placeholder holding
+        // this volume for a sandbox that was never going to exist, and nothing
+        // would ever release it.
+        const volume::VolumeResult<volume::VolumeRecord> after = vf.manager->Get(volume.id);
+        MT_EXPECT_TRUE(after.ok());
+        if (!after.ok()) return;
+        MT_EXPECT_TRUE(!after.value().reserved_by_sandbox_id.has_value());
+    }
+
+    // A sibling path is fine, and that one leases the volume and launches.
+    SnapshotSourceFixture snap;
+    ApiImpl impl(f.orch, vf.manager, images, snap.repository, snap.resolver);
+    CreateSandboxReq req = RequestFor(snap.template_id());
+    std::vector<AttachedDriveRequest> drives;
+    drives.push_back(Drive("data", "/mnt/data"));
+    SetDrives(&req, drives);
+    std::vector<SandboxVolumeMountModel> models;
+    SandboxVolumeMountModel mount;
+    mount.path = "/mnt/data-archive";
+    mount.name = volume.id;
+    models.push_back(mount);
+    req.volume_mounts = core::Optional<std::vector<SandboxVolumeMountModel> >(models);
+
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateSandbox(req);
+    MT_EXPECT_TRUE(created.ok());
+    if (!created.ok()) return;
+    // Attached drives lead, volumes follow: slots are consumed positionally,
+    // so the reverse order would bind the guest's mounts to the wrong devices.
+    const std::vector<sandbox::ExtraDrive>& extras =
+        f.factory->last_launch_config.extra_drives;
+    MT_EXPECT_EQ(extras.size(), static_cast<std::size_t>(2));
+    if (extras.size() != 2) return;
+    MT_EXPECT_EQ(extras[0].drive_id, std::string("data"));
+    MT_EXPECT_TRUE(!extras[0].IsVolume());
+    MT_EXPECT_TRUE(extras[1].IsVolume());
 }
 
 // ---- the schema fields the handler could not receive -----------------------

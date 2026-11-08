@@ -95,6 +95,20 @@ std::string JoinNormal(const std::vector<std::string>& components) {
 
 }  // namespace
 
+bool MountPathStartsWith(const std::string& path, const std::string& prefix) {
+    std::vector<std::string> path_components;
+    std::vector<std::string> prefix_components;
+    // `SplitComponents` writes through the flag unconditionally, so it gets a
+    // real variable rather than NULL. Both inputs here are already-normalized
+    // mount paths, which cannot contain `..`, so the flag has nothing to say
+    // and is discarded.
+    bool ignored = false;
+    SplitComponents(path, &path_components, &ignored);
+    SplitComponents(prefix, &prefix_components, &ignored);
+    return PathStartsWith(path_components, prefix_components);
+}
+
+
 // ---- validation -----------------------------------------------------------
 
 core::Expected<core::Unit, std::string> ValidateDriveId(const std::string& drive_id) {

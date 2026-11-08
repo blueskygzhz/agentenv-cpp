@@ -320,6 +320,50 @@ core::Expected<std::vector<core::SandboxId>, std::string> ParseMetricsIds(
     return parsed;
 }
 
+core::Expected<core::Unit, std::string> CheckSnapshotAttachedDrives(
+    const snapshot::CommittedSnapshot& committed, bool explicit_drives) {
+    // Rust `check_snapshot_attached_drives`. The disjunction is upstream's:
+    // omitting `attachedDrives` restores both the captured drives *and* the
+    // captured volumes, so an explicit list contradicts either one.
+    if (explicit_drives &&
+        (!committed.volume_snapshots.empty() || !committed.attached_drives.empty())) {
+        return core::make_unexpected(std::string(
+            "this snapshot has volume mounts or attached drives, which cannot be "
+            "replaced; omit attachedDrives to restore them"));
+    }
+    return core::Unit{};
+}
+
+core::Expected<core::Unit, std::string> CheckAttachedDriveOverlap(
+    const std::vector<sandbox::ExtraDrive>& drives,
+    const std::map<std::string, std::string>& volume_mounts) {
+    // Rust `check_attached_drive_overlap`.
+    for (std::map<std::string, std::string>::const_iterator it = volume_mounts.begin();
+         it != volume_mounts.end(); ++it) {
+        // Normalised first, as upstream does: `/mnt/data/` and `/mnt/data`
+        // must not read as different paths when compared against a drive's
+        // already-normalised one.
+        const core::Expected<std::string, std::string> path =
+            sandbox::NormalizeMountPath(it->first);
+        if (!path.ok()) return core::make_unexpected(path.error());
+
+        for (std::size_t i = 0; i < drives.size(); ++i) {
+            const std::string& drive_path = drives[i].mount_path;
+            // Both directions, because either nesting shadows a filesystem:
+            // a volume under a drive and a drive under a volume are equally
+            // unpredictable for the guest.
+            const bool overlaps =
+                sandbox::MountPathStartsWith(path.value(), drive_path) ||
+                sandbox::MountPathStartsWith(drive_path, path.value());
+            if (!overlaps) continue;
+            return core::make_unexpected(
+                "attached drive '" + drives[i].drive_id + "' mount path " + drive_path +
+                " overlaps volume mount path " + path.value());
+        }
+    }
+    return core::Unit{};
+}
+
 core::Expected<core::Optional<sandbox::custom_extension::Params>, std::string>
 ParamsModelToMap(const core::Optional<core::Json>& model) {
     // Rust `params_model_to_map`. Absent stays absent -- distinct from an

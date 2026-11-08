@@ -44,8 +44,17 @@ struct AttachedDriveRequest {
 /// Rust `struct ResolvedAttachedDrive` (this module's, not the snapshot one).
 struct ResolvedAttachedDriveSpec {
     sandbox::ExtraDrive drive;
-    /// Raw image config JSON from the source image, empty when absent.
-    std::string         raw_config;
+    /// Rust `raw_config: Option<serde_json::Value>` — the source image's OCI
+    /// `config` object, forwarded verbatim so `build_image_configs` can
+    /// publish it under this drive's id and mount path.
+    ///
+    /// An optional `Json` rather than a string: absent is normal (a bare
+    /// overlaybd config path carries no OCI config) and must stay
+    /// distinguishable from a present `null`, which would read as a config
+    /// that explicitly clears every inherited field. This was declared
+    /// `std::string` and never assigned, so every attached drive's config was
+    /// silently dropped on the way to the guest.
+    core::Optional<core::Json> raw_config;
 };
 
 /// An API-shaped failure: the HTTP status plus the message.
@@ -70,6 +79,26 @@ core::Expected<core::Optional<uint64_t>, AttachedDriveError>
 core::Expected<std::vector<ResolvedAttachedDriveSpec>, AttachedDriveError>
     ResolveAttachedDrives(const std::vector<AttachedDriveRequest>& drives,
                           image::ImageResolver* image_resolver);
+
+/// Rust `models::AttachedDrives` — the `attachedDrives` array of either create
+/// body.
+///
+/// Declared here rather than in `dto.h` so there is one `AttachedDriveRequest`
+/// and not two: a second, byte-identical wire struct would be the same defect
+/// the duplicated `OverlaybdLayerStore` was, and the create DTOs would then be
+/// unable to hand what they parsed to `ResolveAttachedDrives` at all.
+///
+/// Returns an unset optional for an absent key. Absent and `[]` are distinct
+/// for the same reason they are for `volumeMounts`: the schema says providing
+/// the field "including an empty array" refuses a snapshot's captured drives,
+/// while omitting it restores them.
+core::Expected<core::Optional<std::vector<AttachedDriveRequest> >, std::string>
+    ParseAttachedDrives(const core::Json& body);
+
+/// The inverse of `ParseAttachedDrives`, for round-tripping a request.
+void WriteAttachedDrives(
+    core::Json* body,
+    const core::Optional<std::vector<AttachedDriveRequest> >& drives);
 
 }  // namespace api
 }  // namespace agentenv

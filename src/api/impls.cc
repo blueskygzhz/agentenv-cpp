@@ -397,11 +397,6 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
     // repository is threaded into this bundle for `CreateSnapshot`) and is
     // doubly wrong now.
     //
-    // `check_attached_drive_overlap` stays absent, and for the reason that
-    // does still hold: it compares volume mounts against the request's
-    // `attachedDrives`, a field `CreateSandboxReq` does not carry. See the
-    // `/sandboxes-cold` note in `server.cc` for why that field is missing
-    // from *this* request upstream too.
     // `has_value()`, not `!empty()`, and this is the distinction the Optional
     // in `CreateSandboxReq::volume_mounts` exists for: upstream passes
     // `body.volume_mounts.is_some()`. A present-but-empty list is an explicit
@@ -417,6 +412,15 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
             400, "this snapshot has volume mounts, which cannot be replaced; "
                  "omit volumeMounts to restore them"));
     }
+    // Rust `check_snapshot_attached_drives`, which was absent along with the
+    // `attachedDrives` field it guards. Same presence-not-emptiness rule, and
+    // a disjunction: omitting the field restores both the captured drives and
+    // the captured volumes, so an explicit list contradicts either.
+    const core::Expected<core::Unit, std::string> drives_ok =
+        CheckSnapshotAttachedDrives(committed, req.attached_drives.has_value());
+    if (!drives_ok.ok()) {
+        return core::make_unexpected(ApiError::Make(400, drives_ok.error()));
+    }
 
     const core::Expected<core::Optional<std::map<std::string, std::string> >, ApiError>
         requested = VolumeMountsFromModel(
@@ -424,11 +428,13 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
                                           : std::vector<SandboxVolumeMountModel>());
     if (!requested.ok()) return core::make_unexpected(requested.error());
 
-    // Rust's free-slot check. Upstream counts `attached_drives.len() +
-    // volume_mounts.len()`; this request carries no attached drives, so the
-    // volume mounts are the whole of it.
+    // Rust `attached_drives.len() + volume_mounts.len()`. Both halves are now
+    // counted; this used to count only the volumes, because the request could
+    // not carry drives, and the note saying so stood where this does.
+    const std::size_t attached_count =
+        req.attached_drives.has_value() ? req.attached_drives->size() : 0;
     const std::size_t requested_drive_count =
-        requested.value().has_value() ? requested.value()->size() : 0;
+        attached_count + (requested.value().has_value() ? requested.value()->size() : 0);
     const std::size_t free_slots = runnable.value().manifest.FreeDriveSlots();
     if (requested_drive_count > free_slots) {
         std::ostringstream message;
@@ -436,6 +442,50 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
                 << " free drive slots, but " << requested_drive_count
                 << " attached drives and volumes were requested";
         return core::make_unexpected(ApiError::Make(400, message.str()));
+    }
+
+    // Rust `resolve_attached_drives(attached_drives, image_resolver)`, then
+    // `.with_kind(ExtraDriveKind::LaunchSlot)`.
+    //
+    // The kind is not carried: this port's `ExtraDrive` has upstream's legacy
+    // `bool volume` rather than the three-state `ExtraDriveKind`. That is
+    // sound *here* because the only production reader of the distinction,
+    // `PrepareResumeDrives` (`sandbox_backend.cc:586`), asks
+    // `!IsVolume()` where upstream asks `kind() == LaunchSlot` -- and the two
+    // differ only for a drive that is both new to this launch and `Physical`,
+    // which the resume path cannot produce: a capture's physical drives come
+    // from its manifest and are never new. Recorded rather than silently
+    // relied upon, since a future `Physical` drive new to a resume would be
+    // prepared `Fresh` and lose its contents.
+    std::vector<sandbox::ExtraDrive> attached_drives;
+    if (attached_count > 0) {
+        if (!image_resolver_) {
+            return core::make_unexpected(ApiError::Make(
+                501, "attaching drives from images requires an image resolver"));
+        }
+        const core::Expected<std::vector<ResolvedAttachedDriveSpec>, AttachedDriveError>
+            resolved = ResolveAttachedDrives(*req.attached_drives, image_resolver_.get());
+        if (!resolved.ok()) {
+            // Rust `client_or_server_response`: the error already carries the
+            // status, so a bad mount path stays 400 and a registry fault 500.
+            return core::make_unexpected(
+                ApiError::Make(resolved.error().status, resolved.error().message));
+        }
+        for (std::size_t i = 0; i < resolved.value().size(); ++i) {
+            attached_drives.push_back(resolved.value()[i].drive);
+        }
+    }
+
+    // Rust `check_attached_drive_overlap`, which was absent for the same
+    // reason the field was. Compared against the *requested* mounts, before
+    // any volume is leased: a 400 after `PrepareVolumeMounts` would leave
+    // placeholder leases behind for a request that was never going to launch.
+    if (requested.value().has_value()) {
+        const core::Expected<core::Unit, std::string> overlap =
+            CheckAttachedDriveOverlap(attached_drives, *requested.value());
+        if (!overlap.ok()) {
+            return core::make_unexpected(ApiError::Make(400, overlap.error()));
+        }
     }
 
     // `extra_drives_in_snapshot` stays false, and this is the one part of the
@@ -457,7 +507,16 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
     // for a storage fault), so there is nothing left to classify.
     if (!prepared.ok()) return core::make_unexpected(prepared.error());
 
-    request.extra_drives = prepared.value().drives;
+    // Rust: `let mut extra_drives = attached_drives; extra_drives.extend(
+    // volume_drives);`. The order is load-bearing, not cosmetic -- upstream's
+    // own comment is "attached drives take the first free slots, before
+    // volumes" -- because the reserved slots are consumed positionally and a
+    // volume landing on the slot an attached drive expected would rebind the
+    // guest's mounts to the wrong backing devices.
+    request.extra_drives = attached_drives;
+    for (std::size_t i = 0; i < prepared.value().drives.size(); ++i) {
+        request.extra_drives.push_back(prepared.value().drives[i]);
+    }
     for (std::map<std::string, std::string>::const_iterator it =
              prepared.value().mounts.begin();
          it != prepared.value().mounts.end(); ++it) {
@@ -495,6 +554,31 @@ ApiImpl::CreateColdSandbox(const CreateColdSandboxReq& req) {
     const core::Expected<sandbox::SandboxResources, ApiError> resources =
         ColdStartResources(req.resources);
     if (!resources.ok()) return core::make_unexpected(resources.error());
+
+    // Rust `resolve_attached_drives(body.attached_drives.as_deref()
+    // .unwrap_or_default(), image_resolver.as_ref())`. Placed here, between
+    // the resources check and the network policy, because upstream's order is
+    // the error precedence a caller sees: a body with both a bad drive and a
+    // bad network must answer about the drive.
+    //
+    // No presence test and no emptiness test: an absent list resolves to an
+    // empty vector, and this route has no snapshot whose captured drives an
+    // explicit `[]` could be refusing. The resolver is already known non-NULL
+    // from this function's own guard, so `ResolveAttachedDrives` cannot reach
+    // its "no image resolver configured" branch from here.
+    std::vector<ResolvedAttachedDriveSpec> resolved_attached;
+    if (req.attached_drives.has_value() && !req.attached_drives->empty()) {
+        const core::Expected<std::vector<ResolvedAttachedDriveSpec>, AttachedDriveError>
+            drives = ResolveAttachedDrives(*req.attached_drives, image_resolver_.get());
+        if (!drives.ok()) {
+            // Rust `client_or_server_response`: the status travels with the
+            // error, so a reserved mount path stays 400 and a registry fault
+            // stays 500.
+            return core::make_unexpected(
+                ApiError::Make(drives.error().status, drives.error().message));
+        }
+        resolved_attached = drives.value();
+    }
 
     // Rust `network_policy_from_create(body.allow_internet_access,
     // body.network.as_ref())`.
@@ -541,8 +625,8 @@ ApiImpl::CreateColdSandbox(const CreateColdSandboxReq& req) {
     request.source.image_resources =
         core::Optional<sandbox::SandboxResources>(resources.value());
     request.source.extra_boot_args = req.extra_boot_args;
-    // Rust `build_image_configs(&resolved_rootfs, &resolved_attached)`. Only
-    // the rootfs entry here: an unset `drive_id` and a `/` mount path are what
+    // Rust `build_image_configs(&resolved_rootfs, &resolved_attached)`. The
+    // rootfs entry first: an unset `drive_id` and a `/` mount path are what
     // `ImageConfigs::RootfsConfig` matches on, and a snapshot taken from this
     // sandbox publishes that object as its own `Env`/`Entrypoint`. Getting
     // either wrong would make the capture inherit a volume's config.
@@ -554,14 +638,17 @@ ApiImpl::CreateColdSandbox(const CreateColdSandboxReq& req) {
         request.source.image_configs.Add(core::Optional<std::string>(), "/",
                                          *resolved.value().raw_config);
     }
-
-    // Rust's `attached_drives` field and `resolve_attached_drives` are not
-    // ported, so `extra_drives` starts empty and only volume drives join it.
-    // Stated rather than left implicit: it is the one part of `NewColdSandbox`
-    // this route does not honour. The DTO omits the field entirely rather than
-    // accepting and ignoring it, so a caller sending it gets no silent
-    // success. That same absence is why `check_attached_drive_overlap` has
-    // nothing to compare against in either create handler.
+    // Then one entry per attached drive that carried a config, keyed by its
+    // drive id and *resolved* mount path. Both are required to keep these from
+    // being mistaken for the rootfs entry by `RootfsConfig`, which is why the
+    // drive id is set even though the mount path alone would already differ.
+    for (std::size_t i = 0; i < resolved_attached.size(); ++i) {
+        const ResolvedAttachedDriveSpec& spec = resolved_attached[i];
+        if (!spec.raw_config.has_value()) continue;
+        request.source.image_configs.Add(
+            core::Optional<std::string>(spec.drive.drive_id), spec.drive.mount_path,
+            *spec.raw_config);
+    }
 
     request.timeout_action = req.auto_pause.has_value() && !*req.auto_pause
                                  ? orchestrator::SandboxTimeoutAction::Delete
@@ -612,10 +699,22 @@ ApiImpl::CreateColdSandbox(const CreateColdSandboxReq& req) {
     //
     // Kept on the source because the concatenation is ordered -- the image's
     // own drives first, then launch-time ones -- and that order is what
-    // upstream's `extra_drives.extend(volume_drives)` produces. It is
-    // unobservable today only because `attachedDrives` is not ported and so
-    // the image contributes none.
-    request.source.extra_drives = prepared.value().drives;
+    // upstream's `extra_drives.extend(volume_drives)` produces.
+    //
+    // Rust `let mut extra_drives = resolved_attached.into_iter().map(|r|
+    // r.drive).collect(); extra_drives.extend(volume_drives);`. Attached
+    // drives lead, volumes follow: slots are consumed positionally, so the
+    // reverse order would hand the guest a volume where it mounts a drive.
+    // Unlike the snapshot route the kind is not overridden to `LaunchSlot`
+    // here either -- upstream leaves these `Physical` on a cold boot, which is
+    // what this port's `volume == false` already means.
+    request.source.extra_drives.clear();
+    for (std::size_t i = 0; i < resolved_attached.size(); ++i) {
+        request.source.extra_drives.push_back(resolved_attached[i].drive);
+    }
+    for (std::size_t i = 0; i < prepared.value().drives.size(); ++i) {
+        request.source.extra_drives.push_back(prepared.value().drives[i]);
+    }
     for (std::map<std::string, std::string>::const_iterator it =
              prepared.value().mounts.begin();
          it != prepared.value().mounts.end(); ++it) {

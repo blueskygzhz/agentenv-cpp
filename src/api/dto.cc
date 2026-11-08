@@ -276,7 +276,8 @@ static void WriteSharedCreateFields(
     const core::Optional<SandboxNetworkConfigModel>& network,
     const std::map<std::string, std::string>& metadata,
     const core::Optional<core::Json>& custom_extension_params,
-    const core::Optional<std::vector<SandboxVolumeMountModel> >& volume_mounts) {
+    const core::Optional<std::vector<SandboxVolumeMountModel> >& volume_mounts,
+    const core::Optional<std::vector<AttachedDriveRequest> >& attached_drives) {
     if (!env_vars.empty()) {
         core::JsonArray arr;
         for (const auto& e : env_vars) arr.emplace_back(core::Json(e));
@@ -303,6 +304,7 @@ static void WriteSharedCreateFields(
         (*j)["customExtensionParams"] = *custom_extension_params;
     }
     WriteVolumeMounts(j, volume_mounts);
+    WriteAttachedDrives(j, attached_drives);
 }
 
 // -------- CreateSandboxReq --------
@@ -311,7 +313,8 @@ core::Json CreateSandboxReq::ToJson() const {
     // `templateID`, not `template_id`: upstream's `#[serde(rename)]`.
     j["templateID"] = core::Json(template_id);
     WriteSharedCreateFields(&j, env_vars, timeout_secs, secure, auto_pause, auto_resume,
-                            network, metadata, custom_extension_params, volume_mounts);
+                            network, metadata, custom_extension_params, volume_mounts,
+                            attached_drives);
     // Snake_case for *this* body only, matching the generated model.
     if (allow_internet_access.has_value()) {
         j["allow_internet_access"] = core::Json(*allow_internet_access);
@@ -372,6 +375,10 @@ CreateSandboxReq::FromJson(const core::Json& j) {
     auto mounts = ParseVolumeMounts(j);
     if (!mounts.ok()) return core::make_unexpected(std::move(mounts.error()));
     r.volume_mounts = mounts.value();
+
+    auto drives = ParseAttachedDrives(j);
+    if (!drives.ok()) return core::make_unexpected(core::err(drives.error()));
+    r.attached_drives = drives.value();
     return r;
 }
 
@@ -389,7 +396,8 @@ core::Json CreateColdSandboxReq::ToJson() const {
         j["diskSizeMB"] = core::Json(static_cast<int64_t>(*resources.disk_size_mb));
     }
     WriteSharedCreateFields(&j, env_vars, timeout_secs, secure, auto_pause, auto_resume,
-                            network, metadata, custom_extension_params, volume_mounts);
+                            network, metadata, custom_extension_params, volume_mounts,
+                            attached_drives);
     // CamelCase for *this* body; `NewSandbox` spells it with underscores.
     if (allow_internet_access.has_value()) {
         j["allowInternetAccess"] = core::Json(*allow_internet_access);
@@ -466,6 +474,10 @@ CreateColdSandboxReq::FromJson(const core::Json& j) {
     auto mounts = ParseVolumeMounts(j);
     if (!mounts.ok()) return core::make_unexpected(std::move(mounts.error()));
     r.volume_mounts = mounts.value();
+
+    auto drives = ParseAttachedDrives(j);
+    if (!drives.ok()) return core::make_unexpected(core::err(drives.error()));
+    r.attached_drives = drives.value();
 
     const auto& boot = j["extraBootArgs"];
     if (boot.kind() == core::Json::Kind::String) {

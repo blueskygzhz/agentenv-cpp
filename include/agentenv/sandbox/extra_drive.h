@@ -136,6 +136,16 @@ core::Expected<std::string, std::string> NormalizeMountPathForDrive(
 /// for one mount point.
 core::Expected<std::string, std::string> NormalizeMountPath(const std::string& mount_path);
 
+/// Rust `Path::starts_with` on two normalized absolute mount paths —
+/// component-wise, so `/proc` is not a prefix of `/proc-data`.
+///
+/// Exported because `CheckAttachedDriveOverlap` needs exactly this comparison
+/// and a plain string prefix test would make `/mnt/data-backup` collide with
+/// `/mnt/data`, refusing a pair of mounts that do not actually overlap. The
+/// reserved-path check in this module's own `NormalizeMountPathForDrive` uses
+/// the same function rather than a second copy of the rule.
+bool MountPathStartsWith(const std::string& path, const std::string& prefix);
+
 /// Rust's `existing.starts_with(&p) || p.starts_with(existing)` guard, used
 /// wherever a set of mount paths must not shadow one another.
 ///

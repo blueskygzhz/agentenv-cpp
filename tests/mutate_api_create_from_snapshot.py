@@ -20,6 +20,9 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 IMPLS = ROOT / "src/api/impls.cc"
 TYPES = ROOT / "src/orchestrator/types.cc"
 MANIFEST = ROOT / "src/sandbox/manifest.cc"
+# `CheckSnapshotAttachedDrives` and `CheckAttachedDriveOverlap`, which the
+# handler calls but which are neither of them in `impls.cc`.
+PARAMS = ROOT / "src/api/sandbox_params.cc"
 TARGET = "test_api_create_from_snapshot"
 
 # The record lookup, whose result feeds the resolve.
@@ -31,6 +34,39 @@ MISSING_RECORD = """    if (!record.value().has_value()) {
 """
 
 NO_RESOLVER_GUARD = """    if (!runtime_resolver_) {"""
+
+# The overlap check, lifted so it can be *moved* rather than deleted.
+#
+# Deleting it is a separate mutation. This one keeps the same 400 and changes
+# only *when* it is raised, so the sole observable difference is the `pending-`
+# lease left on a volume for a sandbox that was never going to exist. Two
+# edits, because a move is a deletion plus an insertion and no single anchor
+# spans both without swallowing the comment block between them.
+OVERLAP_CHECK = """    if (requested.value().has_value()) {
+        const core::Expected<core::Unit, std::string> overlap =
+            CheckAttachedDriveOverlap(attached_drives, *requested.value());
+        if (!overlap.ok()) {
+            return core::make_unexpected(ApiError::Make(400, overlap.error()));
+        }
+    }
+"""
+
+OVERLAP_COMMENT = """    // Rust `check_attached_drive_overlap`, which was absent for the same
+    // reason the field was. Compared against the *requested* mounts, before
+    // any volume is leased: a 400 after `PrepareVolumeMounts` would leave
+    // placeholder leases behind for a request that was never going to launch.
+"""
+
+# Unique to this handler: the cold one spells its own concatenation
+# differently, so this does not need a disambiguating anchor.
+AFTER_PREPARE = (
+    "    // Rust: `let mut extra_drives = attached_drives; extra_drives.extend("
+)
+
+MOVE_OVERLAP_BELOW_PREPARE = [
+    (OVERLAP_COMMENT + OVERLAP_CHECK + "\n", ""),
+    (AFTER_PREPARE, OVERLAP_CHECK + "\n" + AFTER_PREPARE),
+]
 
 MUTATIONS = [
     # The launch source stops naming the snapshot kind, so the orchestrator
@@ -205,6 +241,102 @@ MUTATIONS = [
         "    if (volume_drive_slots == 0) return attached_drives.size();\n",
         "",
     ),
+    # ---- attachedDrives ----------------------------------------------------
+    #
+    # `ResolveAttachedDrives` was ported, unit-tested, and had no production
+    # caller; `check_snapshot_attached_drives` and `check_attached_drive_overlap`
+    # were not ported at all. Every mutation below leaves the handler at 201.
+    (
+        "snapshot_attached_drive_check_disabled",
+        IMPLS,
+        "        CheckSnapshotAttachedDrives(committed, req.attached_drives.has_value());",
+        "        CheckSnapshotAttachedDrives(committed, false);",
+    ),
+    # The absent-vs-empty distinction collapses, so `[]` reads as "restore the
+    # capture's drives" instead of the explicit refusal it is.
+    (
+        "present_empty_attached_drives_read_as_absent",
+        IMPLS,
+        "        CheckSnapshotAttachedDrives(committed, req.attached_drives.has_value());",
+        "        CheckSnapshotAttachedDrives(\n"
+        "            committed,\n"
+        "            req.attached_drives.has_value() && !req.attached_drives->empty());",
+    ),
+    # Only the captured volumes guard the field, so a capture holding attached
+    # drives and no volumes accepts a replacement list.
+    (
+        "snapshot_attached_drive_check_ignores_captured_drives",
+        PARAMS,
+        "    if (explicit_drives &&\n"
+        "        (!committed.volume_snapshots.empty() || !committed.attached_drives.empty())) {",
+        "    if (explicit_drives && !committed.volume_snapshots.empty()) {",
+    ),
+    # Back to counting only the volumes, which is what this port did while the
+    # request could not carry drives.
+    (
+        "attached_drives_not_counted_against_the_free_slots",
+        IMPLS,
+        "        attached_count + (requested.value().has_value() ? requested.value()->size() : 0);",
+        "        (requested.value().has_value() ? requested.value()->size() : 0);",
+    ),
+    # A node with no resolver stops saying so; `ResolveAttachedDrives` then
+    # reports its own 500 instead of this 501.
+    (
+        "absent_resolver_not_reported_for_attached_drives",
+        IMPLS,
+        "        if (!image_resolver_) {\n"
+        "            return core::make_unexpected(ApiError::Make(\n"
+        "                501, \"attaching drives from images requires an image resolver\"));\n"
+        "        }\n",
+        "",
+    ),
+    # The resolved drives never reach the launch: the handler still answers
+    # 201 and the guest boots without the disk that was asked for.
+    (
+        "attached_drives_dropped_from_the_launch",
+        IMPLS,
+        "    request.extra_drives = attached_drives;\n",
+        "    request.extra_drives.clear();\n",
+    ),
+    # Volumes take the first free slots instead of the attached drives, so the
+    # guest's mounts bind to the wrong backing devices.
+    (
+        "volumes_lead_the_attached_drives",
+        IMPLS,
+        "    request.extra_drives = attached_drives;\n"
+        "    for (std::size_t i = 0; i < prepared.value().drives.size(); ++i) {\n"
+        "        request.extra_drives.push_back(prepared.value().drives[i]);\n"
+        "    }\n",
+        "    request.extra_drives = prepared.value().drives;\n"
+        "    for (std::size_t i = 0; i < attached_drives.size(); ++i) {\n"
+        "        request.extra_drives.push_back(attached_drives[i]);\n"
+        "    }\n",
+    ),
+    (
+        "attached_drive_overlap_check_disabled",
+        IMPLS,
+        "            CheckAttachedDriveOverlap(attached_drives, *requested.value());",
+        "            CheckAttachedDriveOverlap(std::vector<sandbox::ExtraDrive>(),\n"
+        "                                      *requested.value());",
+    ),
+    # Only one nesting direction is refused, so a volume mounted *under* an
+    # attached drive gets through.
+    (
+        "overlap_checked_in_one_direction_only",
+        PARAMS,
+        "                sandbox::MountPathStartsWith(path.value(), drive_path) ||\n"
+        "                sandbox::MountPathStartsWith(drive_path, path.value());",
+        "                sandbox::MountPathStartsWith(drive_path, path.value());",
+    ),
+    # The overlap check moves below `PrepareVolumeMounts`. The request is still
+    # refused with the same 400, but the volume has been leased to a `pending-`
+    # placeholder for a sandbox that will never exist, and nothing releases it.
+    (
+        "overlap_checked_after_the_volumes_are_leased",
+        IMPLS,
+        MOVE_OVERLAP_BELOW_PREPARE,
+        None,
+    ),
     # The resolver is handed a record other than the one that was looked up.
     # Caught only because the fake echoes back the id it was given and the
     # tests assert on it; without that assertion a handler could resolve the
@@ -231,7 +363,7 @@ def run():
 
 
 def main():
-    sources = {IMPLS, TYPES, MANIFEST}
+    sources = {IMPLS, TYPES, MANIFEST, PARAMS}
     originals = {p: p.read_text() for p in sources}
     backups = {p: p.with_suffix(p.suffix + ".mutation-backup") for p in sources}
     for p, b in backups.items():
@@ -250,14 +382,23 @@ def main():
         for name, path, old, new in MUTATIONS:
             for p in sources:
                 p.write_text(originals[p])
+            # A mutation is normally one `old -> new` pair; a *move* needs two
+            # (the deletion and the insertion), so `old` may instead be a list
+            # of pairs. Anchors are counted against the unmutated text, before
+            # any of them is applied, so an edit cannot create or destroy a
+            # later edit's anchor unnoticed.
+            edits = old if isinstance(old, list) else [(old, new)]
             text = path.read_text()
-            assert text.count(old) == 1, \
-                f"anchor for {name} matched {text.count(old)} times in {path.name}"
-            if old == new:
+            for before, _ in edits:
+                assert text.count(before) == 1, \
+                    f"anchor for {name} matched {text.count(before)} times in {path.name}"
+            if all(before == after for before, after in edits):
                 noop.append(name)
                 print(f"  NO-OP    {name} (mutation is identity)")
                 continue
-            path.write_text(text.replace(old, new, 1))
+            for before, after in edits:
+                text = text.replace(before, after, 1)
+            path.write_text(text)
 
             if not build():
                 broken.append(name)

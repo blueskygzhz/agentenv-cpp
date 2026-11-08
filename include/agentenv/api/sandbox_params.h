@@ -30,6 +30,8 @@
 #include "agentenv/sandbox/custom_extension.h"
 #include "agentenv/sandbox/network/policy.h"
 #include "agentenv/sandbox/types.h"
+// `CheckSnapshotAttachedDrives` reads a capture's own drive and volume lists.
+#include "agentenv/snapshot/record.h"
 
 namespace agentenv {
 namespace api {
@@ -48,6 +50,32 @@ namespace api {
 /// either way, which is why `ParamsIsEmpty` is checked first.
 core::Expected<core::Unit, std::string> ValidateCustomExtensionParams(
     const core::Optional<sandbox::custom_extension::Params>& params);
+
+/// Rust `check_snapshot_attached_drives`.
+///
+/// A capture brings its own drives back with it, so naming `attachedDrives` as
+/// well would put two sets of filesystems on the same slots. Takes the
+/// *presence* of the field, not its contents: a present empty array is an
+/// explicit "no drives", which still contradicts a capture that recorded some.
+///
+/// Checks `volume_snapshots` too, not just `attached_drives` -- upstream's
+/// condition is a disjunction, because the restore path recreates both from
+/// the same request field.
+core::Expected<core::Unit, std::string> CheckSnapshotAttachedDrives(
+    const snapshot::CommittedSnapshot& committed, bool explicit_drives);
+
+/// Rust `check_attached_drive_overlap`.
+///
+/// Refuses a volume mounted at, above or below an attached drive's mount
+/// path. Either nesting direction is a conflict: the guest would see one
+/// filesystem shadowing the other, and which one wins is not something the
+/// caller can predict.
+///
+/// The volume path is normalised first, so `/mnt/data/` and `/mnt/data` cannot
+/// slip past a comparison against a normalised drive path.
+core::Expected<core::Unit, std::string> CheckAttachedDriveOverlap(
+    const std::vector<sandbox::ExtraDrive>& drives,
+    const std::map<std::string, std::string>& volume_mounts);
 
 /// Rust `params_model_to_map` — the generated params model into the internal
 /// carrier. Rejects anything that is not a JSON object, as the

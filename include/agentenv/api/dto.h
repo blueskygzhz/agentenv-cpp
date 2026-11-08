@@ -8,6 +8,11 @@
 #include <string>
 #include <vector>
 
+// `AttachedDriveRequest` (Rust `models::AttachedDrive`) is declared there,
+// next to `ResolveAttachedDrives` which consumes it. Included rather than
+// re-declared so the create bodies can hand what they parsed straight to the
+// resolver; a second identical wire struct would not convert.
+#include "agentenv/api/attached_drives.h"
 #include "agentenv/core/error.h"
 #include "agentenv/core/expected.h"
 #include "agentenv/core/json.h"
@@ -114,6 +119,22 @@ struct CreateSandboxReq {
     /// HTTP 400" -- so collapsing the two would turn a documented 400 into a
     /// silent restore.
     core::Optional<std::vector<SandboxVolumeMountModel> > volume_mounts;
+    /// Rust `attached_drives: Option<AttachedDrives>`, key `attachedDrives`.
+    ///
+    /// Optional for the same reason `volume_mounts` is, and the schema states
+    /// it in the same words: providing the field "including an empty array"
+    /// refuses the snapshot's captured drives, while omitting it restores
+    /// them. Upstream passes `attached_drives.is_some()` to
+    /// `check_snapshot_attached_drives`, so collapsing absent into empty would
+    /// turn a documented 400 into a silent restore.
+    ///
+    /// Note that upstream's `NewSandbox` does *not* carry this field --
+    /// `NewSandboxV2` does, and `create_sandbox_from_snapshot` takes it as a
+    /// separate argument that `sandboxes_post` passes as `None`. It is carried
+    /// here because this port has no V2 route, so this is the only body that
+    /// could ever deliver it; the handler's behaviour for an absent value is
+    /// identical to upstream's `sandboxes_post`.
+    core::Optional<std::vector<AttachedDriveRequest> > attached_drives;
 
     // `mcp` is absent because nothing in this port implements MCP; a field
     // accepted and ignored would report success for a sandbox that never got
@@ -180,6 +201,11 @@ struct CreateColdSandboxReq {
     core::Optional<core::Json> custom_extension_params;
     /// Rust `volume_mounts: Option<Vec<models::SandboxVolumeMount>>`.
     core::Optional<std::vector<SandboxVolumeMountModel> > volume_mounts;
+    /// Rust `attached_drives: Option<AttachedDrives>`, key `attachedDrives`.
+    /// A cold boot has no captured drives to refuse, so absent and `[]` mean
+    /// the same thing here; the optional is kept only so the two create bodies
+    /// carry the field identically.
+    core::Optional<std::vector<AttachedDriveRequest> > attached_drives;
     /// Rust `extra_boot_args: Option<String>`, appended to the guest kernel
     /// command line.
     core::Optional<std::string> extra_boot_args;

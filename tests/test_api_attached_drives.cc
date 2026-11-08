@@ -27,6 +27,9 @@ class FakeResolver : public image::ImageResolver {
     /// *class* of failure, which is what decides 400 versus 500.
     core::Optional<image::ImageError> failure;
     std::string last_reference;
+    /// What a pull would have recovered from the image's OCI config. Absent by
+    /// default, which is also legal: a bare overlaybd config path has none.
+    core::Optional<core::Json> raw_config;
 
     core::Expected<image::ResolvedBlockImage, image::ImageError> Resolve(
         const std::string& image_ref) override {
@@ -36,6 +39,7 @@ class FakeResolver : public image::ImageResolver {
         image::ResolvedBlockImage resolved;
         resolved.image_ref             = image_ref;
         resolved.overlaybd_config_path = "/var/lib/agentenv/images/app/image.json";
+        resolved.raw_config            = raw_config;
         return resolved;
     }
 
@@ -110,6 +114,36 @@ MT_TEST(attached_drives_defaults_read_only_to_true) {
     auto writable = ResolveAttachedDrives(drives, &resolver);
     MT_EXPECT_TRUE(writable.ok());
     MT_EXPECT_TRUE(!writable.value()[0].drive.read_only);
+}
+
+MT_TEST(attached_drives_carry_the_source_images_oci_config) {
+    // Rust `ResolvedAttachedDrive { drive, raw_config }`. `build_image_configs`
+    // publishes this object under the drive's id, and the guest reads it from
+    // MMDS. The field was declared here and never assigned, so every attached
+    // drive's `Env`/`Entrypoint` was dropped between the resolver and the
+    // launch -- a defect no test could see while the field had no caller.
+    FakeResolver resolver;
+    core::Json config;
+    config["WorkingDir"] = core::Json(std::string("/srv"));
+    resolver.raw_config  = core::Optional<core::Json>(config);
+
+    std::vector<AttachedDriveRequest> drives;
+    drives.push_back(Request("data", "alpine"));
+    auto resolved = ResolveAttachedDrives(drives, &resolver);
+    MT_EXPECT_TRUE(resolved.ok());
+    if (!resolved.ok()) return;
+    MT_EXPECT_TRUE(resolved.value()[0].raw_config.has_value());
+    if (!resolved.value()[0].raw_config.has_value()) return;
+    MT_EXPECT_EQ((*resolved.value()[0].raw_config)["WorkingDir"].as_string(),
+                 std::string("/srv"));
+
+    // Absent stays absent rather than becoming a present `null`, which a
+    // consumer would read as a config that clears every inherited field.
+    FakeResolver bare;
+    auto without = ResolveAttachedDrives(drives, &bare);
+    MT_EXPECT_TRUE(without.ok());
+    if (!without.ok()) return;
+    MT_EXPECT_TRUE(!without.value()[0].raw_config.has_value());
 }
 
 MT_TEST(attached_drives_rejects_duplicate_drive_id) {

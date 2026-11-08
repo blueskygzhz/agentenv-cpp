@@ -470,6 +470,202 @@ MT_TEST(a_failed_cold_launch_releases_the_volume_lease) {
     MT_EXPECT_EQ(LeaseHolder(vf, volume.id), std::string());
 }
 
+// ---- attachedDrives --------------------------------------------------------
+
+MT_TEST(cold_attached_drives_lead_the_image_sources_drives) {
+    // Rust `let mut extra_drives = resolved_attached...; extra_drives.extend(
+    // volume_drives);`. Order first, because reserved slots are consumed
+    // positionally: a volume taking the slot a drive expected would bind the
+    // guest's mounts to the wrong backing devices.
+    ColdFixture f;
+    VolumeFixture vf;
+    const volume::VolumeRecord volume = vf.PublishedVolume();
+
+    CreateColdSandboxReq req = MountingRequest("python:3.11-slim", volume.id);
+    std::vector<AttachedDriveRequest> drives;
+    AttachedDriveRequest drive;
+    drive.drive_id     = "cache";
+    drive.source_image = "registry.example.com/cache:v1";
+    drive.mount_path   = core::Optional<std::string>(std::string("/mnt/cache"));
+    drives.push_back(drive);
+    req.attached_drives = core::Optional<std::vector<AttachedDriveRequest> >(drives);
+
+    ApiImpl impl(f.orch.orch, vf.manager, f.resolver);
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateColdSandbox(req);
+    MT_EXPECT_TRUE(created.ok());
+    if (!created.ok()) return;
+
+    // On the *image source*, as the volumes already are: a cold boot binds
+    // every drive while building the VM, so `SandboxLaunchConfig::extra_drives`
+    // stays empty and putting them there would leave the guest without them.
+    const std::vector<sandbox::ExtraDrive>& extras =
+        f.orch.factory->last_build_spec.extra_drives;
+    MT_EXPECT_TRUE(f.orch.factory->last_launch_config.extra_drives.empty());
+    MT_EXPECT_EQ(extras.size(), static_cast<std::size_t>(2));
+    if (extras.size() != 2) return;
+    MT_EXPECT_EQ(extras[0].drive_id, std::string("cache"));
+    MT_EXPECT_EQ(extras[0].mount_path, std::string("/mnt/cache"));
+    MT_EXPECT_TRUE(!extras[0].IsVolume());
+    MT_EXPECT_TRUE(extras[1].IsVolume());
+
+    // Two resolves: the rootfs and the drive. One would mean the drive's image
+    // reference never left the request.
+    MT_EXPECT_EQ(f.resolver->calls, 2);
+    MT_EXPECT_EQ(f.resolver->last_reference, std::string("registry.example.com/cache:v1"));
+}
+
+MT_TEST(an_attached_drives_oci_config_is_recorded_under_its_drive_id) {
+    // Rust `build_image_configs(&resolved_rootfs, &resolved_attached)`. The
+    // attached half was dropped twice over: the field was unported, and
+    // `ResolvedAttachedDriveSpec::raw_config` was declared `std::string` and
+    // never assigned, so even a wired-up caller would have published nothing.
+    ColdFixture f;
+    CreateColdSandboxReq req = RequestFor("python:3.11-slim");
+    std::vector<AttachedDriveRequest> drives;
+    AttachedDriveRequest drive;
+    drive.drive_id     = "cache";
+    drive.source_image = "registry.example.com/cache:v1";
+    drive.mount_path   = core::Optional<std::string>(std::string("/mnt/cache"));
+    drives.push_back(drive);
+    req.attached_drives = core::Optional<std::vector<AttachedDriveRequest> >(drives);
+
+    ApiImpl impl = f.Impl();
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateColdSandbox(req);
+    MT_EXPECT_TRUE(created.ok());
+    if (!created.ok()) return;
+    const core::Optional<orchestrator::SandboxMetadata> record =
+        StoredRecord(f.orch, created.value().sandbox_id);
+    MT_EXPECT_TRUE(record.has_value());
+    if (!record.has_value()) return;
+
+    const tpl::ImageConfigs& configs = record->image_configs;
+    MT_EXPECT_EQ(configs.size(), static_cast<std::size_t>(2));
+    if (configs.size() != 2) return;
+    // The rootfs entry stays first and stays keyless, which is what
+    // `RootfsConfig` matches on. An attached drive mis-keyed as the rootfs
+    // would make a snapshot taken from this sandbox publish the drive's
+    // `Env`/`Entrypoint` as its own.
+    MT_EXPECT_TRUE(!configs.entries()[0].drive_id.has_value());
+    MT_EXPECT_EQ(configs.entries()[0].mount_path, std::string("/"));
+    MT_EXPECT_TRUE(configs.entries()[1].drive_id.has_value());
+    MT_EXPECT_EQ(*configs.entries()[1].drive_id, std::string("cache"));
+    MT_EXPECT_EQ(configs.entries()[1].mount_path, std::string("/mnt/cache"));
+    MT_EXPECT_TRUE(configs.RootfsConfig().has_value());
+
+    // An image carrying no OCI config contributes no entry, as upstream's
+    // `if let Some(config)` does -- an entry holding JSON `null` would read as
+    // a config that explicitly clears every inherited field.
+    ColdFixture bare;
+    bare.resolver->raw_config = core::Optional<core::Json>();
+    ApiImpl bare_impl = bare.Impl();
+    const core::Expected<CreateSandboxResp, ApiError> bare_created =
+        bare_impl.CreateColdSandbox(req);
+    MT_EXPECT_TRUE(bare_created.ok());
+    if (!bare_created.ok()) return;
+    const core::Optional<orchestrator::SandboxMetadata> bare_record =
+        StoredRecord(bare.orch, bare_created.value().sandbox_id);
+    MT_EXPECT_TRUE(bare_record.has_value() && bare_record->image_configs.IsEmpty());
+}
+
+MT_TEST(a_malformed_cold_attached_drive_is_a_400_before_the_boot) {
+    // The validation is `ResolveAttachedDrives`', already unit-tested; what is
+    // checked here is that the handler forwards its status rather than
+    // flattening everything to 500, and that it refuses before the VM is
+    // built.
+    ColdFixture f;
+    ApiImpl impl = f.Impl();
+
+    AttachedDriveRequest base;
+    base.drive_id     = "data";
+    base.source_image = "registry.example.com/data:v1";
+
+    // A reserved mount path, a duplicate id, and a blank image reference --
+    // one case per validation pass in request order.
+    std::vector<std::vector<AttachedDriveRequest> > cases;
+    {
+        AttachedDriveRequest reserved = base;
+        reserved.mount_path = core::Optional<std::string>(std::string("/proc/data"));
+        cases.push_back(std::vector<AttachedDriveRequest>(1, reserved));
+    }
+    {
+        std::vector<AttachedDriveRequest> duplicate;
+        duplicate.push_back(base);
+        AttachedDriveRequest second = base;
+        second.mount_path = core::Optional<std::string>(std::string("/mnt/other"));
+        duplicate.push_back(second);
+        cases.push_back(duplicate);
+    }
+    {
+        AttachedDriveRequest blank = base;
+        blank.source_image = "   ";
+        cases.push_back(std::vector<AttachedDriveRequest>(1, blank));
+    }
+
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        CreateColdSandboxReq req = RequestFor("python:3.11-slim");
+        req.attached_drives = core::Optional<std::vector<AttachedDriveRequest> >(cases[i]);
+        const core::Expected<CreateSandboxResp, ApiError> created =
+            impl.CreateColdSandbox(req);
+        MT_EXPECT_TRUE(!created.ok());
+        if (created.ok()) return;
+        MT_EXPECT_EQ(created.error().code, 400);
+    }
+    MT_EXPECT_EQ(f.orch.factory->build_calls, 0);
+}
+
+MT_TEST(the_cold_body_reads_its_attached_drives) {
+    // The wire shape, which is shared with `NewSandbox`: `source.image` is
+    // nested, and the four optionals must stay unset rather than defaulted so
+    // `ResolveAttachedDrives` applies its own defaults.
+    core::Json drive;
+    drive["driveID"] = core::Json(std::string("data"));
+    core::Json source;
+    source["image"] = core::Json(std::string("registry.example.com/data:v1"));
+    drive["source"] = source;
+    core::JsonArray drives;
+    drives.push_back(drive);
+    core::Json j;
+    j["image"]          = core::Json(std::string("python:3.11-slim"));
+    j["attachedDrives"] = core::Json(drives);
+
+    const core::Expected<CreateColdSandboxReq, core::AnyError> parsed =
+        CreateColdSandboxReq::FromJson(j);
+    MT_EXPECT_TRUE(parsed.ok());
+    if (!parsed.ok()) return;
+    MT_EXPECT_TRUE(parsed.value().attached_drives.has_value());
+    if (!parsed.value().attached_drives.has_value()) return;
+    MT_EXPECT_EQ(parsed.value().attached_drives->size(), static_cast<std::size_t>(1));
+    if (parsed.value().attached_drives->size() != 1) return;
+    const AttachedDriveRequest& got = (*parsed.value().attached_drives)[0];
+    MT_EXPECT_EQ(got.drive_id, std::string("data"));
+    MT_EXPECT_EQ(got.source_image, std::string("registry.example.com/data:v1"));
+    MT_EXPECT_TRUE(!got.read_only.has_value());
+    MT_EXPECT_TRUE(!got.mount_path.has_value());
+    MT_EXPECT_TRUE(!got.sub_path.has_value());
+    MT_EXPECT_TRUE(!got.disk_size_mb.has_value());
+
+    // Absent and `[]` stay distinct, for the same reason they do for
+    // `volumeMounts`: on the snapshot route an explicit `[]` refuses a
+    // capture's drives while omitting the key restores them.
+    core::Json without;
+    without["image"] = core::Json(std::string("python:3.11-slim"));
+    const core::Expected<CreateColdSandboxReq, core::AnyError> omitted =
+        CreateColdSandboxReq::FromJson(without);
+    MT_EXPECT_TRUE(omitted.ok());
+    if (!omitted.ok()) return;
+    MT_EXPECT_TRUE(!omitted.value().attached_drives.has_value());
+
+    core::Json emptied;
+    emptied["image"]          = core::Json(std::string("python:3.11-slim"));
+    emptied["attachedDrives"] = core::Json(core::JsonArray());
+    const core::Expected<CreateColdSandboxReq, core::AnyError> empty =
+        CreateColdSandboxReq::FromJson(emptied);
+    MT_EXPECT_TRUE(empty.ok());
+    if (!empty.ok()) return;
+    MT_EXPECT_TRUE(empty.value().attached_drives.has_value());
+    MT_EXPECT_TRUE(empty.value().attached_drives->empty());
+}
+
 // ---- body parsing ----------------------------------------------------------
 
 MT_TEST(the_cold_body_requires_an_image) {
@@ -484,9 +680,11 @@ MT_TEST(the_cold_body_requires_an_image) {
 }
 
 MT_TEST(the_cold_body_reads_its_timeout_in_seconds) {
-    // `NewColdSandbox::timeout` is seconds; `NewSandbox::timeout_ms` is
-    // milliseconds. Reading one as the other is a factor of 1000 in how long
-    // a sandbox lives.
+    // Both create bodies spell this `timeout` and both mean seconds. An
+    // earlier note here claimed `NewSandbox` carried milliseconds, which was
+    // this port's own invention; the record stores milliseconds, so the
+    // conversion is the handler's and reading one as the other is a factor of
+    // 1000 in how long a sandbox lives.
     core::Json j;
     j["image"]   = core::Json(std::string("python:3.11-slim"));
     j["timeout"] = core::Json(static_cast<int64_t>(60));

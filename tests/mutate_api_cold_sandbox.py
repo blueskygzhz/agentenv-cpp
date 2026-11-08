@@ -18,6 +18,9 @@ import subprocess
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 IMPLS = ROOT / "src/api/impls.cc"
 DTO = ROOT / "src/api/dto.cc"
+# `ParseAttachedDrives` and `ResolveAttachedDrives`, which both create bodies
+# share; this suite is the one that exercises them end to end.
+ATTACHED = ROOT / "src/api/attached_drives.cc"
 TARGET = "test_api_cold_sandbox"
 
 MUTATIONS = [
@@ -177,8 +180,128 @@ MUTATIONS = [
     (
         "volume_drives_dropped",
         IMPLS,
-        "    request.source.extra_drives = prepared.value().drives;",
-        "    request.source.extra_drives = std::vector<sandbox::ExtraDrive>();",
+        "    for (std::size_t i = 0; i < prepared.value().drives.size(); ++i) {\n"
+        "        request.source.extra_drives.push_back(prepared.value().drives[i]);\n"
+        "    }",
+        "",
+    ),
+    # ---- attachedDrives ----------------------------------------------------
+    #
+    # The field was unported on this route too, so `resolve_attached_drives`,
+    # the attached half of `build_image_configs`, and the drive ordering were
+    # all unreachable.
+    (
+        "cold_attached_drives_not_resolved",
+        IMPLS,
+        "    if (req.attached_drives.has_value() && !req.attached_drives->empty()) {",
+        "    if (false) {",
+    ),
+    # A malformed drive is reported as this node's fault, so a client retries
+    # a body that can never succeed.
+    (
+        "cold_attached_drive_error_class_ignored",
+        IMPLS,
+        "                ApiError::Make(drives.error().status, drives.error().message));",
+        "                ApiError::Make(500, drives.error().message));",
+    ),
+    # The drives resolve but never reach the VM: a 201 and a guest without the
+    # disk that was asked for.
+    (
+        "cold_attached_drives_dropped_from_the_build",
+        IMPLS,
+        "    for (std::size_t i = 0; i < resolved_attached.size(); ++i) {\n"
+        "        request.source.extra_drives.push_back(resolved_attached[i].drive);\n"
+        "    }",
+        "",
+    ),
+    # Volumes take the first free slots instead, so the guest's mounts bind to
+    # the wrong backing devices.
+    (
+        "cold_volumes_lead_the_attached_drives",
+        IMPLS,
+        "    request.source.extra_drives.clear();\n"
+        "    for (std::size_t i = 0; i < resolved_attached.size(); ++i) {\n"
+        "        request.source.extra_drives.push_back(resolved_attached[i].drive);\n"
+        "    }\n"
+        "    for (std::size_t i = 0; i < prepared.value().drives.size(); ++i) {\n"
+        "        request.source.extra_drives.push_back(prepared.value().drives[i]);\n"
+        "    }",
+        "    request.source.extra_drives = prepared.value().drives;\n"
+        "    for (std::size_t i = 0; i < resolved_attached.size(); ++i) {\n"
+        "        request.source.extra_drives.push_back(resolved_attached[i].drive);\n"
+        "    }",
+    ),
+    # The attached half of `build_image_configs` stops recording anything, so
+    # the guest never sees an attached drive's `Env`/`Entrypoint`.
+    (
+        "cold_attached_image_configs_not_recorded",
+        IMPLS,
+        "        if (!spec.raw_config.has_value()) continue;",
+        "        continue;",
+    ),
+    # The entry is recorded without its drive id, so `RootfsConfig` can match
+    # an attached drive's config and publish it as the rootfs'.
+    (
+        "cold_attached_image_config_recorded_as_the_rootfs",
+        IMPLS,
+        "            core::Optional<std::string>(spec.drive.drive_id), spec.drive.mount_path,",
+        "            core::Optional<std::string>(), \"/\",",
+    ),
+    # The resolver's config never reaches the spec -- the original defect,
+    # where the field existed, was typed `std::string`, and was never assigned.
+    (
+        "resolved_attached_drive_drops_its_raw_config",
+        ATTACHED,
+        "        spec.raw_config = image_result.value().raw_config;\n",
+        "",
+    ),
+    # `attachedDrives` parses but its entries are discarded.
+    (
+        "cold_attached_drives_parsed_into_nothing",
+        ATTACHED,
+        "    return core::Optional<std::vector<AttachedDriveRequest> >(parsed);",
+        "    return core::Optional<std::vector<AttachedDriveRequest> >(\n"
+        "        std::vector<AttachedDriveRequest>());",
+    ),
+    # An absent list becomes an empty one, collapsing the distinction the
+    # snapshot route's `check_snapshot_attached_drives` depends on.
+    (
+        "absent_attached_drive_list_becomes_empty",
+        ATTACHED,
+        "    if (drives.kind() == core::Json::Kind::Null) {\n"
+        "        return core::Optional<std::vector<AttachedDriveRequest> >();\n"
+        "    }",
+        "    if (drives.kind() == core::Json::Kind::Null) {\n"
+        "        return core::Optional<std::vector<AttachedDriveRequest> >(\n"
+        "            std::vector<AttachedDriveRequest>());\n"
+        "    }",
+    ),
+    # `driveID` and `source.image` stop being required, so a drive with no id
+    # reaches `ResolveAttachedDrives` as the empty string.
+    (
+        "attached_drive_required_members_not_enforced",
+        ATTACHED,
+        "        if (drive_id.kind() != core::Json::Kind::String) {",
+        "        if (false) {",
+    ),
+    (
+        "attached_drive_blank_source_image_accepted",
+        ATTACHED,
+        "        if (source_image.kind() != core::Json::Kind::String ||\n"
+        "            source_image.as_string().empty()) {",
+        "        if (source_image.kind() != core::Json::Kind::String) {",
+    ),
+    # A present non-string/non-integer optional reads as absent, so
+    # `\"readOnly\": \"false\"` silently becomes read-only.
+    (
+        "attached_drive_non_boolean_read_only_silently_ignored",
+        ATTACHED,
+        "        } else if (read_only.kind() != core::Json::Kind::Null) {\n"
+        "            return core::make_unexpected(\n"
+        "                std::string(\"invalid field: attachedDrives entry readOnly must be "
+        "a boolean\"));\n"
+        "        }",
+        "        }",
     ),
     # A body with no image resolves the empty reference.
     (
@@ -243,7 +366,7 @@ def run():
 
 
 def main():
-    sources = {IMPLS, DTO}
+    sources = {IMPLS, DTO, ATTACHED}
     originals = {p: p.read_text() for p in sources}
     backups = {p: p.with_suffix(p.suffix + ".mutation-backup") for p in sources}
     for p, b in backups.items():
