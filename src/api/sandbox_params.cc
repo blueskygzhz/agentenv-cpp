@@ -320,5 +320,39 @@ core::Expected<std::vector<core::SandboxId>, std::string> ParseMetricsIds(
     return parsed;
 }
 
+core::Expected<core::Optional<sandbox::custom_extension::Params>, std::string>
+ParamsModelToMap(const core::Optional<core::Json>& model) {
+    // Rust `params_model_to_map`. Absent stays absent -- distinct from an
+    // empty object, which `ValidateCustomExtensionParams` treats as "nothing
+    // asked for" but which the hooks still receive as a present empty map.
+    if (!model.has_value()) {
+        return core::Optional<sandbox::custom_extension::Params>();
+    }
+    if (model->kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(
+            std::string("customExtensionParams must be an object"));
+    }
+    // The caller's bytes reach the extension unchanged; `Params` is the JSON
+    // text precisely so no re-encoding can reorder or retype a value the
+    // extension may be matching on.
+    sandbox::custom_extension::Params params;
+    params.json_bytes = model->ToString();
+    return core::Optional<sandbox::custom_extension::Params>(params);
+}
+
+core::Expected<core::Unit, std::string> ValidateCustomExtensionParams(
+    const core::Optional<sandbox::custom_extension::Params>& params) {
+    // Rust `validate_custom_extension_params`. Both halves of the condition
+    // matter: empty params are always fine, and configured extensions accept
+    // anything. Only "asked for something, nothing to ask" is refused.
+    if (sandbox::custom_extension::ParamsIsEmpty(params)) return core::Unit{};
+    if (!sandbox::custom_extension::Client::Global()) {
+        return core::make_unexpected(std::string(
+            "customExtensionParams requires the custom extension to be configured "
+            "([custom_extension].url)"));
+    }
+    return core::Unit{};
+}
+
 }  // namespace api
 }  // namespace agentenv

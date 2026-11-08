@@ -27,23 +27,33 @@
 #include "agentenv/core/expected.h"
 #include "agentenv/core/identity.h"
 #include "agentenv/core/optional.h"
+#include "agentenv/sandbox/custom_extension.h"
 #include "agentenv/sandbox/network/policy.h"
 #include "agentenv/sandbox/types.h"
 
 namespace agentenv {
 namespace api {
 
-// `SandboxVolumeMountModel` (Rust `models::SandboxVolumeMount`) and
-// `NewColdSandboxResources` (Rust `models::NewColdSandbox`'s resource fields)
-// are declared in `dto.h`, which `CreateSandboxReq` and
-// `CreateColdSandboxReq` need them from.
+// `SandboxVolumeMountModel` (Rust `models::SandboxVolumeMount`),
+// `NewColdSandboxResources` (`models::NewColdSandbox`'s resource fields) and
+// `SandboxNetworkConfigModel` (`models::SandboxNetworkConfig`) are declared in
+// `dto.h`, which `CreateSandboxReq` and `CreateColdSandboxReq` need them from.
+// The functions that validate and consume them stay here.
 
-/// Rust generated `models::SandboxNetworkConfig`.
-struct SandboxNetworkConfigModel {
-    core::Optional<std::vector<std::string> > allow_out;
-    core::Optional<std::vector<std::string> > deny_out;
-    core::Optional<bool>                      allow_public_traffic;
-};
+/// Rust `validate_custom_extension_params`.
+///
+/// Non-empty params with no configured extension is a 400: the caller asked
+/// for behaviour this node cannot provide, and accepting it would start a
+/// sandbox whose params are silently dropped. Empty or absent params are fine
+/// either way, which is why `ParamsIsEmpty` is checked first.
+core::Expected<core::Unit, std::string> ValidateCustomExtensionParams(
+    const core::Optional<sandbox::custom_extension::Params>& params);
+
+/// Rust `params_model_to_map` — the generated params model into the internal
+/// carrier. Rejects anything that is not a JSON object, as the
+/// `CustomExtensionParams` schema (`additionalProperties`) requires.
+core::Expected<core::Optional<sandbox::custom_extension::Params>, std::string>
+    ParamsModelToMap(const core::Optional<core::Json>& model);
 
 /// Rust `base_policy_from_allow_internet_access` — a tri-state: absent means
 /// "inherit the node default", which is distinct from an explicit allow/deny.

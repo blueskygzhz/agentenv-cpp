@@ -137,7 +137,7 @@ expect "POST exec (unported)"      501 -X POST -d '{"cmd":["true"]}' \
 # 500 naming the real cause, not a 201 for a sandbox that does not exist.
 create_status="$(curl -s -o "$WORK/create" -w '%{http_code}' -X POST \
     -H "x-api-key: $AENV_API_KEY" \
-    -H 'Content-Type: application/json' -d '{"template_id":"base"}' "$BASE/sandboxes")"
+    -H 'Content-Type: application/json' -d '{"templateID":"base"}' "$BASE/sandboxes")"
 if [ "$create_status" = "500" ] || [ "$create_status" = "201" ]; then
     echo "  ok    POST /sandboxes reaches the backend ($create_status)"
 else

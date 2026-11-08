@@ -343,6 +343,91 @@ MT_TEST(only_an_explicit_auto_pause_false_switches_to_delete) {
     MT_EXPECT_TRUE(off_record->timeout_action == orchestrator::SandboxTimeoutAction::Delete);
 }
 
+MT_TEST(cold_auto_resume_reaches_the_stored_record) {
+    ColdFixture f;
+    ApiImpl impl = f.Impl();
+
+    CreateColdSandboxReq req = RequestFor("python:3.11-slim");
+    req.auto_resume = core::Optional<bool>(true);
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateColdSandbox(req);
+    MT_EXPECT_TRUE(created.ok());
+    if (!created.ok()) return;
+    const core::Optional<orchestrator::SandboxMetadata> record =
+        StoredRecord(f.orch, created.value().sandbox_id);
+    MT_EXPECT_TRUE(record.has_value());
+    if (!record.has_value()) return;
+    MT_EXPECT_TRUE(record->auto_resume);
+
+    const core::Expected<CreateSandboxResp, ApiError> absent =
+        impl.CreateColdSandbox(RequestFor("python:3.11-slim"));
+    MT_EXPECT_TRUE(absent.ok());
+    if (!absent.ok()) return;
+    const core::Optional<orchestrator::SandboxMetadata> absent_record =
+        StoredRecord(f.orch, absent.value().sandbox_id);
+    MT_EXPECT_TRUE(absent_record.has_value() && !absent_record->auto_resume);
+}
+
+MT_TEST(cold_custom_extension_params_without_an_extension_are_refused) {
+    // Rust `validate_custom_extension_params`. No extension is configured in
+    // these tests, so non-empty params are a 400 rather than a sandbox that
+    // starts with the params silently dropped.
+    ColdFixture f;
+    ApiImpl impl = f.Impl();
+
+    core::Json params;
+    params["tier"] = core::Json(std::string("gold"));
+    CreateColdSandboxReq req = RequestFor("python:3.11-slim");
+    req.custom_extension_params = core::Optional<core::Json>(params);
+
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateColdSandbox(req);
+    MT_EXPECT_TRUE(!created.ok());
+    if (created.ok()) return;
+    MT_EXPECT_EQ(created.error().code, 400);
+    MT_EXPECT_EQ(f.orch.factory->build_calls, 0);
+}
+
+MT_TEST(the_cold_network_config_shapes_the_policy) {
+    // The `network` half of the body used to be absent from the DTO, so the
+    // allow/deny lists and `allowPublicTraffic` could not be set per request.
+    ColdFixture f;
+    ApiImpl impl = f.Impl();
+
+    CreateColdSandboxReq req = RequestFor("python:3.11-slim");
+    SandboxNetworkConfigModel network;
+    network.allow_public_traffic = core::Optional<bool>(false);
+    req.network = core::Optional<SandboxNetworkConfigModel>(network);
+
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateColdSandbox(req);
+    MT_EXPECT_TRUE(created.ok());
+    if (!created.ok()) return;
+    // Only a sandbox that disallows public traffic gets a traffic token.
+    MT_EXPECT_TRUE(created.value().traffic_access_token.has_value());
+
+    const core::Expected<CreateSandboxResp, ApiError> open =
+        impl.CreateColdSandbox(RequestFor("python:3.11-slim"));
+    MT_EXPECT_TRUE(open.ok());
+    if (!open.ok()) return;
+    MT_EXPECT_TRUE(!open.value().traffic_access_token.has_value());
+}
+
+MT_TEST(an_invalid_cold_network_config_is_a_400) {
+    ColdFixture f;
+    ApiImpl impl = f.Impl();
+
+    CreateColdSandboxReq req = RequestFor("python:3.11-slim");
+    SandboxNetworkConfigModel network;
+    std::vector<std::string> allow;
+    allow.push_back("2001:db8::/32");
+    network.allow_out = core::Optional<std::vector<std::string> >(allow);
+    req.network = core::Optional<SandboxNetworkConfigModel>(network);
+
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateColdSandbox(req);
+    MT_EXPECT_TRUE(!created.ok());
+    if (created.ok()) return;
+    MT_EXPECT_EQ(created.error().code, 400);
+    MT_EXPECT_EQ(f.orch.factory->build_calls, 0);
+}
+
 // ---- volumes ---------------------------------------------------------------
 
 MT_TEST(cold_volume_drives_travel_on_the_image_source) {

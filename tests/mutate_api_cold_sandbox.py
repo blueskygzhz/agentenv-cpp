@@ -110,19 +110,60 @@ MUTATIONS = [
     ),
     # `autoPause` absent starts deleting sandboxes on timeout instead of
     # pausing them.
+    #
+    # Anchored on the following line, because `CreateSandbox` now carries the
+    # identical expression: an ambiguous anchor would mutate whichever handler
+    # came first and this suite would not be the one to notice.
     (
         "auto_pause_default_flips_to_delete",
         IMPLS,
-        "    request.timeout_action = req.auto_pause.has_value() && !*req.auto_pause",
-        "    request.timeout_action = !req.auto_pause.has_value() || !*req.auto_pause",
+        "    request.timeout_action = req.auto_pause.has_value() && !*req.auto_pause\n"
+        "                                 ? orchestrator::SandboxTimeoutAction::Delete\n"
+        "                                 : orchestrator::SandboxTimeoutAction::Pause;\n"
+        "    // Rust `body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled)`.\n"
+        "    request.auto_resume = req.auto_resume.has_value() && *req.auto_resume;",
+        "    request.timeout_action = !req.auto_pause.has_value() || !*req.auto_pause\n"
+        "                                 ? orchestrator::SandboxTimeoutAction::Delete\n"
+        "                                 : orchestrator::SandboxTimeoutAction::Pause;\n"
+        "    // Rust `body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled)`.\n"
+        "    request.auto_resume = req.auto_resume.has_value() && *req.auto_resume;",
+    ),
+    # The cold path stops honouring `autoResume`, so a paused cold sandbox can
+    # never be woken by an incoming request.
+    (
+        "cold_auto_resume_never_requested",
+        IMPLS,
+        "    request.auto_resume = req.auto_resume.has_value() && *req.auto_resume;\n"
+        "    request.custom_extension_params = params.value();",
+        "    request.custom_extension_params = params.value();",
+    ),
+    # Non-empty params with no configured extension stop being refused, so the
+    # sandbox starts and the params are silently dropped.
+    (
+        "cold_custom_extension_params_validation_skipped",
+        IMPLS,
+        "    if (!params_ok.ok()) {\n"
+        "        return core::make_unexpected(ApiError::Make(400, params_ok.error()));\n"
+        "    }\n"
+        "\n    orchestrator::CreateSandboxRequest request;",
+        "\n    orchestrator::CreateSandboxRequest request;",
     ),
     # The cold timeout is read as milliseconds, as `NewSandbox`'s is: a factor
     # of 1000 in how long a sandbox lives.
+    #
+    # Anchored on the following line, since `CreateSandbox` now converts the
+    # same way: both bodies carry `timeout` in seconds.
     (
         "cold_timeout_read_as_milliseconds",
         IMPLS,
-        "        request.timeout_ms = core::Optional<int64_t>(*req.timeout_secs * 1000);",
-        "        request.timeout_ms = core::Optional<int64_t>(*req.timeout_secs);",
+        "        request.timeout_ms = core::Optional<int64_t>(*req.timeout_secs * 1000);\n"
+        "    }\n"
+        "    for (std::size_t i = 0; i < req.env_vars.size(); ++i) {\n"
+        "        // `KEY=VALUE`, as in `CreateSandbox`.",
+        "        request.timeout_ms = core::Optional<int64_t>(*req.timeout_secs);\n"
+        "    }\n"
+        "    for (std::size_t i = 0; i < req.env_vars.size(); ++i) {\n"
+        "        // `KEY=VALUE`, as in `CreateSandbox`.",
     ),
     # The requested volumes never reach the launch, so the guest comes up
     # without the disks the caller asked for while the API still answers 201.

@@ -85,6 +85,93 @@ MUTATIONS = [
         "    if (requested_drive_count > free_slots) {",
         "    if (false) {",
     ),
+    # The five request fields the handler never used to set. Each was plumbed
+    # all the way downstream, so breaking one again is invisible except here.
+    (
+        "network_policy_not_built_from_the_request",
+        IMPLS,
+        "    request.network_policy = policy.value();\n"
+        "\n    // Rust `params_model_to_map`",
+        "\n    // Rust `params_model_to_map`",
+    ),
+    (
+        "network_config_half_of_the_policy_ignored",
+        IMPLS,
+        "        NetworkPolicyFromCreate(req.allow_internet_access,\n"
+        "                                req.network.has_value() ? &*req.network : NULL);\n"
+        "    if (!policy.ok()) {\n"
+        "        return core::make_unexpected(ApiError::Make(400, policy.error()));\n"
+        "    }\n"
+        "    request.network_policy = policy.value();",
+        "        NetworkPolicyFromCreate(req.allow_internet_access, NULL);\n"
+        "    if (!policy.ok()) {\n"
+        "        return core::make_unexpected(ApiError::Make(400, policy.error()));\n"
+        "    }\n"
+        "    request.network_policy = policy.value();",
+    ),
+    (
+        "invalid_network_reported_as_a_server_fault",
+        IMPLS,
+        "    if (!policy.ok()) {\n"
+        "        return core::make_unexpected(ApiError::Make(400, policy.error()));\n"
+        "    }\n"
+        "    request.network_policy = policy.value();",
+        "    if (!policy.ok()) {\n"
+        "        return core::make_unexpected(InternalError(policy.error()));\n"
+        "    }\n"
+        "    request.network_policy = policy.value();",
+    ),
+    (
+        "auto_pause_default_flips_to_delete",
+        IMPLS,
+        "    request.timeout_action = req.auto_pause.has_value() && !*req.auto_pause\n"
+        "                                 ? orchestrator::SandboxTimeoutAction::Delete\n"
+        "                                 : orchestrator::SandboxTimeoutAction::Pause;\n"
+        "    // Rust `body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled)`. The",
+        "    request.timeout_action = orchestrator::SandboxTimeoutAction::Pause;\n"
+        "    // Rust `body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled)`. The",
+    ),
+    (
+        "auto_resume_never_requested",
+        IMPLS,
+        "    request.auto_resume = req.auto_resume.has_value() && *req.auto_resume;\n"
+        "    // Rust `user_metadata: body.metadata.clone()`.",
+        "    // Rust `user_metadata: body.metadata.clone()`.",
+    ),
+    # Anchored on the preceding comment: the identical loop appears in
+    # `CreateColdSandbox` too, and an ambiguous anchor would mutate whichever
+    # handler came first.
+    (
+        "request_metadata_dropped",
+        IMPLS,
+        "    // Rust `user_metadata: body.metadata.clone()`.\n"
+        "    for (std::map<std::string, std::string>::const_iterator it = req.metadata.begin();\n"
+        "         it != req.metadata.end(); ++it) {\n"
+        "        request.user_metadata[it->first] = it->second;\n"
+        "    }",
+        "",
+    ),
+    (
+        "custom_extension_params_validation_skipped",
+        IMPLS,
+        "    if (!params_ok.ok()) {\n"
+        "        return core::make_unexpected(ApiError::Make(400, params_ok.error()));\n"
+        "    }\n"
+        "    // Rust's snapshot path passes",
+        "    // Rust's snapshot path passes",
+    ),
+    (
+        "timeout_read_as_milliseconds",
+        IMPLS,
+        "        request.timeout_ms = core::Optional<int64_t>(*req.timeout_secs * 1000);\n"
+        "    }\n"
+        "    for (std::size_t i = 0; i < req.env_vars.size(); ++i) {\n"
+        "        // `KEY=VALUE`, as the DTO carries them.",
+        "        request.timeout_ms = core::Optional<int64_t>(*req.timeout_secs);\n"
+        "    }\n"
+        "    for (std::size_t i = 0; i < req.env_vars.size(); ++i) {\n"
+        "        // `KEY=VALUE`, as the DTO carries them.",
+    ),
     # `check_snapshot_volume_replacement` stops firing.
     (
         "volume_replacement_check_disabled",

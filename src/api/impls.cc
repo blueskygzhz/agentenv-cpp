@@ -326,8 +326,54 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
     }
     request.source = source.value();
 
-    if (req.timeout_ms > 0) {
-        request.timeout_ms = core::Optional<int64_t>(req.timeout_ms);
+    // Rust `network_policy_from_create(body.allow_internet_access,
+    // body.network.as_ref())`. This used to be skipped entirely on the
+    // snapshot path, leaving `request.network_policy` default-constructed --
+    // so `allow_internet_access` and the whole `network` config were accepted
+    // by no field and honoured by no code, and every restored sandbox got
+    // whatever the default policy happens to be rather than the one asked for.
+    const core::Expected<sandbox::network::SandboxNetworkPolicy, std::string> policy =
+        NetworkPolicyFromCreate(req.allow_internet_access,
+                                req.network.has_value() ? &*req.network : NULL);
+    if (!policy.ok()) {
+        return core::make_unexpected(ApiError::Make(400, policy.error()));
+    }
+    request.network_policy = policy.value();
+
+    // Rust `params_model_to_map` + `validate_custom_extension_params`.
+    const core::Expected<core::Optional<sandbox::custom_extension::Params>, std::string>
+        params = ParamsModelToMap(req.custom_extension_params);
+    if (!params.ok()) return core::make_unexpected(ApiError::Make(400, params.error()));
+    const core::Expected<core::Unit, std::string> params_ok =
+        ValidateCustomExtensionParams(params.value());
+    if (!params_ok.ok()) {
+        return core::make_unexpected(ApiError::Make(400, params_ok.error()));
+    }
+    // Rust's snapshot path passes the request's value straight through; the
+    // *inheritance* from the capture happens in `create_sandbox_inner`, which
+    // reads `source.snapshot_custom_extension_params` when this is unset.
+    request.custom_extension_params = params.value();
+
+    // Rust `match body.auto_pause { Some(false) => Delete, _ => Pause }`.
+    request.timeout_action = req.auto_pause.has_value() && !*req.auto_pause
+                                 ? orchestrator::SandboxTimeoutAction::Delete
+                                 : orchestrator::SandboxTimeoutAction::Pause;
+    // Rust `body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled)`. The
+    // orchestrator stores this on the record (`service.cc:1257`) and the proxy
+    // reads it back to decide whether a paused sandbox may be woken by an
+    // incoming request (`service.cc:514`) -- a chain that was fully wired and
+    // permanently false, because no request could ask for it.
+    request.auto_resume = req.auto_resume.has_value() && *req.auto_resume;
+    // Rust `user_metadata: body.metadata.clone()`.
+    for (std::map<std::string, std::string>::const_iterator it = req.metadata.begin();
+         it != req.metadata.end(); ++it) {
+        request.user_metadata[it->first] = it->second;
+    }
+
+    // Rust `duration_from_secs(body.timeout)` — **seconds**, and absent means
+    // the node's configured default rather than any value spelled here.
+    if (req.timeout_secs.has_value()) {
+        request.timeout_ms = core::Optional<int64_t>(*req.timeout_secs * 1000);
     }
     for (std::size_t i = 0; i < req.env_vars.size(); ++i) {
         // `KEY=VALUE`, as the DTO carries them. A pair without `=` is dropped
@@ -451,15 +497,22 @@ ApiImpl::CreateColdSandbox(const CreateColdSandboxReq& req) {
     if (!resources.ok()) return core::make_unexpected(resources.error());
 
     // Rust `network_policy_from_create(body.allow_internet_access,
-    // body.network.as_ref())`. The `network` half of the body is not ported,
-    // so the allow/deny lists and `allowPublicTraffic` cannot be set per
-    // request; `allowInternetAccess` is, and it is the tri-state that decides
-    // whether the sandbox gets egress at all. Passing NULL for the detailed
-    // config is upstream's own `None` arm, not an approximation.
+    // body.network.as_ref())`.
     const core::Expected<sandbox::network::SandboxNetworkPolicy, std::string> policy =
-        NetworkPolicyFromCreate(req.allow_internet_access, NULL);
+        NetworkPolicyFromCreate(req.allow_internet_access,
+                                req.network.has_value() ? &*req.network : NULL);
     if (!policy.ok()) {
         return core::make_unexpected(ApiError::Make(400, policy.error()));
+    }
+
+    // Rust `params_model_to_map` + `validate_custom_extension_params`.
+    const core::Expected<core::Optional<sandbox::custom_extension::Params>, std::string>
+        params = ParamsModelToMap(req.custom_extension_params);
+    if (!params.ok()) return core::make_unexpected(ApiError::Make(400, params.error()));
+    const core::Expected<core::Unit, std::string> params_ok =
+        ValidateCustomExtensionParams(params.value());
+    if (!params_ok.ok()) {
+        return core::make_unexpected(ApiError::Make(400, params_ok.error()));
     }
 
     orchestrator::CreateSandboxRequest request;
@@ -513,9 +566,12 @@ ApiImpl::CreateColdSandbox(const CreateColdSandboxReq& req) {
     request.timeout_action = req.auto_pause.has_value() && !*req.auto_pause
                                  ? orchestrator::SandboxTimeoutAction::Delete
                                  : orchestrator::SandboxTimeoutAction::Pause;
-    // Rust `duration_from_secs(body.timeout)`: this body carries seconds,
-    // while `NewSandbox` carries milliseconds. Reading one as the other is a
-    // factor of 1000 in how long a sandbox lives.
+    // Rust `body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled)`.
+    request.auto_resume = req.auto_resume.has_value() && *req.auto_resume;
+    request.custom_extension_params = params.value();
+    // Rust `duration_from_secs(body.timeout)` — seconds, as in `NewSandbox`.
+    // Both bodies spell this field `timeout` and both mean seconds; an earlier
+    // note here claimed `NewSandbox` carried milliseconds, which was wrong.
     if (req.timeout_secs.has_value()) {
         request.timeout_ms = core::Optional<int64_t>(*req.timeout_secs * 1000);
     }

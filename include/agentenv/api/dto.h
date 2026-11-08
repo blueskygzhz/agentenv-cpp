@@ -39,24 +39,85 @@ struct NewColdSandboxResources {
     core::Optional<uint32_t> disk_size_mb;
 };
 
-/// POST /sandboxes  request body.
+/// Rust generated `models::SandboxNetworkConfig`.
+///
+/// In this header, not `sandbox_params.h`, for the same reason as the two
+/// above: `CreateSandboxReq` and `CreateColdSandboxReq` carry one, and
+/// `sandbox_params.h` includes *this* header. `NetworkPolicyFromCreate`, which
+/// consumes it, stays declared there.
+struct SandboxNetworkConfigModel {
+    core::Optional<std::vector<std::string> > allow_out;
+    core::Optional<std::vector<std::string> > deny_out;
+    core::Optional<bool>                      allow_public_traffic;
+};
+
+/// POST /sandboxes  request body (Rust generated `models::NewSandbox`).
+///
+/// The JSON keys are upstream's `#[serde(rename)]` spellings, which are *not*
+/// uniform: `templateID` and `envVars` are camelCase while
+/// `allow_internet_access` is snake_case. `NewColdSandbox` spells that same
+/// field `allowInternetAccess`. Reproduced rather than regularised, because
+/// this header claims E2B wire compatibility and a client speaks the schema's
+/// spelling, not a tidier one.
 struct CreateSandboxReq {
+    /// Rust `template_id: String`, key `templateID` — the only required field.
     std::string template_id;
+    /// Rust `env_vars`, key `envVars`.
     std::vector<std::string> env_vars;
-    int64_t     timeout_ms = 300000;
+    /// Rust `timeout: Option<u32>`, key `timeout`, in **seconds**.
+    ///
+    /// Optional, and the schema's `default: 15` is deliberately *not* applied
+    /// here: the generated model carries no `#[serde(default)]`, so an omitted
+    /// timeout reaches `duration_from_secs(None)` as `None` and the node's
+    /// configured default applies. Baking 15 in would override that default
+    /// with a value no operator chose.
+    core::Optional<int64_t> timeout_secs;
     /// Rust `secure: body.secure == Some(true)` — only a JSON `true` turns on
     /// envd access-token enforcement.
     bool        secure = false;
+    /// Rust `auto_pause: Option<bool>`, key `autoPause`. Only an explicit
+    /// `false` selects `SandboxTimeoutAction::Delete`; absent and `true` both
+    /// mean Pause.
+    core::Optional<bool> auto_pause;
+    /// Rust `auto_resume: Option<SandboxAutoResumeConfig>`, key `autoResume`,
+    /// read as `is_some_and(|cfg| cfg.enabled)`.
+    ///
+    /// Flattened to the inner `enabled` flag because that is the only member
+    /// the schema defines and the only one upstream reads. The nesting is
+    /// still honoured on the wire: `{"autoResume": {"enabled": true}}`.
+    core::Optional<bool> auto_resume;
+    /// Rust `allow_internet_access: Option<bool>` — note the snake_case key,
+    /// which is upstream's spelling for *this* body only. A tri-state: absent
+    /// means "inherit the node default", which is distinct from an explicit
+    /// allow or deny.
+    core::Optional<bool> allow_internet_access;
+    /// Rust `network: Option<SandboxNetworkConfig>`.
+    core::Optional<SandboxNetworkConfigModel> network;
+    /// Rust `metadata: Option<HashMap<String, String>>`.
+    std::map<std::string, std::string> metadata;
+    /// Rust `custom_extension_params: Option<CustomExtensionParams>`, key
+    /// `customExtensionParams`.
+    ///
+    /// Held as raw JSON rather than as `sandbox::custom_extension::Params` so
+    /// this header need not include the whole custom-extension client. The
+    /// conversion happens in the handler, which is where upstream's
+    /// `params_model_to_map` runs too.
+    core::Optional<core::Json> custom_extension_params;
     /// Rust `volume_mounts: Option<Vec<models::SandboxVolumeMount>>`, JSON key
     /// `volumeMounts`.
     ///
     /// Optional rather than a plain vector because upstream's
     /// `sandboxes_post` branches on `is_some()`, not on emptiness: an absent
     /// list means "restore whatever volumes the snapshot captured", while a
-    /// present empty list means "this sandbox has no volumes". Collapsing the
-    /// two would make a restore indistinguishable from an explicit refusal of
-    /// every volume.
+    /// present empty list means "this sandbox has no volumes". The schema says
+    /// so outright -- "providing this field, including an empty array, returns
+    /// HTTP 400" -- so collapsing the two would turn a documented 400 into a
+    /// silent restore.
     core::Optional<std::vector<SandboxVolumeMountModel> > volume_mounts;
+
+    // `mcp` is absent because nothing in this port implements MCP; a field
+    // accepted and ignored would report success for a sandbox that never got
+    // the servers the caller asked for.
 
     core::Json ToJson() const;
     static core::Expected<CreateSandboxReq, core::AnyError> FromJson(const core::Json& j);
@@ -104,8 +165,19 @@ struct CreateColdSandboxReq {
     /// Rust `auto_pause: Option<bool>` — only an explicit `false` turns the
     /// timeout action into Delete. Absent means Pause, as does `true`.
     core::Optional<bool> auto_pause;
+    /// Rust `auto_resume`, key `autoResume`, flattened to its `enabled` member
+    /// exactly as `CreateSandboxReq::auto_resume` is.
+    core::Optional<bool> auto_resume;
+    /// Rust `allow_internet_access: Option<bool>` — key `allowInternetAccess`
+    /// here. `NewSandbox` spells the same field `allow_internet_access`; the
+    /// inconsistency is upstream's and both spellings are reproduced.
     core::Optional<bool> allow_internet_access;
+    /// Rust `network: Option<SandboxNetworkConfig>`.
+    core::Optional<SandboxNetworkConfigModel> network;
     std::map<std::string, std::string> metadata;
+    /// Rust `custom_extension_params`, key `customExtensionParams`. Raw JSON,
+    /// for the reason given on `CreateSandboxReq`'s copy of this field.
+    core::Optional<core::Json> custom_extension_params;
     /// Rust `volume_mounts: Option<Vec<models::SandboxVolumeMount>>`.
     core::Optional<std::vector<SandboxVolumeMountModel> > volume_mounts;
     /// Rust `extra_boot_args: Option<String>`, appended to the guest kernel

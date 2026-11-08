@@ -4,7 +4,7 @@
 //
 // The chain this covers is the one that was broken end to end:
 //
-//   POST /sandboxes {"template_id": X}
+//   POST /sandboxes {"templateID": X}
 //     -> repository.Get(X)                     (was never called)
 //     -> SnapshotRuntimeResolver::Resolve(rec)  (had no production caller)
 //     -> SandboxLaunchSource::FromRunnableSnapshot  (did not exist)
@@ -42,6 +42,20 @@ CreateSandboxReq RequestFor(const std::string& template_id) {
     CreateSandboxReq req;
     req.template_id = template_id;
     return req;
+}
+
+/// The stored record for a sandbox the handler just created. Several fields
+/// under test (`timeout_action`, `auto_resume`, `user_metadata`) live on the
+/// record rather than on the launch config.
+core::Optional<orchestrator::SandboxMetadata> StoredRecord(
+    Fixture& f, const std::string& sandbox_id) {
+    const core::Expected<core::SandboxId, std::string> id =
+        core::SandboxId::Parse(sandbox_id);
+    if (!id.ok()) return core::Optional<orchestrator::SandboxMetadata>();
+    const orchestrator::OrchestratorResult<core::Optional<orchestrator::SandboxMetadata> >
+        found = f.orch->GetSandbox(id.value());
+    if (!found.ok()) return core::Optional<orchestrator::SandboxMetadata>();
+    return found.value();
 }
 
 }  // namespace
@@ -314,6 +328,193 @@ MT_TEST(free_drive_slots_saturates_rather_than_wrapping) {
     MT_EXPECT_EQ(manifest.EffectivePhysicalExtraDriveCount(),
                  static_cast<std::size_t>(0));
     MT_EXPECT_EQ(manifest.FreeDriveSlots(), static_cast<std::size_t>(0));
+}
+
+// ---- the schema fields the handler could not receive -----------------------
+//
+// Five request fields were never set on the snapshot path: `network_policy`,
+// `timeout_action`, `auto_resume`, `user_metadata` and
+// `custom_extension_params`. Each was fully plumbed downstream, so the break
+// was invisible from anywhere except the handler itself.
+
+MT_TEST(the_network_policy_is_built_from_the_request) {
+    // Previously `request.network_policy` was left default-constructed, so
+    // `allow_internet_access` and the whole `network` config had no effect.
+    Fixture f;
+    SnapshotSourceFixture snap;
+    ApiImpl impl = MakeImpl(f, snap);
+
+    CreateSandboxReq req = RequestFor(snap.template_id());
+    SandboxNetworkConfigModel network;
+    network.allow_public_traffic = core::Optional<bool>(false);
+    req.network = core::Optional<SandboxNetworkConfigModel>(network);
+
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateSandbox(req);
+    MT_EXPECT_TRUE(created.ok());
+    if (!created.ok()) return;
+    // `allowPublicTraffic: false` is observable in the response: the handler
+    // only mints a traffic token for a sandbox that disallows public traffic.
+    MT_EXPECT_TRUE(created.value().traffic_access_token.has_value());
+
+    // And the default stays permissive, so the token is absent.
+    const core::Expected<CreateSandboxResp, ApiError> open =
+        impl.CreateSandbox(RequestFor(snap.template_id()));
+    MT_EXPECT_TRUE(open.ok());
+    if (!open.ok()) return;
+    MT_EXPECT_TRUE(!open.value().traffic_access_token.has_value());
+}
+
+MT_TEST(an_invalid_network_config_is_a_400) {
+    // `NetworkPolicyFromCreate` rejects IPv6 CIDRs and bad allowlists. Routing
+    // that to a 500 would blame the node for the caller's body.
+    Fixture f;
+    SnapshotSourceFixture snap;
+    ApiImpl impl = MakeImpl(f, snap);
+
+    CreateSandboxReq req = RequestFor(snap.template_id());
+    SandboxNetworkConfigModel network;
+    std::vector<std::string> allow;
+    allow.push_back("2001:db8::/32");
+    network.allow_out = core::Optional<std::vector<std::string> >(allow);
+    req.network = core::Optional<SandboxNetworkConfigModel>(network);
+
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateSandbox(req);
+    MT_EXPECT_TRUE(!created.ok());
+    if (created.ok()) return;
+    MT_EXPECT_EQ(created.error().code, 400);
+    MT_EXPECT_EQ(f.factory->build_from_snapshot_calls, 0);
+}
+
+MT_TEST(only_an_explicit_auto_pause_false_switches_to_delete) {
+    Fixture f;
+    SnapshotSourceFixture snap;
+    ApiImpl impl = MakeImpl(f, snap);
+
+    const core::Expected<CreateSandboxResp, ApiError> absent =
+        impl.CreateSandbox(RequestFor(snap.template_id()));
+    MT_EXPECT_TRUE(absent.ok());
+    if (!absent.ok()) return;
+    const core::Optional<orchestrator::SandboxMetadata> absent_record =
+        StoredRecord(f, absent.value().sandbox_id);
+    MT_EXPECT_TRUE(absent_record.has_value());
+    if (!absent_record.has_value()) return;
+    MT_EXPECT_TRUE(absent_record->timeout_action ==
+                   orchestrator::SandboxTimeoutAction::Pause);
+
+    CreateSandboxReq deleted = RequestFor(snap.template_id());
+    deleted.auto_pause = core::Optional<bool>(false);
+    const core::Expected<CreateSandboxResp, ApiError> off = impl.CreateSandbox(deleted);
+    MT_EXPECT_TRUE(off.ok());
+    if (!off.ok()) return;
+    const core::Optional<orchestrator::SandboxMetadata> off_record =
+        StoredRecord(f, off.value().sandbox_id);
+    MT_EXPECT_TRUE(off_record.has_value());
+    if (!off_record.has_value()) return;
+    MT_EXPECT_TRUE(off_record->timeout_action ==
+                   orchestrator::SandboxTimeoutAction::Delete);
+}
+
+MT_TEST(auto_resume_reaches_the_stored_record) {
+    // The orchestrator stores this and the proxy reads it back to decide
+    // whether an incoming request may wake a paused sandbox. That chain was
+    // complete and permanently false, because nothing could request it.
+    Fixture f;
+    SnapshotSourceFixture snap;
+    ApiImpl impl = MakeImpl(f, snap);
+
+    CreateSandboxReq req = RequestFor(snap.template_id());
+    req.auto_resume = core::Optional<bool>(true);
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateSandbox(req);
+    MT_EXPECT_TRUE(created.ok());
+    if (!created.ok()) return;
+    const core::Optional<orchestrator::SandboxMetadata> record =
+        StoredRecord(f, created.value().sandbox_id);
+    MT_EXPECT_TRUE(record.has_value());
+    if (!record.has_value()) return;
+    MT_EXPECT_TRUE(record->auto_resume);
+
+    // And an explicitly disabled config stays false, as does an absent one.
+    CreateSandboxReq off = RequestFor(snap.template_id());
+    off.auto_resume = core::Optional<bool>(false);
+    const core::Expected<CreateSandboxResp, ApiError> disabled = impl.CreateSandbox(off);
+    MT_EXPECT_TRUE(disabled.ok());
+    if (!disabled.ok()) return;
+    const core::Optional<orchestrator::SandboxMetadata> off_record =
+        StoredRecord(f, disabled.value().sandbox_id);
+    MT_EXPECT_TRUE(off_record.has_value() && !off_record->auto_resume);
+}
+
+MT_TEST(the_timeout_is_read_as_seconds) {
+    // `NewSandbox::timeout` is seconds, like `NewColdSandbox`'s. The DTO field
+    // used to be `timeout_ms` with a baked-in 300000 default, so a client
+    // sending the schema's `timeout` got the default and a client sending
+    // `timeout_ms` got a value 1000x off.
+    Fixture f;
+    SnapshotSourceFixture snap;
+    ApiImpl impl = MakeImpl(f, snap);
+
+    CreateSandboxReq req = RequestFor(snap.template_id());
+    req.timeout_secs = core::Optional<int64_t>(static_cast<int64_t>(45));
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateSandbox(req);
+    MT_EXPECT_TRUE(created.ok());
+    if (!created.ok()) return;
+    const core::Optional<orchestrator::SandboxMetadata> record =
+        StoredRecord(f, created.value().sandbox_id);
+    MT_EXPECT_TRUE(record.has_value());
+    if (!record.has_value()) return;
+    MT_EXPECT_TRUE(record->timeout_ms.has_value());
+    if (!record->timeout_ms.has_value()) return;
+    MT_EXPECT_EQ(*record->timeout_ms, static_cast<int64_t>(45000));
+}
+
+MT_TEST(request_metadata_reaches_the_stored_record) {
+    Fixture f;
+    SnapshotSourceFixture snap;
+    ApiImpl impl = MakeImpl(f, snap);
+
+    CreateSandboxReq req = RequestFor(snap.template_id());
+    req.metadata["team"]  = "infra";
+    req.metadata["owner"] = "alice";
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateSandbox(req);
+    MT_EXPECT_TRUE(created.ok());
+    if (!created.ok()) return;
+    const core::Optional<orchestrator::SandboxMetadata> record =
+        StoredRecord(f, created.value().sandbox_id);
+    MT_EXPECT_TRUE(record.has_value());
+    if (!record.has_value()) return;
+    MT_EXPECT_EQ(record->user_metadata.size(), static_cast<std::size_t>(2));
+    MT_EXPECT_EQ(record->user_metadata.find("team")->second, std::string("infra"));
+}
+
+MT_TEST(custom_extension_params_without_an_extension_are_refused) {
+    // Rust `validate_custom_extension_params`. No extension is configured in
+    // these tests, so non-empty params are a 400: accepting them would start a
+    // sandbox whose params are silently dropped.
+    Fixture f;
+    SnapshotSourceFixture snap;
+    ApiImpl impl = MakeImpl(f, snap);
+
+    core::Json params;
+    params["tier"] = core::Json(std::string("gold"));
+    CreateSandboxReq req = RequestFor(snap.template_id());
+    req.custom_extension_params = core::Optional<core::Json>(params);
+
+    const core::Expected<CreateSandboxResp, ApiError> created = impl.CreateSandbox(req);
+    MT_EXPECT_TRUE(!created.ok());
+    if (created.ok()) return;
+    MT_EXPECT_EQ(created.error().code, 400);
+    MT_EXPECT_TRUE(created.error().message.find("custom_extension") != std::string::npos);
+    MT_EXPECT_EQ(f.factory->build_from_snapshot_calls, 0);
+
+    // An *empty* object is not a request for anything, so it is allowed --
+    // both halves of upstream's condition matter.
+    const core::Expected<core::Json, core::AnyError> empty_object =
+        core::Json::Parse("{}");
+    MT_EXPECT_TRUE(empty_object.ok());
+    if (!empty_object.ok()) return;
+    CreateSandboxReq empty = RequestFor(snap.template_id());
+    empty.custom_extension_params = core::Optional<core::Json>(empty_object.value());
+    MT_EXPECT_TRUE(impl.CreateSandbox(empty).ok());
 }
 
 MT_MAIN
