@@ -293,6 +293,15 @@ class FreshDriveResources {
     /// errors. `Release` drops it, which only relinquishes this sandbox's
     /// share; the manager keeps one idle device alive for the next launch.
     void AdoptSharedTools(const ublk::SharedReadOnlyDevice& device) { tools_ = device; }
+
+    /// Rust `SandboxResources::mem_ublk_device`.
+    ///
+    /// Same contract as the tools device and for a sharper reason: the memory
+    /// device is what the guest's RAM is paged from for the whole life of a
+    /// resumed sandbox, not just during the load. Dropping the handle once
+    /// `load_snapshot` returned would let the last-holder teardown delete
+    /// `/dev/ublkbN` out from under a running guest.
+    void AdoptSharedMem(const ublk::SharedReadOnlyDevice& device) { mem_ = device; }
     void SetRootfs(const ublk::OverlaybdRuntimeDevice& device) {
         rootfs_ = device;
         has_rootfs_ = true;
@@ -328,6 +337,8 @@ class FreshDriveResources {
     /// Default-constructed (`valid() == false`) when the legacy ext4 drive is
     /// in use, which is why this is the handle type rather than an optional.
     ublk::SharedReadOnlyDevice tools_;
+    /// Default-constructed on a fresh boot, which has no memory device.
+    ublk::SharedReadOnlyDevice mem_;
     ublk::OverlaybdRuntimeDevice rootfs_;
     bool has_rootfs_ = false;
     std::vector<ublk::OverlaybdRuntimeDevice> extra_drives_;
@@ -496,6 +507,16 @@ struct ResumeDrivePlan {
     ToolsDriveResolver tools_drive_resolver;
     /// Rust `ublk.overlaybd.global_config_path`.
     std::string overlaybd_global_config;
+    /// Rust `memory_snapshot.overlaybd_global_config_path` — the global
+    /// config `get_or_create_shared_mem` opens the memory image with.
+    ///
+    /// A *different* setting from `overlaybd_global_config` above, and
+    /// deliberately a separate field rather than a reuse: guest memory is
+    /// paged through its own overlaybd stack with its own cache and download
+    /// policy, and `ValidateOverlaybdGlobalConfigPaths` checks the two
+    /// independently. Feeding the drive config here would open the memory
+    /// image under the rootfs cache settings.
+    std::string mem_overlaybd_global_config;
     /// Rust `ublk.overlaybd.runtime_upper_mode`.
     storage::overlaybd::UpperMode runtime_upper_mode =
         storage::overlaybd::UpperMode::HybridLogStructured;
@@ -545,9 +566,19 @@ struct ResumeStartSpec {
     /// Host path of the block device backing guest memory, which the snapshot
     /// load reads through.
     ///
-    /// Rust gets this from `UblkDeviceManager::get_or_create_shared_mem`. It
-    /// is a parameter here because this port has no ublk daemon: without one
-    /// the resume cannot proceed, and an empty value is what says so.
+    /// **An override, not the normal source.** Rust gets this from
+    /// `UblkDeviceManager::get_or_create_shared_mem` inside `start_resume`,
+    /// and so does `StartResumeInstance` when this is left empty and
+    /// `drives->device_manager` is set. It stays a field only so a test can
+    /// drive the sequence against a fake path with no daemon reachable.
+    ///
+    /// An earlier note here said the path was a parameter "because this port
+    /// has no ublk daemon", and both factory paths filled it from a
+    /// test-only hook. That was already wrong when written -- the same
+    /// factory hands that very manager to `FreshDrivePlan` and to
+    /// `ResumeDrivePlan` -- and it made every production resume fail at
+    /// `BuildResumeSequence` with a message blaming a missing daemon client
+    /// that was in fact wired up.
     std::string mem_device_path;
 
     /// Rust `initial_guest_drive_mounts` — `(index into extra_drives, drive)`

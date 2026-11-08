@@ -387,7 +387,10 @@ MT_TEST(a_resume_without_a_memory_device_is_refused_up_front) {
         BuildResumeSequence(spec);
     MT_EXPECT_TRUE(!built.ok());
     if (built.ok()) return;
-    MT_EXPECT_TRUE(built.error().find("memory block device") != std::string::npos);
+    // Upstream's wording, now that the message names the real condition: an
+    // empty path at this point means there was no device manager to acquire
+    // the device from, not that the port lacks a daemon client.
+    MT_EXPECT_TRUE(built.error().find("ublk daemon client") != std::string::npos);
 }
 
 MT_TEST(a_capture_missing_its_rootfs_is_refused_up_front) {

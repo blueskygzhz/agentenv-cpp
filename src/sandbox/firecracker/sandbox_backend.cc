@@ -214,6 +214,13 @@ core::Expected<core::Unit, std::string> FreshDriveResources::Release() {
     // removed from under a guest that is still running.
     tools_ = ublk::SharedReadOnlyDevice();
 
+    // Rust `self.resources.mem_ublk_device`, dropped on the same terms and
+    // for the same reason: many sandboxes resumed from one capture share a
+    // single read-only memory device, so this hands back only this sandbox's
+    // share. Released after the VMM has stopped -- a memory device torn down
+    // under a running guest does not fail an I/O, it faults the guest's RAM.
+    mem_ = ublk::SharedReadOnlyDevice();
+
     // Taken before the call, as Rust's `network_slot.take()`: the manager owns
     // the slot from here whether it pools it or tears it down, so a retry must
     // not hand it back a second time.
@@ -968,14 +975,52 @@ StartResumeInstance(const ResumeStartSpec& spec, std::shared_ptr<Connector> conn
             std::string("resume from the warm pool needs a resource holder"));
     }
 
+    // Rust `acquire_shared_mem_device`. Production resumes reach it here;
+    // `spec.mem_device_path` is an override that only tests set.
+    //
+    // Upstream acquires the device later, after the work dir and the network
+    // slot, and fails fast *before* them on `is_available()` alone. This port
+    // has to acquire before `BuildResumeSequence`, because that is what bakes
+    // the path into the `SnapshotLoad` step. The observable difference is
+    // only which resources exist when a broken capture is rejected, and
+    // acquiring first releases strictly less: the handle below is dropped on
+    // every early return, whereas upstream's ordering has a work dir and a
+    // tap device to unwind. The device is shared and reference-counted, so
+    // taking it early costs a refcount, not a creation.
+    ublk::SharedReadOnlyDevice mem_device;
+    std::string mem_device_path = spec.mem_device_path;
+    if (mem_device_path.empty() && spec.drives.has_value() &&
+        spec.drives->device_manager) {
+        ublk::CreateSpec create;
+        create.image_config = spec.snapshot_config.mem_overlaybd_config.image_config_path;
+        create.global_config = spec.drives->mem_overlaybd_global_config;
+        const ublk::daemon::DaemonResult<ublk::SharedReadOnlyDevice> acquired =
+            spec.drives->device_manager->GetOrCreateSharedMem(
+                create, spec.snapshot_config.mem_virtual_size);
+        if (!acquired.ok()) {
+            return core::make_unexpected(
+                std::string("create or reuse shared memory ublk device for resume: ") +
+                acquired.error().message);
+        }
+        mem_device = acquired.value();
+        mem_device_path = mem_device.device_path();
+        // Recorded before anything else can fail, exactly as the fresh path
+        // records each device as soon as it exists: an early return from here
+        // on must still hand this share back.
+        if (resources != NULL) resources->AdoptSharedMem(mem_device);
+    }
+
     // The sequence is built first, exactly as the fresh path builds its
     // configure plan up front: every check inside is a property of the capture
     // itself, so finding one after a VMM is running means killing it for
     // something that was knowable before anything was created.
     std::vector<ResumeStep> steps;
     {
+        // The acquired path, not the (usually empty) one the caller passed.
+        ResumeStartSpec sequenced = spec;
+        sequenced.mem_device_path = mem_device_path;
         const core::Expected<std::vector<ResumeStep>, std::string> built =
-            BuildResumeSequence(spec);
+            BuildResumeSequence(sequenced);
         if (!built.ok()) return core::make_unexpected(built.error());
         steps = built.value();
     }

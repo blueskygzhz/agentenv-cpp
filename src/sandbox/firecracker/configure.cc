@@ -334,13 +334,18 @@ BuildResumeSequence(const ResumeStartSpec& spec) {
     if (config.vm_state_path.empty()) {
         return core::make_unexpected(std::string("snapshot vm state path is missing"));
     }
-    // Rust fails fast on `UblkDeviceManager::is_available()` for exactly this:
-    // memory restore reads through a block device, and without one the load
-    // would be issued against a path that does not exist.
+    // Rust `ensure!(UblkDeviceManager::global().is_available())`, which fails
+    // fast for exactly this: memory restore reads through a block device, and
+    // without one the load would be issued against a path that is not one.
+    //
+    // By the time the sequence is built, `StartResumeInstance` has already
+    // acquired the device, so an empty path here means there was no device
+    // manager to acquire it from -- the same condition Rust's `ensure!`
+    // catches, reported in the same terms.
     if (spec.mem_device_path.empty()) {
         return core::make_unexpected(std::string(
-            "snapshot resume requires a memory block device "
-            "(this build has no ublk daemon client)"));
+            "snapshot resume requires an available ublk daemon client "
+            "because memory restore uses a shared ublk device"));
     }
 
     // 1. Logger first. Firecracker accepts `PUT /logger` pre-boot only, and a

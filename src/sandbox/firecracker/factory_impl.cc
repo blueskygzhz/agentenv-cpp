@@ -35,10 +35,10 @@ class FirecrackerSandboxFactory::Impl {
     bool has_app_config;
     core::Optional<std::string> cpu_config_json;
 
-    /// Stands in for `UblkDeviceManager::get_or_create_shared_mem`, which this
-    /// port has no client for. Empty in production, which is what makes a
-    /// resume refuse at start instead of loading from a path that is not a
-    /// block device.
+    /// Overrides `get_or_create_shared_mem` for tests that drive the resume
+    /// sequence with no daemon reachable. Empty in production, where
+    /// `StartResumeInstance` acquires the real device from
+    /// `ublk_device_manager` below.
     std::string mem_device_path_for_testing;
     std::shared_ptr<Connector> connector_for_testing;
     /// Rust `UblkDeviceManager::global()`.
@@ -78,6 +78,12 @@ class FirecrackerSandboxFactory::Impl {
         plan.tools_drive_version = snapshot_config.common.tools_drive_version;
         plan.tools_drive_resolver = tools_drive_resolver;
         plan.overlaybd_global_config = app_config.ublk.overlaybd.global_config_path;
+        // Rust `ConfigManager::global_config().memory_snapshot
+        // .overlaybd_global_config_path`, read inside
+        // `acquire_shared_mem_device`. Not the drive config on the line above:
+        // guest memory pages through its own overlaybd stack.
+        plan.mem_overlaybd_global_config =
+            app_config.memory_snapshot.overlaybd_global_config_path;
         plan.runtime_upper_mode = app_config.ublk.overlaybd.runtime_upper_mode;
         plan.extra_drive_allow_shrink = app_config.ublk.overlaybd.allow_shrink;
         return core::Optional<ResumeDrivePlan>(plan);
@@ -327,9 +333,10 @@ FirecrackerSandboxFactory::BuildFromSnapshot(const RunnableSnapshotView& snapsho
         static_cast<int64_t>(snapshot_config.common.runtime_policy.envd_timeout_ms);
     spec.envd_poll_ms =
         static_cast<int64_t>(snapshot_config.common.runtime_policy.envd_poll_interval_ms);
-    // Same as the paused-state path: Rust acquires the shared memory device in
-    // `start_resume`, and this port has no ublk client, so the refusal lands
-    // at start where Rust's own `ensure!` fires.
+    // Left to `StartResumeInstance`, which acquires the shared memory device
+    // from the same manager `ResumeDrivesFor` below uses -- Rust acquires it
+    // in `start_resume` too, not when the sandbox is built. Non-empty only
+    // under `SetResumeDepsForTesting`.
     spec.mem_device_path = impl_->mem_device_path_for_testing;
     // Rust `from_snapshot`: the launch's drives are absent from the source
     // state and are bound and patched after the load.
@@ -390,11 +397,8 @@ FirecrackerSandboxFactory::BuildFromPausedState(
         static_cast<int64_t>(snapshot_config.common.runtime_policy.envd_timeout_ms);
     spec.envd_poll_ms =
         static_cast<int64_t>(snapshot_config.common.runtime_policy.envd_poll_interval_ms);
-    // Left empty: Rust gets it from `get_or_create_shared_mem`, and this port
-    // has no ublk daemon client. `BuildResumeSequence` turns that into a
-    // refusal naming the missing daemon, so the backend is constructed and
-    // fails at start -- where Rust's own `ensure!(is_available())` fires too,
-    // rather than at construction where Rust would still succeed.
+    // As on the snapshot path: acquired at start from the device manager, not
+    // here. Non-empty only under `SetResumeDepsForTesting`.
     spec.mem_device_path = impl_->mem_device_path_for_testing;
     // No `initial_guest_drive_mounts`: every drive of a paused capture is in
     // its state, so all of them are bound before the load.
