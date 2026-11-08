@@ -11,9 +11,13 @@
 #include "agentenv/core/digest.h"
 #include "agentenv/core/fs.h"
 #include "agentenv/core/identity.h"
+#include "agentenv/image/cache_store.h"
 #include "agentenv/image/commit_index.h"
 #include "agentenv/image/resolver.h"
 #include "agentenv/p2p/mock.h"
+// The consumer of `cache::OverlaybdLayerStore` on the other side of the
+// image/snapshot boundary.
+#include "agentenv/snapshot/runtime_support.h"
 #include "agentenv/storage/overlaybd/local_file.h"
 #include "agentenv/storage/overlaybd/lsmt_rw.h"
 #include "image_test_support.h"
@@ -597,6 +601,101 @@ MT_TEST(overlaybd_layer_location_binds_file_for_cache_local_and_dir_for_remote) 
     MT_EXPECT_TRUE(location.kind == OverlaybdLayerLocation::Kind::CacheDir);
 }
 
+// ---- the layer store across the image/snapshot boundary ------------------
+
+namespace {
+
+/// Stands in for the managed-layer resolver. These layers are all external,
+/// so this must never run; failing loudly beats returning something plausible
+/// and having the assertions below pass for the wrong reason.
+snapshot::RuntimeImageMaterializer::ResolveManagedResult
+NeverResolvesManaged(void*, size_t, const snapshot::ManagedLayer&) {
+    return core::make_unexpected(snapshot::repository::RepositoryError::Backend(
+        "resolve managed layer", "the materializer took the managed branch"));
+}
+
+}  // namespace
+
+MT_TEST(the_cache_layer_store_decides_file_versus_dir_in_a_materialized_config) {
+    // The decision `ImageCacheService::LayerLocation` makes is only worth
+    // anything if it reaches the overlaybd `image.json` a snapshot launches
+    // from, and that config is written on the *snapshot* side.
+    //
+    // **This test could not be written before.** `OverlaybdLayerStore` was
+    // declared twice -- once in `image/cache_store.h` (implemented) and again
+    // in `snapshot/runtime_support.h` (consumed) -- with byte-identical
+    // signatures. Two identical C++ types are still two types, so the
+    // argument below simply would not convert, and the cache's store could
+    // never drive the materializer in production either.
+    TempRoot temp;
+    std::shared_ptr<ImageCacheService> service = TestService(temp);
+    const std::string payload = "layerbytes";
+    const std::string commit_file = WriteCommitFile(*service, "sha256:layer", payload);
+    const uint64_t size = payload.size();
+
+    cache::LocalImageServices services = cache::LocalImageServicesFromService(
+        service, core::Optional<std::pair<uint64_t, uint64_t> >(), 0);
+    MT_EXPECT_TRUE(static_cast<bool>(services.overlaybd_layers));
+    if (!services.overlaybd_layers) return;
+
+    snapshot::RuntimeImageMaterializer materializer(temp.path + "/runtime",
+                                                    services.overlaybd_layers.get());
+
+    // Same cached commit twice; only the registry fallback differs, which is
+    // the single input the store's decision turns on.
+    std::vector<snapshot::OverlaybdLayerRef> layers;
+    snapshot::ExternalLayer local_only;
+    local_only.digest = "sha256:layer";
+    local_only.size   = size;
+    layers.push_back(snapshot::OverlaybdLayerRef::External(local_only));
+
+    snapshot::ExternalLayer recoverable;
+    recoverable.digest        = "sha256:layer";
+    recoverable.size          = size;
+    recoverable.repo_blob_url = "https://registry.example/v2/repo/blobs/";
+    layers.push_back(snapshot::OverlaybdLayerRef::External(recoverable));
+
+    const std::string destination = temp.path + "/runtime/materialized/image.json";
+    const snapshot::repository::RepositoryResult<std::string> written =
+        materializer.MaterializeImageConfig(layers, destination, "rootfs", std::string(),
+                                            &NeverResolvesManaged, NULL);
+    MT_EXPECT_TRUE(written.ok());
+    if (!written.ok()) {
+        MT_EXPECT_EQ(written.error().ToString(), std::string(""));
+        return;
+    }
+
+    const core::Expected<storage::overlaybd::ImageConfig, std::string> config =
+        storage::overlaybd::LoadImageConfig(destination);
+    MT_EXPECT_TRUE(config.ok());
+    if (!config.ok()) return;
+    MT_EXPECT_EQ(config.value().lowers.size(), static_cast<std::size_t>(2));
+    if (config.value().lowers.size() != 2) return;
+
+    // Compared against the *normalized* paths, because `LoadImageConfig` is
+    // read + `ResolveImageConfigLocalPaths` + validate, exactly as upstream's
+    // `load_image_config` is -- it rebases local paths against the config's
+    // directory through `LexicallyNormalizePath`. The cache's own paths are
+    // built by string concatenation and can carry a `//` (they do here, from
+    // `TMPDIR`), so comparing raw strings would be asserting a spelling the
+    // read path deliberately does not preserve. An earlier version of this
+    // test did exactly that and failed; the production code was right.
+    const std::string normalized_commit =
+        storage::overlaybd::LexicallyNormalizePath(commit_file);
+    const std::string normalized_dir = storage::overlaybd::LexicallyNormalizePath(
+        CommitDir(service->commit_store(), "sha256:layer"));
+
+    // Local-only: pinned with `file=`, because nothing else can recover it.
+    MT_EXPECT_EQ(config.value().lowers[0].file, normalized_commit);
+    MT_EXPECT_TRUE(config.value().lowers[0].dir.empty());
+
+    // Remote-recoverable: `dir=` even though the commit is cached, so GC may
+    // still reclaim it. Binding `file=` here is the regression that would
+    // make a reclaimed layer break a running sandbox.
+    MT_EXPECT_EQ(config.value().lowers[1].dir, normalized_dir);
+    MT_EXPECT_TRUE(config.value().lowers[1].file.empty());
+}
+
 MT_TEST(run_gc_collects_free_candidate_and_skips_roots_holds_and_live_refs) {
     TempRoot temp;
     std::shared_ptr<ImageCacheService> service = TestService(temp);
@@ -865,5 +964,37 @@ MT_TEST(evict_source_configs_over_capacity_removes_unrooted_config) {
     MT_EXPECT_TRUE(service->EvictSourceConfigsOverCapacity(0, 0, 0).ok());
     MT_EXPECT_TRUE(!core::fs::Exists(config_path));
 }
+
+// ---- the startup hook ----------------------------------------------------
+//
+// Rust `image::initialize_image_cache_p2p_transport`, called from
+// `src/bin/server.rs`. This port built the transport in `main.cc` and never
+// handed it over, so the cache held none and every P2P layer lookup was
+// skipped -- invisible, because the images still resolve from the registry.
+
+MT_TEST(initialize_image_cache_p2p_transport_reaches_the_shared_service) {
+    TempRoot temp;
+    const std::string node = temp.path + "/node";
+    cfg::AppConfig config;
+    cfg::ImageConfig::Normalize(&config.image, node, node);
+
+    // The instance the production lookups go through. Taken *before* the
+    // hook runs and left untouched: the point is that the hook initialises
+    // this one rather than a second service built from the same config.
+    std::shared_ptr<ImageCacheService> shared = ImageCacheService::SharedFromAppConfig(config);
+    MT_EXPECT_TRUE(!shared->P2pTransport());
+
+    std::shared_ptr<p2p::P2pTransport> transport(new p2p::MockTransport());
+    InitializeImageCacheP2pTransport(config, transport);
+
+    MT_EXPECT_TRUE(shared->P2pTransport() == transport);
+}
+
+// No null-transport case. One was written and deleted rather than kept: the
+// hook has no null guard (see the note on its definition), and a test for one
+// asserted a difference that does not exist -- `InitializeP2pTransport` tests
+// the stored pointer's truthiness, so storing a null and storing nothing are
+// indistinguishable. The mutation that removed the guard survived, which is
+// what showed the guard and its test were both inert.
 
 int main() { return microtest::RunAll(); }

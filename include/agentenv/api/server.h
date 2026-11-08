@@ -22,7 +22,10 @@ namespace agentenv {
 namespace orchestrator { class Orchestrator; }
 namespace volume { class VolumeManager; }
 namespace image { class ImageResolver; }
-namespace snapshot { namespace repository { class SnapshotRepository; } }
+namespace snapshot {
+class SnapshotRuntimeResolver;
+namespace repository { class SnapshotRepository; }
+}  // namespace snapshot
 
 namespace api {
 
@@ -112,12 +115,21 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc)
 /// `repository` may be null on the same terms: only
 /// `POST /sandboxes/{id}/snapshots` reads it, and that route answers 500
 /// rather than reporting a snapshot it never published.
+///
+/// `runtime_resolver` is what `POST /sandboxes` needs to turn a `templateID`
+/// into launchable paths. Null is legal and means that route answers 501:
+/// only the posix-fs repository backend can supply a resolver (see
+/// `snapshot::repository::SnapshotBackend`). Passing it is what connects
+/// `MakeSnapshotBackendFromConfig`'s second return value to the one handler
+/// that consumes it.
 void RegisterOrchestratorRoutes(
     Server* server, orchestrator::Orchestrator* svc,
     std::shared_ptr<volume::VolumeManager> volumes,
     std::shared_ptr<image::ImageResolver> image_resolver,
     std::shared_ptr<snapshot::repository::SnapshotRepository> repository =
-        std::shared_ptr<snapshot::repository::SnapshotRepository>());
+        std::shared_ptr<snapshot::repository::SnapshotRepository>(),
+    std::shared_ptr<snapshot::SnapshotRuntimeResolver> runtime_resolver =
+        std::shared_ptr<snapshot::SnapshotRuntimeResolver>());
 
 }  // namespace api
 }  // namespace agentenv

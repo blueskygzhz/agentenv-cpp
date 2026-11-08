@@ -15,8 +15,8 @@ namespace snapshot {
 
 // ---- RuntimeImageMaterializer ----------------------------------------------
 
-RuntimeImageMaterializer::RuntimeImageMaterializer(const std::string& runtime_root,
-                                                   const OverlaybdLayerStore* store)
+RuntimeImageMaterializer::RuntimeImageMaterializer(
+    const std::string& runtime_root, const image::cache::OverlaybdLayerStore* store)
     : runtime_root_(runtime_root), store_(store) {}
 
 std::string RuntimeImageMaterializer::SnapshotDir(const core::SnapshotId& id) const {
@@ -45,10 +45,12 @@ std::string RuntimeImageMaterializer::DriveImageConfigPath(const core::SnapshotI
 // A lower that already has a placement, or whose digest is empty, is left
 // untouched.
 static void AttachLocalLayerLocation(storage::overlaybd::LayerConfig* lower,
-                                     const OverlaybdLayerStore* store, bool has_remote) {
+                                     const image::cache::OverlaybdLayerStore* store,
+                                     bool has_remote) {
     if (!lower->file.empty() || !lower->dir.empty() || lower->digest.empty()) return;
-    OverlaybdLayerLocation loc = store->LayerLocation(lower->digest, lower->size, has_remote);
-    if (loc.kind == OverlaybdLayerLocation::Kind::LocalFile) {
+    const image::cache::OverlaybdLayerLocation loc =
+        store->LayerLocation(lower->digest, lower->size, has_remote);
+    if (loc.kind == image::cache::OverlaybdLayerLocation::Kind::LocalFile) {
         lower->file = loc.path;
     } else {
         lower->dir = loc.path;

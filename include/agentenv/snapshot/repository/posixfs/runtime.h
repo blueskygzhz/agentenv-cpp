@@ -1,16 +1,26 @@
 // SPDX-License-Identifier: MIT
-// Rust: src/snapshot/repository/backends/posixfs/runtime.rs
+// Rust: src/snapshot/resolver.rs :: RepositoryRuntimeResolver.
 //
-// Resolves committed snapshot artifacts into node-local runnable paths on a
-// POSIX filesystem.
+// Provenance correction. This header used to cite
+// `src/snapshot/repository/backends/posixfs/runtime.rs`, **which does not
+// exist upstream** -- `repository/backends/posixfs/` holds only
+// `artifacts.rs`, `backend.rs`, `catalog.rs` and `mod.rs`. The real
+// counterpart is the *generic* `RepositoryRuntimeResolver`, which resolves
+// against any `Repository`; upstream's `PosixFsBackend::from_parts`
+// constructs that one rather than a posix-specific resolver.
 //
-// Porting note. `repository::SnapshotRuntimeResolver` in `interfaces.h` is
-// still the scaffold subset (its `SnapshotRecord` carries `id` as a string and
-// `committed` as a bool), so this resolver deliberately does *not* implement
-// that interface yet: it works on the real `snapshot::SnapshotRecord` and
-// returns a `RunnableSnapshot`, exactly as Rust does. Once `interfaces.h` is
-// migrated onto the real record, the only change needed here is adding the
-// `: public SnapshotRuntimeResolver` base and an `override`.
+// So the posix-only shape of this class is a port deviation, not upstream's
+// design. It is kept for now because nothing here yet needs to resolve
+// against the OSS backend (whose resolver upstream builds from the same
+// generic type plus a P2P transport), and generalising it with one
+// implementation and no second caller would be speculative. Recorded rather
+// than left to look deliberate.
+//
+// It does now implement `snapshot::SnapshotRuntimeResolver`. The previous note
+// here said it could not until `interfaces.h` stopped carrying a cut-down
+// `SnapshotRecord` -- that unification has since happened, so the note was
+// stale; what actually remained was the trait's wrong return type, now fixed
+// by moving it to `snapshot/resolver.h` where upstream keeps it.
 #ifndef AGENTENV_SNAPSHOT_REPOSITORY_POSIXFS_RUNTIME_H_
 #define AGENTENV_SNAPSHOT_REPOSITORY_POSIXFS_RUNTIME_H_
 
@@ -23,6 +33,8 @@
 #include "agentenv/snapshot/drive.h"
 #include "agentenv/snapshot/record.h"
 #include "agentenv/snapshot/repository/errors.h"
+// `RunnableSnapshot` and the `SnapshotRuntimeResolver` seam this implements.
+#include "agentenv/snapshot/resolver.h"
 #include "agentenv/snapshot/runtime_support.h"
 #include "agentenv/snapshot/types.h"
 #include "agentenv/storage/overlaybd/config.h"
@@ -32,25 +44,21 @@ namespace snapshot {
 namespace repository {
 namespace posixfs {
 
-/// Rust `struct RunnableSnapshot` — the record, the hydrated node-local
-/// manifest, and the cache lease that keeps the materialised files pinned for
-/// as long as the caller holds it.
-struct RunnableSnapshot {
-    SnapshotRecord                       record;
-    sandbox::SandboxSnapshotManifest     manifest;
-    std::shared_ptr<CacheArtifactLease>  lease;
-};
+// `RunnableSnapshot` now lives in `snapshot/resolver.h`, beside the trait
+// that returns it -- it is not posix-specific, and declaring it here left the
+// seam unable to name its own return type.
 
-/// Rust `struct PosixFsRuntimeResolver`.
-class PosixFsRuntimeResolver {
+/// Rust `RepositoryRuntimeResolver`, specialised to a POSIX repository root
+/// (see the provenance note at the top of this file).
+class PosixFsRuntimeResolver : public SnapshotRuntimeResolver {
  public:
     PosixFsRuntimeResolver(const std::string& repository_root,
                            const std::string& runtime_cache_root,
-                           const OverlaybdLayerStore* store,
+                           const image::cache::OverlaybdLayerStore* store,
                            std::shared_ptr<LocalArtifactCache> cache);
 
     /// Rust `resolve(snapshot) -> RunnableSnapshot`.
-    RepositoryResult<RunnableSnapshot> Resolve(const SnapshotRecord& snapshot);
+    RepositoryResult<RunnableSnapshot> Resolve(const SnapshotRecord& snapshot) override;
 
     /// Rust `resolve_local_managed_layer`. Public because the materializer
     /// reaches it through a C-style callback (`ResolveManagedFn`).

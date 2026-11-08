@@ -115,7 +115,7 @@ class PosixFsBackend {
  public:
     /// Rust `PosixFsBackend::from_parts`.
     PosixFsBackend(const PosixFsBackendConfig& config,
-                   const OverlaybdLayerStore* store,
+                   const image::cache::OverlaybdLayerStore* store,
                    std::shared_ptr<LocalArtifactCache> cache);
 
     const std::shared_ptr<PosixFsCatalogStore>&  catalog_store() const { return catalog_store_; }

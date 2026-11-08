@@ -58,20 +58,38 @@ class ApiImpl {
     /// it, and it refuses rather than pretending to publish. Defaulted rather
     /// than split into another overload because, unlike the volume manager,
     /// its absence changes nothing about any *other* handler's behaviour.
+    ///
+    /// `runtime_resolver` is what turns `CreateSandbox`'s `templateID` into a
+    /// launchable snapshot. Optional because only the posix-fs backend can
+    /// supply one (see `SnapshotBackend` in
+    /// `snapshot/repository/backends.h`); without it `CreateSandbox` cannot
+    /// take the snapshot path at all and says so.
     ApiImpl(std::shared_ptr<orchestrator::Orchestrator> svc,
             std::shared_ptr<volume::VolumeManager> volumes,
             std::shared_ptr<image::ImageResolver> image_resolver =
                 std::shared_ptr<image::ImageResolver>(),
             std::shared_ptr<snapshot::repository::SnapshotRepository> repository =
-                std::shared_ptr<snapshot::repository::SnapshotRepository>())
+                std::shared_ptr<snapshot::repository::SnapshotRepository>(),
+            std::shared_ptr<snapshot::SnapshotRuntimeResolver> runtime_resolver =
+                std::shared_ptr<snapshot::SnapshotRuntimeResolver>())
         : svc_(std::move(svc)),
           volumes_(std::move(volumes)),
           image_resolver_(std::move(image_resolver)),
-          repository_(std::move(repository)) {}
+          repository_(std::move(repository)),
+          runtime_resolver_(std::move(runtime_resolver)) {}
 
     // Sandbox handlers (Rust: src/api/impls/sandbox.rs).
     core::Expected<CreateSandboxResp, ApiError>
         CreateSandbox(const CreateSandboxReq& req);
+    /// Rust `sandboxes_cold_post` — `POST /sandboxes-cold`.
+    ///
+    /// The route that takes an OCI reference. `POST /sandboxes` cannot: its
+    /// `NewSandbox` schema carries only `templateID`, and its own description
+    /// sends callers here. So the two are not alternatives -- one launches
+    /// from a published snapshot, the other pulls an image and boots it cold,
+    /// and only this one needs the image resolver.
+    core::Expected<CreateSandboxResp, ApiError>
+        CreateColdSandbox(const CreateColdSandboxReq& req);
     core::Expected<core::Unit, ApiError>
         DeleteSandbox(const std::string& sandbox_id);
     core::Expected<GetSandboxResp, ApiError>
@@ -160,6 +178,28 @@ class ApiImpl {
     core::Expected<snapshot::repository::SnapshotRepository*, ApiError>
         RequireRepository() const;
 
+    /// Rust `self.snapshot_manager.load_runnable(&body.template_id)` —
+    /// `SnapshotManager::get` followed by `resolve_runnable`.
+    ///
+    /// Inlined rather than ported as a `SnapshotManager` type: that struct's
+    /// other eleven methods are thin forwards to the repository, and the two
+    /// this port needs are the pair that actually composes. Everything else it
+    /// owns (publish, P2P fan-out) is already reachable as the free functions
+    /// in `snapshot/publish.h`.
+    ///
+    /// Three distinct outcomes, and they must stay distinct:
+    ///
+    ///   * no resolver on this node -> 501. The node cannot launch from a
+    ///     snapshot at all, which is not the caller's fault and will not
+    ///     change on retry.
+    ///   * no such record -> 400 "template <id> not found", matching
+    ///     upstream's `Ok(None)` arm. Deliberately not 404: upstream treats a
+    ///     bad `templateID` as a malformed request body, because the path
+    ///     itself (`/sandboxes`) does exist.
+    ///   * repository or resolve failure -> 500.
+    core::Expected<snapshot::RunnableSnapshot, ApiError>
+        LoadRunnableSnapshot(const std::string& id_or_alias);
+
     /// Rust `snapshot_sandbox_volumes` — the mounted volumes' sealed layers,
     /// as of the capture.
     ///
@@ -182,6 +222,12 @@ class ApiImpl {
     /// a free function over `SnapshotRepository&` -- so the repository is held
     /// directly.
     std::shared_ptr<snapshot::repository::SnapshotRepository> repository_;
+    /// Null unless supplied, and null on every OSS node. `CreateSandbox`
+    /// resolves `templateID` through it; without one that handler cannot
+    /// produce a `Kind::Snapshot` launch source and reports 501 rather than
+    /// falling through to a fresh boot with an empty rootfs config, which is
+    /// what it used to do.
+    std::shared_ptr<snapshot::SnapshotRuntimeResolver> runtime_resolver_;
 };
 
 }  // namespace api

@@ -919,5 +919,23 @@ core::Expected<LocalLayer, std::string> OperationHoldConversion::StoreConvertedL
 }
 
 }  // namespace cache
+
+void InitializeImageCacheP2pTransport(const cfg::AppConfig& config,
+                                      std::shared_ptr<p2p::P2pTransport> transport) {
+    // No null guard, matching upstream, which cannot express one: its
+    // `Arc<dyn P2pTransport>` is always inhabited. The same holds at the only
+    // caller here -- `p2p::TransportFromConfig` returns a non-null transport
+    // on every arm (a `disabled` node gets a `DisabledP2pTransport`) or an
+    // error, so `main.cc` has nothing else to pass.
+    //
+    // A guard was tried and removed: `InitializeP2pTransport` tests the
+    // stored pointer's truthiness rather than whether it was ever assigned,
+    // so storing a null is indistinguishable from storing nothing. The branch
+    // changed no observable behaviour, and the test written for it asserted a
+    // difference that did not exist.
+    cache::ImageCacheService::SharedFromAppConfig(config)->InitializeP2pTransport(
+        std::move(transport));
+}
+
 }  // namespace image
 }  // namespace agentenv

@@ -68,6 +68,28 @@ class DefaultImageResolver : public ImageResolver {
         const std::string& image_ref, const RegistryAuth* auth);
 
     /// Rust `resolve_buildkit`.
+    ///
+    /// **Nothing calls this, and in production nothing can.** Stated here
+    /// because the rest of this class is live, so a reader has every reason to
+    /// assume this is too.
+    ///
+    /// Upstream's only caller is `ImageBuildService::import_build_image`
+    /// (`src/api/impls/image_build.rs`), reached from the build worker
+    /// (`src/api/image_build/worker.rs`). Neither is ported -- `api/
+    /// image_build.cc` carries the session state and HEALTHCHECK rendering,
+    /// not the worker -- so there is no host to call this from. Wiring it to
+    /// something else would invent a call chain upstream does not have.
+    ///
+    /// It would also fail immediately: the caller must first obtain a
+    /// `BuildkitContent`, and `BuildkitContent::Connect` goes through
+    /// `MakeBuildkitContentWire`, which has no gRPC transport in this tree and
+    /// always returns an error. See the header comment of
+    /// `src/image/buildkit_wire.cc`.
+    ///
+    /// Kept rather than deleted because it is a *complete* port of the
+    /// upstream function and the wire types it consumes are tested directly
+    /// (`BuildkitContent` takes an injected wire); what is missing is above
+    /// it, not in it.
     core::Expected<ResolvedBlockImage, std::string> ResolveBuildkit(
         const BuildkitContent& content, const std::string& digest);
 

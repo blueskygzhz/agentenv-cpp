@@ -3,6 +3,10 @@
 #include "agentenv/snapshot/repository/backends.h"
 
 #include "agentenv/core/fs.h"
+// `LocalImageServicesFromAppConfig` — the layer store the runtime resolver
+// places lowers with. The library edge runs `agentenv-snapshot` ->
+// `agentenv-image`, so this include direction is the allowed one.
+#include "agentenv/image/cache_store.h"
 #include "agentenv/snapshot/repository/oss/repository.h"
 #include "agentenv/snapshot/repository/posixfs/backend.h"
 
@@ -189,6 +193,20 @@ RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeOssRepository(
         new oss::OssSnapshotRepository(owned, uploader.value(), policy));
 }
 
+namespace {
+
+/// Rust `config.backend.posix_fs.snapshot_store.join("repository")`.
+///
+/// Shared by the repository factory and the pair factory below so the two
+/// cannot drift: the resolver reads the committed artifacts the repository
+/// writes, and a one-character difference here would make every resolve
+/// report `ArtifactNotFound` against files that exist.
+std::string PosixFsRepositoryRoot(const cfg::PosixFsBackendConfig& posix_fs) {
+    return core::fs::Join(posix_fs.snapshot_store, "repository");
+}
+
+}  // namespace
+
 RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeRepositoryFromConfig(
     const cfg::AppConfig& config) {
     switch (config.snapshot.repository_backend) {
@@ -202,9 +220,7 @@ RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeRepositoryFromConfig(
                 return core::make_unexpected(RepositoryError::InvalidRequest(
                     "backend.posix_fs config is required when repository_backend = posix_fs"));
             }
-            // Rust `config.backend.posix_fs.snapshot_store.join("repository")`.
-            const std::string root =
-                core::fs::Join(config.backend.posix_fs->snapshot_store, "repository");
+            const std::string root = PosixFsRepositoryRoot(*config.backend.posix_fs);
             // Both stores take the same root; the split is internal to this
             // backend (catalog records vs. blobs), not two configured paths.
             return std::shared_ptr<SnapshotRepository>(new posixfs::PosixFsSnapshotRepository(
@@ -228,6 +244,62 @@ RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeRepositoryFromConfig(
     // through to a null repository.
     return core::make_unexpected(
         RepositoryError::InvalidRequest("unknown snapshot.repository_backend"));
+}
+
+RepositoryResult<SnapshotBackend> MakeSnapshotBackendFromConfig(const cfg::AppConfig& config) {
+    SnapshotBackend backend;
+
+    const RepositoryResult<std::shared_ptr<SnapshotRepository> > repository =
+        MakeRepositoryFromConfig(config);
+    if (!repository.ok()) return core::make_unexpected(repository.error());
+    backend.repository = repository.value();
+
+    // Rust `local_image_services_from_app_config(config).overlaybd_layers`.
+    // Only this one of the three services takes part: the resolver decides
+    // `file=` versus `dir=` per lower and has no use for the source-image
+    // store or the runtime pin registry.
+    backend.overlaybd_layers = image::cache::LocalImageServicesFromAppConfig(config)
+                                   .overlaybd_layers;
+
+    // Only posix-fs gets a resolver; see the note on `SnapshotBackend`.
+    // Returned as a success with a null resolver rather than an error: an OSS
+    // node still serves `/volumes*` and still publishes, so refusing to build
+    // the backend at all would take down more than the launch path this
+    // cannot serve.
+    if (config.snapshot.repository_backend != cfg::SnapshotRepositoryBackendKind::PosixFs) {
+        return backend;
+    }
+    // Checked by `MakeRepositoryFromConfig` above, which has already returned
+    // an error if it is absent; re-checked because the dereference below is
+    // only safe by that argument, not by anything local.
+    if (!config.backend.posix_fs.has_value()) {
+        return core::make_unexpected(RepositoryError::InvalidRequest(
+            "backend.posix_fs config is required when repository_backend = posix_fs"));
+    }
+
+    // Rust's `shared_cache_root`, and the `None` max-size that goes with the
+    // posix-fs arm: `cache_max_size_gb` is an `[backend.oss]` field, so there
+    // is no watermark to enforce here and the cache only ever pins.
+    const core::Expected<std::shared_ptr<LocalArtifactCache>, std::string> cache =
+        LocalArtifactCache::New(config.snapshot.local_cache_path, false, 0);
+    if (!cache.ok()) {
+        return core::make_unexpected(RepositoryError::Backend(
+            "open snapshot artifact cache at '" + config.snapshot.local_cache_path + "'",
+            cache.error()));
+    }
+    backend.artifact_cache = cache.value();
+
+    // Rust `PosixFsBackend::from_parts`, whose runtime root is
+    // `shared_cache_root.join("runtime")`.
+    //
+    // The store is handed over as a raw pointer, which is why
+    // `backend.overlaybd_layers` holds the owner: the resolver borrows it for
+    // its whole life.
+    backend.runtime_resolver.reset(new posixfs::PosixFsRuntimeResolver(
+        PosixFsRepositoryRoot(*config.backend.posix_fs),
+        core::fs::Join(config.snapshot.local_cache_path, "runtime"),
+        backend.overlaybd_layers.get(), backend.artifact_cache));
+    return backend;
 }
 
 }  // namespace repository

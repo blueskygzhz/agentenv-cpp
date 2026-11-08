@@ -24,6 +24,7 @@
 #include "agentenv/image/cache.h"
 #include "agentenv/image/cache_gc.h"
 #include "agentenv/image/cache_hold.h"
+#include "agentenv/image/cache_layer_store.h"
 #include "agentenv/image/cache_metadata_store.h"
 #include "agentenv/image/cache_source_config.h"
 #include "agentenv/image/local_layer.h"
@@ -69,14 +70,9 @@ struct CachedImageConfig {
     CachedImageConfig() : kind(Kind::Missing) {}
 };
 
-/// Rust `store::OverlaybdLayerLocation`.
-struct OverlaybdLayerLocation {
-    enum class Kind { LocalFile, CacheDir };
-    Kind kind;
-    std::string path;
-
-    OverlaybdLayerLocation() : kind(Kind::CacheDir) {}
-};
+// `OverlaybdLayerLocation` now comes from `image/cache_layer_store.h`, which
+// also carries the `OverlaybdLayerStore` trait it belongs to. It was declared
+// here and *again* under `namespace snapshot`; see that header for why.
 
 class ImageCacheService;
 
@@ -285,6 +281,33 @@ class ImageCacheService : public std::enable_shared_from_this<ImageCacheService>
 };
 
 }  // namespace cache
+
+/// Rust `image::initialize_image_cache_p2p_transport` (`src/image/mod.rs`),
+/// called once at startup from `src/bin/server.rs` right after the transport
+/// is built.
+///
+/// Without it the image cache holds no transport, so every P2P layer lookup
+/// is skipped and each node falls back to pulling from the registry. That is
+/// not a visible failure -- the images still resolve -- which is exactly why
+/// it went unnoticed here: the transport was built in `main.cc` and simply
+/// never handed over, and only the tests ever called
+/// `ImageCacheService::InitializeP2pTransport`.
+///
+/// Reaches the same service the resolver does: `SharedFromAppConfig` keys its
+/// registry on the cache root, so this initialises the instance the
+/// production lookups go through rather than a second one.
+///
+/// **Deviation**: upstream takes only the transport and reads
+/// `ConfigManager::global_config()` for the layout. This port has no global
+/// config manager -- the config is threaded explicitly everywhere else -- so
+/// it is a parameter here too.
+///
+/// `transport` must be non-null, as upstream's `Arc` inherently is.
+/// `p2p::TransportFromConfig` only ever yields a non-null transport or an
+/// error, so the one caller has nothing else to hand over.
+void InitializeImageCacheP2pTransport(const cfg::AppConfig& config,
+                                      std::shared_ptr<p2p::P2pTransport> transport);
+
 }  // namespace image
 }  // namespace agentenv
 #endif  // AGENTENV_IMAGE_CACHE_SERVICE_H_

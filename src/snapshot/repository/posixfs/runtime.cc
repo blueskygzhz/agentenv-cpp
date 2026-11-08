@@ -14,7 +14,7 @@ namespace posixfs {
 PosixFsRuntimeResolver::PosixFsRuntimeResolver(
     const std::string& repository_root,
     const std::string& runtime_cache_root,
-    const OverlaybdLayerStore* store,
+    const image::cache::OverlaybdLayerStore* store,
     std::shared_ptr<LocalArtifactCache> cache)
     : repository_root_(repository_root),
       image_materializer_(runtime_cache_root, store),

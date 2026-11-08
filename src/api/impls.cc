@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Rust: src/api/impls/*.rs
 #include "agentenv/api/impls.h"
+#include <sstream>
 #include <unordered_map>
 
 #include "agentenv/api/sandbox_params.h"
@@ -194,15 +195,79 @@ ApiImpl::ParseId(const std::string& text) const {
     return parsed.value();
 }
 
+core::Expected<snapshot::RunnableSnapshot, ApiError>
+ApiImpl::LoadRunnableSnapshot(const std::string& id_or_alias) {
+    if (!runtime_resolver_) {
+        // 501, not 500: a node with no resolver is correctly configured and
+        // simply cannot serve this; retrying will not help, and the operator
+        // needs to see which capability is absent rather than a generic fault.
+        return core::make_unexpected(ApiError::Make(
+            501,
+            "this node cannot launch from a snapshot: no snapshot runtime resolver "
+            "(only the posix_fs repository backend provides one)"));
+    }
+    const core::Expected<snapshot::repository::SnapshotRepository*, ApiError> repository =
+        RequireRepository();
+    if (!repository.ok()) return core::make_unexpected(repository.error());
+
+    // Rust `SnapshotManager::get`, which is `repository.get(id_or_alias)` --
+    // the repository resolves an alias itself, so no separate alias lookup.
+    const snapshot::repository::RepositoryResult<core::Optional<snapshot::SnapshotRecord> >
+        record = repository.value()->Get(id_or_alias);
+    if (!record.ok()) {
+        return core::make_unexpected(InternalError(
+            "load committed snapshot '" + id_or_alias + "' through repository: " +
+            record.error().ToString()));
+    }
+    if (!record.value().has_value()) {
+        // Upstream's `Ok(None)` arm, verbatim down to the wording.
+        return core::make_unexpected(
+            ApiError::Make(400, "template " + id_or_alias + " not found"));
+    }
+
+    // Rust `SnapshotManager::resolve_runnable`. This is the call the whole
+    // chain existed for and that had no production caller: it materialises
+    // the node-local `image.json` for rootfs, memory and every attached
+    // drive, and hands back the lease that keeps them from being reclaimed.
+    const snapshot::repository::RepositoryResult<snapshot::RunnableSnapshot> runnable =
+        runtime_resolver_->Resolve(*record.value());
+    if (!runnable.ok()) {
+        return core::make_unexpected(InternalError(
+            "resolve committed snapshot into runnable runtime paths: " +
+            runnable.error().ToString()));
+    }
+    return runnable.value();
+}
+
 core::Expected<CreateSandboxResp, ApiError>
 ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
     orchestrator::CreateSandboxRequest request;
-    // Rust resolves `template_id` to a snapshot through the template store
-    // before launching. There is no template store in this port, so the id is
-    // carried straight through as the launch source's snapshot id; a caller
-    // naming a template that does not exist is rejected by the launch rather
-    // than silently given an empty sandbox.
-    request.source.snapshot_id = req.template_id;
+    // Rust `create_sandbox_from_snapshot`: `template_id` names a record in the
+    // repository, which is resolved into node-local paths *before* the launch
+    // source is built. There is no template store in this port, so the id is
+    // looked up as a snapshot id or alias directly -- upstream's template
+    // store is a second catalog in front of the same repository, and skipping
+    // it changes which names resolve, not what a resolved one launches.
+    //
+    // This used to assign `request.source.snapshot_id = req.template_id` and
+    // stop there, leaving `kind` at its `Kind::Image` default. The snapshot
+    // branch in `Orchestrator::CreateSandbox` was therefore unreachable, and
+    // every create fell through to the fresh path with an empty
+    // `image_config_path` -- a rootfs ublk device that cannot be built.
+    const core::Expected<snapshot::RunnableSnapshot, ApiError> runnable =
+        LoadRunnableSnapshot(req.template_id);
+    if (!runnable.ok()) return core::make_unexpected(runnable.error());
+
+    const core::Expected<orchestrator::SandboxLaunchSource, std::string> source =
+        orchestrator::SandboxLaunchSource::FromRunnableSnapshot(runnable.value());
+    if (!source.ok()) {
+        // Not reachable through a resolver, which refuses an uncommitted
+        // record first; reported as 500 because if it ever is, the repository
+        // handed out a record the resolver should have rejected.
+        return core::make_unexpected(InternalError(source.error()));
+    }
+    request.source = source.value();
+
     if (req.timeout_ms > 0) {
         request.timeout_ms = core::Optional<int64_t>(req.timeout_ms);
     }
@@ -219,24 +284,65 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
     // sandbox whose envd port accepts any caller.
     request.secure = req.secure;
 
-    // Rust `sandboxes_post`, volume section. Three of its checks have no
-    // counterpart here and are deliberately absent rather than approximated:
+    // Rust `sandboxes_post`, volume section.
     //
-    //  * `check_snapshot_volume_replacement` and the free-drive-slot check
-    //    both read the source snapshot's manifest, and this port has no
-    //    snapshot repository (see `CreateSnapshot`, which reports 501).
-    //  * `check_attached_drive_overlap` compares volume mounts against the
-    //    request's `attachedDrives`, a field `CreateSandboxReq` does not
-    //    carry, so there is nothing to overlap with.
+    // The two checks that read the source snapshot are now performed, because
+    // the snapshot is finally resolved above. The note that used to stand here
+    // said they were "deliberately absent" since "this port has no snapshot
+    // repository" -- which was already wrong when it was written (the
+    // repository is threaded into this bundle for `CreateSnapshot`) and is
+    // doubly wrong now.
     //
-    // `extra_drives_in_snapshot` stays false for the same reason: upstream
-    // sets it only when the request omits `volumeMounts` *and* the snapshot
-    // captured volumes, which is the restore path this port cannot take.
+    // `check_attached_drive_overlap` stays absent, and for the reason that
+    // does still hold: it compares volume mounts against the request's
+    // `attachedDrives`, a field `CreateSandboxReq` does not carry. See the
+    // `/sandboxes-cold` note in `server.cc` for why that field is missing
+    // from *this* request upstream too.
+    // `has_value()`, not `!empty()`, and this is the distinction the Optional
+    // in `CreateSandboxReq::volume_mounts` exists for: upstream passes
+    // `body.volume_mounts.is_some()`. A present-but-empty list is an explicit
+    // "this sandbox has no volumes", which still contradicts a capture that
+    // recorded some; only an absent list means "restore them".
+    const bool replaces_mounts = req.volume_mounts.has_value();
+    const snapshot::CommittedSnapshot& committed = *runnable.value().record.committed;
+    // Rust `check_snapshot_volume_replacement`. A restore brings the captured
+    // volumes back with it; honouring `volumeMounts` as well would put the
+    // guest's own filesystems and the requested ones on the same slots.
+    if (replaces_mounts && !committed.volume_snapshots.empty()) {
+        return core::make_unexpected(ApiError::Make(
+            400, "this snapshot has volume mounts, which cannot be replaced; "
+                 "omit volumeMounts to restore them"));
+    }
+
     const core::Expected<core::Optional<std::map<std::string, std::string> >, ApiError>
         requested = VolumeMountsFromModel(
             req.volume_mounts.has_value() ? *req.volume_mounts
                                           : std::vector<SandboxVolumeMountModel>());
     if (!requested.ok()) return core::make_unexpected(requested.error());
+
+    // Rust's free-slot check. Upstream counts `attached_drives.len() +
+    // volume_mounts.len()`; this request carries no attached drives, so the
+    // volume mounts are the whole of it.
+    const std::size_t requested_drive_count =
+        requested.value().has_value() ? requested.value()->size() : 0;
+    const std::size_t free_slots = runnable.value().manifest.FreeDriveSlots();
+    if (requested_drive_count > free_slots) {
+        std::ostringstream message;
+        message << "this snapshot has " << free_slots
+                << " free drive slots, but " << requested_drive_count
+                << " attached drives and volumes were requested";
+        return core::make_unexpected(ApiError::Make(400, message.str()));
+    }
+
+    // `extra_drives_in_snapshot` stays false, and this is the one part of the
+    // old note that survives. Upstream sets it when the request omits
+    // `volumeMounts` *and* the capture recorded volumes -- but it sets it
+    // beside `restore_snapshot_volume_mounts`, which recreates a volume record
+    // per captured volume and puts the resulting drives in `extra_drives`. That
+    // restore is not ported. The flag only describes how `extra_drives` are
+    // bound, so setting it with an empty list would assert something about
+    // drives that are not there. Left false rather than set speculatively; the
+    // missing behaviour is the restore, not the flag.
 
     const core::Expected<PreparedVolumeMounts, ApiError> prepared = PrepareVolumeMounts(
         volumes_.get(),
@@ -254,15 +360,20 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
         request.volume_mounts[it->first] = it->second;
     }
 
+    return FinishCreate(request, prepared.value());
+}
+
+core::Expected<CreateSandboxResp, ApiError>
+ApiImpl::FinishCreate(const orchestrator::CreateSandboxRequest& request,
+                      const PreparedVolumeMounts& prepared) {
     const orchestrator::OrchestratorResult<orchestrator::SandboxMetadata> r =
         svc_->CreateSandbox(request);
     if (!r.ok()) {
         // The launch never happened, so the placeholder lease has to go --
         // these volumes already existed and belong to the caller, so they are
         // released, not deleted.
-        FinishVolumeReservation(volumes_.get(), prepared.value().owner,
-                                core::Optional<std::string>(),
-                                prepared.value().volume_ids);
+        FinishVolumeReservation(volumes_.get(), prepared.owner,
+                                core::Optional<std::string>(), prepared.volume_ids);
         return core::make_unexpected(ToApiError(r.error()));
     }
 
@@ -273,16 +384,15 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
     // nothing will ever release, so the sandbox is torn down and the lease
     // dropped rather than left in that state.
     const core::Expected<core::Unit, volume::VolumeError> handover =
-        FinishVolumeReservation(volumes_.get(), prepared.value().owner,
+        FinishVolumeReservation(volumes_.get(), prepared.owner,
                                 core::Optional<std::string>(meta.id.ToString()),
-                                prepared.value().volume_ids);
+                                prepared.volume_ids);
     if (!handover.ok()) {
         const std::string message =
             "failed to finalize volume reservation: " + handover.error().ToString();
         svc_->DeleteSandbox(meta.id);
-        FinishVolumeReservation(volumes_.get(), prepared.value().owner,
-                                core::Optional<std::string>(),
-                                prepared.value().volume_ids);
+        FinishVolumeReservation(volumes_.get(), prepared.owner,
+                                core::Optional<std::string>(), prepared.volume_ids);
         return core::make_unexpected(ApiError::Make(500, message));
     }
 

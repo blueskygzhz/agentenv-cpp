@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
-// Rust: src/snapshot/repository/interfaces.rs — SnapshotRepository /
-// SnapshotRuntimeResolver traits + SnapshotListFilter.
+// Rust: src/snapshot/repository/interfaces.rs — the SnapshotRepository trait
+// and SnapshotListFilter.
+//
+// The runtime resolver is *not* part of this boundary; see the note at the
+// bottom of this file and `agentenv/snapshot/resolver.h`.
 //
 // Type unification note. This header used to carry its own cut-down
 // `SnapshotRecord`, `TemplateBuildStatus` and `SnapshotSourceKind` — declared
@@ -268,13 +271,12 @@ RepositoryResult<std::string> MaterializeVolumeBacking(
     const SnapshotRepository& repository, const std::vector<OverlaybdLayerRef>& layers,
     const std::string& destination);
 
-/// Rust trait `SnapshotRuntimeResolver`.
-class SnapshotRuntimeResolver {
- public:
-    virtual ~SnapshotRuntimeResolver() {}
-    /// Rust `resolve(snapshot) -> RunnableSnapshot`. Returns a runnable path bundle.
-    virtual RepositoryResult<std::string> Resolve(const SnapshotRecord& record) = 0;
-};
+// `SnapshotRuntimeResolver` is **not** here, and upstream does not put it
+// here either: `repository/interfaces.rs` carries the repository trait, while
+// the runtime resolver has its own `snapshot/resolver.rs`. The copy that used
+// to sit below declared `Resolve` as returning `RepositoryResult<std::string>`
+// against upstream's `RunnableSnapshot`, which is why the one real resolver
+// could not implement it. See `agentenv/snapshot/resolver.h`.
 
 }  // namespace repository
 }  // namespace snapshot

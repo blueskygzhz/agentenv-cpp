@@ -15,6 +15,10 @@
 
 #include "agentenv/core/expected.h"
 #include "agentenv/core/identity.h"
+// Only the two layer-store declarations, in a header deliberately kept to
+// `<cstdint>/<string>/<vector>`. `agentenv-snapshot` links `agentenv-image`,
+// so this direction is the legal one.
+#include "agentenv/image/cache_layer_store.h"
 #include "agentenv/sandbox/manifest.h"
 #include "agentenv/snapshot/drive.h"
 #include "agentenv/snapshot/layers.h"
@@ -25,44 +29,15 @@
 namespace agentenv {
 namespace snapshot {
 
-// ---- OverlaybdLayerStore ---------------------------------------------------
-
-/// Rust `enum OverlaybdLayerLocation`.
-struct OverlaybdLayerLocation {
-    enum class Kind { LocalFile, CacheDir };
-
-    Kind        kind = Kind::LocalFile;
-    std::string path;
-
-    static OverlaybdLayerLocation LocalFile(const std::string& p) {
-        OverlaybdLayerLocation loc;
-        loc.kind = Kind::LocalFile;
-        loc.path = p;
-        return loc;
-    }
-    static OverlaybdLayerLocation CacheDir(const std::string& p) {
-        OverlaybdLayerLocation loc;
-        loc.kind = Kind::CacheDir;
-        loc.path = p;
-        return loc;
-    }
-};
-
-/// Rust `trait OverlaybdLayerStore`.
-///
-/// Decides where a layer lives on this node. The `has_remote` flag signals
-/// that the layer also has a registry URL, so overlaybd can recover it
-/// without a local file — allowing the local entry to use `dir=` (reclaimable
-/// cache) rather than `file=` (required local copy).
-class OverlaybdLayerStore {
- public:
-    virtual ~OverlaybdLayerStore() {}
-    virtual OverlaybdLayerLocation LayerLocation(const std::string& digest, uint64_t size,
-                                                 bool has_remote) const = 0;
-    virtual std::vector<std::string> PublishableRoots() const = 0;
-};
-
 // ---- RuntimeImageMaterializer ----------------------------------------------
+//
+// The `OverlaybdLayerStore` this consumes is `image::cache::
+// OverlaybdLayerStore`, the one `image/cache_store.cc` implements -- not a
+// `snapshot::` copy. A byte-identical second declaration used to live right
+// here, which made the implementation unpassable to the constructor below:
+// two identical C++ types are still two types. Upstream has one
+// `pub(crate) trait` in `image/cache/store.rs`, and that is now also true
+// here.
 
 /// Rust `struct RuntimeImageMaterializer`.
 ///
@@ -73,7 +48,7 @@ class OverlaybdLayerStore {
 class RuntimeImageMaterializer {
  public:
     RuntimeImageMaterializer(const std::string& runtime_root,
-                             const OverlaybdLayerStore* store);
+                             const image::cache::OverlaybdLayerStore* store);
 
     /// Rust `snapshot_dir`.
     std::string SnapshotDir(const core::SnapshotId& id) const;
@@ -116,7 +91,7 @@ class RuntimeImageMaterializer {
 
  private:
     std::string           runtime_root_;
-    const OverlaybdLayerStore* store_;
+    const image::cache::OverlaybdLayerStore* store_;
 };
 
 // ---- pure helpers (all synchronous) ----------------------------------------

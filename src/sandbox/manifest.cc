@@ -211,6 +211,20 @@ std::vector<ExtraDrive> SandboxSnapshotManifest::ExtraDrives() const {
     return drives;
 }
 
+std::size_t SandboxSnapshotManifest::EffectivePhysicalExtraDriveCount() const {
+    if (volume_drive_slots == 0) return attached_drives.size();
+    return physical_extra_drive_count;
+}
+
+std::size_t SandboxSnapshotManifest::FreeDriveSlots() const {
+    const std::size_t physical = EffectivePhysicalExtraDriveCount();
+    // Rust `saturating_sub`: a manifest claiming more physical drives than it
+    // has attached must yield 0 here, not wrap.
+    const std::size_t slot_drives =
+        attached_drives.size() > physical ? attached_drives.size() - physical : 0;
+    return volume_drive_slots > slot_drives ? volume_drive_slots - slot_drives : 0;
+}
+
 core::Expected<SandboxSnapshotManifest, std::string>
 SandboxSnapshotManifest::WithExtraDrives(const std::vector<ExtraDrive>& extra_drives) const {
     SandboxSnapshotManifest updated = *this;

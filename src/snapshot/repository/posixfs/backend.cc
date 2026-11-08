@@ -17,7 +17,7 @@ std::string SharedRuntimeCacheRoot() {
 }
 
 PosixFsBackend::PosixFsBackend(const PosixFsBackendConfig& config,
-                               const OverlaybdLayerStore* store,
+                               const image::cache::OverlaybdLayerStore* store,
                                std::shared_ptr<LocalArtifactCache> cache) {
     const std::string cache_root =
         config.cache_root.has_value() ? *config.cache_root : SharedRuntimeCacheRoot();

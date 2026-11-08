@@ -128,6 +128,25 @@ struct SandboxSnapshotManifest {
     /// Rust `SandboxSnapshotManifest::extra_drives`.
     std::vector<ExtraDrive> ExtraDrives() const;
 
+    /// Rust `effective_physical_extra_drive_count` — attached drives that
+    /// carry their own Firecracker drive id.
+    ///
+    /// `volume_drive_slots == 0` identifies a capture taken before reserved
+    /// slots existed, where every attached drive is physical and
+    /// `physical_extra_drive_count` was never written. Reading the stored
+    /// count unconditionally would report 0 for all of them.
+    std::size_t EffectivePhysicalExtraDriveCount() const;
+
+    /// Rust `free_drive_slots` — reserved slots not already occupied.
+    ///
+    /// What `POST /sandboxes` checks a request's volumes and attached drives
+    /// against: a restore binds launch-time drives to slots the capture left
+    /// free, so asking for more than exist cannot be satisfied by booting
+    /// anyway. Both subtractions saturate, as upstream's do -- a manifest
+    /// whose counts disagree must report "no free slots", not underflow to
+    /// `SIZE_MAX` and admit every request.
+    std::size_t FreeDriveSlots() const;
+
     /// Rust `SandboxSnapshotManifest::with_extra_drives` — returns a copy, so
     /// a rejected drive leaves the original manifest untouched.
     core::Expected<SandboxSnapshotManifest, std::string> WithExtraDrives(

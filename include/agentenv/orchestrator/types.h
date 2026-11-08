@@ -23,6 +23,8 @@
 #include "agentenv/sandbox/network/policy.h"
 #include "agentenv/sandbox/types.h"
 #include "agentenv/snapshot/record.h"
+// `RunnableSnapshot` — `FromRunnableSnapshot` below unpacks one.
+#include "agentenv/snapshot/resolver.h"
 #include "agentenv/snapshot/types.h"
 #include "agentenv/snapshot/version.h"
 #include "agentenv/template/build_spec.h"
@@ -118,6 +120,25 @@ struct SandboxLaunchSource {
     static SandboxLaunchSource FromSnapshot(const std::string& snapshot_id);
     static SandboxLaunchSource FromImage(const std::string& image_ref,
                                          const std::string& overlaybd_config_path);
+
+    /// Rust `SandboxLaunchSource::Snapshot(Box::new(snapshot))`.
+    ///
+    /// Upstream needs no projection: its variant *holds* the
+    /// `RunnableSnapshot`, and `create_sandbox_inner` reads the record,
+    /// committed payload and manifest off it there. This function is the cost
+    /// of the deviation documented above -- the fields are flattened into the
+    /// source, so the flattening has to happen somewhere, and doing it here
+    /// keeps it next to the note that explains why it exists rather than
+    /// spread across each caller.
+    ///
+    /// Fails for a record with no committed payload. The resolver already
+    /// refuses those, so this is not reachable through
+    /// `SnapshotRuntimeResolver::Resolve`; it is checked because the only
+    /// alternative is to read a `core::Optional` that may be empty, and a
+    /// source built from a template that has not been built yet would launch
+    /// a VM against default-constructed resources and an empty manifest.
+    static core::Expected<SandboxLaunchSource, std::string> FromRunnableSnapshot(
+        const snapshot::RunnableSnapshot& snapshot);
 };
 
 /// Rust struct `SandboxForkChildSpec` (types.rs).

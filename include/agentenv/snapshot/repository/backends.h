@@ -10,7 +10,13 @@
 #include <string>
 
 #include "agentenv/cfg.h"
+// `OverlaybdLayerStore` — the pair factory below has to keep the store the
+// resolver was built over alive, so the struct names its type.
+#include "agentenv/image/cache_layer_store.h"
+#include "agentenv/snapshot/artifact_cache.h"
 #include "agentenv/snapshot/repository/interfaces.h"
+// `SnapshotRuntimeResolver` — the other half of `SnapshotBackend`.
+#include "agentenv/snapshot/resolver.h"
 
 namespace agentenv {
 namespace snapshot {
@@ -121,12 +127,73 @@ cfg::SnapshotImageStoragePolicy SnapshotImageStorageFor(const cfg::AppConfig& co
 /// to no repository would disable volumes on a node whose config asked for
 /// one.
 ///
-/// Deviation from Rust, stated because the signature hides it: upstream
-/// returns the repository *and* a `SnapshotRuntimeResolver` as a pair, built
-/// over a `LocalArtifactCache`. Neither the resolver nor that cache is ported,
-/// so this returns the repository alone.
+/// Returns the repository alone. Upstream has no such function -- its
+/// `build_snapshot_backend_from_config` returns the repository *and* the
+/// runtime resolver -- so this is a narrower entry point kept for the callers
+/// that genuinely only publish and read records. Everything that has to
+/// *launch* from a snapshot needs `MakeSnapshotBackendFromConfig` below.
+///
+/// A previous note here claimed that neither the resolver nor the
+/// `LocalArtifactCache` it is built over was ported. Both assertions were
+/// wrong by the time it was written: `LocalArtifactCache` lives in
+/// `snapshot/artifact_cache.h`, and `PosixFsRuntimeResolver` implements the
+/// `SnapshotRuntimeResolver` seam in `snapshot/resolver.h`. What was actually
+/// missing was this file's counterpart to upstream's *pair* return, which is
+/// what left the resolver with no production caller at all.
 RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeRepositoryFromConfig(
     const cfg::AppConfig& config);
+
+/// Rust `PosixFsBackend`/`OssBackend::into_parts()` — what
+/// `build_snapshot_backend_from_config` returns.
+///
+/// Upstream returns `(Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>)`.
+/// A struct rather than a `std::pair` because two more members have to travel
+/// with them, and a pair would have hidden that:
+///
+///   * `overlaybd_layers` — `PosixFsRuntimeResolver` takes the layer store as
+///     a **raw** `const` pointer (so does `RuntimeImageMaterializer`), so the
+///     `shared_ptr` that owns it must outlive the resolver. Upstream holds an
+///     `Arc` inside the resolver and has nothing to arrange. Dropping this
+///     field would leave every resolve reading a destroyed store.
+///   * `artifact_cache` — the resolver holds a `shared_ptr` to it, so this is
+///     not strictly load-bearing; it is exposed because the cache is the thing
+///     that decides when materialised files are reclaimed, and a caller that
+///     wants to hold a lease across several launches needs to name it.
+struct SnapshotBackend {
+    std::shared_ptr<SnapshotRepository>      repository;
+    /// **Null on the OSS backend.** Upstream's `RepositoryRuntimeResolver` is
+    /// generic over `Arc<dyn Repository>` and serves both backends; this port
+    /// only has `PosixFsRuntimeResolver`, which is constructed from a
+    /// *repository root path* and so cannot be pointed at a bucket. An OSS
+    /// node therefore gets a repository and no resolver, and the callers that
+    /// need one refuse rather than launching from paths nobody materialised.
+    /// Recorded here rather than papered over with a stub resolver that would
+    /// report every snapshot as missing.
+    std::shared_ptr<SnapshotRuntimeResolver> runtime_resolver;
+    std::shared_ptr<image::cache::OverlaybdLayerStore> overlaybd_layers;
+    std::shared_ptr<LocalArtifactCache>      artifact_cache;
+};
+
+/// Rust `build_snapshot_backend_from_config` (`snapshot/backends/mod.rs:57`),
+/// returning both halves.
+///
+/// The repository comes from `MakeRepositoryFromConfig`, so the
+/// declared-backend selection and its error messages are shared rather than
+/// written twice. The resolver is added on top, for posix-fs only.
+///
+/// Both node-local roots come from `snapshot.local_cache_path`, as upstream's
+/// `shared_cache_root` does -- **not** from
+/// `posixfs::SharedRuntimeCacheRoot()`. That default exists for
+/// `PosixFsBackendConfig`'s optional fields and upstream never reaches it from
+/// this path either, because it always passes `cache_root` explicitly here.
+/// Letting it apply would put a node's materialised configs under `/tmp`
+/// while its config named somewhere else.
+///
+/// Creating the cache root is a side effect, and an intended one: upstream
+/// calls `LocalArtifactCache::new` before building the backend and propagates
+/// its failure with `?`. A node whose cache root cannot be created cannot
+/// resolve any snapshot, and finding that out at startup is the point.
+RepositoryResult<SnapshotBackend> MakeSnapshotBackendFromConfig(const cfg::AppConfig& config);
 
 }  // namespace repository
 }  // namespace snapshot

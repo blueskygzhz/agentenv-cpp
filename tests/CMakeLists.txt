@@ -195,7 +195,11 @@ agentenv_add_test(test_image_cache_metadata_store test_image_cache_metadata_stor
 # Rust: the deleting-GC tests in src/image/cache/service.rs.
 agentenv_add_test(test_image_cache_gc     test_image_cache_gc.cc      agentenv-image)
 # Rust: the tests in src/image/cache/{service,source_config}.rs.
-agentenv_add_test(test_image_cache_service test_image_cache_service.cc agentenv-image)
+# `agentenv-snapshot` for the cross-boundary case: the layer store the image
+# cache implements is consumed by `snapshot::RuntimeImageMaterializer`. One-way
+# edge — `agentenv-snapshot` links `agentenv-image`, not the reverse.
+agentenv_add_test(test_image_cache_service test_image_cache_service.cc
+                  agentenv-image agentenv-snapshot)
 agentenv_add_test(test_p2p                 test_p2p.cc                 agentenv-p2p)
 # Rust: the catalog tests in src/p2p/iroh/{catalog,endpoint}.rs.
 agentenv_add_test(test_p2p_catalog         test_p2p_catalog.cc         agentenv-p2p)
@@ -266,6 +270,15 @@ agentenv_add_test(test_api_sandbox_fork   test_api_sandbox_fork.cc   agentenv-ap
 agentenv_add_test(test_api_volume_fork    test_api_volume_fork.cc    agentenv-api agentenv-volume)
 # Rust: src/api/impls/sandbox.rs :: sandboxes_post (volume mount section)
 agentenv_add_test(test_api_sandbox_volume_mounts test_api_sandbox_volume_mounts.cc
+                  agentenv-api agentenv-orchestrator agentenv-volume)
+# Rust: src/snapshot/resolver.rs :: RepositoryRuntimeResolver, through the
+# `SnapshotRuntimeResolver` seam, plus the publish/resolve layout round trip.
+agentenv_add_test(test_snapshot_runtime_resolver test_snapshot_runtime_resolver.cc
+                  agentenv-snapshot agentenv-image)
+# Rust: src/api/impls/sandbox.rs :: create_sandbox_from_snapshot, and
+# src/snapshot/manager.rs :: load_runnable -- the `templateID` -> repository ->
+# resolver -> `Kind::Snapshot` launch chain.
+agentenv_add_test(test_api_create_from_snapshot test_api_create_from_snapshot.cc
                   agentenv-api agentenv-orchestrator agentenv-volume)
 # Rust: src/api/impls/sandbox.rs :: sandboxes_sandbox_id_snapshots_post
 agentenv_add_test(test_api_create_snapshot test_api_create_snapshot.cc

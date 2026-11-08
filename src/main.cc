@@ -18,6 +18,7 @@
 #include "agentenv/core/fs.h"
 #include "agentenv/core/identity.h"
 #include "agentenv/core/logging.h"
+#include "agentenv/image/cache_service.h"
 #include "agentenv/image/resolver.h"
 #include "agentenv/orchestrator/persistence.h"
 #include "agentenv/orchestrator/service.h"
@@ -559,20 +560,31 @@ int main(int argc, char** argv) {
     // releases leases on delete and publishes backings on capture) and the API
     // bundle (which serves `/volumes*`).
     //
-    // The repository comes from `MakeRepositoryFromConfig`, which selects on
-    // `snapshot.repository_backend`. This used to branch on
+    // The repository comes from `MakeSnapshotBackendFromConfig`, which selects
+    // on `snapshot.repository_backend`. This used to branch on
     // `backend.posix_fs.has_value()` and build the posix-fs stores inline --
     // which silently sent an OSS-configured node to its local disk whenever a
     // `[backend.posix_fs]` section was also present, the ordinary state of a
     // migrated node. See that function for the whole argument.
+    //
+    // It returns the *pair* upstream's `build_snapshot_backend` does. The
+    // second half is the runtime resolver, and it is why this call changed:
+    // the repository-only form left `PosixFsRuntimeResolver` with no
+    // production caller at all, so `POST /sandboxes` could not turn a
+    // `templateID` into launchable paths and fell through to a fresh boot with
+    // an empty rootfs config.
     std::shared_ptr<ae::volume::VolumeManager> volume_manager;
     std::shared_ptr<ae::image::ImageResolver> image_resolver;
     // Outlives the block below because the API bundle needs it too: the
     // snapshot route publishes through it. It used to be a local here, which
     // is why that route had nowhere to publish to.
     std::shared_ptr<ae::snapshot::repository::SnapshotRepository> repository;
+    // The whole backend is held, not just the resolver: it owns the overlaybd
+    // layer store the resolver borrows as a raw pointer, so letting it die
+    // here would leave every resolve reading freed memory.
+    ae::snapshot::repository::SnapshotBackend snapshot_backend;
     {
-        auto made = ae::snapshot::repository::MakeRepositoryFromConfig(app_cfg);
+        auto made = ae::snapshot::repository::MakeSnapshotBackendFromConfig(app_cfg);
         if (!made.ok()) {
             // Fatal, as Rust's `?` in `build_snapshot_backend_from_config`
             // is. Carrying on would serve a node whose declared storage
@@ -583,7 +595,17 @@ int main(int argc, char** argv) {
                            << made.error().ToString());
             return 1;
         }
-        repository = made.value();
+        snapshot_backend = made.value();
+        repository = snapshot_backend.repository;
+        if (!snapshot_backend.runtime_resolver) {
+            // Not fatal, and said out loud because the consequence is a whole
+            // route answering 501: an OSS node publishes and serves volumes
+            // normally but cannot resume a snapshot, since this port has no
+            // resolver for that backend.
+            AGENTENV_WARN("snapshot runtime resolver unavailable for the configured"
+                          << " repository backend; POST /sandboxes cannot launch from"
+                          << " a snapshot on this node");
+        }
 
         ae::volume::VolumeLimits limits;
         limits.max_size_mb = app_cfg.volume.max_size_mb;
@@ -701,6 +723,16 @@ int main(int argc, char** argv) {
                       << " address=" << p2p_local_endpoint.address);
     }
 
+    // Rust `server.rs:90`, immediately after `local_endpoint()`. The image
+    // cache resolves layers through this transport; until now it was built
+    // here and never handed over, so every node silently fell back to pulling
+    // from the registry while the p2p surface sat idle.
+    //
+    // Before `OverlaybdP2pRuntime` and the ublk manager, as upstream has it:
+    // both can start fetching, and a cache that learns about the transport
+    // afterwards would miss exactly the first round of lookups.
+    ae::image::InitializeImageCacheP2pTransport(app_cfg, p2p_transport);
+
     // 5) HTTP server.
     auto server = ae::api::MakeServer();
 
@@ -724,7 +756,8 @@ int main(int argc, char** argv) {
                 1000)));
 
     ae::api::RegisterOrchestratorRoutes(server.get(), svc.get(), volume_manager,
-                                        image_resolver, repository);
+                                        image_resolver, repository,
+                                        snapshot_backend.runtime_resolver);
 
     InstallShutdownHandlers(server.get());
 

@@ -2,8 +2,10 @@
 // Rust: src/image/cache/store.rs — the ports the rest of AgentENV uses to
 // reach the node-local image cache, and their `ImageCacheService` adapter.
 //
-// The data types (`CachedImageConfig`, `OverlaybdLayerLocation`) live in
-// `cache_service.h`, beside the service that produces them.
+// `CachedImageConfig` lives in `cache_service.h`, beside the service that
+// produces it. `OverlaybdLayerStore` and `OverlaybdLayerLocation` live in
+// `cache_layer_store.h`, which is light enough for the snapshot side to
+// include -- they used to be declared a second time over there.
 #ifndef AGENTENV_IMAGE_CACHE_STORE_H_
 #define AGENTENV_IMAGE_CACHE_STORE_H_
 
@@ -17,6 +19,7 @@
 #include "agentenv/core/identity.h"
 #include "agentenv/core/json.h"
 #include "agentenv/core/optional.h"
+#include "agentenv/image/cache_layer_store.h"
 #include "agentenv/image/cache_service.h"
 #include "agentenv/image/metadata.h"
 #include "agentenv/image/oci_image.h"
@@ -76,14 +79,8 @@ class SourceImageStore {
         const core::Optional<std::string>& repository_scope) = 0;
 };
 
-/// Rust `OverlaybdLayerStore`.
-class OverlaybdLayerStore {
- public:
-    virtual ~OverlaybdLayerStore() {}
-    virtual OverlaybdLayerLocation LayerLocation(const std::string& digest, uint64_t size,
-                                                 bool has_remote) const = 0;
-    virtual std::vector<std::string> PublishableRoots() const = 0;
-};
+// `OverlaybdLayerStore` now comes from `image/cache_layer_store.h`, so the
+// snapshot side can name the same type instead of declaring its own copy.
 
 /// Rust `RuntimeImageRefs`.
 class RuntimeImageRefs {

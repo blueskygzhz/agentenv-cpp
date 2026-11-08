@@ -4,6 +4,7 @@
 #define AGENTENV_API_DTO_H_
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -24,6 +25,18 @@ namespace api {
 struct SandboxVolumeMountModel {
     std::string name;
     std::string path;
+};
+
+/// Rust generated `models::NewColdSandbox`, restricted to the resource fields.
+///
+/// Here rather than in `sandbox_params.h` for the same reason
+/// `SandboxVolumeMountModel` is: `CreateColdSandboxReq` below carries one, and
+/// `sandbox_params.h` includes *this* header. `ColdStartResources`, which
+/// validates it, stays declared there.
+struct NewColdSandboxResources {
+    core::Optional<uint32_t> cpu_count;
+    core::Optional<uint32_t> memory_mb;
+    core::Optional<uint32_t> disk_size_mb;
 };
 
 /// POST /sandboxes  request body.
@@ -64,6 +77,43 @@ struct CreateSandboxResp {
 
     core::Json ToJson() const;
     static core::Expected<CreateSandboxResp, core::AnyError> FromJson(const core::Json& j);
+};
+
+/// POST /sandboxes-cold  request body (Rust generated `models::NewColdSandbox`).
+///
+/// A separate route, and a separate body, because `POST /sandboxes` genuinely
+/// does not take an image: upstream's `NewSandbox` schema carries only
+/// `templateID`, and its own description points callers here to "create a
+/// sandbox directly from an external OCI image". Adding an `image` field to
+/// `CreateSandboxReq` would have diverged from the schema rather than filled a
+/// gap in it.
+struct CreateColdSandboxReq {
+    /// Rust `image: String` — required, and the only required field. An OCI
+    /// reference such as `python:3.11-slim`.
+    std::string image;
+    /// Rust's flattened resource fields. Held as the same struct
+    /// `ColdStartResources` validates, so the validation cannot be applied to
+    /// a different set of values than the ones parsed.
+    NewColdSandboxResources resources;
+    std::vector<std::string> env_vars;
+    /// Rust `timeout: Option<i64>`, in **seconds** (`duration_from_secs`).
+    /// Unset applies the node default, which is why this is not an `int64_t`
+    /// with a sentinel: zero is a legal explicit "no timeout" upstream.
+    core::Optional<int64_t> timeout_secs;
+    bool secure = false;
+    /// Rust `auto_pause: Option<bool>` — only an explicit `false` turns the
+    /// timeout action into Delete. Absent means Pause, as does `true`.
+    core::Optional<bool> auto_pause;
+    core::Optional<bool> allow_internet_access;
+    std::map<std::string, std::string> metadata;
+    /// Rust `volume_mounts: Option<Vec<models::SandboxVolumeMount>>`.
+    core::Optional<std::vector<SandboxVolumeMountModel> > volume_mounts;
+    /// Rust `extra_boot_args: Option<String>`, appended to the guest kernel
+    /// command line.
+    core::Optional<std::string> extra_boot_args;
+
+    core::Json ToJson() const;
+    static core::Expected<CreateColdSandboxReq, core::AnyError> FromJson(const core::Json& j);
 };
 
 /// GET /sandboxes/{id}  response body.
