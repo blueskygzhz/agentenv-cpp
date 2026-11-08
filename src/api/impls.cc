@@ -157,6 +157,64 @@ SnapshotInfoResp ToSnapshotInfoResp(const snapshot::SnapshotRecord& record) {
     return resp;
 }
 
+/// The tail both create handlers share, from the launch onwards.
+///
+/// A free function because `PreparedVolumeMounts` is file-local: declaring it
+/// as a member would have meant hoisting that struct into the public header
+/// for no other reason. Rust duplicates this block between `sandboxes_post`
+/// and `sandboxes_cold_post`; sharing it here is a deliberate deviation,
+/// because the duplicated part is the volume-lease handover and two copies of
+/// *that* is how one of them stops releasing on failure.
+core::Expected<CreateSandboxResp, ApiError> FinishCreate(
+    orchestrator::Orchestrator* svc, volume::VolumeManager* volumes,
+    const orchestrator::CreateSandboxRequest& request,
+    const PreparedVolumeMounts& prepared) {
+    const orchestrator::OrchestratorResult<orchestrator::SandboxMetadata> r =
+        svc->CreateSandbox(request);
+    if (!r.ok()) {
+        // The launch never happened, so the placeholder lease has to go --
+        // these volumes already existed and belong to the caller, so they are
+        // released, not deleted.
+        FinishVolumeReservation(volumes, prepared.owner,
+                                core::Optional<std::string>(), prepared.volume_ids);
+        return core::make_unexpected(ToApiError(r.error()));
+    }
+
+    const orchestrator::SandboxMetadata& meta = r.value();
+
+    // Handing the lease to the sandbox that now holds the volumes. If this
+    // fails the sandbox is running with volumes still leased to a placeholder
+    // nothing will ever release, so the sandbox is torn down and the lease
+    // dropped rather than left in that state.
+    const core::Expected<core::Unit, volume::VolumeError> handover =
+        FinishVolumeReservation(volumes, prepared.owner,
+                                core::Optional<std::string>(meta.id.ToString()),
+                                prepared.volume_ids);
+    if (!handover.ok()) {
+        const std::string message =
+            "failed to finalize volume reservation: " + handover.error().ToString();
+        svc->DeleteSandbox(meta.id);
+        FinishVolumeReservation(volumes, prepared.owner,
+                                core::Optional<std::string>(), prepared.volume_ids);
+        return core::make_unexpected(ApiError::Make(500, message));
+    }
+
+    CreateSandboxResp resp;
+    resp.sandbox_id    = meta.id.ToString();
+    resp.template_id   = meta.template_id;
+    resp.state         = orchestrator::SandboxStateName(meta.state);
+    resp.created_at_ms = meta.created_at_ms;
+    // Rust `sandbox_model`.
+    const core::Optional<sandbox::EnvdAccessToken> envd = svc->GetEnvdAccessToken(meta);
+    if (envd.has_value()) {
+        resp.envd_access_token = core::Optional<std::string>(envd->Expose());
+    }
+    if (!meta.network_policy.allow_public_traffic) {
+        resp.traffic_access_token = core::Optional<std::string>(svc->TrafficAccessToken(meta.id));
+    }
+    return resp;
+}
+
 }  // namespace
 
 ApiError SandboxNotFound(const std::string& id) {
@@ -360,56 +418,155 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
         request.volume_mounts[it->first] = it->second;
     }
 
-    return FinishCreate(request, prepared.value());
+    return FinishCreate(svc_.get(), volumes_.get(), request, prepared.value());
 }
 
 core::Expected<CreateSandboxResp, ApiError>
-ApiImpl::FinishCreate(const orchestrator::CreateSandboxRequest& request,
-                      const PreparedVolumeMounts& prepared) {
-    const orchestrator::OrchestratorResult<orchestrator::SandboxMetadata> r =
-        svc_->CreateSandbox(request);
-    if (!r.ok()) {
-        // The launch never happened, so the placeholder lease has to go --
-        // these volumes already existed and belong to the caller, so they are
-        // released, not deleted.
-        FinishVolumeReservation(volumes_.get(), prepared.owner,
-                                core::Optional<std::string>(), prepared.volume_ids);
-        return core::make_unexpected(ToApiError(r.error()));
+ApiImpl::CreateColdSandbox(const CreateColdSandboxReq& req) {
+    // Rust `sandboxes_cold_post`.
+    if (!image_resolver_) {
+        return core::make_unexpected(ApiError::Make(
+            501, "creating a sandbox from an image requires an image resolver"));
+    }
+    // Rust `image_resolver.resolve(&body.image)`. This is the step that turns
+    // `python:3.11-slim` into an overlaybd `image.json` on this node -- the
+    // thing `POST /sandboxes` cannot do, because its body has no image to
+    // resolve.
+    const core::Expected<image::ResolvedBlockImage, image::ImageError> resolved =
+        image_resolver_->Resolve(req.image);
+    if (!resolved.ok()) {
+        // Rust: `is_user_error()` decides 400 against 500. A bad reference or
+        // a missing tag is the caller's; a registry fault is this node's, and
+        // a caller must be able to tell which one to retry.
+        const int code = resolved.error().IsUserError() ? 400 : 500;
+        return core::make_unexpected(ApiError::Make(
+            code, "resolve sandbox rootfs image '" + req.image + "': " +
+                      resolved.error().reason));
     }
 
-    const orchestrator::SandboxMetadata& meta = r.value();
+    // Rust `cold_start_resources(body)`, which was already ported and tested
+    // and had no caller: this route is the only one that reads these fields.
+    const core::Expected<sandbox::SandboxResources, ApiError> resources =
+        ColdStartResources(req.resources);
+    if (!resources.ok()) return core::make_unexpected(resources.error());
 
-    // Handing the lease to the sandbox that now holds the volumes. If this
-    // fails the sandbox is running with volumes still leased to a placeholder
-    // nothing will ever release, so the sandbox is torn down and the lease
-    // dropped rather than left in that state.
-    const core::Expected<core::Unit, volume::VolumeError> handover =
-        FinishVolumeReservation(volumes_.get(), prepared.owner,
-                                core::Optional<std::string>(meta.id.ToString()),
-                                prepared.volume_ids);
-    if (!handover.ok()) {
-        const std::string message =
-            "failed to finalize volume reservation: " + handover.error().ToString();
-        svc_->DeleteSandbox(meta.id);
-        FinishVolumeReservation(volumes_.get(), prepared.owner,
-                                core::Optional<std::string>(), prepared.volume_ids);
-        return core::make_unexpected(ApiError::Make(500, message));
+    // Rust `network_policy_from_create(body.allow_internet_access,
+    // body.network.as_ref())`. The `network` half of the body is not ported,
+    // so the allow/deny lists and `allowPublicTraffic` cannot be set per
+    // request; `allowInternetAccess` is, and it is the tri-state that decides
+    // whether the sandbox gets egress at all. Passing NULL for the detailed
+    // config is upstream's own `None` arm, not an approximation.
+    const core::Expected<sandbox::network::SandboxNetworkPolicy, std::string> policy =
+        NetworkPolicyFromCreate(req.allow_internet_access, NULL);
+    if (!policy.ok()) {
+        return core::make_unexpected(ApiError::Make(400, policy.error()));
     }
 
-    CreateSandboxResp resp;
-    resp.sandbox_id    = meta.id.ToString();
-    resp.template_id   = meta.template_id;
-    resp.state         = orchestrator::SandboxStateName(meta.state);
-    resp.created_at_ms = meta.created_at_ms;
-    // Rust `sandbox_model`.
-    const core::Optional<sandbox::EnvdAccessToken> envd = svc_->GetEnvdAccessToken(meta);
-    if (envd.has_value()) {
-        resp.envd_access_token = core::Optional<std::string>(envd->Expose());
+    orchestrator::CreateSandboxRequest request;
+    // Rust `SandboxLaunchSource::Image { .. }`.
+    request.source = orchestrator::SandboxLaunchSource::FromImage(
+        resolved.value().image_ref, resolved.value().overlaybd_config_path);
+    // Rust `resolved_rootfs.base_context.into()` — `From<ImageBaseContext> for
+    // CommandContext`. The fields line up one to one, including the two
+    // optionals whose absent-versus-empty distinction OCI inheritance depends
+    // on, so this is a copy and not a reinterpretation. `FromEnvAndWorkdir`
+    // rather than aggregate assignment because it normalises a blank workdir
+    // to `/`, which an image config may well carry.
+    const image::ImageBaseContext& base = resolved.value().base_context;
+    request.source.context =
+        snapshot::CommandContext::FromEnvAndWorkdir(base.env_vars, base.workdir);
+    request.source.context.WithUser(base.user)
+        .WithExposedPorts(base.exposed_ports)
+        .WithEntrypoint(base.entrypoint)
+        .WithCmd(base.cmd)
+        .WithVolumes(base.volumes)
+        .WithLabels(base.labels);
+    // Rust `resources: Some(resources)` — the Image variant's optional, where
+    // unset would mean "the node's configured defaults". Always set here,
+    // because `ColdStartResources` has already applied those defaults to
+    // whichever fields the body omitted.
+    request.source.image_resources =
+        core::Optional<sandbox::SandboxResources>(resources.value());
+    request.source.extra_boot_args = req.extra_boot_args;
+    // Rust `build_image_configs(&resolved_rootfs, &resolved_attached)`. Only
+    // the rootfs entry here: an unset `drive_id` and a `/` mount path are what
+    // `ImageConfigs::RootfsConfig` matches on, and a snapshot taken from this
+    // sandbox publishes that object as its own `Env`/`Entrypoint`. Getting
+    // either wrong would make the capture inherit a volume's config.
+    //
+    // Skipped entirely when the image carried no OCI config, as upstream's
+    // `if let Some(config)` does -- an entry holding JSON `null` would read as
+    // a rootfs config that explicitly clears every inherited field.
+    if (resolved.value().raw_config.has_value()) {
+        request.source.image_configs.Add(core::Optional<std::string>(), "/",
+                                         *resolved.value().raw_config);
     }
-    if (!meta.network_policy.allow_public_traffic) {
-        resp.traffic_access_token = core::Optional<std::string>(svc_->TrafficAccessToken(meta.id));
+
+    // Rust's `attached_drives` field and `resolve_attached_drives` are not
+    // ported, so `extra_drives` starts empty and only volume drives join it.
+    // Stated rather than left implicit: it is the one part of `NewColdSandbox`
+    // this route does not honour. The DTO omits the field entirely rather than
+    // accepting and ignoring it, so a caller sending it gets no silent
+    // success. That same absence is why `check_attached_drive_overlap` has
+    // nothing to compare against in either create handler.
+
+    request.timeout_action = req.auto_pause.has_value() && !*req.auto_pause
+                                 ? orchestrator::SandboxTimeoutAction::Delete
+                                 : orchestrator::SandboxTimeoutAction::Pause;
+    // Rust `duration_from_secs(body.timeout)`: this body carries seconds,
+    // while `NewSandbox` carries milliseconds. Reading one as the other is a
+    // factor of 1000 in how long a sandbox lives.
+    if (req.timeout_secs.has_value()) {
+        request.timeout_ms = core::Optional<int64_t>(*req.timeout_secs * 1000);
     }
-    return resp;
+    for (std::size_t i = 0; i < req.env_vars.size(); ++i) {
+        // `KEY=VALUE`, as in `CreateSandbox`. A pair without `=` is dropped
+        // rather than stored under an empty key.
+        const std::string& kv = req.env_vars[i];
+        const std::size_t eq = kv.find('=');
+        if (eq == std::string::npos || eq == 0) continue;
+        request.env_vars[kv.substr(0, eq)] = kv.substr(eq + 1);
+    }
+    for (std::map<std::string, std::string>::const_iterator it = req.metadata.begin();
+         it != req.metadata.end(); ++it) {
+        request.user_metadata[it->first] = it->second;
+    }
+    request.network_policy = policy.value();
+    request.secure         = req.secure;
+
+    const core::Expected<core::Optional<std::map<std::string, std::string> >, ApiError>
+        requested = VolumeMountsFromModel(
+            req.volume_mounts.has_value() ? *req.volume_mounts
+                                          : std::vector<SandboxVolumeMountModel>());
+    if (!requested.ok()) return core::make_unexpected(requested.error());
+
+    const core::Expected<PreparedVolumeMounts, ApiError> prepared = PrepareVolumeMounts(
+        volumes_.get(),
+        requested.value().has_value() ? *requested.value()
+                                      : std::map<std::string, std::string>());
+    if (!prepared.ok()) return core::make_unexpected(prepared.error());
+
+    // On the *source*, matching Rust's `SandboxLaunchSource::Image {
+    // extra_drives }`. Note what this is **not**: a correctness requirement.
+    // `Orchestrator::CreateSandbox`'s fresh branch concatenates
+    // `source.extra_drives` with `request.extra_drives` before building the
+    // spec, so either field reaches the guest. A mutation that moved these to
+    // `request.extra_drives` survived its test, which is how that was
+    // established rather than assumed.
+    //
+    // Kept on the source because the concatenation is ordered -- the image's
+    // own drives first, then launch-time ones -- and that order is what
+    // upstream's `extra_drives.extend(volume_drives)` produces. It is
+    // unobservable today only because `attachedDrives` is not ported and so
+    // the image contributes none.
+    request.source.extra_drives = prepared.value().drives;
+    for (std::map<std::string, std::string>::const_iterator it =
+             prepared.value().mounts.begin();
+         it != prepared.value().mounts.end(); ++it) {
+        request.volume_mounts[it->first] = it->second;
+    }
+
+    return FinishCreate(svc_.get(), volumes_.get(), request, prepared.value());
 }
 
 core::Expected<core::Unit, ApiError>

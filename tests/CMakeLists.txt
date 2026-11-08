@@ -280,6 +280,10 @@ agentenv_add_test(test_snapshot_runtime_resolver test_snapshot_runtime_resolver.
 # resolver -> `Kind::Snapshot` launch chain.
 agentenv_add_test(test_api_create_from_snapshot test_api_create_from_snapshot.cc
                   agentenv-api agentenv-orchestrator agentenv-volume)
+# Rust: src/api/impls/sandbox.rs :: sandboxes_cold_post -- the OCI-reference
+# route. `POST /sandboxes` cannot take an image; this one can.
+agentenv_add_test(test_api_cold_sandbox test_api_cold_sandbox.cc
+                  agentenv-api agentenv-orchestrator agentenv-volume)
 # Rust: src/api/impls/sandbox.rs :: sandboxes_sandbox_id_snapshots_post
 agentenv_add_test(test_api_create_snapshot test_api_create_snapshot.cc
                   agentenv-api agentenv-orchestrator agentenv-volume agentenv-snapshot

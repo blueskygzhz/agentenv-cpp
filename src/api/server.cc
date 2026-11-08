@@ -106,6 +106,30 @@ void RegisterOrchestratorRoutes(
         resp->body = r.value().ToJson().ToString();
     });
 
+    // Rust `POST /sandboxes-cold`. Registered as its own route because that is
+    // what upstream's schema declares: `NewSandbox` carries only `templateID`
+    // and its description points callers here to "create a sandbox directly
+    // from an external OCI image". This port had the whole cold-start
+    // apparatus -- `ColdStartResources`, the metrics stage label, the
+    // gateway's `new_cold_sandbox` scheduling hint -- and no route calling any
+    // of it, so there was no way to go from an OCI reference to a running
+    // Firecracker VM over HTTP at all.
+    server->Route("POST", "/sandboxes-cold",
+                  [impl](const HttpRequest& req, HttpResponse* resp) {
+        core::Json body;
+        if (!ParseBody(req, &body, resp)) return;
+        const core::Expected<CreateColdSandboxReq, core::AnyError> parsed =
+            CreateColdSandboxReq::FromJson(body);
+        if (!parsed.ok()) {
+            return WriteError(ApiError::Make(400, parsed.error().chain()), resp);
+        }
+        const core::Expected<CreateSandboxResp, ApiError> r =
+            impl->CreateColdSandbox(parsed.value());
+        if (!r.ok()) return WriteError(r.error(), resp);
+        resp->status = 201;
+        resp->body = r.value().ToJson().ToString();
+    });
+
     server->Route("GET", "/sandboxes/{sandbox_id}",
                   [impl](const HttpRequest& req, HttpResponse* resp) {
         const core::Expected<GetSandboxResp, ApiError> r =

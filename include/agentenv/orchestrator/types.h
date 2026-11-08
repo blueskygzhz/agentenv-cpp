@@ -62,11 +62,16 @@ enum class SandboxTimeoutAction {
 
 /// Rust enum `SandboxLaunchSource` (types.rs).
 ///
-/// Deviation: Rust's `Snapshot` variant holds `Box<RunnableSnapshot>`, whose
-/// loader is not ported. The variant therefore carries the fields
-/// `create_sandbox_inner` actually reads off the snapshot's committed record,
-/// so the inheritance rules (custom params, image configs, context, ...) port
-/// faithfully; only resolving a snapshot id into those fields is out of scope.
+/// Deviation: Rust's `Snapshot` variant holds `Box<RunnableSnapshot>`. This
+/// one flattens the fields `create_sandbox_inner` reads off that snapshot, so
+/// the inheritance rules (custom params, image configs, context, ...) port
+/// faithfully without the variant owning a resolver's output.
+///
+/// An earlier note here said the `RunnableSnapshot` loader was "not ported"
+/// and that resolving a snapshot id into these fields was "out of scope".
+/// Both are obsolete: `SnapshotRuntimeResolver` resolves the record, and
+/// `FromRunnableSnapshot` below performs the flattening. The flattening itself
+/// is the only remaining deviation.
 struct SandboxLaunchSource {
     enum class Kind { Snapshot, Image };
 
