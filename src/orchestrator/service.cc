@@ -2193,7 +2193,7 @@ Orchestrator::CaptureSnapshot(const core::SandboxId& id) {
     OrchestratorResult<SandboxHandlePtr> handle = BeginSnapshotOperation(id);
     if (!handle.ok()) return core::make_unexpected(handle.error());
 
-    sandbox::SandboxCaptureResult<std::string> result =
+    sandbox::SandboxCaptureResult<sandbox::CapturedSandboxSnapshot> result =
         core::make_unexpected(sandbox::SandboxCaptureError::Recoverable(""));
     {
         SandboxHandle::Guard sandbox = handle.value()->Lock();

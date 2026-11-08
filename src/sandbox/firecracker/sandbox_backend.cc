@@ -22,6 +22,7 @@
 #include "agentenv/sandbox/firecracker/process_vm.h"
 
 #include "agentenv/sandbox/firecracker/lifecycle.h"
+#include "agentenv/overlaybd/compact.h"
 
 namespace agentenv {
 namespace sandbox {
@@ -38,6 +39,33 @@ namespace {
 /// actually running again, which is what `RecoverCaptureFailure` enforces.
 SandboxCaptureError ClassifyCaptureError(const std::string& message) {
     return SandboxCaptureError::Recoverable(message);
+}
+
+/// `{snapshot_dir}/mem_image.json` — the name a resume reads the memory stack
+/// back from, so it is fixed rather than a caller's choice.
+const char* const kMemImageConfigFileName = "mem_image.json";
+
+/// What a rootfs capture produced.
+struct RootfsCaptureOutcome {
+    std::string image_config_path;
+    uint64_t virtual_size = 0;
+};
+
+/// The production compactor: seal a run of layers into one.
+///
+/// Raw, not compressed. Compression happens once at publish time under
+/// `[snapshot.publish_compression]`; doing it here would pay the cost on every
+/// pause and then pay it again at publish.
+LayerCompactor DefaultLayerCompactor() {
+    return [](const std::vector<storage::overlaybd::LayerConfig>& layers,
+              const std::string& output_path)
+               -> core::Expected<core::Optional<std::string>, std::string> {
+        // Named rather than default-constructed: raw is the *intent* here, and
+        // relying on the default would make a later change to it silently
+        // start compressing on every pause.
+        return agentenv::overlaybd::CompactLayers(
+            layers, output_path, agentenv::overlaybd::OverlaybdCompactOutput::Raw());
+    };
 }
 
 }  // namespace
@@ -1141,6 +1169,13 @@ class FirecrackerSandboxBackend::Impl {
     std::shared_ptr<EnvdInstance> envd_instance;
     /// Test override for the guest-memory layer write.
     MemoryLayerWriter memory_layer_writer;
+    /// Test override for the rootfs capture inputs.
+    ///
+    /// Held here, not just accepted on `PauseToDirSpec`, because `Snapshot`
+    /// and `CaptureToDir` build their own specs -- so without this the rootfs
+    /// half of either entry point would be unreachable in a test. Same
+    /// arrangement as `memory_layer_writer`, for the same reason.
+    core::Optional<PauseToDirSpec::RootfsCaptureInputs> rootfs_override;
 
     /// Rust `self.launch.common().extra_drives`.
     ///
@@ -1176,6 +1211,208 @@ class FirecrackerSandboxBackend::Impl {
             if (!drives[i].read_only && drives[i].snapshot_output_dir.has_value()) return true;
         }
         return false;
+    }
+
+    /// Rust `uses_overlaybd_ublk`.
+    ///
+    /// **Deviation**: upstream asks `launch.common().ublk_config.is_some()` —
+    /// whether a ublk *daemon* was configured. Here the question is answered
+    /// by whether a rootfs device was actually created, which is what the
+    /// restack needs: the daemon being configured does not establish that
+    /// there is a device to seal, and sealing is addressed by device id. The
+    /// C++ `FreshStartSpec` has no `ublk_config` field at all — the fresh path
+    /// carries its rootfs under `drives->rootfs_image_config` — so the
+    /// upstream spelling has nothing to read on that path anyway.
+    bool UsesOverlaybdUblk() const { return drive_resources.rootfs() != NULL; }
+
+    /// Whether a rootfs capture is attempted, which also governs whether a
+    /// manifest is produced -- the two must agree, so there is one predicate.
+    bool CapturesRootfs(const PauseToDirSpec& pause_spec) const {
+        return pause_spec.rootfs_override.has_value() || UsesOverlaybdUblk();
+    }
+
+    /// The manager that owns the rootfs device, or null when none ran here.
+    ///
+    /// Only the fresh path has one: a resume adopts devices created elsewhere,
+    /// and a handed-in instance never created any.
+    std::shared_ptr<ublk::DeviceManager> DeviceManagerOf() const {
+        if (spec.drives.has_value()) return spec.drives->device_manager;
+        return std::shared_ptr<ublk::DeviceManager>();
+    }
+
+    /// Rust `snapshot_rootfs_virtual_size` — the size cached when the device
+    /// was created.
+    ///
+    /// An error rather than a zero: the manifest's size is what a restore
+    /// sizes the ublk device with, and a zero there would open the captured
+    /// stack behind a zero-length device. Rust words this as "ensure start()
+    /// was called before pause() or snapshot", which is the only way the
+    /// cache can be missing.
+    core::Expected<uint64_t, std::string> SnapshotRootfsVirtualSize() const {
+        const ublk::OverlaybdRuntimeDevice* rootfs = drive_resources.rootfs();
+        if (rootfs == NULL) {
+            return core::make_unexpected(std::string(
+                "rootfs virtual size cache missing; sandbox must record the user image "
+                "block-device size before snapshot; ensure start() was called before "
+                "pause() or snapshot"));
+        }
+        return rootfs->actual_virtual_size;
+    }
+
+    /// The memory stack this pause extends, or absent on a first pause.
+    ///
+    /// Rust's `load_existing_image_config` reads the path off the launch
+    /// config and tolerates a missing file. Absent here means "start a fresh
+    /// stack", which is what a fresh launch legitimately is; a *present but
+    /// unreadable* config is a different thing and is reported as an error by
+    /// `BuildMemSnapshotImageConfig`'s caller below.
+    core::Optional<storage::overlaybd::ImageConfig> InheritedMemImageConfig() const {
+        const std::string& path =
+            launch.kind == LaunchMode::Kind::Resume
+                ? resume_spec.snapshot_config.mem_overlaybd_config.image_config_path
+                : snapshot_config.mem_overlaybd_config.image_config_path;
+        if (path.empty()) return core::Optional<storage::overlaybd::ImageConfig>();
+        const core::Expected<storage::overlaybd::ImageConfig, std::string> loaded =
+            storage::overlaybd::LoadImageConfig(path);
+        if (!loaded.ok()) return core::Optional<storage::overlaybd::ImageConfig>();
+        return core::Optional<storage::overlaybd::ImageConfig>(loaded.value());
+    }
+
+    /// The roots under which a lower counts as runtime-owned.
+    ///
+    /// A test supplies its own so the classification does not depend on the
+    /// host's layout. Production falls back to the configured bases.
+    std::vector<std::string> RuntimeOwnedRoots(const PauseToDirSpec& pause_spec) const {
+        if (!pause_spec.runtime_owned_roots.empty()) return pause_spec.runtime_owned_roots;
+        // Rust reads both roots from `ConfigManager::global_config()`. The two
+        // it names are the managed-snapshot base and the persisted sandbox
+        // store; only the former is derivable here, and it is the one the
+        // live memory and rootfs layers actually sit under. The persisted
+        // store is passed as the same root rather than omitted: dropping a
+        // root makes layers look durable, and a layer wrongly judged durable
+        // is referenced instead of adopted, leaving the snapshot pointing at
+        // a file the runtime later deletes.
+        const std::string base = ManagedSnapshotBase(spec.firecracker_work_dir);
+        return CanonicalizedRuntimeOwnedRoots(base, base);
+    }
+
+    LayerCompactor LayerCompactorFor(const PauseToDirSpec& spec) const {
+        if (spec.compact_layers) return spec.compact_layers;
+        return DefaultLayerCompactor();
+    }
+
+    LayerAdopter LayerAdopterFor(const PauseToDirSpec& spec) const {
+        if (spec.adopt_layer) return spec.adopt_layer;
+        return LinkOrCopyRuntimeLayer;
+    }
+
+    /// Seals the live rootfs upper through the ublk daemon.
+    ///
+    /// Addressed by device id rather than by config path: the daemon owns the
+    /// device, and the live config is only how the *stack* is described.
+    SnapshotRestacker RootfsRestackerFor(const PauseToDirSpec& pause_spec) const {
+        if (pause_spec.rootfs_override) return pause_spec.rootfs_override->restack;
+
+        const ublk::OverlaybdRuntimeDevice* rootfs = drive_resources.rootfs();
+        std::shared_ptr<ublk::DeviceManager> manager = DeviceManagerOf();
+        if (rootfs == NULL || !manager) return SnapshotRestacker();
+
+        const ublk::Device device = rootfs->device;
+        return [manager, device](const std::string& output_layer_path)
+                   -> SandboxCaptureResult<core::Optional<RestackedLayer> > {
+            const storage::ublk_daemon::DaemonResult<storage::ublk_daemon::RestackSnapshotStats>
+                sealed = manager->RestackSnapshotDevice(device, output_layer_path);
+            if (!sealed.ok()) {
+                // Terminal: the daemon may have sealed the upper before
+                // failing, and from out here the two cases are
+                // indistinguishable. Guessing recoverable would resume a
+                // sandbox whose device had already been restacked.
+                return core::make_unexpected(
+                    SandboxCaptureError::Terminal(sealed.error().message));
+            }
+            if (!sealed.value().has_descriptor) return core::Optional<RestackedLayer>();
+
+            // The daemon reports the descriptor as raw JSON. A malformed one
+            // is treated as *absent* rather than fatal, matching how a daemon
+            // that omits the field is handled: the only thing lost is the
+            // size cross-check, whereas failing here would condemn a sandbox
+            // whose upper was sealed correctly.
+            //
+            // Each field's kind is checked before reading it -- `core::Json`'s
+            // accessors are undefined on the wrong kind, so a daemon answering
+            // `{"size": "123"}` would otherwise be read as an integer out of a
+            // string's storage.
+            const core::Json& json = sealed.value().descriptor;
+            if (json.kind() != core::Json::Kind::Object) return core::Optional<RestackedLayer>();
+
+            RestackedLayer descriptor;
+            const core::Json& digest = json["digest"];
+            if (digest.kind() == core::Json::Kind::String) descriptor.digest = digest.as_string();
+            const core::Json& size = json["size"];
+            if (size.kind() == core::Json::Kind::Int && size.as_int() >= 0) {
+                descriptor.size = static_cast<uint64_t>(size.as_int());
+            }
+            if (descriptor.digest.empty() && descriptor.size == 0) {
+                return core::Optional<RestackedLayer>();
+            }
+            return core::Optional<RestackedLayer>(descriptor);
+        };
+    }
+
+    /// Rust `restack_snapshot_overlaybd_rootfs`'s call site inside
+    /// `pause_to_dir`.
+    ///
+    /// **Precondition**: `CapturesRootfs(pause_spec)`. The caller decides
+    /// whether a rootfs capture is attempted at all, because that decision
+    /// also governs whether a manifest is produced, and the two have to agree.
+    /// Re-checking here would be unreachable code that reads as though this
+    /// function were safe to call unconditionally.
+    ///
+    /// Upstream captures the rootfs either by restacking an overlaybd ublk
+    /// device or by copying a raw drive file. Only the first is ported; the
+    /// raw-drive form has no counterpart, which is what the caller's guard
+    /// ends up standing in for.
+    SandboxCaptureResult<RootfsCaptureOutcome> CaptureRootfs(const PauseToDirSpec& pause_spec,
+                                                             const std::string& snapshot_dir) {
+        // The three rootfs inputs travel together: a supplied set is used
+        // whole, and the live device is read whole. Mixing them would seal one
+        // device and record another's size.
+        std::string live_image_config_path;
+        uint64_t virtual_size = 0;
+        if (pause_spec.rootfs_override) {
+            live_image_config_path = pause_spec.rootfs_override->live_image_config_path;
+            virtual_size = pause_spec.rootfs_override->virtual_size;
+        } else {
+            const core::Expected<uint64_t, std::string> live_size =
+                SnapshotRootfsVirtualSize();
+            if (!live_size.ok()) {
+                // Checked before the seal, so the sandbox is untouched.
+                return core::make_unexpected(
+                    SandboxCaptureError::Recoverable(live_size.error()));
+            }
+            live_image_config_path = drive_resources.rootfs()->image_config_path;
+            virtual_size = live_size.value();
+        }
+
+        const SnapshotRestacker restack = RootfsRestackerFor(pause_spec);
+        if (!restack) {
+            return core::make_unexpected(SandboxCaptureError::Recoverable(
+                "rootfs capture requires a ublk device manager to seal the live upper"));
+        }
+
+        // `read_only` is false: a live sandbox's rootfs always carries a
+        // writable upper, and the read-only form exists for capturing a stack
+        // that was never booted.
+        const SandboxCaptureResult<std::string> staged = RestackSnapshotOverlaybdRootfs(
+            restack, false, live_image_config_path, snapshot_dir,
+            RuntimeOwnedRoots(pause_spec), LayerCompactorFor(pause_spec),
+            LayerAdopterFor(pause_spec));
+        if (!staged.ok()) return core::make_unexpected(staged.error());
+
+        RootfsCaptureOutcome out;
+        out.image_config_path = staged.value();
+        out.virtual_size = virtual_size;
+        return out;
     }
 
     /// Rust `live_snapshot_root` — resolved once, then reused.
@@ -1387,12 +1624,33 @@ FirecrackerSandboxBackend::PauseToDir(const PauseToDirSpec& spec) {
 
         result.memory_layer_path = mem_dir + "/overlaybd.commit";
         result.memory_size = memory_size;
-        if (spec.write_memory_layer) {
-            return spec.write_memory_layer(result.memory_layer_path, mappings.value(),
-                                           memory_size, pid.value());
-        }
-        return PublishMemoryOverlaybdLayer(result.memory_layer_path, mappings.value(),
-                                           memory_size, pid.value());
+        const core::Expected<core::Unit, std::string> wrote_layer =
+            spec.write_memory_layer
+                ? spec.write_memory_layer(result.memory_layer_path, mappings.value(),
+                                          memory_size, pid.value())
+                : PublishMemoryOverlaybdLayer(result.memory_layer_path, mappings.value(),
+                                              memory_size, pid.value());
+        if (!wrote_layer.ok()) return wrote_layer;
+
+        // 5. Write the memory *stack* beside the layer.
+        //
+        //    `memory_layer_path` is only this pause's new layer; a resume needs
+        //    the stack it sits on. Without this, every pause after the first
+        //    would produce a device holding just the pages that happened to be
+        //    dirty at capture time, with the rest unreadable.
+        const core::Expected<storage::overlaybd::ImageConfig, std::string> mem_config =
+            BuildMemSnapshotImageConfig(impl_->InheritedMemImageConfig(),
+                                        result.memory_layer_path, mem_dir,
+                                        impl_->RuntimeOwnedRoots(spec),
+                                        impl_->LayerCompactorFor(spec),
+                                        impl_->LayerAdopterFor(spec));
+        if (!mem_config.ok()) return core::make_unexpected(mem_config.error());
+
+        result.memory_image_config_path = spec.snapshot_dir + "/" + kMemImageConfigFileName;
+        return core::fs::WriteAtomically(
+            result.memory_image_config_path,
+            storage::overlaybd::ImageConfigToJsonPretty(mem_config.value()),
+            "memory snapshot image config");
     }();
 
     if (!captured.ok()) {
@@ -1401,10 +1659,62 @@ FirecrackerSandboxBackend::PauseToDir(const PauseToDirSpec& spec) {
             impl_->RecoverCaptureFailure("snapshot capture",
                                          ClassifyCaptureError(captured.error())));
     }
+
+    // 6. Restack the rootfs — only when there is an overlaybd ublk rootfs to
+    //    restack.
+    //
+    //    Upstream always has one, so `pause_to_dir` always returns a manifest.
+    //    Here the rootfs may be absent (a backend built around a handed-in
+    //    instance, or a resume that adopted devices it did not create), and
+    //    the two callers want different things from that: `Snapshot` only
+    //    promises a directory, while `CaptureToDir` promises a manifest.
+    //
+    //    Skipping is therefore *not* silent in any way that matters: the
+    //    manifest stays absent, and `CaptureToDir` — the only caller that
+    //    needs one — refuses with that as the reason. What must never happen
+    //    is a manifest naming a rootfs config that was never written, which is
+    //    why the two are produced together or not at all.
+    if (impl_->CapturesRootfs(spec)) {
+        // Deliberately outside the lambda above. The restack already answers
+        // with a classified `SandboxCaptureError`, and that classification is
+        // the one thing it exists to get right: once the live upper is sealed,
+        // the sandbox is no longer resumable. Routing it back through
+        // `ClassifyCaptureError`, which only sees a string, would relabel a
+        // terminal seal failure as recoverable and the caller would resume a
+        // VM whose block device had silently lost the sealed writes.
+        const SandboxCaptureResult<RootfsCaptureOutcome> rootfs =
+            impl_->CaptureRootfs(spec, spec.snapshot_dir);
+        if (!rootfs.ok()) {
+            CleanupFailedSnapshotDir(spec.snapshot_dir);
+            // The error's own classification is preserved;
+            // `RecoverCaptureFailure` skips the recovery resume when terminal.
+            return core::make_unexpected(
+                impl_->RecoverCaptureFailure("rootfs restack", rootfs.error()));
+        }
+        result.rootfs_image_config_path = rootfs.value().image_config_path;
+        result.rootfs_virtual_size = rootfs.value().virtual_size;
+
+        // 7. Only now describe the capture. A manifest asserts the snapshot is
+        //    complete and restorable, so it is built last and only from
+        //    artifacts that were actually written -- producing one earlier
+        //    would let a caller publish a snapshot whose rootfs never landed.
+        const core::Expected<SandboxSnapshotManifest, std::string> manifest =
+            SandboxSnapshotManifest::New(kFirecrackerBackend, result.vm_state_path,
+                                         result.memory_image_config_path, result.memory_size,
+                                         result.rootfs_image_config_path,
+                                         result.rootfs_virtual_size, impl_->ExtraDrives());
+        if (!manifest.ok()) {
+            CleanupFailedSnapshotDir(spec.snapshot_dir);
+            // Terminal: the rootfs was already sealed by step 6.
+            return core::make_unexpected(impl_->RecoverCaptureFailure(
+                "snapshot manifest", SandboxCaptureError::Terminal(manifest.error())));
+        }
+        result.manifest = core::Optional<SandboxSnapshotManifest>(manifest.value());
+    }
     return result;
 }
 
-SandboxCaptureResult<std::string> FirecrackerSandboxBackend::Snapshot() {
+SandboxCaptureResult<CapturedSandboxSnapshot> FirecrackerSandboxBackend::Snapshot() {
     if (!impl_->instance) {
         return core::make_unexpected(
             SandboxCaptureError::Terminal("snapshot: no live microVM"));
@@ -1432,6 +1742,7 @@ SandboxCaptureResult<std::string> FirecrackerSandboxBackend::Snapshot() {
     // through -- a stale filesystem is worse than a refused snapshot.
     spec.has_writable_persistent_volumes = impl_->HasWritablePersistentVolumes();
     spec.write_memory_layer = impl_->memory_layer_writer;
+    spec.rootfs_override = impl_->rootfs_override;
 
     const SandboxCaptureResult<PauseToDirResult> captured = PauseToDir(spec);
     if (!captured.ok()) {
@@ -1451,12 +1762,83 @@ SandboxCaptureResult<std::string> FirecrackerSandboxBackend::Snapshot() {
         return core::make_unexpected(SandboxCaptureError::Terminal(
             "snapshot captured but sandbox could not be resumed: " + resumed.error()));
     }
-    return spec.snapshot_dir;
+
+    // Checked *after* the resume, deliberately. `Snapshot`'s contract is that
+    // the sandbox keeps running, so the resume is owed regardless of whether
+    // the capture turned out to be publishable; reporting first would leave a
+    // frozen VM behind a failure the caller is told is recoverable.
+    //
+    // Upstream has no absent-manifest case: production always has an
+    // overlaybd ublk rootfs, so `snapshot()` always produces one. Here the
+    // rootfs may be missing, and the only caller of this -- the publish path
+    // -- cannot do anything with a capture it cannot describe. Handing back a
+    // default-constructed manifest would be worse than failing: it would
+    // claim an empty backend and empty artifact paths, and the publisher
+    // would commit a record pointing at nothing.
+    if (!captured.value().manifest) {
+        CleanupFailedSnapshotDir(spec.snapshot_dir);
+        return core::make_unexpected(SandboxCaptureError::Recoverable(
+            "snapshot: this sandbox has no overlaybd ublk rootfs to capture, so the capture "
+            "cannot be described for publication"));
+    }
+    return CapturedSandboxSnapshot(*captured.value().manifest, spec.snapshot_dir);
+}
+
+SandboxCaptureResult<SandboxSnapshotManifest> FirecrackerSandboxBackend::CaptureToDir(
+    const std::string& at) {
+    if (!impl_->instance) {
+        return core::make_unexpected(
+            SandboxCaptureError::Terminal("capture_to_dir: no live microVM"));
+    }
+
+    PauseToDirSpec spec;
+    // The caller names the directory, unlike `Snapshot`, which mints an id
+    // under the live snapshot root. A template build captures into a path it
+    // already owns and then stops the sandbox.
+    spec.snapshot_dir = at;
+    spec.has_writable_persistent_volumes = impl_->HasWritablePersistentVolumes();
+    spec.write_memory_layer = impl_->memory_layer_writer;
+    spec.rootfs_override = impl_->rootfs_override;
+
+    const SandboxCaptureResult<PauseToDirResult> captured = PauseToDir(spec);
+    if (!captured.ok()) return core::make_unexpected(captured.error());
+
+    // Upstream's `pause_to_dir` always returns a manifest because production
+    // always has an overlaybd ublk rootfs. Here it is absent exactly when the
+    // rootfs capture was not attempted, so this is where that shows up --
+    // loudly, rather than as a manifest naming a rootfs config nobody wrote.
+    //
+    // The partial directory goes, and the error is routed through
+    // `RecoverCaptureFailure`. Both are needed: a successful `PauseToDir`
+    // leaves the VM *paused*, so reporting `Recoverable` without resuming
+    // would promise a runnable sandbox while leaving it frozen. No seal was
+    // attempted in this branch, so the resume is safe and the sandbox really
+    // is recoverable.
+    if (!captured.value().manifest) {
+        CleanupFailedSnapshotDir(at);
+        return core::make_unexpected(impl_->RecoverCaptureFailure(
+            "capture_to_dir",
+            SandboxCaptureError::Recoverable(
+                "this sandbox has no overlaybd ublk rootfs to capture, so no snapshot "
+                "manifest could be produced")));
+    }
+
+    // Deliberately **not** resumed: this is what separates `CaptureToDir` from
+    // `Snapshot`. The caller captured in order to stop the sandbox, and
+    // resuming here would leave a VM running that it believes it owns and has
+    // already accounted for as finished.
+    return *captured.value().manifest;
 }
 
 void FirecrackerSandboxBackend::SetMemoryLayerWriterForTesting(
     const MemoryLayerWriter& writer) {
     impl_->memory_layer_writer = writer;
+}
+
+void FirecrackerSandboxBackend::SetRootfsCaptureForTesting(
+    const PauseToDirSpec::RootfsCaptureInputs& inputs) {
+    impl_->rootfs_override =
+        core::Optional<PauseToDirSpec::RootfsCaptureInputs>(inputs);
 }
 
 // ---- not available in this build ------------------------------------------

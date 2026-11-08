@@ -221,6 +221,46 @@ struct TempFile {
 Expected<TempFile, std::string> CreateTempFileIn(const std::string& dir,
                                                  const std::string& prefix);
 
+/// Rust `on_same_filesystem` (`firecracker/overlaybd_snapshot.rs`) — whether
+/// two existing paths sit on one filesystem, by `stat(2)`'s `st_dev`.
+///
+/// Both paths must exist; a missing one is an error rather than a `false`.
+/// The callers use this to decide whether a file can be *produced in place*
+/// instead of produced elsewhere and copied, and "cannot tell" must not be
+/// read as "different device" — that would turn a cheap in-place write into a
+/// copy, or worse, be taken as proof a rename would work.
+Expected<bool, std::string> OnSameFilesystem(const std::string& a, const std::string& b);
+
+/// Rust `write_bytes_atomically` — write to a sibling temporary, `fsync` it,
+/// then `rename(2)` over `path`.
+///
+/// Distinct from `Write`, which truncates in place: a reader that opens the
+/// file mid-write sees a half-written config there, whereas `rename(2)` is
+/// atomic, so a reader sees either the old bytes or the new ones. That matters
+/// for every file overlaybd-tcmu may be reading while this process rewrites it.
+///
+/// Unlike `PersistNoClobber` this *replaces* an existing file, because the
+/// callers are rewriting a config that is expected to be there already.
+///
+/// `description` only names the thing in error messages, matching upstream.
+///
+/// The published file carries `mkstemp`'s 0600 rather than the umask-derived
+/// bits `Write` would leave, which is upstream's behaviour too
+/// (`tempfile::NamedTempFile` creates 0600 and `persist` keeps it).
+Expected<Unit, std::string> WriteAtomically(const std::string& path,
+                                            const std::string& contents,
+                                            const std::string& description);
+
+/// Rust `copy_file_atomically` — copy `src` to a temporary beside `dst`,
+/// `fsync` it, then `rename(2)` it onto `dst`.
+///
+/// The copy lands on the destination's filesystem on purpose: it is used to
+/// move a sealed layer across a filesystem boundary, where a rename is not
+/// available, and the `fsync`-then-rename keeps a partially copied layer from
+/// ever being visible under the final name.
+Expected<Unit, std::string> CopyFileAtomically(const std::string& src, const std::string& dst,
+                                               const std::string& description);
+
 /// Rust `nix::unistd::Uid::effective().as_raw()`.
 uint32_t EffectiveUid();
 

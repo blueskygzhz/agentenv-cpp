@@ -64,9 +64,11 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc)
                                std::shared_ptr<image::ImageResolver>());
 }
 
-void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc,
-                                std::shared_ptr<volume::VolumeManager> volumes,
-                                std::shared_ptr<image::ImageResolver> image_resolver) {
+void RegisterOrchestratorRoutes(
+    Server* server, orchestrator::Orchestrator* svc,
+    std::shared_ptr<volume::VolumeManager> volumes,
+    std::shared_ptr<image::ImageResolver> image_resolver,
+    std::shared_ptr<snapshot::repository::SnapshotRepository> repository) {
     if (server == NULL || svc == NULL) return;
 
     // The handlers share one ApiImpl. It holds a shared_ptr, so the lambdas
@@ -77,7 +79,7 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc,
     // that decides when the orchestrator dies.
     std::shared_ptr<orchestrator::Orchestrator> alias(
         std::shared_ptr<orchestrator::Orchestrator>(), svc);
-    std::shared_ptr<ApiImpl> impl(new ApiImpl(alias, volumes, image_resolver));
+    std::shared_ptr<ApiImpl> impl(new ApiImpl(alias, volumes, image_resolver, repository));
 
     // ---- sandboxes --------------------------------------------------------
 
@@ -177,12 +179,41 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc,
         resp->status = 201;
     });
 
-    server->Route("POST", "/sandboxes/{sandbox_id}/snapshot",
+    // `snapshots`, plural, and 201 with the published snapshot in the body.
+    //
+    // This used to be `POST /sandboxes/{id}/snapshot` answering 204, which
+    // matched neither upstream's `/sandboxes/{sandboxID}/snapshots` nor this
+    // port's own metrics route label (`observability/prometheus.cc`, which has
+    // always folded the plural path). While the handler was a 501 the
+    // difference did not show; now that it publishes, the old spelling would
+    // have left clients unable to find the route and the per-route metrics
+    // labelled for a path nothing served.
+    server->Route("POST", "/sandboxes/{sandbox_id}/snapshots",
                   [impl](const HttpRequest& req, HttpResponse* resp) {
-        const core::Expected<core::Unit, ApiError> r =
-            impl->CreateSnapshot(Param(req, "sandbox_id"));
+        // Upstream's `requestBody` is `required: true`, so an absent body is
+        // a 400. Checked here rather than through `ParseBody`, which treats an
+        // empty body as `{}`: that leniency is harmless on routes whose DTO
+        // has required fields (`POST /sandboxes` fails on the missing
+        // `templateID` either way), but `CreateSnapshotReq`'s only field is
+        // optional, so an omitted body would quietly publish unaliased the
+        // snapshot the caller meant to name.
+        if (req.body.empty()) {
+            return WriteError(ApiError::Make(400, "a request body is required"), resp);
+        }
+        core::Json body;
+        if (!ParseBody(req, &body, resp)) return;
+        const core::Expected<CreateSnapshotReq, core::AnyError> parsed =
+            CreateSnapshotReq::FromJson(body);
+        if (!parsed.ok()) {
+            return WriteError(ApiError::Make(400, parsed.error().chain()), resp);
+        }
+        const core::Expected<SnapshotInfoResp, ApiError> r =
+            impl->CreateSnapshot(Param(req, "sandbox_id"), parsed.value());
         if (!r.ok()) return WriteError(r.error(), resp);
-        resp->status = 204;
+        // 201: the snapshot is a new resource, and the body names it. A 204
+        // would leave the caller with no id to launch from.
+        WriteJson(r.value().ToJson(), resp);
+        resp->status = 201;
     });
 
     // ---- volumes ----------------------------------------------------------

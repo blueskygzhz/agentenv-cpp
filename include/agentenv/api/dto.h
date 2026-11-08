@@ -88,6 +88,38 @@ struct ListSandboxesResp {
     static core::Expected<ListSandboxesResp, core::AnyError> FromJson(const core::Json& j);
 };
 
+/// Rust `models::SandboxSnapshotRequest` — POST /sandboxes/{id}/snapshots body.
+struct CreateSnapshotReq {
+    /// Rust `name` — an optional alias for the published snapshot. Absent is
+    /// distinct from empty: an absent name publishes without an alias, while
+    /// an empty one is a malformed alias and is rejected.
+    core::Optional<std::string> name;
+
+    core::Json ToJson() const;
+    static core::Expected<CreateSnapshotReq, core::AnyError> FromJson(const core::Json& j);
+};
+
+/// Rust `models::SnapshotInfo` — the published snapshot, as the create and
+/// read handlers both report it.
+struct SnapshotInfoResp {
+    std::string snapshot_id;
+    /// Rust `names` — the alias as a one-element list, empty when there is
+    /// none. A list because upstream's schema says so; a snapshot carries at
+    /// most one alias.
+    std::vector<std::string> names;
+    uint32_t cpu_count = 0;
+    uint64_t memory_mb = 0;
+    uint64_t disk_size_mb = 0;
+    int64_t created_at_unix_ms = 0;
+    int64_t updated_at_unix_ms = 0;
+    /// Rust `image_ref` — set only when the rootfs was published to a
+    /// registry, so its absence is meaningful rather than a missing field.
+    core::Optional<std::string> image_ref;
+
+    core::Json ToJson() const;
+    static core::Expected<SnapshotInfoResp, core::AnyError> FromJson(const core::Json& j);
+};
+
 /// POST /sandboxes/{id}/exec  request body.
 struct ExecReq {
     std::vector<std::string> cmd;

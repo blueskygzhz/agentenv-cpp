@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT
 #include "agentenv/api/dto.h"
 
+// `SnapshotInfoResp` reports its timestamps as RFC3339, as upstream's
+// `DateTime<Utc>` does.
+#include "agentenv/core/time.h"
+
 namespace agentenv {
 namespace api {
 
@@ -180,6 +184,90 @@ ListSandboxesResp::FromJson(const core::Json& j) {
             if (!s.ok()) return core::make_unexpected(std::move(s.error()));
             r.sandboxes.push_back(s.value());
         }
+    }
+    return r;
+}
+
+// -------- CreateSnapshotReq --------
+core::Json CreateSnapshotReq::ToJson() const {
+    core::Json j;
+    // Omitted when absent rather than sent as null or "": upstream's `name` is
+    // an `Option<String>`, and an empty string is a *malformed alias* rather
+    // than "no alias", so the two must not collapse on the wire.
+    if (name.has_value()) j["name"] = core::Json(*name);
+    return j;
+}
+core::Expected<CreateSnapshotReq, core::AnyError>
+CreateSnapshotReq::FromJson(const core::Json& j) {
+    CreateSnapshotReq r;
+    const core::Json& name = j["name"];
+    if (name.kind() == core::Json::Kind::String) {
+        r.name = core::Optional<std::string>(name.as_string());
+    }
+    return r;
+}
+
+// -------- SnapshotInfoResp --------
+core::Json SnapshotInfoResp::ToJson() const {
+    core::Json j;
+    j["snapshotID"] = core::Json(snapshot_id);
+    core::JsonArray names_json;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        names_json.emplace_back(core::Json(names[i]));
+    }
+    j["names"] = core::Json(names_json);
+    j["cpuCount"]   = core::Json(static_cast<int64_t>(cpu_count));
+    j["memoryMB"]   = core::Json(static_cast<int64_t>(memory_mb));
+    j["diskSizeMB"] = core::Json(static_cast<int64_t>(disk_size_mb));
+    // RFC3339, as upstream's `DateTime<Utc>` serializes. The record stores
+    // milliseconds, so the value is widened to nanos for the formatter rather
+    // than emitted as a number -- a client parsing a timestamp must not have
+    // to know which of the two shapes this field is in.
+    j["createdAt"] = core::Json(
+        core::FormatRfc3339Nanos(core::SystemTime(created_at_unix_ms * 1000000)));
+    j["updatedAt"] = core::Json(
+        core::FormatRfc3339Nanos(core::SystemTime(updated_at_unix_ms * 1000000)));
+    if (image_ref.has_value()) j["imageRef"] = core::Json(*image_ref);
+    return j;
+}
+core::Expected<SnapshotInfoResp, core::AnyError>
+SnapshotInfoResp::FromJson(const core::Json& j) {
+    SnapshotInfoResp r;
+    auto id = GetString(j, "snapshotID");
+    if (!id.ok()) return core::make_unexpected(std::move(id.error()));
+    r.snapshot_id = id.value();
+
+    const core::Json& names = j["names"];
+    if (names.kind() == core::Json::Kind::Array) {
+        const core::JsonArray& arr = names.as_array();
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+            if (arr[i].kind() == core::Json::Kind::String) {
+                r.names.push_back(arr[i].as_string());
+            }
+        }
+    }
+    r.cpu_count    = static_cast<uint32_t>(GetIntOr(j, "cpuCount", 0));
+    r.memory_mb    = static_cast<uint64_t>(GetIntOr(j, "memoryMB", 0));
+    r.disk_size_mb = static_cast<uint64_t>(GetIntOr(j, "diskSizeMB", 0));
+
+    // Parsed back from RFC3339, matching what `ToJson` writes. A failure
+    // leaves the field at zero rather than failing the whole parse: the
+    // timestamps are informational, while `snapshotID` above is not.
+    const core::Json& created = j["createdAt"];
+    if (created.kind() == core::Json::Kind::String) {
+        const core::Expected<core::SystemTime, std::string> t =
+            core::ParseRfc3339(created.as_string());
+        if (t.ok()) r.created_at_unix_ms = t.value().unix_nanos / 1000000;
+    }
+    const core::Json& updated = j["updatedAt"];
+    if (updated.kind() == core::Json::Kind::String) {
+        const core::Expected<core::SystemTime, std::string> t =
+            core::ParseRfc3339(updated.as_string());
+        if (t.ok()) r.updated_at_unix_ms = t.value().unix_nanos / 1000000;
+    }
+    const core::Json& image_ref_json = j["imageRef"];
+    if (image_ref_json.kind() == core::Json::Kind::String) {
+        r.image_ref = core::Optional<std::string>(image_ref_json.as_string());
     }
     return r;
 }

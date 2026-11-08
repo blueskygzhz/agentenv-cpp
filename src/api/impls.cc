@@ -83,6 +83,79 @@ core::Expected<core::Unit, volume::VolumeError> FinishVolumeReservation(
     return manager->ReplaceOwnerFor(owner, new_owner, volume_ids);
 }
 
+/// Rust `ApiImpl::bad_request_for_repository_build_error`, folded together
+/// with the `unwrap_or_else(|| error(500, ...))` arm every caller pairs it
+/// with.
+///
+/// Only three variants are the caller's fault: a malformed request, an alias
+/// someone else holds, and a digest that did not match what was uploaded.
+/// Everything else -- a missing artifact, an unsupported backend, a transport
+/// failure -- is this node's problem, and a 400 would tell the client to stop
+/// retrying something that a retry might well fix.
+///
+/// Note `AliasConflict` maps to 400 and not 409, which is upstream's choice:
+/// the generated response for this route has only a 400 and a 500 variant, so
+/// that is the status a client written against upstream can ever observe here.
+ApiError RepositoryPublishError(const snapshot::repository::RepositoryError& err) {
+    switch (err.kind) {
+        case snapshot::repository::RepositoryErrorKind::InvalidRequest:
+        case snapshot::repository::RepositoryErrorKind::AliasConflict:
+        case snapshot::repository::RepositoryErrorKind::IntegrityMismatch:
+            return ApiError::Make(400, err.ToString());
+        default:
+            return ApiError::Make(500, err.ToString());
+    }
+}
+
+/// Rust passes `capture.metadata.custom_extension_params.clone()` straight
+/// into the publish metadata, because both sides are the same
+/// `serde_json::Map` there. This port stores the sandbox's copy as the
+/// caller's original *text* (`custom_extension::Params::json_bytes`) and the
+/// snapshot's as a parsed `core::Json`, so the hand-off needs a parse.
+///
+/// Mirrors `custom_extension::ParamsJson`, the other place that crosses the
+/// same boundary: an empty value becomes an empty object, and a non-empty one
+/// must parse to a JSON object.
+///
+/// A malformed non-empty value is an error rather than being dropped. These
+/// params are forwarded to the extension's lifecycle hooks, so a snapshot
+/// published without them would launch sandboxes that behave differently from
+/// the one that was captured -- and nothing would say why.
+core::Expected<core::Optional<core::Json>, ApiError> PublishedCustomExtensionParams(
+    const core::Optional<sandbox::custom_extension::Params>& params) {
+    if (!params.has_value()) return core::Optional<core::Json>();
+    if (sandbox::custom_extension::ParamsIsEmpty(params)) {
+        return core::Optional<core::Json>(core::Json(core::JsonObject()));
+    }
+    const core::Expected<core::Json, core::AnyError> parsed =
+        core::Json::Parse(params->json_bytes);
+    if (!parsed.ok()) {
+        return core::make_unexpected(InternalError(
+            "stored custom extension params are not valid JSON: " + parsed.error().chain()));
+    }
+    if (parsed.value().kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(
+            InternalError("stored custom extension params must be a JSON object"));
+    }
+    return core::Optional<core::Json>(parsed.value());
+}
+
+/// Rust `From<SnapshotRecord> for models::SnapshotInfo` (impls/snapshots.rs).
+SnapshotInfoResp ToSnapshotInfoResp(const snapshot::SnapshotRecord& record) {
+    SnapshotInfoResp resp;
+    resp.snapshot_id = record.id.ToString();
+    // Rust `vec![alias.to_string()]` or `vec![]`: a snapshot carries at most
+    // one alias, and the schema reports it as a list.
+    if (record.alias.has_value()) resp.names.push_back(record.alias->ToString());
+    resp.cpu_count    = record.resources.cpu_count;
+    resp.memory_mb    = record.resources.memory_mib;
+    resp.disk_size_mb = record.resources.disk_size_mib;
+    resp.created_at_unix_ms = record.created_at_unix_ms;
+    resp.updated_at_unix_ms = record.updated_at_unix_ms;
+    resp.image_ref = record.PublishedRootfsImageRef();
+    return resp;
+}
+
 }  // namespace
 
 ApiError SandboxNotFound(const std::string& id) {
@@ -455,21 +528,151 @@ ApiImpl::Exec(const std::string& sandbox_id, const ExecReq& /*req*/) {
         501, "exec is not available in this build (needs the envd guest client)"));
 }
 
-core::Expected<core::Unit, ApiError>
-ApiImpl::CreateSnapshot(const std::string& sandbox_id) {
+core::Expected<snapshot::repository::SnapshotRepository*, ApiError>
+ApiImpl::RequireRepository() const {
+    if (!repository_) {
+        // Upstream's `snapshot_manager` is non-optional, so there is no
+        // upstream message to copy. Refused rather than answered with a
+        // fabricated id: a caller told its snapshot was taken will later
+        // launch from a snapshot that was never written, and the failure then
+        // surfaces on another node as a corrupt record.
+        return core::make_unexpected(
+            ApiError::Make(500, "no snapshot repository configured"));
+    }
+    return repository_.get();
+}
+
+core::Expected<std::vector<snapshot::SnapshotVolume>, ApiError>
+ApiImpl::SnapshotSandboxVolumes(const orchestrator::SandboxMetadata& metadata) {
+    std::vector<snapshot::SnapshotVolume> snapshots;
+    if (metadata.volume_mounts.empty()) return snapshots;
+
+    // The manager is only demanded once there is something to ask it for. A
+    // sandbox with no mounts publishes fine without one, and refusing it
+    // would make every snapshot on a volume-less node fail for a reason that
+    // does not apply to it.
+    const core::Expected<volume::VolumeManager*, ApiError> manager = RequireVolumes();
+    if (!manager.ok()) return core::make_unexpected(manager.error());
+
+    // Upstream iterates a `HashMap`, so its order is arbitrary and nothing
+    // can depend on it. Sorted by mount path here, which is within that
+    // freedom and makes the published record reproducible for the same
+    // sandbox -- an arbitrary order would make two captures of one sandbox
+    // differ in a field that carries no ordering meaning.
+    const std::map<std::string, std::string> mounts(metadata.volume_mounts.begin(),
+                                                    metadata.volume_mounts.end());
+    snapshots.reserve(mounts.size());
+    for (std::map<std::string, std::string>::const_iterator it = mounts.begin();
+         it != mounts.end(); ++it) {
+        const volume::VolumeResult<volume::VolumeRecord> state =
+            manager.value()->SnapshotVolumeState(it->second);
+        if (!state.ok()) {
+            return core::make_unexpected(VolumeErrorResponse(state.error()));
+        }
+        snapshot::SnapshotVolume entry;
+        entry.mount_path = it->first;
+        entry.mode       = state.value().mode;
+        entry.size_mb    = state.value().size_mb;
+        entry.layers     = state.value().backing_layers;
+        snapshots.push_back(entry);
+    }
+    return snapshots;
+}
+
+core::Expected<SnapshotInfoResp, ApiError>
+ApiImpl::CreateSnapshot(const std::string& sandbox_id, const CreateSnapshotReq& req) {
     const core::Expected<core::SandboxId, ApiError> id = ParseId(sandbox_id);
     if (!id.ok()) return core::make_unexpected(id.error());
 
-    // Rust publishes the capture into the snapshot repository and records it
-    // under a new snapshot id. The repository side is not ported, so there is
-    // nowhere to publish to.
+    // Demanded before the capture rather than after it. A capture pauses the
+    // guest and writes its memory and rootfs out in full, and the only reason
+    // to pay that is to publish the result; discovering afterwards that there
+    // is nowhere to publish would have cost the sandbox a pause and left the
+    // files on disk with nothing naming them.
+    const core::Expected<snapshot::repository::SnapshotRepository*, ApiError> repository =
+        RequireRepository();
+    if (!repository.ok()) return core::make_unexpected(repository.error());
+
+    // Rust parses the alias before capturing too, for the same reason.
+    core::Optional<snapshot::SnapshotAlias> alias;
+    if (req.name.has_value()) {
+        const core::Expected<snapshot::SnapshotAlias, std::string> parsed =
+            snapshot::SnapshotAlias::Parse(*req.name);
+        if (!parsed.ok()) {
+            // Rust `format!("invalid snapshot alias: {}", err)`.
+            return core::make_unexpected(
+                ApiError::Make(400, "invalid snapshot alias: " + parsed.error()));
+        }
+        alias = core::Optional<snapshot::SnapshotAlias>(parsed.value());
+    }
+
+    // 1) Capture. The orchestrator claims `Snapshotting`, drives the backend
+    // and puts the sandbox back the way it found it.
+    const orchestrator::OrchestratorResult<orchestrator::SnapshotCaptureResult> capture =
+        svc_->CaptureSnapshot(id.value());
+    if (!capture.ok()) {
+        // `ToApiError` already produces the statuses upstream assigns this
+        // route: 404 for a missing sandbox and 400 for a state a snapshot
+        // cannot be taken from. Only the wording differs, and it comes from
+        // the orchestrator error rather than being re-spelled here.
+        return core::make_unexpected(ToApiError(capture.error()));
+    }
+    const orchestrator::SandboxMetadata& metadata = capture.value().metadata;
+
+    // 2) The mounted volumes, as of the capture.
+    const core::Expected<std::vector<snapshot::SnapshotVolume>, ApiError> volume_snapshots =
+        SnapshotSandboxVolumes(metadata);
+    if (!volume_snapshots.ok()) {
+        // Rust: `match error.code { 500 => 500, _ => 400 }`. A volume
+        // conflict is a 409 in `VolumeErrorResponse`, but this route's
+        // generated response upstream has only the two variants, so 400 is
+        // the status a client can observe here.
+        const ApiError& error = volume_snapshots.error();
+        return core::make_unexpected(error.code == 500 ? error
+                                                       : ApiError::Make(400, error.message));
+    }
+
+    const core::Expected<core::Optional<core::Json>, ApiError> extension_params =
+        PublishedCustomExtensionParams(metadata.custom_extension_params);
+    if (!extension_params.ok()) {
+        return core::make_unexpected(extension_params.error());
+    }
+
+    // 3) Publish: store the files and layers, then commit the record.
+    snapshot::SnapshotPublishMetadata publish;
+    publish.id    = core::SnapshotId::Fresh();
+    publish.alias = alias;
+    // The user metadata is provenance only; it never affects a launch.
     //
-    // This one is the most dangerous to fake: a caller told the snapshot
-    // succeeded will later launch from a snapshot id that was never written,
-    // and the failure then appears on another node as a corrupt record.
-    return core::make_unexpected(ApiError::Make(
-        501, "snapshot publication is not available in this build "
-             "(needs the snapshot repository)"));
+    // Upstream's field is an `Option<HashMap>` on both sides and is cloned
+    // straight across. This port's `SandboxMetadata` holds a plain map, so
+    // "absent" and "empty" have already collapsed by the time the capture
+    // hands it over -- an empty one is published as absent, which is the
+    // shape upstream writes for a sandbox that never had any.
+    core::Optional<std::map<std::string, std::string> > user_metadata;
+    if (!metadata.user_metadata.empty()) {
+        user_metadata = core::Optional<std::map<std::string, std::string> >(
+            std::map<std::string, std::string>(metadata.user_metadata.begin(),
+                                               metadata.user_metadata.end()));
+    }
+    publish.source = snapshot::SnapshotPublishSource::Sandbox(metadata.id.ToString(),
+                                                              user_metadata);
+    publish.context             = metadata.context;
+    publish.startup             = metadata.startup;
+    publish.resources           = metadata.resources;
+    publish.runtime_versions    = metadata.runtime_versions;
+    publish.virtualization_mode = metadata.virtualization_mode;
+    publish.image_configs       = metadata.image_configs;
+    publish.volume_snapshots    = volume_snapshots.value();
+    publish.custom_extension_params = extension_params.value();
+
+    const snapshot::repository::RepositoryResult<snapshot::SnapshotPublication> published =
+        snapshot::Publish(*repository.value(), publish,
+                          capture.value().captured_snapshot.manifest);
+    if (!published.ok()) {
+        return core::make_unexpected(RepositoryPublishError(published.error()));
+    }
+    return ToSnapshotInfoResp(published.value().record);
 }
 
 core::Expected<core::Unit, ApiError>

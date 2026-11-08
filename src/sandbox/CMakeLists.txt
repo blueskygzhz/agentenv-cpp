@@ -54,6 +54,9 @@ add_library(agentenv-sandbox STATIC
     firecracker/sandbox_backend.cc
     # Rust: overlaybd_snapshot.rs :: build_mem_snapshot_image_config
     firecracker/mem_image_config.cc
+    # Rust: overlaybd_snapshot.rs :: the capture half — restack_snapshot_*,
+    # capture_live_overlaybd_snapshot, stage_overlaybd_snapshot_from_live_runtime
+    firecracker/overlaybd_restack.cc
     # Rust: factory.rs :: impl SandboxBackendFactory
     firecracker/factory_impl.cc
     firecracker/mmds.cc
@@ -79,6 +82,11 @@ target_link_libraries(agentenv-sandbox PUBLIC
     # `storage::overlaybd::UpperModeToString` / `UpperModeParse`, so the
     # persisted spelling has exactly one definition.
     agentenv-overlaybd
+    # `PauseToDir`'s default layer compactor seals a run of runtime-owned
+    # layers into one, which is what keeps the stack under overlaybd's
+    # 255-layer limit across repeated pauses. One-way: the compact target does
+    # not know about sandbox, so this adds no cycle.
+    agentenv-overlaybd-compact
     # sandbox/ublk/device.cc drives the daemon over its wire protocol.
     agentenv-ublk-daemon-protocol
 )

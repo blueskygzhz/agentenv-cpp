@@ -10,6 +10,9 @@
 #include "agentenv/core/expected.h"
 #include "agentenv/image/layers.h"
 #include "agentenv/orchestrator/service.h"
+// `CreateSnapshot` publishes through `snapshot::Publish`, which takes a
+// repository reference and a `SnapshotVolume` list.
+#include "agentenv/snapshot/publish.h"
 #include "agentenv/volume.h"
 
 namespace agentenv {
@@ -50,13 +53,21 @@ class ApiImpl {
     /// source needs it. Upstream's `ApiImpl` holds it unconditionally; here a
     /// request naming an image without one is refused rather than served from
     /// a resolver this bundle does not have.
+    ///
+    /// `repository` is optional on the same terms: only `CreateSnapshot` reads
+    /// it, and it refuses rather than pretending to publish. Defaulted rather
+    /// than split into another overload because, unlike the volume manager,
+    /// its absence changes nothing about any *other* handler's behaviour.
     ApiImpl(std::shared_ptr<orchestrator::Orchestrator> svc,
             std::shared_ptr<volume::VolumeManager> volumes,
             std::shared_ptr<image::ImageResolver> image_resolver =
-                std::shared_ptr<image::ImageResolver>())
+                std::shared_ptr<image::ImageResolver>(),
+            std::shared_ptr<snapshot::repository::SnapshotRepository> repository =
+                std::shared_ptr<snapshot::repository::SnapshotRepository>())
         : svc_(std::move(svc)),
           volumes_(std::move(volumes)),
-          image_resolver_(std::move(image_resolver)) {}
+          image_resolver_(std::move(image_resolver)),
+          repository_(std::move(repository)) {}
 
     // Sandbox handlers (Rust: src/api/impls/sandbox.rs).
     core::Expected<CreateSandboxResp, ApiError>
@@ -110,9 +121,25 @@ class ApiImpl {
     /// Rust `volumes_volume_id_delete`.
     core::Expected<core::Unit, ApiError> DeleteVolume(const std::string& volume_id);
 
-    // Snapshot handlers (Rust: src/api/impls/snapshot.rs).
-    core::Expected<core::Unit, ApiError>
-        CreateSnapshot(const std::string& sandbox_id);
+    /// Rust `sandboxes_sandbox_id_snapshots_post` (impls/sandbox.rs) — capture
+    /// the running sandbox, then publish it as a snapshot.
+    ///
+    /// The three steps, and why the order is not free:
+    ///
+    ///   1. **Capture.** `Orchestrator::CaptureSnapshot` pauses the guest,
+    ///      writes the artifacts and resumes it, handing back the manifest
+    ///      that describes them.
+    ///   2. **Snapshot the mounted volumes.** Their sealed layers are read
+    ///      from the volume catalog and recorded in the publication, so a
+    ///      restore gets the volumes as of the capture. Done *after* the
+    ///      capture, as upstream does: the guest's volume writes are flushed
+    ///      as part of the capture, so reading the layers first would record
+    ///      a state older than the rootfs the snapshot restores.
+    ///   3. **Publish.** Stores the files and layers, then commits the
+    ///      record. The record is what names the snapshot, so nothing before
+    ///      this point is visible to any other node.
+    core::Expected<SnapshotInfoResp, ApiError>
+        CreateSnapshot(const std::string& sandbox_id, const CreateSnapshotReq& req);
 
     // Template handlers (Rust: src/api/impls/template.rs).
     core::Expected<core::Unit, ApiError>
@@ -129,12 +156,32 @@ class ApiImpl {
     /// and reports the same 500 when it is missing.
     core::Expected<volume::VolumeManager*, ApiError> RequireVolumes() const;
 
+    /// The same demand for the repository, which only `CreateSnapshot` needs.
+    core::Expected<snapshot::repository::SnapshotRepository*, ApiError>
+        RequireRepository() const;
+
+    /// Rust `snapshot_sandbox_volumes` — the mounted volumes' sealed layers,
+    /// as of the capture.
+    ///
+    /// A sandbox with no mounts yields an empty list, which is a successful
+    /// answer rather than a reason to skip the publication.
+    core::Expected<std::vector<snapshot::SnapshotVolume>, ApiError>
+        SnapshotSandboxVolumes(const orchestrator::SandboxMetadata& metadata);
+
     std::shared_ptr<orchestrator::Orchestrator> svc_;
     /// Null when this bundle was built without one. The fork handler needs it
     /// for a source that has volume mounts, and `/volumes*` needs it always.
     std::shared_ptr<volume::VolumeManager> volumes_;
     /// Null unless supplied. Only `CreateVolume`'s `image` source reads it.
     std::shared_ptr<image::ImageResolver> image_resolver_;
+    /// Null unless supplied. Only `CreateSnapshot` reads it, and it refuses
+    /// rather than publishing nowhere when it is absent.
+    ///
+    /// Upstream reaches this through a `SnapshotManager` that owns both the
+    /// repository and the catalog. There is no such type here -- `Publish` is
+    /// a free function over `SnapshotRepository&` -- so the repository is held
+    /// directly.
+    std::shared_ptr<snapshot::repository::SnapshotRepository> repository_;
 };
 
 }  // namespace api

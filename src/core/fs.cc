@@ -507,6 +507,125 @@ Expected<TempFile, std::string> CreateTempFileIn(const std::string& dir,
     return out;
 }
 
+Expected<bool, std::string> OnSameFilesystem(const std::string& a, const std::string& b) {
+    struct stat sa;
+    if (::stat(a.c_str(), &sa) != 0) {
+        return make_unexpected(Errno("stat", a, errno));
+    }
+    struct stat sb;
+    if (::stat(b.c_str(), &sb) != 0) {
+        return make_unexpected(Errno("stat", b, errno));
+    }
+    return sa.st_dev == sb.st_dev;
+}
+
+namespace {
+
+// The shared tail of the two atomic publishers: fsync the temporary, rename it
+// onto `dst`, and clean the temporary up on any failure.
+//
+// The fsync has to happen before the rename, not after. A rename is ordered
+// against the data only if the data is already durable; reversing them leaves a
+// window where the name points at a file whose bytes are still in page cache,
+// so a crash yields an entry that exists and is empty -- which is worse than
+// no entry, because every reader treats it as a valid config.
+Expected<Unit, std::string> FinishAtomicPublish(const TempFile& temp, const std::string& dst,
+                                                const std::string& description) {
+    const Expected<Unit, std::string> synced = SyncFd(temp.fd.get());
+    if (!synced.ok()) {
+        ::unlink(temp.path.c_str());
+        return make_unexpected("sync temp " + description + " '" + temp.path +
+                               "': " + synced.error());
+    }
+    if (::rename(temp.path.c_str(), dst.c_str()) != 0) {
+        const int saved = errno;
+        ::unlink(temp.path.c_str());
+        return make_unexpected(Errno(("persist " + description).c_str(), dst, saved));
+    }
+    return Unit();
+}
+
+// Both publishers need the destination's directory: the temporary must be
+// created there for the rename to stay within one filesystem.
+Expected<std::string, std::string> AtomicPublishParent(const std::string& path,
+                                                       const std::string& description) {
+    const Optional<std::string> parent = Parent(path);
+    if (!parent) {
+        return make_unexpected(description + " path has no parent directory: " + path);
+    }
+    return *parent;
+}
+
+}  // namespace
+
+Expected<Unit, std::string> WriteAtomically(const std::string& path, const std::string& contents,
+                                            const std::string& description) {
+    const Expected<std::string, std::string> parent = AtomicPublishParent(path, description);
+    if (!parent.ok()) return make_unexpected(parent.error());
+
+    const Expected<TempFile, std::string> temp = CreateTempFileIn(parent.value(), ".aenv-tmp-");
+    if (!temp.ok()) {
+        return make_unexpected("create temp " + description + " in '" + parent.value() +
+                               "': " + temp.error());
+    }
+
+    const Expected<Unit, std::string> written = WriteFd(temp.value().fd.get(), contents);
+    if (!written.ok()) {
+        ::unlink(temp.value().path.c_str());
+        return make_unexpected("write temp " + description + " '" + temp.value().path +
+                               "': " + written.error());
+    }
+    return FinishAtomicPublish(temp.value(), path, description);
+}
+
+Expected<Unit, std::string> CopyFileAtomically(const std::string& src, const std::string& dst,
+                                               const std::string& description) {
+    const Expected<std::string, std::string> parent = AtomicPublishParent(dst, description);
+    if (!parent.ok()) return make_unexpected(parent.error());
+
+    const int in = ::open(src.c_str(), O_RDONLY | O_CLOEXEC);
+    if (in < 0) {
+        return make_unexpected(Errno(("open " + description).c_str(), src, errno));
+    }
+    const FileDescriptor source(in);
+
+    const Expected<TempFile, std::string> temp = CreateTempFileIn(parent.value(), ".aenv-tmp-");
+    if (!temp.ok()) {
+        return make_unexpected("create temp " + description + " in '" + parent.value() +
+                               "': " + temp.error());
+    }
+
+    // Streamed in chunks rather than read whole: the files this moves are
+    // overlaybd layers, which run to gigabytes. Buffering one in memory to
+    // copy it would make the copy's peak RSS the size of the layer.
+    std::vector<char> buffer(1u << 20);
+    for (;;) {
+        const ssize_t got = ::read(source.get(), &buffer[0], buffer.size());
+        if (got < 0) {
+            if (errno == EINTR) continue;
+            const int saved = errno;
+            ::unlink(temp.value().path.c_str());
+            return make_unexpected(Errno(("read " + description).c_str(), src, saved));
+        }
+        if (got == 0) break;
+
+        std::size_t offset = 0;
+        while (offset < static_cast<std::size_t>(got)) {
+            const ssize_t put = ::write(temp.value().fd.get(), &buffer[offset],
+                                        static_cast<std::size_t>(got) - offset);
+            if (put < 0) {
+                if (errno == EINTR) continue;
+                const int saved = errno;
+                ::unlink(temp.value().path.c_str());
+                return make_unexpected(
+                    Errno(("write " + description).c_str(), temp.value().path, saved));
+            }
+            offset += static_cast<std::size_t>(put);
+        }
+    }
+    return FinishAtomicPublish(temp.value(), dst, description);
+}
+
 uint32_t EffectiveUid() { return static_cast<uint32_t>(::geteuid()); }
 
 bool EffectiveUidIsRoot() { return ::geteuid() == 0; }

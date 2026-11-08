@@ -22,6 +22,7 @@ namespace agentenv {
 namespace orchestrator { class Orchestrator; }
 namespace volume { class VolumeManager; }
 namespace image { class ImageResolver; }
+namespace snapshot { namespace repository { class SnapshotRepository; } }
 
 namespace api {
 
@@ -107,9 +108,16 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc)
 /// `image_resolver` may be null independently: it is read only by
 /// `POST /volumes` when the request names an `image`, so a deployment that
 /// never creates volumes from images does not need one.
-void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc,
-                                std::shared_ptr<volume::VolumeManager> volumes,
-                                std::shared_ptr<image::ImageResolver> image_resolver);
+///
+/// `repository` may be null on the same terms: only
+/// `POST /sandboxes/{id}/snapshots` reads it, and that route answers 500
+/// rather than reporting a snapshot it never published.
+void RegisterOrchestratorRoutes(
+    Server* server, orchestrator::Orchestrator* svc,
+    std::shared_ptr<volume::VolumeManager> volumes,
+    std::shared_ptr<image::ImageResolver> image_resolver,
+    std::shared_ptr<snapshot::repository::SnapshotRepository> repository =
+        std::shared_ptr<snapshot::repository::SnapshotRepository>());
 
 }  // namespace api
 }  // namespace agentenv

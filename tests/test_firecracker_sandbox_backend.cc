@@ -1212,6 +1212,48 @@ bool StartsWithPath(const std::string& s, const std::string& prefix) {
     return s.size() > prefix.size() && s.compare(0, prefix.size(), prefix) == 0;
 }
 
+/// A live rootfs `image.json` with one lower and a writable upper, plus the
+/// inputs needed to capture it.
+///
+/// Defined up here rather than beside the rootfs tests because `Snapshot`
+/// needs it too: without a rootfs to seal the capture produces no manifest,
+/// and `Snapshot` refuses a capture it cannot describe.
+PauseToDirSpec::RootfsCaptureInputs RootfsInputs(const std::string& dir,
+                                                 CaptureTrace* trace,
+                                                 bool seal_fails,
+                                                 bool seal_terminal) {
+    const std::string live_dir = dir + "/live-rootfs";
+    (void)core::fs::CreateDirAll(live_dir);
+    storage::overlaybd::ImageConfig live;
+    storage::overlaybd::LayerConfig lower;
+    lower.file = live_dir + "/base.commit";
+    live.lowers.push_back(lower);
+    live.upper.data = live_dir + "/upper.data";
+    live.upper.index = live_dir + "/upper.index";
+    (void)core::fs::Write(lower.file, "base");
+    (void)core::fs::Write(live.upper.data, "upper");
+    const std::string live_config = live_dir + "/image.json";
+    (void)core::fs::Write(live_config, storage::overlaybd::ImageConfigToJsonPretty(live));
+
+    PauseToDirSpec::RootfsCaptureInputs inputs;
+    inputs.live_image_config_path = live_config;
+    inputs.virtual_size = 4096;
+    inputs.restack = [trace, live_config, seal_fails, seal_terminal](
+                         const std::string& output_layer_path)
+        -> SandboxCaptureResult<core::Optional<RestackedLayer> > {
+        trace->events.push_back("seal");
+        if (seal_fails) {
+            return core::make_unexpected(seal_terminal
+                                             ? SandboxCaptureError::Terminal("seal refused")
+                                             : SandboxCaptureError::Recoverable("seal refused"));
+        }
+        // Stand in for the daemon: produce the sealed layer file.
+        (void)core::fs::Write(output_layer_path, "sealed");
+        return core::Optional<RestackedLayer>();
+    };
+    return inputs;
+}
+
 }  // namespace
 
 MT_TEST(snapshot_captures_then_leaves_the_sandbox_running) {
@@ -1222,8 +1264,11 @@ MT_TEST(snapshot_captures_then_leaves_the_sandbox_running) {
         StartedBackend(dir, &trace, std::string());
     if (!backend) return;
     backend->SetMemoryLayerWriterForTesting(TracingWriter(&trace));
+    // Supplied because `Snapshot` publishes: with no rootfs to seal it has
+    // nothing to describe and refuses, which is its own test below.
+    backend->SetRootfsCaptureForTesting(RootfsInputs(dir, &trace, false, false));
 
-    SandboxCaptureResult<std::string> r = backend->Snapshot();
+    SandboxCaptureResult<CapturedSandboxSnapshot> r = backend->Snapshot();
     MT_EXPECT_TRUE(r.ok());
     if (!r.ok()) {
         MT_EXPECT_EQ(r.error().Message(), std::string(""));
@@ -1241,15 +1286,28 @@ MT_TEST(snapshot_captures_then_leaves_the_sandbox_running) {
     // Artifacts are where the result says they are. Only the memory layer is
     // checked on disk: `vm_state.bin` is written by the VMM in response to
     // `/snapshot/create`, which the stand-in only records.
-    MT_EXPECT_TRUE(PathExists(r.value()));
-    MT_EXPECT_TRUE(PathExists(r.value() + "/mem_overlaybd/overlaybd.commit"));
+    MT_EXPECT_TRUE(PathExists(r.value().snapshot_dir));
+    MT_EXPECT_TRUE(PathExists(r.value().snapshot_dir + "/mem_overlaybd/overlaybd.commit"));
 
     // Under the configured work dir, namespaced by sandbox id -- not in the
     // process's temp dir, which is where an unconfigured base would land.
     const std::string expected_root =
         dir + "/fc-work/managed-snapshots/" +
         TestSandboxId().ToString();
-    MT_EXPECT_TRUE(StartsWithPath(r.value(), expected_root + "/"));
+    MT_EXPECT_TRUE(StartsWithPath(r.value().snapshot_dir, expected_root + "/"));
+
+    // The manifest describes *this* capture, and is the only thing the
+    // publish path reads. Checking the directory alone would pass just as
+    // well with a default-constructed manifest, which would commit a record
+    // naming an empty backend and files at the filesystem root.
+    MT_EXPECT_EQ(r.value().Backend(), std::string(kFirecrackerBackend));
+    MT_EXPECT_EQ(r.value().manifest.vm_state.path,
+                 r.value().snapshot_dir + "/vm_state.bin");
+    MT_EXPECT_EQ(r.value().manifest.memory.image_config_path,
+                 r.value().snapshot_dir + "/mem_image.json");
+    // The memory image's virtual size is the guest's RAM, not zero: a
+    // restore sizes the overlaybd device from it.
+    MT_EXPECT_TRUE(r.value().manifest.memory.virtual_size > 0);
 
     MT_EXPECT_TRUE(backend->Stop().ok());
 }
@@ -1263,20 +1321,68 @@ MT_TEST(two_snapshots_share_a_root_and_do_not_collide) {
     if (!backend) return;
     backend->SetMemoryLayerWriterForTesting(TracingWriter(&trace));
 
-    SandboxCaptureResult<std::string> first = backend->Snapshot();
-    SandboxCaptureResult<std::string> second = backend->Snapshot();
+    backend->SetRootfsCaptureForTesting(RootfsInputs(dir, &trace, false, false));
+
+    SandboxCaptureResult<CapturedSandboxSnapshot> first = backend->Snapshot();
+    SandboxCaptureResult<CapturedSandboxSnapshot> second = backend->Snapshot();
     MT_EXPECT_TRUE(first.ok());
     MT_EXPECT_TRUE(second.ok());
     if (!first.ok() || !second.ok()) return;
 
+    const std::string first_dir = first.value().snapshot_dir;
+    const std::string second_dir = second.value().snapshot_dir;
+
     // Distinct directories: a reused name would have the second capture
     // overwrite the first, and both records would then point at one of them.
-    MT_EXPECT_TRUE(first.value() != second.value());
-    MT_EXPECT_TRUE(PathExists(first.value() + "/mem_overlaybd/overlaybd.commit"));
-    MT_EXPECT_TRUE(PathExists(second.value() + "/mem_overlaybd/overlaybd.commit"));
+    MT_EXPECT_TRUE(first_dir != second_dir);
+    MT_EXPECT_TRUE(PathExists(first_dir + "/mem_overlaybd/overlaybd.commit"));
+    MT_EXPECT_TRUE(PathExists(second_dir + "/mem_overlaybd/overlaybd.commit"));
     // ...but one root, so a sandbox's captures stay together.
-    MT_EXPECT_EQ(first.value().substr(0, first.value().rfind('/')),
-                 second.value().substr(0, second.value().rfind('/')));
+    MT_EXPECT_EQ(first_dir.substr(0, first_dir.rfind('/')),
+                 second_dir.substr(0, second_dir.rfind('/')));
+
+    // And each manifest names its own capture. One shared manifest would make
+    // the second publication overwrite the first's artifacts.
+    MT_EXPECT_EQ(first.value().manifest.vm_state.path, first_dir + "/vm_state.bin");
+    MT_EXPECT_EQ(second.value().manifest.vm_state.path, second_dir + "/vm_state.bin");
+
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(snapshot_without_a_ublk_rootfs_is_refused_but_keeps_the_sandbox_running) {
+    // `PauseToDir` is allowed to come back without a manifest -- the fork path
+    // does not need one. `Snapshot` exists to be published, so a capture it
+    // cannot describe is no use: handing back a default-constructed manifest
+    // would commit a record naming an empty backend and files at `/`.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+    backend->SetMemoryLayerWriterForTesting(TracingWriter(&trace));
+    // Deliberately no `SetRootfsCaptureForTesting`.
+
+    SandboxCaptureResult<CapturedSandboxSnapshot> r = backend->Snapshot();
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+
+    // Recoverable, and the resume happened: the refusal is about the capture
+    // being unpublishable, not about the sandbox being broken. Reporting
+    // before the resume would leave a frozen VM behind an error that promises
+    // a running one.
+    MT_EXPECT_TRUE(!r.error().IsTerminal());
+    MT_EXPECT_TRUE(IndexIn(trace.events, "resume") > IndexIn(trace.events, "create_snapshot"));
+    MT_EXPECT_TRUE(r.error().Message().find("overlaybd ublk rootfs") != std::string::npos);
+
+    // The partial capture is gone. Left behind it would be indistinguishable
+    // by name from a good one.
+    const std::string root =
+        dir + "/fc-work/managed-snapshots/" + TestSandboxId().ToString();
+    const core::Expected<std::vector<std::string>, std::string> entries =
+        core::fs::ReadDir(root);
+    MT_EXPECT_TRUE(entries.ok());
+    if (entries.ok()) MT_EXPECT_EQ(entries.value().size(), static_cast<std::size_t>(0));
 
     MT_EXPECT_TRUE(backend->Stop().ok());
 }
@@ -1291,7 +1397,7 @@ MT_TEST(a_failed_snapshot_capture_resumes_and_leaves_no_directory) {
     if (!backend) return;
     backend->SetMemoryLayerWriterForTesting(TracingWriter(&trace));
 
-    SandboxCaptureResult<std::string> r = backend->Snapshot();
+    SandboxCaptureResult<CapturedSandboxSnapshot> r = backend->Snapshot();
     MT_EXPECT_TRUE(!r.ok());
     if (r.ok()) return;
     // Recoverable, and therefore a promise the sandbox is running again.
@@ -1316,7 +1422,7 @@ MT_TEST(snapshot_without_a_live_vm_is_terminal) {
     std::unique_ptr<FirecrackerSandboxBackend> backend(new FirecrackerSandboxBackend(
         FreshStartSpec(), SnapshotConfig(), std::shared_ptr<Connector>(conn)));
 
-    SandboxCaptureResult<std::string> r = backend->Snapshot();
+    SandboxCaptureResult<CapturedSandboxSnapshot> r = backend->Snapshot();
     MT_EXPECT_TRUE(!r.ok());
     if (r.ok()) return;
     // Terminal rather than recoverable: `Recoverable` promises a running
@@ -1338,6 +1444,257 @@ MT_TEST(managed_snapshot_base_follows_the_configured_work_dir) {
     // An empty string is a missing value, not a request to write at the root:
     // `/managed-snapshots` is both unwritable and not what was meant.
     MT_EXPECT_EQ(ManagedSnapshotBase(core::Optional<std::string>(std::string())), fallback);
+}
+
+// ---- the memory stack a capture writes ------------------------------------
+
+MT_TEST(capture_writes_the_memory_stack_beside_the_layer) {
+    // `memory_layer_path` is only *this* pause's new layer. Without a stack
+    // naming it, a resume would open a device holding just the pages that
+    // happened to be dirty at capture time, with everything else unreadable.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    const SandboxCaptureResult<PauseToDirResult> r = backend->PauseToDir(spec);
+    MT_EXPECT_TRUE(r.ok());
+    if (!r.ok()) return;
+
+    MT_EXPECT_EQ(r.value().memory_image_config_path, spec.snapshot_dir + "/mem_image.json");
+    MT_EXPECT_TRUE(core::fs::Exists(r.value().memory_image_config_path));
+
+    // Read as written: `LoadImageConfig` would rebase the paths, so it would
+    // be checking the loader rather than what the capture produced.
+    const core::Expected<std::string, std::string> text =
+        core::fs::ReadToString(r.value().memory_image_config_path);
+    MT_EXPECT_TRUE(text.ok());
+    if (!text.ok()) return;
+    const core::Expected<storage::overlaybd::ImageConfig, std::string> parsed =
+        storage::overlaybd::ParseImageConfig(text.value());
+    MT_EXPECT_TRUE(parsed.ok());
+    if (!parsed.ok()) return;
+    // The new memory layer is the newest lower.
+    MT_EXPECT_TRUE(!parsed.value().lowers.empty());
+    if (parsed.value().lowers.empty()) return;
+    MT_EXPECT_EQ(parsed.value().lowers.back().file, r.value().memory_layer_path);
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(capture_without_a_ublk_rootfs_produces_no_manifest) {
+    // A manifest asserts the capture is complete. With no rootfs to seal there
+    // is no complete capture, so the honest answer is no manifest -- rather
+    // than one naming a rootfs config nobody wrote, which would let a caller
+    // publish a snapshot that restores a VM with no root filesystem.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    const SandboxCaptureResult<PauseToDirResult> r =
+        backend->PauseToDir(TracingSpec(dir, &trace));
+    MT_EXPECT_TRUE(r.ok());
+    if (!r.ok()) return;
+    MT_EXPECT_TRUE(!r.value().manifest);
+    MT_EXPECT_TRUE(r.value().rootfs_image_config_path.empty());
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+// ---- the rootfs half, with the seal supplied -----------------------------
+
+MT_TEST(capture_seals_the_rootfs_and_describes_it_in_a_manifest) {
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    spec.rootfs_override = core::Optional<PauseToDirSpec::RootfsCaptureInputs>(
+        RootfsInputs(dir, &trace, false, false));
+
+    const SandboxCaptureResult<PauseToDirResult> r = backend->PauseToDir(spec);
+    MT_EXPECT_TRUE(r.ok());
+    if (!r.ok()) return;
+
+    MT_EXPECT_EQ(r.value().rootfs_image_config_path, spec.snapshot_dir + "/rootfs/image.json");
+    MT_EXPECT_TRUE(core::fs::Exists(r.value().rootfs_image_config_path));
+    MT_EXPECT_TRUE(static_cast<bool>(r.value().manifest));
+    if (!r.value().manifest) return;
+
+    const SandboxSnapshotManifest& m = *r.value().manifest;
+    MT_EXPECT_EQ(m.backend, std::string(kFirecrackerBackend));
+    MT_EXPECT_EQ(m.vm_state.path, r.value().vm_state_path);
+    // The manifest names the memory *stack*, not the bare layer: that is what
+    // a resume opens.
+    MT_EXPECT_EQ(m.memory.image_config_path, r.value().memory_image_config_path);
+    MT_EXPECT_EQ(m.rootfs.image_config_path, r.value().rootfs_image_config_path);
+    MT_EXPECT_EQ(m.rootfs.virtual_size, static_cast<uint64_t>(4096));
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(capture_seals_the_rootfs_only_after_the_memory_layer) {
+    // Ordering with consequences: the seal mutates the live runtime, so it
+    // must come after every step that can still fail harmlessly. Sealing
+    // first would turn an ordinary memory-write failure into a sandbox that
+    // can no longer be resumed.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    spec.rootfs_override = core::Optional<PauseToDirSpec::RootfsCaptureInputs>(
+        RootfsInputs(dir, &trace, false, false));
+
+    MT_EXPECT_TRUE(backend->PauseToDir(spec).ok());
+    MT_EXPECT_TRUE(IndexIn(trace.events, "seal") >= 0);
+    MT_EXPECT_TRUE(IndexIn(trace.events, "write_layer") < IndexIn(trace.events, "seal"));
+    MT_EXPECT_TRUE(IndexIn(trace.events, "pause") < IndexIn(trace.events, "seal"));
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(a_terminal_seal_failure_is_not_followed_by_a_resume) {
+    // The whole point of the terminal classification. The daemon may have
+    // sealed the upper before failing, so the live config no longer describes
+    // the device; resuming would run a VM whose block device silently lost
+    // the sealed writes.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    spec.rootfs_override = core::Optional<PauseToDirSpec::RootfsCaptureInputs>(
+        RootfsInputs(dir, &trace, true, true));
+
+    const SandboxCaptureResult<PauseToDirResult> r = backend->PauseToDir(spec);
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+    MT_EXPECT_TRUE(r.error().IsTerminal());
+    MT_EXPECT_EQ(IndexIn(trace.events, "resume"), -1);
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(a_recoverable_seal_failure_resumes_before_reporting) {
+    // `Recoverable` is a promise that the sandbox is still runnable, so it may
+    // only be reported once the VM is actually running again.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    spec.rootfs_override = core::Optional<PauseToDirSpec::RootfsCaptureInputs>(
+        RootfsInputs(dir, &trace, true, false));
+
+    const SandboxCaptureResult<PauseToDirResult> r = backend->PauseToDir(spec);
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) return;
+    MT_EXPECT_TRUE(!r.error().IsTerminal());
+    MT_EXPECT_TRUE(IndexIn(trace.events, "resume") >= 0);
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(a_failed_rootfs_capture_removes_the_partial_directory) {
+    // A half-written snapshot directory cannot be told from a complete one by
+    // name, and a later resume would load a vm_state.bin whose rootfs was
+    // never staged.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    spec.rootfs_override = core::Optional<PauseToDirSpec::RootfsCaptureInputs>(
+        RootfsInputs(dir, &trace, true, false));
+
+    MT_EXPECT_TRUE(!backend->PauseToDir(spec).ok());
+    MT_EXPECT_TRUE(!core::fs::Exists(spec.snapshot_dir));
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+// ---- CaptureToDir --------------------------------------------------------
+
+MT_TEST(capture_to_dir_returns_the_manifest_and_leaves_the_vm_paused) {
+    // The one thing separating this from `Snapshot`: a template build captures
+    // in order to stop the sandbox, so resuming here would leave a VM running
+    // that the caller has already accounted for as finished.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    backend->SetMemoryLayerWriterForTesting(TracingSpec(dir, &trace).write_memory_layer);
+    backend->SetRootfsCaptureForTesting(RootfsInputs(dir, &trace, false, false));
+
+    const std::string at = dir + "/captured";
+    const SandboxCaptureResult<SandboxSnapshotManifest> m = backend->CaptureToDir(at);
+    MT_EXPECT_TRUE(m.ok());
+    if (!m.ok()) return;
+
+    MT_EXPECT_EQ(m.value().rootfs.image_config_path, at + "/rootfs/image.json");
+    MT_EXPECT_EQ(m.value().memory.image_config_path, at + "/mem_image.json");
+    // Paused, not resumed.
+    MT_EXPECT_TRUE(IndexIn(trace.events, "pause") >= 0);
+    MT_EXPECT_EQ(IndexIn(trace.events, "resume"), -1);
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(capture_to_dir_refuses_when_there_is_no_rootfs_to_capture) {
+    // And resumes first: no seal was attempted, so the sandbox really is
+    // recoverable -- but `PauseToDir` succeeded, which leaves the VM paused.
+    // Reporting recoverable without resuming would promise a runnable sandbox
+    // while leaving it frozen.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string());
+    if (!backend) return;
+
+    backend->SetMemoryLayerWriterForTesting(TracingSpec(dir, &trace).write_memory_layer);
+
+    const std::string at = dir + "/captured";
+    const SandboxCaptureResult<SandboxSnapshotManifest> m = backend->CaptureToDir(at);
+    MT_EXPECT_TRUE(!m.ok());
+    if (m.ok()) return;
+    MT_EXPECT_TRUE(!m.error().IsTerminal());
+    MT_EXPECT_TRUE(m.error().message.find("no overlaybd ublk rootfs") != std::string::npos);
+    MT_EXPECT_TRUE(IndexIn(trace.events, "resume") >= 0);
+    // The partial directory is gone.
+    MT_EXPECT_TRUE(!core::fs::Exists(at));
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(capture_to_dir_without_a_vm_is_terminal) {
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    SnapshotConfig cfg;
+    CaptureTrace trace;
+    FirecrackerSandboxBackend backend(
+        SpecIn(dir), cfg, std::shared_ptr<Connector>(new CaptureConnector(&trace, std::string())));
+
+    const SandboxCaptureResult<SandboxSnapshotManifest> m = backend.CaptureToDir(dir + "/at");
+    MT_EXPECT_TRUE(!m.ok());
+    if (m.ok()) return;
+    MT_EXPECT_TRUE(m.error().IsTerminal());
 }
 
 MT_MAIN

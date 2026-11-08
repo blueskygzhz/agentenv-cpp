@@ -267,6 +267,10 @@ agentenv_add_test(test_api_volume_fork    test_api_volume_fork.cc    agentenv-ap
 # Rust: src/api/impls/sandbox.rs :: sandboxes_post (volume mount section)
 agentenv_add_test(test_api_sandbox_volume_mounts test_api_sandbox_volume_mounts.cc
                   agentenv-api agentenv-orchestrator agentenv-volume)
+# Rust: src/api/impls/sandbox.rs :: sandboxes_sandbox_id_snapshots_post
+agentenv_add_test(test_api_create_snapshot test_api_create_snapshot.cc
+                  agentenv-api agentenv-orchestrator agentenv-volume agentenv-snapshot
+                  agentenv-observability)
 # Rust: src/api/impls/volumes.rs
 agentenv_add_test(test_api_volumes        test_api_volumes.cc         agentenv-api agentenv-volume)
 # Rust: src/api/impls/template_helpers.rs
@@ -280,6 +284,10 @@ agentenv_add_test(test_core_rwlock         test_core_rwlock.cc         agentenv-
 agentenv_add_test(test_firecracker_lifecycle test_firecracker_lifecycle.cc agentenv-sandbox)
 # Rust: src/sandbox/firecracker/overlaybd_snapshot.rs (dirty-page mapping)
 agentenv_add_test(test_firecracker_dirty_memory test_firecracker_dirty_memory.cc agentenv-sandbox)
+# Rust: src/sandbox/firecracker/overlaybd_snapshot.rs (the capture/restack half)
+agentenv_add_test(test_firecracker_overlaybd_restack test_firecracker_overlaybd_restack.cc agentenv-sandbox)
+# Rust: src/sandbox/firecracker/overlaybd_snapshot.rs (the layer-stack budget)
+agentenv_add_test(test_firecracker_mem_image_config test_firecracker_mem_image_config.cc agentenv-sandbox)
 # Rust: src/api/impls/image_build.rs
 agentenv_add_test(test_api_image_build     test_api_image_build.cc     agentenv-api)
 # Rust: src/image/cache/service.rs (operation holds)

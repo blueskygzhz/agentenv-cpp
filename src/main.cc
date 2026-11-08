@@ -567,6 +567,10 @@ int main(int argc, char** argv) {
     // migrated node. See that function for the whole argument.
     std::shared_ptr<ae::volume::VolumeManager> volume_manager;
     std::shared_ptr<ae::image::ImageResolver> image_resolver;
+    // Outlives the block below because the API bundle needs it too: the
+    // snapshot route publishes through it. It used to be a local here, which
+    // is why that route had nowhere to publish to.
+    std::shared_ptr<ae::snapshot::repository::SnapshotRepository> repository;
     {
         auto made = ae::snapshot::repository::MakeRepositoryFromConfig(app_cfg);
         if (!made.ok()) {
@@ -579,7 +583,7 @@ int main(int argc, char** argv) {
                            << made.error().ToString());
             return 1;
         }
-        std::shared_ptr<ae::snapshot::repository::SnapshotRepository> repository = made.value();
+        repository = made.value();
 
         ae::volume::VolumeLimits limits;
         limits.max_size_mb = app_cfg.volume.max_size_mb;
@@ -720,7 +724,7 @@ int main(int argc, char** argv) {
                 1000)));
 
     ae::api::RegisterOrchestratorRoutes(server.get(), svc.get(), volume_manager,
-                                        image_resolver);
+                                        image_resolver, repository);
 
     InstallShutdownHandlers(server.get());
 

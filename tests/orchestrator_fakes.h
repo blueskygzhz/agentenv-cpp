@@ -42,7 +42,11 @@ struct BackendScript {
 
     // snapshot branches
     bool succeed_snapshot = false;  // off by default (FakeSandbox returns unsupported)
-    std::string snapshot_id = "fake-snapshot-id";
+    /// Where the capture claims to have written its artifacts. Named for what
+    /// it is: the manifest the fake hands back points *into* this directory,
+    /// so a test that publishes the capture has to create the files there.
+    /// It was called `snapshot_id` while nothing read it.
+    std::string snapshot_dir = "/tmp/aenv-fake-snapshot";
     bool fail_snapshot_terminal   = false;
     bool fail_snapshot_recoverable = false;  // default when succeed_snapshot==false
 
@@ -162,9 +166,36 @@ class FakeSandbox : public sandbox::SandboxBackend {
     core::Expected<core::Unit, core::AnyError> Resume() override {
         return core::Unit();
     }
-    sandbox::SandboxCaptureResult<std::string> Snapshot() override {
-        return core::make_unexpected(
-            sandbox::SandboxCaptureError::Recoverable("fake: snapshot unsupported"));
+    sandbox::SandboxCaptureResult<sandbox::CapturedSandboxSnapshot> Snapshot() override {
+        // The script's `succeed_snapshot` / `snapshot_dir` used to be read by
+        // nothing: this returned `Recoverable` unconditionally, so the
+        // orchestrator's capture *success* path had no coverage at all. They
+        // are honoured now.
+        ++script_->snapshot_calls;
+        if (script_->fail_snapshot_terminal) {
+            return core::make_unexpected(
+                sandbox::SandboxCaptureError::Terminal("fake: snapshot refused"));
+        }
+        if (!script_->succeed_snapshot) {
+            return core::make_unexpected(
+                sandbox::SandboxCaptureError::Recoverable("fake: snapshot unsupported"));
+        }
+
+        // A real manifest, built through the validating constructor rather
+        // than assembled field-by-field: a fake that can produce a manifest
+        // the real one would reject proves nothing about the publish path it
+        // feeds.
+        const std::string dir = script_->snapshot_dir;
+        const core::Expected<sandbox::SandboxSnapshotManifest, std::string> manifest =
+            sandbox::SandboxSnapshotManifest::New("firecracker", dir + "/vm_state.bin",
+                                                  dir + "/mem_image.json", 8192,
+                                                  dir + "/rootfs/image.json", 4096,
+                                                  std::vector<sandbox::ExtraDrive>());
+        if (!manifest.ok()) {
+            return core::make_unexpected(
+                sandbox::SandboxCaptureError::Terminal("fake: " + manifest.error()));
+        }
+        return sandbox::CapturedSandboxSnapshot(manifest.value(), dir);
     }
     sandbox::SandboxCaptureResult<core::Unit> SnapshotVolumes() override {
         // Counted so a test can assert the volume flush happened *before* the

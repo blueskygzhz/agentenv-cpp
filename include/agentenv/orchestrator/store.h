@@ -137,11 +137,17 @@ struct SandboxMetadata {
 using SandboxForkOutcome = core::Expected<SandboxMetadata, OrchestratorError>;
 
 /// Rust struct `SnapshotCaptureResult` — the sandbox metadata as of the
-/// capture plus the backend's snapshot identifier.
+/// capture plus what the backend captured.
 struct SnapshotCaptureResult {
     SandboxMetadata metadata;
-    /// Rust `captured_snapshot` — the backend's opaque snapshot id.
-    std::string     captured_snapshot;
+    /// Rust `captured_snapshot: CapturedSandboxSnapshot`.
+    ///
+    /// Carries the manifest, not an opaque id as this used to. The publish
+    /// step needs to know *what* was captured, and the id alone forced the
+    /// caller to re-derive that by reading the capture directory back — at
+    /// which point the record could describe something other than what the
+    /// backend actually wrote.
+    sandbox::CapturedSandboxSnapshot captured_snapshot;
 };
 
 /// Rust struct `SandboxListFilter` (store/mod.rs).

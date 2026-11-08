@@ -27,18 +27,50 @@ A C++11 architectural port of [kvcache-ai/AgentENV](https://github.com/kvcache-a
 >   `ProcessVmReader`-backed source, writing `<path>.tmp` and renaming on
 >   success. The status rows below that still describe it as missing are wrong
 >   on that point; what those rows get right is the *surrounding* work —
->   rootfs capture, `build_mem_snapshot_image_config` and
 >   `resume_from_snapshot_config`.
+>
+> - **"rootfs capture and `build_mem_snapshot_image_config` are missing"** —
+>   both are ported. `build_mem_snapshot_image_config` lives in
+>   `firecracker/mem_image_config.h`, and the rootfs capture half is
+>   `firecracker/overlaybd_restack.h`: `RestackTargetUpperDataPath`,
+>   `StageOverlaybdSnapshotFromLiveRuntime`, `RestackSnapshotOverlaybdDevice`
+>   and `RestackSnapshotOverlaybdRootfs`, with the ublk seal injected as a
+>   `SnapshotRestacker`. `PauseToDir` now drives both — it writes
+>   `mem_image.json`, restacks the rootfs and assembles a
+>   `SandboxSnapshotManifest` — and `FirecrackerSandboxBackend::CaptureToDir`
+>   exposes that, leaving the guest paused as upstream does.
+>
+>   What remains is the step *above* it, and it is now only one step:
+>   `ApiImpl::CreateSnapshot` is wired (`POST /sandboxes/{id}/snapshots`
+>   captures, snapshots the mounted volumes and publishes), but it goes through
+>   `Snapshot()` — as upstream's API path does — not through `CaptureToDir`.
+>   `CaptureToDir` is the *template* entry point, which leaves the guest
+>   paused, and `TemplateBuilder`'s sandbox-driving half is still the one open
+>   end calling it. `CaptureToDir` is also deliberately **not** on the
+>   `SandboxBackend` interface — see the `template/runner.rs` row for why.
+>
+>   `Snapshot()` now returns a `CapturedSandboxSnapshot` (manifest +
+>   directory) rather than a bare path, because the publisher has to know what
+>   was captured; re-deriving the manifest by reading the directory back would
+>   let the two disagree. It refuses a capture with no manifest rather than
+>   handing back a default-constructed one — which would commit a record
+>   naming an empty backend and files at `/` — and it does so *after* the
+>   resume it owes, since `Recoverable` is a promise the sandbox is running.
 >
 > - **"the volume operations are still stubs"** — the volume *module* is now a
 >   complete port: `VolumeManager` (create / empty + child backing / COW clone
 >   / materialize / publish / reserve / remove / fork), the durable record and
 >   catalog (`volumes/records/<id>.json`, `volumes/aliases/<name>`), and the
 >   posix-fs document store with `flock` + atomic-rename + CAS. What *is* still
->   missing is the capture side: `SnapshotVolumes`, `FreezeAndSnapshotVolumes`,
->   `ThawVolumes` and `Fork` on `FirecrackerSandboxBackend` report
->   "not available in this build", so nothing drives
->   `VolumeManager::SnapshotVolumeState` in production yet.
+>   missing is the *guest-side* capture: `SnapshotVolumes`,
+>   `FreezeAndSnapshotVolumes`, `ThawVolumes` and `Fork` on
+>   `FirecrackerSandboxBackend` report "not available in this build", so the
+>   guest's page cache is never flushed before a capture.
+>   `VolumeManager::SnapshotVolumeState` *is* driven now, by
+>   `ApiImpl::CreateSnapshot`: a published snapshot records each mount's path,
+>   mode, size and backing layers, so a restore recreates the volumes at the
+>   same paths. Read after the capture, as upstream does — the layers are
+>   whatever the capture left committed.
 > - **"`main.cc` still wires an in-memory metadata store, so a restart loses
 >   every sandbox record"** — the in-memory store is only the hot index. It is
 >   paired with `FileBackedSandboxPersister` (`main.cc`), whose `LoadAll`
@@ -237,10 +269,10 @@ table, not for the layout.
 
 | Rust | What is missing |
 |---|---|
-| `src/template/runner.rs` | The sandbox-driving half: `build_template`, `build_template_from_snapshot` and `run_template_build`. The publish half is now ported (above), and the pieces this would stand on all exist — `TemplateStepExecutor`, `EnsureDefaultUser`, `PrepareStartup`, `RunStartupCommands`, `ProbeRuntimeVersions`, and the error-combining stop. What blocks it is one method: **`SandboxBackend::capture_to_dir` is absent from the C++ trait**, and it cannot simply be added, because the Firecracker implementation of it assembles the manifest through `restack_snapshot_overlaybd_rootfs` — the `RestackTargetUpperData` half listed below as not ported. So this gap is downstream of the overlaybd one, not independent of it. `MockBackend` would also need porting to `SandboxBackend` (it currently implements only the legacy `Backend` shim), since that is the only way to drive the orchestration without a VMM |
-| `src/sandbox/firecracker/overlaybd_snapshot.rs` | The **capture** half: `capture_live_overlaybd_snapshot`, `restack_target_upper_data` and `restack_snapshot_overlaybd_rootfs` have no counterpart, which is what the note at the top of this README means by snapshot/restore/fork still being stubs. The earlier claim that "only `ConvertDirtyMemoryToOverlaybd` is ported" was wrong: `SplitRuntimeSuffix` (`firecracker/dirty_memory.h`) and `BuildMemSnapshotImageConfig` with `LocalLayerConfig` / `MaxRuntimeOwnedLayers` (`firecracker/mem_image_config.h`, covering upstream's `rewrite_lowers_with_runtime_roots`, `local_layer_config` and `load_existing_image_config`) are real implementations too. The remaining gap is a hard blocker for the template runner's sandbox-driving half, which needs `capture_to_dir` |
+| `src/template/runner.rs` | The sandbox-driving half: `build_template`, `build_template_from_snapshot` and `run_template_build`. The publish half is now ported (above), and the pieces this would stand on all exist — `TemplateStepExecutor`, `EnsureDefaultUser`, `PrepareStartup`, `RunStartupCommands`, `ProbeRuntimeVersions`, and the error-combining stop. The capture it would stand on **now exists**: `FirecrackerSandboxBackend::CaptureToDir` writes `mem_image.json`, restacks the rootfs and returns a `SandboxSnapshotManifest`, leaving the guest paused. Two things are left. First, nothing calls it. Second, **it is a concrete method, not a `SandboxBackend` interface method** — a deliberate deviation from upstream, where `capture_to_dir` is on the trait: a pure virtual would force every implementor to supply one, and the only other implementors are test fakes and `MockBackend`, none of which can capture anything, so the result would be a row of `not available` stubs satisfying a signature. It moves to the interface when a second backend can honestly implement it; `TemplateBuilder` can drive the concrete type meanwhile. `MockBackend` would still need porting to `SandboxBackend` (it currently implements only the legacy `Backend` shim) to drive the orchestration without a VMM. Also unported: upstream returns an opaque `Box<dyn Any>` carrying the backend's `FirecrackerSnapshotConfig` for the startup-manifest recorder, which has no counterpart here, so there is no consumer for the payload |
+| `src/sandbox/firecracker/overlaybd_snapshot.rs` | **The capture half is now ported** (`firecracker/overlaybd_restack.h`), which retires the claim that used to sit in this row. `capture_live_overlaybd_snapshot`, `restack_target_upper_data_path`, `rewrite_live_runtime_config_for_restack`, `stage_overlaybd_snapshot_from_live_runtime`, `restack_snapshot_overlaybd_device`, `restack_snapshot_overlaybd_rootfs`, `link_or_copy_runtime_layer` and `canonicalized_runtime_owned_roots` all have counterparts, alongside the previously-ported `SplitRuntimeSuffix` (`firecracker/dirty_memory.h`) and `BuildMemSnapshotImageConfig` (`firecracker/mem_image_config.h`). The ublk seal is injected as a `SnapshotRestacker` rather than reached through a global device manager, because the terminal/recoverable split is driven by *what the daemon answered* and a fake is the only way to vary it. **Deviations**: `canonicalized_runtime_owned_roots` takes its two roots as parameters and is not memoized (Rust reads `ConfigManager::global_config()` into a `OnceLock`); the cross-filesystem branch — where the daemon seals beside the live upper and the layer is then copied across — has **no test**, since it needs two real filesystems, so `CopyFileAtomically`'s terminal classification there is asserted only by inspection. Upstream also leaves the beside-the-upper copy in place rather than unlinking it after a successful copy; that is kept. Two further **coverage gaps**, both recorded rather than papered over: `PauseToDir`'s default layer compactor is asserted to stay raw only by inspection — reaching it needs an over-budget runtime-owned suffix of *real* overlaybd layers, since `CompactLayers` reads them, and the capture suite's live configs hold placeholder bytes; and `RuntimeOwnedRoots` passes the managed-snapshot base as *both* roots, because the persisted sandbox store path is not derivable inside the backend (upstream reads it from the global config). The second is the conservative direction — a missing root would make runtime layers look durable, and a layer wrongly judged durable is referenced instead of adopted, leaving the snapshot pointing at a file the runtime later deletes |
 | `src/sandbox/mock.rs` | The mock backend is a fraction of upstream's, which bounds what can be tested without a VMM |
-| `src/api/impls/{template,image_build}.rs` | Parameter validation is ported; the handler bodies largely are not. **`sandbox.rs` no longer belongs in this row**: `CreateSandbox`, `DeleteSandbox`, `GetSandbox`, `ListSandboxes`, `PauseSandbox`, `ResumeSandbox` and `ForkSandbox` are real implementations in `api/impls.cc`. Exactly three handlers across the whole surface still answer 501, each for a stated reason rather than for being unwritten: `Exec` (needs the envd guest client), `CreateSnapshot` (needs the snapshot repository publish path) and `ListTemplates` |
+| `src/api/impls/{template,image_build}.rs` | Parameter validation is ported; the handler bodies largely are not. **`sandbox.rs` no longer belongs in this row**: `CreateSandbox`, `DeleteSandbox`, `GetSandbox`, `ListSandboxes`, `PauseSandbox`, `ResumeSandbox` and `ForkSandbox` are real implementations in `api/impls.cc`. **`CreateSnapshot` has also left this row**: `POST /sandboxes/{sandboxID}/snapshots` captures through `Orchestrator::CaptureSnapshot`, reads the mounted volumes through `VolumeManager::SnapshotVolumeState` and commits through `snapshot::Publish`, answering 201 with a `SnapshotInfo`. Exactly two handlers across the whole surface still answer 501, each for a stated reason rather than for being unwritten: `Exec` (needs the envd guest client) and `ListTemplates` (needs the template store). **Deviations in the snapshot handler**, all recorded rather than silent: upstream reaches the repository through a `SnapshotManager` that also owns a catalog, while this port's `Publish` is a free function over a `SnapshotRepository&`, so `ApiImpl` holds the repository directly — null-tolerant, answering 500 rather than reporting a snapshot it never published. The repository and the alias are validated *before* the capture, since a capture pauses the guest and writes its memory out in full and a request that cannot publish should not cost that. `SandboxMetadata::user_metadata` is a plain map here where upstream has `Option<HashMap>`, so an empty one is published as absent — the shape upstream writes for a sandbox that never had any. `custom_extension_params` crosses a type boundary this port introduced (stored as the caller's text, published as parsed JSON); a malformed non-empty value is a 500 rather than being dropped, because those params drive the extension's lifecycle hooks. Volume errors are collapsed onto 400/500 as upstream's generated response forces, so an alias conflict is a 400 and not a 409. The route was previously registered at the singular `/sandboxes/{id}/snapshot` answering 204, which matched neither upstream nor this port's own metrics route label; both now read `snapshots` |
 | `src/orchestrator/sandbox_metrics.rs` :: `start_metrics_task` | Only the *scheduling* shell: the 15 s `tokio::time::interval` with `MissedTickBehavior::Skip`, plus the `select!` over the shutdown watch and the lifecycle-event broadcast that decides whether a tick or an event drives the next sweep. `CollectSandboxMetrics` (the body) is ported and tested; what is absent is a task runtime to call it on, which is the same gap as every other background loop in this tree. A caller with a thread can drive it directly |
 | `src/sandbox/envd.rs` | The guest client and `exec` report "not available in this build" — they need an in-guest transport |
 | `src/snapshot/image_export/acr/publisher.rs` | The ACR push half (~3,000 lines): blob upload and manifest assembly against a registry's HTTP API. The ACR *delete* half is ported, and the `regctl` exporter covers rootfs export end to end; what is missing is this path and the policy that would choose it over `regctl` |

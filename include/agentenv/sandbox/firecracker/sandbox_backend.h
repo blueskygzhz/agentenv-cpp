@@ -25,8 +25,11 @@
 #include "agentenv/sandbox/envd.h"
 #include "agentenv/sandbox/firecracker/instance.h"
 #include "agentenv/sandbox/firecracker/dirty_memory.h"
+#include "agentenv/sandbox/firecracker/mem_image_config.h"
+#include "agentenv/sandbox/firecracker/overlaybd_restack.h"
 #include "agentenv/sandbox/firecracker/paused_state.h"
 #include "agentenv/sandbox/firecracker/sandbox.h"
+#include "agentenv/sandbox/manifest.h"
 #include "agentenv/sandbox/ublk.h"
 #include "agentenv/sandbox/ublk/device.h"
 
@@ -108,6 +111,37 @@ struct PauseToDirSpec {
     /// rule above can be asserted, since the pid's *value* is identical
     /// whether it is read before or after and therefore proves nothing.
     std::function<void(int64_t)> on_pid_read;
+
+    /// Everything the rootfs capture needs, when it is supplied instead of
+    /// read off the live ublk device.
+    ///
+    /// Collected into one struct rather than added as separate override fields
+    /// because the three are only meaningful together: sealing a device whose
+    /// virtual size came from somewhere else would write a manifest that
+    /// restores the captured stack behind a wrongly-sized device. Supplying
+    /// the set is what makes a rootfs capture happen at all in a test, which
+    /// is otherwise unreachable -- the real path needs a live ublk daemon.
+    struct RootfsCaptureInputs {
+        /// The live `image.json` whose upper gets sealed and whose lowers the
+        /// staged config inherits.
+        std::string live_image_config_path;
+        /// Recorded into the manifest so a restore can size the device.
+        uint64_t virtual_size = 0;
+        /// The seal itself. Required: without it there is nothing to capture.
+        SnapshotRestacker restack;
+    };
+    core::Optional<RootfsCaptureInputs> rootfs_override;
+
+    /// Overrides layer compaction and adoption for both the memory and the
+    /// rootfs stacks. Null uses `overlaybd::CompactLayers` and
+    /// `LinkOrCopyRuntimeLayer`.
+    LayerCompactor compact_layers;
+    LayerAdopter adopt_layer;
+
+    /// The roots under which a lower counts as runtime-owned. Empty means
+    /// "ask the config", which is what production does; a test supplies its
+    /// own so the classification does not depend on the host's layout.
+    std::vector<std::string> runtime_owned_roots;
 };
 
 /// Rust `managed_snapshot_base` — `{work_dir}/managed-snapshots`, or
@@ -127,6 +161,33 @@ struct PauseToDirResult {
     std::string memory_layer_path;
     /// Total size of the contiguous guest-memory image.
     uint64_t memory_size = 0;
+
+    /// `{snapshot_dir}/mem_image.json` — the persisted memory layer stack.
+    ///
+    /// Distinct from `memory_layer_path`: that is this pause's *one* new
+    /// layer, while this config names the whole stack it sits on top of. A
+    /// resume needs the stack; the bare layer would be a device holding only
+    /// the pages that happened to be dirty at capture time.
+    std::string memory_image_config_path;
+
+    /// `{snapshot_dir}/rootfs/image.json` — the restacked rootfs stack.
+    ///
+    /// Empty when the sandbox has no overlaybd-backed ublk rootfs, which is
+    /// the only case upstream handles differently (it copies the raw drive
+    /// file instead). That branch is not ported; see the header note on
+    /// `CaptureToDir`.
+    std::string rootfs_image_config_path;
+    /// Virtual size of the rootfs device, carried into the manifest so a
+    /// restore can size the ublk device before opening the stack.
+    uint64_t rootfs_virtual_size = 0;
+
+    /// Rust `pause_to_dir`'s second return value.
+    ///
+    /// Present only when every artifact above was produced, because a
+    /// manifest is a claim that the capture is complete and restorable --
+    /// handing back a partial one would let a caller publish a snapshot whose
+    /// rootfs was never written.
+    core::Optional<SandboxSnapshotManifest> manifest;
 };
 
 /// Rust `enum LaunchMode { Fresh(..), Resume(..) }`.
@@ -719,6 +780,29 @@ class FirecrackerSandboxBackend : public SandboxBackend {
     /// the recovery resume matters more, not less.
     SandboxCaptureResult<PauseToDirResult> PauseToDir(const PauseToDirSpec& spec);
 
+    /// Rust `capture_to_dir` — capture into `at` and describe what was
+    /// written. The guest is left **paused**.
+    ///
+    /// That is the whole difference from [`Snapshot`]: a template build takes
+    /// its capture this way and stops the sandbox afterwards, so nothing is
+    /// resumed and the directory belongs to the caller. `Snapshot` resumes,
+    /// because it snapshots a sandbox that is meant to keep serving.
+    ///
+    /// **Deviation: this is not on the `SandboxBackend` interface**, where
+    /// upstream declares it. Adding a pure virtual there would force every
+    /// implementor to supply one, and the only other implementors are test
+    /// fakes and `MockBackend` — none of which can capture anything. The
+    /// result would be a row of `not available` stubs satisfying a signature,
+    /// which is exactly the shape of fake implementation this port avoids.
+    /// It moves to the interface when a second backend can honestly implement
+    /// it; `TemplateBuilder` can drive this concrete type in the meantime.
+    ///
+    /// Upstream also returns an opaque `Box<dyn Any>` carrying the backend's
+    /// `FirecrackerSnapshotConfig` for the startup-manifest recorder to reboot
+    /// from. That recorder is not ported, so there is no consumer, and an
+    /// opaque payload nothing reads would only invite someone to downcast it.
+    SandboxCaptureResult<SandboxSnapshotManifest> CaptureToDir(const std::string& at);
+
     /// Rust `resume` — `PATCH /vm {"state":"Resumed"}`.
     ///
     /// Idempotent, as the trait requires. The idempotence is Firecracker's:
@@ -745,7 +829,7 @@ class FirecrackerSandboxBackend : public SandboxBackend {
     /// The destination is `{ManagedSnapshotBase}/{sandbox_id}/{uuid}`. The
     /// per-sandbox root is resolved once and reused, so repeated snapshots of
     /// one sandbox stay together instead of scattering across the base.
-    SandboxCaptureResult<std::string> Snapshot() override;
+    SandboxCaptureResult<CapturedSandboxSnapshot> Snapshot() override;
 
     /// Rust `runtime_info`.
     SandboxRuntimeInfo RuntimeInfoOf() const override;
@@ -757,6 +841,14 @@ class FirecrackerSandboxBackend : public SandboxBackend {
     /// microVM: a stand-in VMM has no guest memory to read, so the layer write
     /// fails for a reason that has nothing to do with the sequence under test.
     void SetMemoryLayerWriterForTesting(const MemoryLayerWriter& writer);
+
+    /// Supplies the rootfs capture inputs `Snapshot` and `CaptureToDir` would
+    /// otherwise read off the live ublk device.
+    ///
+    /// Without this the rootfs half of both entry points is unreachable in a
+    /// test: they build their own `PauseToDirSpec`, and the real path needs a
+    /// ublk daemon holding a device whose upper can actually be sealed.
+    void SetRootfsCaptureForTesting(const PauseToDirSpec::RootfsCaptureInputs& inputs);
 
     // ---- volume capture: no-op when there is nothing to capture ------------
     //

@@ -23,6 +23,9 @@
 #include "agentenv/sandbox/custom_extension.h"
 #include "agentenv/sandbox/envd.h"
 #include "agentenv/sandbox/extra_drive.h"
+// `CapturedSandboxSnapshot` carries a `SandboxSnapshotManifest` by value, so
+// the full definition is needed here rather than a forward declaration.
+#include "agentenv/sandbox/manifest.h"
 #include "agentenv/sandbox/network/policy.h"
 #include "agentenv/sandbox/types.h"
 // Header-only use: `CommandContext` is a plain struct, so naming it here does
@@ -143,6 +146,38 @@ struct SandboxForkSpec {
 
 using SandboxForkResult = core::Expected<std::unique_ptr<class SandboxBackend>, core::AnyError>;
 
+/// Rust `CapturedSandboxSnapshot` — what a capture produced, in the form the
+/// snapshot layer publishes.
+///
+/// The manifest is the point: it is what `snapshot::Publish` consumes, and
+/// returning only the directory (as this used to) left the publisher with no
+/// way to learn what was in it. A caller must not have to re-derive the
+/// manifest by reading the directory back, because the two could then disagree
+/// about what was captured.
+///
+/// **Deviation**: Rust carries `artifacts: Box<dyn Any + Send>`, a type-erased
+/// payload a backend uses to keep a temporary capture root alive until
+/// publication finishes, and which `publish_captured` downcasts to
+/// `FirecrackerCaptureArtifacts` to drive the startup-manifest recorder. That
+/// recorder is not ported, so the only remaining job is naming the directory —
+/// carried here as a plain string. A `void*`-style escape hatch with no
+/// consumer would just invite an unchecked downcast.
+struct CapturedSandboxSnapshot {
+    SandboxSnapshotManifest manifest;
+    /// Where the artifacts the manifest names were written. Durable, not a
+    /// temporary: the Firecracker capture writes under the managed-snapshot
+    /// root, so nothing here owns a lifetime that publication has to respect.
+    std::string snapshot_dir;
+
+    CapturedSandboxSnapshot() {}
+    CapturedSandboxSnapshot(const SandboxSnapshotManifest& m, const std::string& dir)
+        : manifest(m), snapshot_dir(dir) {}
+
+    /// Rust `backend()` — the VMM that took the capture, read off the
+    /// manifest rather than stored twice.
+    const std::string& Backend() const { return manifest.backend; }
+};
+
 // ---------------------------------------------------------------------------
 // Rust `SandboxBackend` trait
 // ---------------------------------------------------------------------------
@@ -193,7 +228,11 @@ class SandboxBackend {
     virtual core::Expected<core::Unit, core::AnyError> Resume() = 0;
 
     /// Rust `snapshot` — persistent snapshot, sandbox keeps running.
-    virtual SandboxCaptureResult<std::string> Snapshot() = 0;
+    ///
+    /// Returns the manifest, not just the directory: the publisher needs to
+    /// know *what* was captured, and having it read that back out of the
+    /// directory would let the two disagree.
+    virtual SandboxCaptureResult<CapturedSandboxSnapshot> Snapshot() = 0;
 
     /// Rust `snapshot_volumes`.
     virtual SandboxCaptureResult<core::Unit> SnapshotVolumes() = 0;
