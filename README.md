@@ -20,6 +20,62 @@ A C++11 architectural port of [kvcache-ai/AgentENV](https://github.com/kvcache-a
 > Statements that used to live here were stale and are corrected rather than
 > deleted, because each was load-bearing when deciding what to trust:
 >
+> - **"volume capture is refused, so a volume can only lose writes loudly"**
+>   — it was refused at three of its four doors. `snapshot_volumes`,
+>   `freeze_and_snapshot_volumes` and `snapshot` (via `PauseToDir`'s flush
+>   check) all refuse a sandbox holding a writable persistent volume, because
+>   sealing needs the overlaybd layer writer and the flush needs an envd
+>   client. **`pause` and `fork` did not**, and both now do.
+>
+>   Worth spelling out why that was a silent data loss rather than a partial
+>   capture, because nothing downstream of it is wrong: upstream's
+>   `pause(None)` is not a bare VMM pause — it routes through `pause_to_dir`,
+>   which flushes the volumes and seals each upper into a new commit layer.
+>   With the pause allowed through unsealed, the record moves to `Paused`; a
+>   later delete sees `previous_state != Running` and skips
+>   `freeze_and_snapshot_volumes`, *exactly as upstream does*;
+>   `publish_sandbox_volume_backings` then publishes the volume's `image.json`
+>   **lowers**, which is also exactly upstream (`store_disk_layers` iterates
+>   `lowers` and nothing else) and is correct there only because the seal has
+>   already folded the run's upper into them; `Stop` finally removes the work
+>   dir and `extra-drive-runtime-<id>/upper.data` with it. Every link after
+>   the pause is aligned, so the pause is the one that had to refuse.
+>
+>   `fork` is one step removed: the parent keeps running so its upper survives,
+>   but upstream forks through the same full `pause`, so each child was being
+>   built from a capture naming the *pre-seal* lowers and would boot cleanly
+>   while silently missing every write the parent had made. Refused too.
+>
+>   Pinned by `tests/mutate_volume_capture_guards.py` (10/10), which re-opens
+>   each door in turn — including refusing only *after* the guest is frozen,
+>   and reporting the refusal as `Terminal` so a still-healthy sandbox gets
+>   condemned. **Still missing, unchanged:** the layer writer and the
+>   guest-dispatching executor that would let any of the four succeed, so a
+>   sandbox with an exclusive volume can currently be neither paused, forked,
+>   snapshotted nor deleted.
+>
+> - **"a resume cannot get a memory block device, because this port has no
+>   ublk daemon client"** — it has one, and had one when that was written.
+>   `ublk::DeviceManager::GetOrCreateSharedMem` is ported in full, refcount
+>   and weak table included, and `FirecrackerSandboxFactoryImpl` already hands
+>   that same manager to the fresh drive plan and to `ResumeDrivesFor`. What
+>   was actually missing was the call: both resume paths set
+>   `mem_device_path` from a *test-only* hook, so every production resume died
+>   in `BuildResumeSequence` on an empty path, blaming a client that was wired
+>   up two lines away. `StartResumeInstance` now acquires the device where
+>   Rust's `acquire_shared_mem_device` does, holds the handle in
+>   `FreshDriveResources::AdoptSharedMem` for the life of the sandbox (Rust
+>   `resources.mem_ublk_device`) and drops it in `Release` after the VMM has
+>   stopped. Two deliberate divergences: the device is acquired *before* the
+>   work dir and network slot rather than after, because the path has to be
+>   baked into the `SnapshotLoad` step — this releases strictly less on an
+>   early return, and costs a refcount rather than a creation; and the memory
+>   image is opened under `memory_snapshot.overlaybd_global_config_path`, a
+>   separate `ResumeDrivePlan` field from the drives'
+>   `ublk.overlaybd.global_config_path`, which is what upstream reads too.
+>   **Still unverified against a real daemon** — no test drives the acquiring
+>   branch end to end, only the refusal when no manager is configured.
+>
 > - **"the overlaybd layer writer is not ported, so a memory capture would
 >   produce an empty layer"** — it is ported. `storage/overlaybd/lsmt_rw.cc`
 >   carries the read-write LSMT file and its commit path, and

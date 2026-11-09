@@ -563,6 +563,82 @@ MT_TEST(volume_capture_refuses_a_writable_persistent_volume) {
     MT_EXPECT_TRUE(backend->ThawVolumes().ok());
 }
 
+// Rust `pause(None)` is not a bare VMM pause: it routes through `pause_to_dir`,
+// which flushes the writable volumes through envd and seals each one's upper
+// into a new commit layer. This port can do neither, and pausing anyway loses
+// data silently rather than partially:
+//
+//   pause succeeds -> record becomes Paused -> a later delete sees
+//   `previous_state != Running` and so skips `freeze_and_snapshot_volumes`
+//   (upstream does the same) -> `publish_sandbox_volume_backings` publishes the
+//   volume's *lowers*, which is also upstream's behaviour and is correct there
+//   only because the seal already folded this run's upper into them -> `Stop`
+//   removes the work dir and `extra-drive-runtime-<id>/upper.data` with it.
+//
+// Every link after the pause is aligned, so the pause is the one that must
+// refuse. This test is the anchor for that: without it the guard reads like
+// dead weight next to a `Pause` that otherwise just forwards to the VMM.
+MT_TEST(pause_refuses_a_sandbox_with_writable_persistent_volumes) {
+    ScriptedConnector* conn = new ScriptedConnector();
+    std::vector<ExtraDrive> drives;
+    drives.push_back(WritableVolumeDrive("data"));
+    std::unique_ptr<FirecrackerSandboxBackend> backend = MakeBackendWithDrives(conn, drives);
+
+    const SandboxCaptureResult<std::shared_ptr<PausedSandboxState> > paused =
+        backend->Pause(core::nullopt);
+    MT_EXPECT_TRUE(!paused.ok());
+    if (paused.ok()) return;
+    // Recoverable: nothing was touched, so the sandbox is still serving and
+    // must not be condemned over a capture this build cannot take.
+    MT_EXPECT_TRUE(paused.error().kind == SandboxCaptureError::Kind::Recoverable);
+    // Refused *before* the VMM was asked to pause. A refusal afterwards would
+    // leave the guest frozen behind an error the caller is told is recoverable.
+    MT_EXPECT_EQ(conn->calls.size(), static_cast<std::size_t>(0));
+
+    // Same sandbox, same answer from the other two capture doors -- the point
+    // of the guard is that all three now agree.
+    MT_EXPECT_TRUE(!backend->SnapshotVolumes().ok());
+    MT_EXPECT_TRUE(!backend->FreezeAndSnapshotVolumes().ok());
+}
+
+MT_TEST(pause_still_works_without_writable_persistent_volumes) {
+    // The guard must not cost the common case: a sandbox with no volume, or
+    // with only a read-only one, pauses exactly as before.
+    ScriptedConnector* conn = new ScriptedConnector();
+    ExtraDrive read_only = WritableVolumeDrive("ro");
+    read_only.read_only = true;
+    std::vector<ExtraDrive> drives;
+    drives.push_back(read_only);
+    std::unique_ptr<FirecrackerSandboxBackend> backend = MakeBackendWithDrives(conn, drives);
+
+    MT_EXPECT_TRUE(backend->Pause(core::nullopt).ok());
+    MT_EXPECT_EQ(conn->calls.size(), static_cast<std::size_t>(1));
+    if (conn->calls.size() == 1) {
+        MT_EXPECT_TRUE(conn->calls[0].find("Paused") != std::string::npos);
+    }
+}
+
+MT_TEST(fork_refuses_a_sandbox_with_writable_persistent_volumes) {
+    // Rust forks through `FirecrackerSandbox::pause(self)` -- the same full
+    // pause -- so the children are built from a capture whose volumes were
+    // flushed and sealed. One step removed from `Pause`'s failure mode: the
+    // parent keeps running so its upper survives, but each child would boot
+    // cleanly on the *pre-seal* lowers and silently miss every write the parent
+    // had made to those volumes.
+    ScriptedConnector* conn = new ScriptedConnector();
+    std::vector<ExtraDrive> drives;
+    drives.push_back(WritableVolumeDrive("data"));
+    std::unique_ptr<FirecrackerSandboxBackend> backend = MakeBackendWithDrives(conn, drives);
+
+    const SandboxCaptureResult<std::vector<SandboxForkResult> > forked =
+        backend->Fork(std::vector<SandboxForkSpec>());
+    MT_EXPECT_TRUE(!forked.ok());
+    if (forked.ok()) return;
+    MT_EXPECT_TRUE(forked.error().kind == SandboxCaptureError::Kind::Recoverable);
+    // Refused before the pause, so the parent was never frozen.
+    MT_EXPECT_EQ(conn->calls.size(), static_cast<std::size_t>(0));
+}
+
 MT_TEST(fork_pauses_and_resumes_the_source_around_the_capture) {
     ScriptedConnector* conn = new ScriptedConnector();
     std::unique_ptr<FirecrackerSandboxBackend> backend = MakeBackend(conn);

@@ -499,7 +499,10 @@ MT_TEST(a_resume_without_the_ublk_daemon_fails_at_start) {
     const core::Expected<core::Unit, core::AnyError> started = built.value()->StartNowait();
     MT_EXPECT_TRUE(!started.ok());
     if (started.ok()) return;
-    MT_EXPECT_TRUE(started.error().chain().find("memory block device") != std::string::npos);
+    // No device manager on this factory, so `StartResumeInstance` has nothing
+    // to acquire the memory device from and the sequence refuses -- the same
+    // condition and the same wording as Rust's `ensure!`.
+    MT_EXPECT_TRUE(started.error().chain().find("ublk daemon client") != std::string::npos);
 }
 
 // ============================================================

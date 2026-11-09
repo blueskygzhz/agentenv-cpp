@@ -1536,14 +1536,50 @@ FirecrackerSandboxBackend::Pause(const core::Optional<std::string>& artifact_roo
         return core::make_unexpected(
             SandboxCaptureError::Terminal("pause: no live microVM"));
     }
-    // Writing capture artifacts into a caller-managed directory is Rust's
-    // `pause_to_dir`, which also flushes writable volumes through envd. Neither
-    // is ported, so an artifact root is refused rather than ignored: honouring
-    // the pause but dropping the artifacts would hand back a paused state whose
-    // files were never written.
+    // Rust `pause(Some(root))` is `pause_to_dir`, whose second half assembles
+    // the `FirecrackerSnapshotConfig` that the paused state is built from. That
+    // assembly is what is missing here -- `PauseToDir` returns artifact paths
+    // and a manifest, not a config -- so an artifact root is refused rather
+    // than ignored: honouring the pause but dropping the artifacts would hand
+    // back a paused state whose files were never written.
+    //
+    // An earlier note here said `pause_to_dir` itself was unported. It is
+    // ported, and `Snapshot` drives it; only the config assembly is absent.
     if (artifact_root.has_value()) {
         return core::make_unexpected(SandboxCaptureError::Recoverable(
             "pause to a caller-managed artifact root is not available in this build"));
+    }
+
+    // Rust `pause(None)` is **not** a bare VMM pause either: it routes through
+    // `pause_to_dir`, which first runs `if has_writable_persistent_volumes() {
+    // sync_writable_volume_filesystems() }` and then seals each volume's upper
+    // into a new overlaybd commit layer.
+    //
+    // This port can do neither (no envd client, no layer writer), and pausing
+    // anyway is not a reduced version of the same operation -- it is a silent
+    // loss of every write made to those volumes:
+    //
+    //   * the pause succeeds and the record moves to Paused;
+    //   * a later delete sees `previous_state != Running` and therefore skips
+    //     `freeze_and_snapshot_volumes` -- which matches upstream exactly --
+    //     going straight to `publish_sandbox_volume_backings`;
+    //   * publishing reads the volume's `image.json` *lowers*, which is also
+    //     upstream's behaviour and is right there precisely because the seal
+    //     has already turned this run's upper into one of those lowers;
+    //   * `Stop` then removes the work dir, taking
+    //     `extra-drive-runtime-<id>/upper.data` with it.
+    //
+    // Every step after the first is aligned, so the pause is the one that has
+    // to refuse. `Snapshot` already refuses the same sandbox by way of
+    // `PauseToDir`'s flush check, and `FreezeAndSnapshotVolumes` refuses it on
+    // the delete path; this is what makes all three agree instead of leaving
+    // pause as the one door that opens onto the loss.
+    if (impl_->HasWritablePersistentVolumes()) {
+        return core::make_unexpected(SandboxCaptureError::Recoverable(
+            "pause: this sandbox has writable persistent volumes, which must be flushed "
+            "through envd and sealed into a new overlaybd commit layer before the VM is "
+            "paused; neither is available in this build, and pausing without them would "
+            "discard every write made to those volumes"));
     }
 
     const core::Expected<core::Unit, std::string> paused = impl_->instance->Pause();
@@ -2045,6 +2081,24 @@ FirecrackerSandboxBackend::Fork(const std::vector<SandboxForkSpec>& specs) {
     if (!impl_->instance) {
         return core::make_unexpected(
             SandboxCaptureError::Terminal("fork: no live microVM"));
+    }
+
+    // Rust forks through `FirecrackerSandbox::pause(self)`, the same full pause
+    // the trait's `pause` uses -- so it too flushes the writable volumes and
+    // seals each one's upper before the children are built from the capture.
+    //
+    // Refused here for a reason one step removed from `Pause`'s: the parent
+    // keeps running, so its upper is not deleted, but each child is built from
+    // a capture whose volume stacks are the *pre-seal* lowers. The children
+    // would boot cleanly and silently miss every write the parent had made to
+    // those volumes, which is harder to notice than a refusal and impossible
+    // to reconstruct afterwards.
+    if (impl_->HasWritablePersistentVolumes()) {
+        return core::make_unexpected(SandboxCaptureError::Recoverable(
+            "fork: this sandbox has writable persistent volumes, which must be flushed "
+            "through envd and sealed into a new overlaybd commit layer before the capture "
+            "the children are built from; neither is available in this build, and forking "
+            "without them would give every child a stale view of those volumes"));
     }
 
     const core::Expected<core::Unit, std::string> paused = impl_->instance->Pause();
