@@ -313,10 +313,133 @@ void RegisterOrchestratorRoutes(
     // ---- templates --------------------------------------------------------
 
     server->Route("GET", "/templates", [impl](const HttpRequest&, HttpResponse* resp) {
-        const core::Expected<core::Unit, ApiError> r = impl->ListTemplates();
+        const core::Expected<std::vector<TemplateModel>, ApiError> r = impl->ListTemplates();
         if (!r.ok()) return WriteError(r.error(), resp);
-        resp->status = 200;
-        resp->body = "{\"templates\":[]}";
+        // A bare JSON array, which is what `TemplatesGetResponse`'s 200
+        // variant carries (`Vec<models::Template>`). The hard-coded
+        // `{"templates":[]}` this used to write was a second defect hidden
+        // behind the first: while the handler was a 501 the body never
+        // reached a client, so nothing showed that the shape was wrong as
+        // well as the content.
+        core::JsonArray items;
+        for (std::size_t i = 0; i < r.value().size(); ++i) {
+            items.emplace_back(r.value()[i].ToJson());
+        }
+        WriteJson(core::Json(items), resp);
+    });
+
+    // Rust `POST /v3/templates`, 202. The first half of upstream's two-step
+    // build: this reserves the build by committing a `TemplateWaiting` record
+    // and claiming the name, and `POST /v2/templates/{id}/builds/{id}` runs
+    // it.
+    //
+    // Versioned path, as upstream declares it. The V3 request body and the V2
+    // start body are different schemas on purpose -- V3 names the template
+    // and sizes the machine, V2 carries the build steps -- so folding them
+    // onto one unversioned `/templates` route would have made the second
+    // step unreachable by any client written against the real API.
+    server->Route("POST", "/v3/templates", [impl](const HttpRequest& req, HttpResponse* resp) {
+        // Upstream's `requestBody` is `required: true`. Not delegated to
+        // `ParseBody`'s empty-body-as-`{}` leniency: every field of
+        // `TemplateBuildRequestV3` is optional in the schema, so an omitted
+        // body would reach the handler as a request with no name and be
+        // reported as a missing field rather than a missing body.
+        if (req.body.empty()) {
+            return WriteError(ApiError::Make(400, "a request body is required"), resp);
+        }
+        core::Json body;
+        if (!ParseBody(req, &body, resp)) return;
+        const core::Expected<TemplateBuildRequestV3, core::AnyError> parsed =
+            TemplateBuildRequestV3::FromJson(body);
+        if (!parsed.ok()) {
+            return WriteError(ApiError::Make(400, parsed.error().chain()), resp);
+        }
+        const core::Expected<TemplateRequestResponseV3, ApiError> r =
+            impl->CreateTemplateBuild(parsed.value());
+        if (!r.ok()) return WriteError(r.error(), resp);
+        // 202, not 201: nothing has been built yet. The record is `waiting`
+        // and the caller must still start the build with the ids in this body.
+        resp->status = 202;
+        resp->body = r.value().ToJson().ToString();
+    });
+
+    // Rust `POST /v2/templates/{templateID}/builds/{buildID}` — the second
+    // step, which claims the reservation above and runs the build.
+    //
+    // Registered even though the handler cannot finish: the route is where
+    // every synchronous rule lives (the two ids must agree *and* must name
+    // the same record, the base source is exclusive, the spec must
+    // translate), and leaving it unrouted meant none of that could be
+    // reached by a client. It answers 400/404 for a bad request and 501 only
+    // when the request was entirely in order.
+    server->Route("POST", "/v2/templates/{template_id}/builds/{build_id}",
+                  [impl](const HttpRequest& req, HttpResponse* resp) {
+        // The body is required by the schema, but every field in it is
+        // optional: a build with no steps and no base is a valid request for
+        // the configured default image. So an empty body is parsed as `{}`
+        // rather than refused -- unlike `POST /v3/templates`, where an
+        // omitted body would read as a missing name.
+        core::Json body;
+        if (!ParseBody(req, &body, resp)) return;
+        const core::Expected<TemplateBuildStartRequest, core::AnyError> parsed =
+            TemplateBuildStartRequest::FromJson(body);
+        if (!parsed.ok()) {
+            return WriteError(ApiError::Make(400, parsed.error().chain()), resp);
+        }
+        const core::Expected<core::Unit, ApiError> r = impl->StartTemplateBuild(
+            Param(req, "template_id"), Param(req, "build_id"), parsed.value());
+        if (!r.ok()) return WriteError(r.error(), resp);
+        // Rust's `Status202_TheBuildHasStarted` carries no body: the build is
+        // asynchronous, and its outcome is read back from the status route
+        // below.
+        resp->status = 202;
+    });
+
+    // Rust `GET /templates/{templateID}/builds/{buildID}/status` — what a
+    // client polls after starting a build, and the only route that reports
+    // *why* one failed.
+    //
+    // `GET /templates` was the only way to observe a reserved template before
+    // this: it lists every template on the node and carries neither the
+    // failure reason nor any log line, so a client could see that a build had
+    // failed and had nowhere to learn what failed.
+    server->Route("GET", "/templates/{template_id}/builds/{build_id}/status",
+                  [impl](const HttpRequest& req, HttpResponse* resp) {
+        const core::Expected<BuildLogQuery, core::AnyError> query = BuildLogQuery::ForStatus(
+            Param(req, "logsOffset"), Param(req, "limit"), Param(req, "level"));
+        if (!query.ok()) {
+            return WriteError(ApiError::Make(400, query.error().chain()), resp);
+        }
+        const core::Expected<TemplateBuildInfoModel, ApiError> r = impl->GetTemplateBuildStatus(
+            Param(req, "template_id"), Param(req, "build_id"), query.value());
+        if (!r.ok()) return WriteError(r.error(), resp);
+        WriteJson(r.value().ToJson(), resp);
+    });
+
+    // Rust `GET /templates/{templateID}/builds/{buildID}/logs`.
+    server->Route("GET", "/templates/{template_id}/builds/{build_id}/logs",
+                  [impl](const HttpRequest& req, HttpResponse* resp) {
+        const core::Expected<BuildLogQuery, core::AnyError> query = BuildLogQuery::ForLogs(
+            Param(req, "cursor"), Param(req, "limit"), Param(req, "level"),
+            Param(req, "direction"), Param(req, "source"));
+        if (!query.ok()) {
+            return WriteError(ApiError::Make(400, query.error().chain()), resp);
+        }
+        const core::Expected<std::vector<tpl::BuildLogEntry>, ApiError> r =
+            impl->GetTemplateBuildLogs(Param(req, "template_id"), Param(req, "build_id"),
+                                       query.value());
+        if (!r.ok()) return WriteError(r.error(), resp);
+        // `TemplateBuildLogsResponse` wraps the array in a `logs` key -- which
+        // is *not* the shape `GET /templates` uses, where the 200 variant is a
+        // bare array. The two differ upstream and a client generated from the
+        // schema reads them differently, so the wrapper is not optional.
+        core::JsonObject body;
+        core::JsonArray  entries;
+        for (std::size_t i = 0; i < r.value().size(); ++i) {
+            entries.emplace_back(r.value()[i].ToJson());
+        }
+        body["logs"] = core::Json(entries);
+        WriteJson(core::Json(body), resp);
     });
 
     // ---- health -----------------------------------------------------------

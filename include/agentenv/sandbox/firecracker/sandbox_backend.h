@@ -181,6 +181,16 @@ struct PauseToDirResult {
     /// restore can size the ublk device before opening the stack.
     uint64_t rootfs_virtual_size = 0;
 
+    /// Rust `snapshot_extra_drives`' result — every extra drive, rewritten to
+    /// name the stack this capture sealed for it and sized to the device it
+    /// actually had.
+    ///
+    /// Volumes are **present** here and absent from `manifest`: a resume needs
+    /// the full list to rebuild its drive table, while the manifest describes
+    /// only what a restore must recreate from the capture itself. Keeping both
+    /// views from one list is what stops them disagreeing.
+    std::vector<ExtraDrive> extra_drives;
+
     /// Rust `pause_to_dir`'s second return value.
     ///
     /// Present only when every artifact above was produced, because a
@@ -189,6 +199,45 @@ struct PauseToDirResult {
     /// rootfs was never written.
     core::Optional<SandboxSnapshotManifest> manifest;
 };
+
+/// Builds the sealer for one live device (Rust reaches the daemon through
+/// `UblkDeviceManager::global()`).
+///
+/// A factory rather than a single restacker because each drive is sealed by
+/// *its own* device id: one shared sealer would seal whichever device it had
+/// captured, for every drive in the list.
+typedef std::function<SnapshotRestacker(const ublk::Device& device)> DriveRestackerFactory;
+
+/// Rust `snapshot_extra_drives` — seal every extra drive into the capture and
+/// return the drives rewritten to name the sealed stacks.
+///
+/// A free function, not a backend method, because every decision it makes is a
+/// function of its arguments: the backend half is only picking them out of the
+/// launch config. That is also what makes it testable without a ublk daemon,
+/// and it had no test at all before -- it had no implementation.
+///
+/// `drives` and `runtimes` are index-paired, which is the bookkeeping upstream
+/// asserts with `bail!("extra drive bookkeeping mismatch")`: the two lists are
+/// built by different steps, and a drive sealed against another drive's device
+/// would capture the wrong disk under the right name.
+///
+/// Two details carry consequences:
+///
+///   * **Volumes seal into their own backing directory**, non-volumes into
+///     `{snapshot_dir}/drives/{id}`. A volume outlives the capture and is
+///     published from its own directory; a non-volume travels with the
+///     capture.
+///   * **A volume's layer file name is unique per pause.** A volume reuses one
+///     directory across pauses, so a fixed name would overwrite a lower that
+///     its `image.json` still references -- corrupting the stack rather than
+///     extending it. Non-volumes get the fixed `snapshot.commit`, their
+///     directory being fresh per capture.
+SandboxCaptureResult<std::vector<ExtraDrive> > SnapshotExtraDrives(
+    const std::vector<ExtraDrive>& drives,
+    const std::vector<ublk::OverlaybdRuntimeDevice>& runtimes,
+    const std::string& snapshot_dir, const DriveRestackerFactory& restacker,
+    const std::vector<std::string>& runtime_owned_roots, const LayerCompactor& compact,
+    const LayerAdopter& adopt);
 
 /// Rust `enum LaunchMode { Fresh(..), Resume(..) }`.
 ///

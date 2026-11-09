@@ -113,6 +113,231 @@ A C++11 architectural port of [kvcache-ai/AgentENV](https://github.com/kvcache-a
 >   naming an empty backend and files at `/` — and it does so *after* the
 >   resume it owes, since `Recoverable` is a promise the sandbox is running.
 >
+> - **"the extra drives are captured along with the rootfs"** — they were not
+>   captured at all. Rust `snapshot_extra_drives` had no counterpart, and the
+>   consequence was not a missing feature but a *wrong manifest*: `PauseToDir`
+>   described each drive straight off the launch config, so every entry named
+>   the drive's **source image** config and its **requested** size. A restore
+>   from such a snapshot opens each data disk's pre-boot stack — cleanly, with
+>   none of the writes the sandbox made — and `attachedDrives` being wired into
+>   both create routes is what made that reachable. Two smaller faults rode
+>   along: volumes were left *in* the manifest, where they both inflate
+>   `physical_extra_drive_count` and get recorded as drives to recreate rather
+>   than slots to rebind; and `volume_drive_slots` stayed at the constructor's
+>   zero, so a restore read the capture as having no rebindable slots at all.
+>
+>   The loop is now `SnapshotExtraDrives`, a **free function** rather than a
+>   backend method, because every decision it makes is a function of its
+>   arguments — which is also what lets it be tested without a ublk daemon.
+>   `PauseToDir` seals the drives inside its rootfs branch (sealing is
+>   irreversible, so a capture that cannot be described must not consume the
+>   running sandbox's uppers), then builds the manifest from the *sealed*
+>   drives with volumes filtered out. Three rules carry consequences and are
+>   pinned by `tests/mutate_snapshot_extra_drives.py` (13/13): each drive is
+>   sealed against **its own** device (upstream's `bail!("extra drive
+>   bookkeeping mismatch")` guards the pairing); a **volume** seals into its
+>   own backing directory under a name unique per pause, because it reuses one
+>   directory across pauses and a fixed name would overwrite a lower its live
+>   `image.json` still references — corrupting the stack instead of extending
+>   it; and the recorded size is the device's **actual** virtual size, since a
+>   restore sizes the ublk device from it before opening the stack.
+>
+>   Note that the earlier note above — "the overlaybd layer writer is not
+>   ported" — was also the wrong diagnosis *here*: the production sealer
+>   `DeviceManager::RestackSnapshotDevice` existed all along and the rootfs
+>   path was already using it. What was missing was only this loop.
+>   **Still unlocked:** the manifest's volume filter. Reaching that branch
+>   needs at least one *sealed* drive, which needs a live ublk device, so no
+>   test gets there today — `volume_drive_slots` and the bookkeeping mismatch
+>   are covered, the filter is not.
+>
+> - **"sandbox timeouts are enforced"** — they were not enforced at all.
+>   `evict_expired_sandboxes` is ported in full and had two tests;
+>   `auto_evict_interval_ms` is parsed and defaults to 1000 with a test of its
+>   own (`test_cfg`); every sandbox gets an `expires_at` and the store answers
+>   `ListExpired`. What there was no counterpart to was
+>   `start_auto_evict_task`: upstream's `new_inner_with_volumes` ends by
+>   spawning the sweep, and `Orchestrator::New` built the orchestrator and
+>   returned. So the sweep was dead code — no sandbox ever reached its
+>   timeout, `timeout_action` (the field a caller sets to choose between pause
+>   and delete) never ran once, and a leaked sandbox held its VM, network
+>   slot, drives and image refs until the process died. Nothing reported it,
+>   because the config kept saying eviction was on.
+>
+>   This is the fourth instance of the same defect class in this port
+>   (`mem_device_path`, the `pause`/`fork` volume doors, `snapshot_extra_drives`
+>   and now this): a component that is complete, tested and configured, with
+>   zero production callers. It is worth naming as a class, because "is it
+>   ported?" has repeatedly been the wrong question — the right one is "who
+>   calls it?".
+>
+>   `New` now calls `StartAutoEvictTask(config.orchestrator.auto_evict_interval_ms)`
+>   last, as upstream does, so the thread cannot sweep a half-built
+>   orchestrator. Upstream holds a `Weak<Self>` so the task cannot keep the
+>   orchestrator alive and selects on a `watch` channel so a shutdown is not
+>   charged for the rest of a tick; here the thread is a member joined by
+>   `StopAutoEvictTask`, called from both `Shutdown` and the destructor, and
+>   the interval is a `condition_variable::wait_for` on a stop flag rather
+>   than a sleep. The join is what makes `this` safe to capture: the sweep
+>   reads the store, the handle map and the deletion locks, and a thread still
+>   running after those members die is a use-after-free.
+>
+>   Pinned by `tests/mutate_auto_evict_task.py` (11/11), which unhooks the
+>   driver, hard-codes the interval past the config, ends the loop after one
+>   cycle or one error, and breaks the stop in all four of its available ways
+>   (no notify, no flag, no predicate, no post-wait check — the last two being
+>   the lost-wakeup and the one-more-sweep-after-shutdown cases). Writing it
+>   was what showed that three of the tests only looked like they locked this:
+>   "an expired sandbox stays put after shutdown" is true whether or not the
+>   task was joined, because `EvictExpiredSandboxes` checks `IsShuttingDown`
+>   itself; and a cycle *failure* cannot be provoked through a sandbox whose
+>   pause fails, since the sweep logs and continues per sandbox and still
+>   returns `Ok`. It needs a store whose `ListExpired` fails, which the only
+>   production store cannot do.
+>
+>   **Still missing, same function:** `start_metrics_task`, upstream's other
+>   constructor-spawned loop (`metrics_interval_secs` is parsed and unused).
+>   **Not locked:** replacing the start guard with `detach()` — the abandoned
+>   thread still exits on the flag, so what it leaves is a use-after-free
+>   rather than a wrong value, and catching it needs a sanitizer build.
+>
+> - **"a snapshot record can be produced from an API route"** — from exactly
+>   one, and the template build pipeline was fully ported and **unreachable**.
+>   `TemplateBuilder` (`ExecuteAndPublish` / `BuildAndPublishWithId`) and
+>   `TemplateBuildRecordFromV3Request` all existed with tests and no caller
+>   outside them, because neither of the two routes that drive them upstream
+>   was served. The record builder was the sharper case: it produced a
+>   `TemplateWaiting` record that nothing stored, so the name it claimed was
+>   never actually reserved and `TryStartBuild` had no record to find.
+>
+>   `POST /v3/templates` is now served, answering 202. It is the first of
+>   upstream's two steps: validate, build the waiting record, and **commit
+>   it** through `record_catalog::Create` (Rust `snapshot_manager.create`),
+>   which is what claims the name. Committing is the whole point — without
+>   the write, two concurrent requests for one template name would both be
+>   told they had it, which is why `tests/test_api_template_build.cc` drives
+>   the *real* OSS repository over an HTTP-level ETag stub rather than a
+>   hand-written document store: the conflict is a compare-and-swap, and a
+>   fake store would make the only interesting failure unobservable. Every
+>   assertion reads the record back from the store, because the response is
+>   exactly what a handler that built the record and dropped it would also
+>   return.
+>
+>   `imageOnly` is **refused with a 501** rather than accepted and ignored.
+>   Upstream sends it to `create_image_build`, which produces a reusable image
+>   and no template record at all; ignoring the flag would answer 202 and hand
+>   over the one artifact the request explicitly asked not to have, with the
+>   tags pointing at it. What it needs is the Dockerfile build pipeline —
+>   `ImageBuildRecord`, the buildkit worker and its log tunnel — none of which
+>   is ported.
+>
+>   Pinned by `tests/mutate_api_template_build.py`, which unhooks the
+>   commit in the two ways that still answer 202, turns each refusal into
+>   silent success, and breaks every field of the request DTO. Two properties
+>   are deliberately **not** pinned and the script says so: where
+>   `RequireRepository` sits in the sequence (observable only for a request
+>   that would also fail to build a record), and reading the response ids from
+>   the stored record rather than the local one (`Create` never rewrites the
+>   id, so the two are equal by construction — the guard is against a future
+>   backend that does).
+>
+>   **Still missing:** the build itself. `POST
+>   /v2/templates/{templateID}/builds/{buildID}` now validates and refuses
+>   (below), so a template can be *reserved* over HTTP but not yet *built*,
+>   and `aenv snapshot` / `aenv build` remain stubs.
+>
+> - **"`GET /templates` needs the template store"** — the 501 it answered said
+>   so, and there is no template store, upstream or here. Templates *are*
+>   snapshot records: `record_catalog::List` was ported and tested, the
+>   `SnapshotListFilter::Templates()` filter existed, and this class already
+>   held the repository that `CreateSnapshot` and `CreateTemplateBuild`
+>   publish through. Only the call was missing — the stale diagnosis is what
+>   made it look like a dependency problem rather than four lines.
+>
+>   Fixing it exposed a **second defect hidden behind the first**: the route
+>   wrote a hard-coded `{"templates":[]}` body, where the 200 variant of
+>   upstream's `TemplatesGetResponse` carries a bare `Vec<models::Template>`.
+>   While the handler was a 501 that body never reached a client, so nothing
+>   showed the shape was wrong as well as the content. This is the second time
+>   in this audit that a refusal has been hiding a wrong answer behind it (the
+>   first was `POST /sandboxes/{id}/snapshot`, singular, answering 204).
+>
+>   `TemplateModel::FromRecord` is Rust's `impl From<SnapshotRecord> for
+>   models::Template`. Three of its rules carry consequences: a record's
+>   `names` falls back to its id when it has no alias, because `names` is how
+>   a client addresses the template and an empty list would make an
+>   addressable one invisible; a sandbox-sourced record reports `Ready` rather
+>   than its build's default `Waiting`, since it has no build and exists only
+>   because a capture succeeded; and `buildStatus` is written in the
+>   **lowercase wire spelling**, not `snapshot::TemplateBuildStatusToString`'s
+>   capitalised record spelling — the two enums are both called
+>   `TemplateBuildStatus`, and putting `"Waiting"` in a body whose schema
+>   declares `"waiting"` is rejected by a generated client as an unknown
+>   variant.
+>
+>   `tests/mutate_api_template_build.py` was extended to this route too.
+>   Writing the new half caught two tests of mine that only looked like they
+>   locked something: a corrupt catalog read as an empty list passed, because
+>   I had no record that fails to decode (`List` refuses one rather than
+>   skipping it, so the handler must not flatten that to 200); and
+>   `lastSpawnedAt` being *omitted* passed a `kind() == Null` check, because a
+>   const `operator[]` on an absent key yields a null `Json` — the assertion
+>   had to move to the object's key set.
+>
+> - **"`POST /v2/templates/{templateID}/builds/{buildID}` is not available"** —
+>   the diagnosis was right, the *scope* was not: the 501 was returned before
+>   anything was checked, so every malformed start request was answered as an
+>   unsupported feature. The route is upstream's second step, and what is
+>   genuinely absent is only the last piece of it —
+>   `TemplateBuildExecuteFn`, which boots a Firecracker sandbox and drives
+>   start/capture/stop. Everything in front of that is ported.
+>
+>   So the handler now runs the **entire** upstream sequence and refuses at the
+>   end: the two path segments must agree, `buildID` must parse, the record
+>   must exist, `fromImage`/`fromTemplate` must not both be set, the step list
+>   must translate into a `TemplateBuildSpec`. A caller with a bad body now
+>   gets a 400 that names the field instead of a 501 telling them to wait for a
+>   release that will not fix it.
+>
+>   The ordering is the point, and it is the opposite of what reads naturally.
+>   The refusal must land **before** `TryStartBuild`, because that call moves
+>   the record `waiting` → `building` and only a `waiting` record can be
+>   claimed — claiming and then failing to build would leave the template
+>   permanently unstartable, dead even once the executor lands. Refusing first
+>   keeps the reservation intact, which makes the refusal idempotent: the same
+>   request works unchanged later. Both properties are asserted against the
+>   stored record, not the response.
+>
+>   One check is easy to read as redundant and is not: the record lookup
+>   accepts an id *or* an alias, so `templateID` can resolve to a record whose
+>   id is not `buildID` even after the two segments were compared as strings.
+>   That is reachable because `SnapshotAlias::Parse` allows letters, digits,
+>   hyphens and underscores — a template may be *named* after a uuid — and
+>   building it would run against someone else's reservation and publish it
+>   under their name. Upstream has it too (`pending_record.id != build_id`,
+>   `template.rs`), with the same 400.
+>
+>   `fromImageRegistry` is **refused, not ignored**, and this is the one
+>   refusal that is not about the missing executor: `RegistryAuth` is ported
+>   but not wired into the build path, so honouring the body is impossible.
+>   Ignoring it pulls anonymously, which either fails with the authentication
+>   error the caller already solved or — worse — silently resolves a
+>   *different, public* image of the same name and publishes it as their
+>   template. Its own 400 (`fromImageRegistry` without `fromImage`) is checked
+>   first, so a malformed credential block is reported as malformed.
+>
+>   `tests/mutate_api_template_build.py` covers all three routes (46/46). One
+>   mutation was **removed rather than left as a passing survivor**: which
+>   resources the handler sizes the spec from cannot be observed, because
+>   `TemplateBuildSpecFromStartRequest` never fails on that argument and the
+>   handler drops the spec after using it to validate the steps. The property
+>   is asserted directly against the helper instead, and the script records
+>   why — it becomes mutable at the call site when the executor lands.
+>
+>   **Still missing:** `TemplateBuildExecuteFn` and the background executor
+>   around it (`capture_to_dir`, the build log stream, the task that polls the
+>   record to `Ready`). That is the same block `aenv build` is stubbed on.
+>
 > - **"the volume operations are still stubs"** — the volume *module* is now a
 >   complete port: `VolumeManager` (create / empty + child backing / COW clone
 >   / materialize / publish / reserve / remove / fork), the durable record and

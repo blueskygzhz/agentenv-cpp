@@ -90,7 +90,75 @@ Orchestrator::Orchestrator(std::shared_ptr<MetadataStore> store,
     default_fresh_resources_.disk_size_mib = 0;
 }
 
-Orchestrator::~Orchestrator() {}
+Orchestrator::~Orchestrator() {
+    // Before any member dies: the sweep thread touches the store, the handle
+    // map and the deletion locks, so it must be joined while they are still
+    // alive. Upstream gets this from `Weak::upgrade` returning `None` once the
+    // last `Arc` is gone; a joined thread is the same guarantee without
+    // depending on how the orchestrator happens to be owned.
+    StopAutoEvictTask();
+}
+
+// Rust `start_auto_evict_task`.
+void Orchestrator::StartAutoEvictTask(uint64_t evict_interval_ms) {
+    // Rust's task is spawned once from the constructor. Starting a second
+    // sweep would have two threads claiming the same expired sandbox; the CAS
+    // in `ClaimExpiredRunningSandbox` makes that safe but not useful.
+    if (auto_evict_thread_.joinable()) return;
+
+    // Rust `Duration::from_millis(config.auto_evict_interval_ms)` with no
+    // lower bound, but a zero interval here is a spin loop over the whole
+    // store rather than Tokio's immediately-ready timer: clamp to 1ms, which
+    // is below the smallest interval anyone configures (upstream's default is
+    // 1000) and so cannot change behaviour for a real configuration.
+    const uint64_t interval_ms = evict_interval_ms == 0 ? 1 : evict_interval_ms;
+
+    {
+        std::lock_guard<std::mutex> g(auto_evict_mu_);
+        auto_evict_stop_ = false;
+    }
+
+    AGENTENV_DEBUG("auto-evict task started with interval " << interval_ms << "ms");
+    auto_evict_thread_ = std::thread([this, interval_ms]() {
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(auto_evict_mu_);
+                // `wait_for` on the stop flag, not a sleep: `StopAutoEvictTask`
+                // must not have to wait out a tick. The predicate also covers
+                // a stop raised before the first wait.
+                auto_evict_cv_.wait_for(lock, std::chrono::milliseconds(interval_ms),
+                                        [this]() { return auto_evict_stop_; });
+                if (auto_evict_stop_) return;
+            }
+            // Outside the lock: the sweep pauses and deletes sandboxes, which
+            // can take arbitrarily long, and holding `auto_evict_mu_` across
+            // it would make a shutdown wait for the sandbox it is evicting.
+            //
+            // Each cycle waits a fresh interval rather than catching up on
+            // ticks missed while sweeping — Rust's
+            // `MissedTickBehavior::Skip`.
+            const OrchestratorResult<std::vector<core::SandboxId> > evicted =
+                EvictExpiredSandboxes();
+            if (!evicted.ok()) {
+                // Rust `warn!("auto-evict task failed: {err}")` and keeps the
+                // loop: a store hiccup must not silently end eviction for the
+                // life of the process.
+                AGENTENV_WARN("auto-evict task failed: " << evicted.error().Message());
+            }
+        }
+    });
+}
+
+void Orchestrator::StopAutoEvictTask() {
+    {
+        std::lock_guard<std::mutex> g(auto_evict_mu_);
+        auto_evict_stop_ = true;
+    }
+    auto_evict_cv_.notify_all();
+    if (auto_evict_thread_.joinable()) {
+        auto_evict_thread_.join();
+    }
+}
 
 // Rust `persisted_sandboxes_require_managed_seed`.
 bool PersistedSandboxesRequireManagedSeed(const std::vector<SandboxMetadata>& persisted) {
@@ -171,6 +239,16 @@ Orchestrator::New(std::shared_ptr<MetadataStore> store,
     orchestrator->SetConfiguredRuntimeVersions(ConfiguredRuntimeVersions(config));
     orchestrator->SetAccessTokenGenerator(access_tokens.value());
     if (volume_manager) orchestrator->SetVolumeManager(volume_manager);
+
+    // Rust: `Self::start_auto_evict_task(Arc::clone(&orchestrator),
+    // Duration::from_millis(config.auto_evict_interval_ms), shutdown_rx)`,
+    // immediately after the struct is built. Last, as upstream does, because
+    // the sweep reads the default timeout and the volume manager the setters
+    // above install — a thread started before them could sweep a half-built
+    // orchestrator.
+    //
+    // Rust also starts `start_metrics_task` here; that one is still missing.
+    orchestrator->StartAutoEvictTask(config.orchestrator.auto_evict_interval_ms);
     return orchestrator;
 }
 
@@ -2735,6 +2813,17 @@ OrchestratorResult<core::Unit> Orchestrator::Shutdown() {
     }
 
     is_shutting_down_.store(true, std::memory_order_relaxed);
+
+    // Rust sends on `shutdown_tx`, which the auto-evict task is selecting on,
+    // so the sweep stops with the shutdown rather than outliving it. The flag
+    // is set first on purpose: a sweep already in flight sees it at its next
+    // `IsShuttingDown` check and returns early instead of pausing or deleting
+    // more sandboxes while the node is going down.
+    //
+    // Joining under `shutdown_mu_` is safe because nothing the sweep calls
+    // takes that lock — it is held only here — and it serialises the join
+    // against a concurrent `Shutdown`.
+    StopAutoEvictTask();
 
     OrchestratorResult<core::Unit> result = core::Unit{};
     shutdown_outcome_ = core::Optional<ShutdownOutcome>(

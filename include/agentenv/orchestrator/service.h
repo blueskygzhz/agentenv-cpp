@@ -12,6 +12,7 @@
 #define AGENTENV_ORCHESTRATOR_SERVICE_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -19,6 +20,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "agentenv/cfg.h"
@@ -381,6 +383,44 @@ class Orchestrator {
     /// one sandbox is logged and skipped rather than aborting the sweep.
     OrchestratorResult<std::vector<core::SandboxId> > EvictExpiredSandboxes();
 
+    /// Rust `start_auto_evict_task` — the sweep's only production driver.
+    ///
+    /// Without it `EvictExpiredSandboxes` was dead code: every sandbox still
+    /// got an `expires_at`, the store still answered `ListExpired`, and
+    /// `auto_evict_interval_ms` was still parsed from config, so nothing
+    /// anywhere reported that no sandbox would ever time out. A leaked sandbox
+    /// then holds its VM, network slot, drives and image refs for the life of
+    /// the process, and `timeout_action` — the thing a caller sets to choose
+    /// between pause and delete — never runs at all.
+    ///
+    /// Upstream spawns this on the Tokio runtime holding a `Weak<Self>`, so
+    /// the task cannot keep the orchestrator alive. Here the thread is a
+    /// member joined by `StopAutoEvictTask`, which gives the same guarantee
+    /// more directly: `this` stays valid because the destructor joins before
+    /// any member dies, and no reference is held that would stop it running.
+    ///
+    /// Idempotent: a second call is ignored, matching the fact that upstream
+    /// spawns it exactly once from the constructor.
+    void StartAutoEvictTask(uint64_t evict_interval_ms);
+
+    /// Stops and joins the sweep thread. Called by `Shutdown` and by the
+    /// destructor; safe to call twice and safe to call having never started.
+    ///
+    /// The wait is interruptible rather than a sleep, because a shutdown must
+    /// not block for the remainder of a tick — upstream's `tokio::select!` on
+    /// `shutdown_rx.changed()` is the same promise.
+    void StopAutoEvictTask();
+
+    /// Whether the sweep thread is still joined to this orchestrator.
+    ///
+    /// Upstream can assert on the task by dropping its `JoinHandle`; the
+    /// equivalent observation here is the thread itself. Exposed because
+    /// "shutdown stopped the sweep" is otherwise indistinguishable from "the
+    /// sweep is still running but `EvictExpiredSandboxes` returns early on
+    /// `IsShuttingDown`" — the second is what upstream does *not* do, and
+    /// without this a test for the first passes either way.
+    bool AutoEvictTaskRunning() const { return auto_evict_thread_.joinable(); }
+
     /// Rust `deletion_progress` — the per-sandbox delete phase, created on
     /// first use. Shared with auto-eviction so both take the same lock.
     DeleteProgress DeletionProgress(const core::SandboxId& id) const;
@@ -726,6 +766,16 @@ class Orchestrator {
     std::atomic<bool>                     is_shutting_down_;
     mutable std::mutex                    shutdown_mu_;
     core::Optional<ShutdownOutcome>       shutdown_outcome_;  // Rust OnceCell
+
+    /// Rust's auto-evict `tokio::spawn` task and the `watch::Receiver<bool>`
+    /// it selects on. `auto_evict_stop_` is separate from
+    /// `is_shutting_down_`: the thread must also be stoppable by the
+    /// destructor on an orchestrator that was never shut down, and reusing
+    /// the shutdown flag would make joining mean "refuse all lifecycle work".
+    std::thread                           auto_evict_thread_;
+    mutable std::mutex                    auto_evict_mu_;
+    std::condition_variable               auto_evict_cv_;
+    bool                                  auto_evict_stop_ = false;
 
     /// Rust `deletions: Mutex<HashMap<SandboxId, Arc<Mutex<DeleteProgress>>>>`.
     mutable std::mutex                          deletions_mu_;

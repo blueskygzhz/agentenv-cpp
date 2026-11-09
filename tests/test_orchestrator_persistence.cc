@@ -662,6 +662,57 @@ MT_TEST(new_refuses_to_regenerate_seed_under_token_protected_sandboxes) {
     MT_EXPECT_TRUE(!core::fs::Exists(home.Join("secrets/sandbox-access-token-hash-seed")));
 }
 
+MT_TEST(new_starts_the_auto_evict_task) {
+    // Rust `new_inner_with_volumes` ends with `start_auto_evict_task`. This
+    // port built the orchestrator and stopped, so `evict_expired_sandboxes`
+    // had no production caller at all: no sandbox ever reached its timeout,
+    // `timeout_action` never ran, and a leaked sandbox held its VM, network
+    // slot, drives and image refs for the life of the process.
+    //
+    // Nothing surfaced it either. `auto_evict_interval_ms` is parsed and
+    // defaulted to 1000 (see `test_cfg`), so the config said eviction was on.
+    TempDir home;
+    cfg::AppConfig config = TestConfig(home);
+    // 1ms rather than the default 1000 so the test does not wait out a
+    // production interval; the interval is all that differs from a real node.
+    config.orchestrator.auto_evict_interval_ms = 1;
+    BackendScript script;
+    std::shared_ptr<FakeFactory> factory(new FakeFactory(&script));
+
+    std::shared_ptr<InMemoryMetadataStore> store(new InMemoryMetadataStore());
+    OrchestratorResult<std::shared_ptr<Orchestrator> > orch = Orchestrator::New(
+        store, factory,
+        std::shared_ptr<SandboxPersister>(new DisabledSandboxPersister()), config);
+    MT_EXPECT_TRUE(orch.ok());
+    if (!orch.ok()) return;
+
+    SandboxMetadata expired;
+    expired.id             = core::SandboxId::Fresh();
+    expired.state          = SandboxState::Running;
+    expired.created_at_ms  = 1000;
+    expired.timeout_action = SandboxTimeoutAction::Delete;
+    expired.SetTimeout(core::Optional<int64_t>(100));
+    MT_EXPECT_TRUE(store->Add(expired).ok());
+
+    // Polled rather than slept on, so the test neither flakes under load nor
+    // pads every run.
+    //
+    // The budget is deliberately under one second: that is what makes this a
+    // test of the *configured* interval rather than just of the wiring. An
+    // implementation that ignored the config and hard-coded upstream's 1000ms
+    // default would still evict — one tick later — and a longer budget would
+    // wave it through.
+    const int64_t budget_ms = 600;
+    bool evicted = false;
+    for (int i = 0; i < budget_ms && !evicted; ++i) {
+        evicted = !store->Get(expired.id).value().has_value();
+        if (!evicted) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    MT_EXPECT_TRUE(evicted);
+    MT_EXPECT_TRUE(orch.value()->Shutdown().ok());
+    MT_EXPECT_TRUE(!orch.value()->AutoEvictTaskRunning());
+}
+
 MT_TEST(new_takes_timeout_mode_and_machine_shape_from_config) {
     TempDir home;
     cfg::AppConfig config = TestConfig(home);

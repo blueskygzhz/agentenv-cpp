@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "agentenv/core/fs.h"
+#include "agentenv/sandbox/firecracker/sandbox_backend.h"
 #include "agentenv/storage/overlaybd/config.h"
 #include "microtest.h"
 
@@ -786,6 +787,374 @@ MT_TEST(restack_rootfs_passes_the_read_only_flag_through) {
 
     MT_EXPECT_TRUE(out.ok());
     MT_EXPECT_TRUE(restacker.calls.empty());
+}
+
+// ---- SnapshotExtraDrives --------------------------------------------------
+//
+// Rust `snapshot_extra_drives`. The loop had no implementation at all until
+// now, which is why `PauseToDir` described every extra drive by its
+// *launch-time* config: a restore opened each drive's pre-boot stack and
+// silently dropped every write the sandbox had made to it.
+//
+// What these tests pin down is the part that is not "call the restack once per
+// drive": where each drive's layer lands, what it is named, and which size
+// travels into the result. Each of those three has a failure mode that only
+// shows up on a *later* restore, long after the capture reported success.
+
+namespace {
+
+ExtraDrive Drive(const std::string& id, const std::string& image_config, bool read_only) {
+    const core::Expected<ExtraDrive, std::string> made =
+        ExtraDrive::TryNewOverlaybd(id, image_config, read_only);
+    MT_EXPECT_TRUE(made.ok());
+    return made.value();
+}
+
+ublk::OverlaybdRuntimeDevice Runtime(uint32_t dev_id, const std::string& live_config,
+                                     uint64_t actual_virtual_size) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/dev/ublkb%u", dev_id);
+    ublk::OverlaybdRuntimeDevice runtime;
+    runtime.device.dev_id      = dev_id;
+    runtime.device.device_path = path;
+    runtime.image_config_path  = live_config;
+    runtime.actual_virtual_size = actual_virtual_size;
+    return runtime;
+}
+
+// A sealer factory that records *which device* each seal was asked for.
+//
+// The device is the whole point of the factory: one shared sealer would seal
+// whichever device it had captured for every drive in the list, producing a
+// capture in which drive B's name describes drive A's disk. Recording the pair
+// is what makes that confusion visible to a test.
+struct FakeDriveSealers {
+    std::vector<std::pair<uint32_t, std::string> > seals;
+    // When set, the seal fails with this classification instead.
+    bool fail = false;
+    bool fail_terminal = false;
+
+    DriveRestackerFactory Fn() {
+        FakeDriveSealers* self = this;
+        return [self](const ublk::Device& device) -> SnapshotRestacker {
+            const uint32_t dev_id = device.dev_id;
+            return [self, dev_id](const std::string& output_layer_path)
+                       -> SandboxCaptureResult<core::Optional<RestackedLayer> > {
+                self->seals.push_back(std::make_pair(dev_id, output_layer_path));
+                if (self->fail) {
+                    return core::make_unexpected(
+                        self->fail_terminal
+                            ? SandboxCaptureError::Terminal("daemon refused")
+                            : SandboxCaptureError::Recoverable("daemon refused"));
+                }
+                // Appending, like the daemon does, for the reason given on
+                // `FakeRestacker`.
+                uint64_t existing = 0;
+                const core::Expected<uint64_t, std::string> had =
+                    core::fs::FileSize(output_layer_path);
+                if (had.ok()) existing = had.value();
+                MT_EXPECT_TRUE(
+                    core::fs::CreateSizedFile(output_layer_path, existing + 128).ok());
+                RestackedLayer descriptor;
+                descriptor.digest = "sha256:abcd";
+                descriptor.size   = 128;
+                return core::Optional<RestackedLayer>(descriptor);
+            };
+        };
+    }
+};
+
+// A drive that is live: a writable upper is what makes it sealable.
+void WriteLiveDrive(const Scratch& scratch, const std::string& dir) {
+    WriteLiveConfig(scratch, dir + "/image.json", std::vector<obd::LayerConfig>(),
+                    dir + "/upper.data");
+    scratch.WriteFile(dir + "/upper.data", "guest writes");
+}
+
+}  // namespace
+
+MT_TEST(snapshot_extra_drives_without_drives_needs_no_sealer) {
+    // The common case: a sandbox with no extra drives must capture on a node
+    // whose daemon is unreachable. Requiring the sealer first would make the
+    // presence of a ublk manager a precondition for *every* snapshot.
+    Scratch scratch;
+    const SandboxCaptureResult<std::vector<ExtraDrive> > out = SnapshotExtraDrives(
+        std::vector<ExtraDrive>(), std::vector<ublk::OverlaybdRuntimeDevice>(),
+        scratch.At("snap"), DriveRestackerFactory(), NoRuntimeRoots(),
+        LayerCompactor(), LayerAdopter());
+
+    MT_EXPECT_TRUE(out.ok());
+    MT_EXPECT_TRUE(out.value().empty());
+}
+
+MT_TEST(snapshot_extra_drives_with_drives_but_no_sealer_refuses_recoverably) {
+    // There is a drive to capture and no way to seal it. Recoverable: nothing
+    // has been touched, so the sandbox is still exactly as it was. Going ahead
+    // without the sealer would describe each drive by its live config, whose
+    // writable upper the runtime deletes when the sandbox stops.
+    Scratch scratch;
+    WriteLiveDrive(scratch, scratch.At("runtime/data"));
+
+    std::vector<ExtraDrive> drives;
+    drives.push_back(Drive("data", scratch.At("images/data/image.json"), false));
+    std::vector<ublk::OverlaybdRuntimeDevice> runtimes;
+    runtimes.push_back(Runtime(7, scratch.At("runtime/data/image.json"), 4096));
+
+    FakeStager stager;
+    const SandboxCaptureResult<std::vector<ExtraDrive> > out =
+        SnapshotExtraDrives(drives, runtimes, scratch.At("snap"), DriveRestackerFactory(),
+                            NoRuntimeRoots(), stager.Compact(), stager.Adopt());
+
+    MT_EXPECT_TRUE(!out.ok());
+    MT_EXPECT_TRUE(!out.error().IsTerminal());
+    MT_EXPECT_TRUE(out.error().Message().find("ublk device manager") != std::string::npos);
+}
+
+MT_TEST(snapshot_extra_drives_keeps_the_restacks_own_classification) {
+    // The restack is the one step that knows whether the seal happened, and
+    // its answer must survive the loop unchanged: downgrading a terminal
+    // failure to recoverable tells the caller to resume a sandbox whose drive
+    // now describes a stack it no longer has.
+    Scratch scratch;
+    WriteLiveDrive(scratch, scratch.At("runtime/data"));
+
+    std::vector<ExtraDrive> drives;
+    drives.push_back(Drive("data", scratch.At("images/data/image.json"), false));
+    std::vector<ublk::OverlaybdRuntimeDevice> runtimes;
+    runtimes.push_back(Runtime(7, scratch.At("runtime/data/image.json"), 4096));
+
+    FakeDriveSealers sealers;
+    sealers.fail = true;
+    sealers.fail_terminal = true;
+    FakeStager stager;
+    const SandboxCaptureResult<std::vector<ExtraDrive> > out =
+        SnapshotExtraDrives(drives, runtimes, scratch.At("snap"), sealers.Fn(),
+                            NoRuntimeRoots(), stager.Compact(), stager.Adopt());
+
+    MT_EXPECT_TRUE(!out.ok());
+    MT_EXPECT_TRUE(out.error().IsTerminal());
+
+    // And the recoverable half of the same failure stays recoverable.
+    Scratch other;
+    WriteLiveDrive(other, other.At("runtime/data"));
+    std::vector<ublk::OverlaybdRuntimeDevice> other_runtimes;
+    other_runtimes.push_back(Runtime(7, other.At("runtime/data/image.json"), 4096));
+    FakeDriveSealers recoverable;
+    recoverable.fail = true;
+    const SandboxCaptureResult<std::vector<ExtraDrive> > soft =
+        SnapshotExtraDrives(drives, other_runtimes, other.At("snap"), recoverable.Fn(),
+                            NoRuntimeRoots(), stager.Compact(), stager.Adopt());
+    MT_EXPECT_TRUE(!soft.ok());
+    MT_EXPECT_TRUE(!soft.error().IsTerminal());
+}
+
+MT_TEST(snapshot_extra_drives_seals_a_non_volume_into_the_capture) {
+    Scratch scratch;
+    WriteLiveDrive(scratch, scratch.At("runtime/data"));
+
+    // The drive's own `image_config_path` names the *source* image, and it
+    // does not exist here on purpose: the loop must seal the live runtime
+    // config instead. Sealing the source would capture the image the sandbox
+    // booted from and none of what it wrote.
+    std::vector<ExtraDrive> drives;
+    drives.push_back(Drive("data", scratch.At("images/data/image.json"), false));
+    std::vector<ublk::OverlaybdRuntimeDevice> runtimes;
+    runtimes.push_back(Runtime(7, scratch.At("runtime/data/image.json"), 4096));
+
+    FakeDriveSealers sealers;
+    FakeStager stager;
+    const SandboxCaptureResult<std::vector<ExtraDrive> > out =
+        SnapshotExtraDrives(drives, runtimes, scratch.At("snap"), sealers.Fn(),
+                            NoRuntimeRoots(), stager.Compact(), stager.Adopt());
+
+    MT_EXPECT_TRUE(out.ok());
+    MT_EXPECT_EQ(out.value().size(), static_cast<std::size_t>(1));
+    MT_EXPECT_EQ(sealers.seals.size(), static_cast<std::size_t>(1));
+    // Inside the capture, under the fixed name: a non-volume travels with the
+    // snapshot, and its directory is fresh per capture so nothing can collide.
+    MT_EXPECT_EQ(sealers.seals[0].first, static_cast<uint32_t>(7));
+    MT_EXPECT_EQ(sealers.seals[0].second, scratch.At("snap/drives/data/snapshot.commit"));
+    // The returned drive names the stack this capture sealed, which is the
+    // whole output of the loop: the manifest and the resume drive table are
+    // both built from it.
+    MT_EXPECT_EQ(out.value()[0].image_config_path, scratch.At("snap/drives/data/image.json"));
+    MT_EXPECT_TRUE(core::fs::Exists(scratch.At("snap/drives/data/image.json")));
+}
+
+MT_TEST(snapshot_extra_drives_records_the_size_the_device_actually_had) {
+    // Rust `try_with_virtual_size(runtime.actual_virtual_size)`. A restore
+    // sizes the ublk device from this value before opening the stack, so
+    // carrying the *requested* size forward would open a correctly captured
+    // stack behind a device of the wrong length.
+    Scratch scratch;
+    WriteLiveDrive(scratch, scratch.At("runtime/data"));
+
+    std::vector<ExtraDrive> drives;
+    drives.push_back(Drive("data", scratch.At("images/data/image.json"), false));
+    drives[0].virtual_size = core::Optional<uint64_t>(1024);
+    std::vector<ublk::OverlaybdRuntimeDevice> runtimes;
+    runtimes.push_back(Runtime(7, scratch.At("runtime/data/image.json"), 8192));
+
+    FakeDriveSealers sealers;
+    FakeStager stager;
+    const SandboxCaptureResult<std::vector<ExtraDrive> > out =
+        SnapshotExtraDrives(drives, runtimes, scratch.At("snap"), sealers.Fn(),
+                            NoRuntimeRoots(), stager.Compact(), stager.Adopt());
+
+    MT_EXPECT_TRUE(out.ok());
+    MT_EXPECT_TRUE(out.value()[0].virtual_size.has_value());
+    MT_EXPECT_EQ(*out.value()[0].virtual_size, static_cast<uint64_t>(8192));
+}
+
+MT_TEST(snapshot_extra_drives_refuses_a_device_of_no_size_as_terminal) {
+    // `try_with_virtual_size` rejects zero rather than letting it reach the
+    // daemon as a request for an empty device. Terminal, because by the time
+    // the size is applied this drive's upper is already sealed: the sandbox
+    // now describes a stack it no longer has, so it cannot simply resume.
+    Scratch scratch;
+    WriteLiveDrive(scratch, scratch.At("runtime/data"));
+
+    std::vector<ExtraDrive> drives;
+    drives.push_back(Drive("data", scratch.At("images/data/image.json"), false));
+    std::vector<ublk::OverlaybdRuntimeDevice> runtimes;
+    runtimes.push_back(Runtime(7, scratch.At("runtime/data/image.json"), 0));
+
+    FakeDriveSealers sealers;
+    FakeStager stager;
+    const SandboxCaptureResult<std::vector<ExtraDrive> > out =
+        SnapshotExtraDrives(drives, runtimes, scratch.At("snap"), sealers.Fn(),
+                            NoRuntimeRoots(), stager.Compact(), stager.Adopt());
+
+    MT_EXPECT_TRUE(!out.ok());
+    MT_EXPECT_TRUE(out.error().IsTerminal());
+    MT_EXPECT_TRUE(out.error().Message().find("data") != std::string::npos);
+}
+
+MT_TEST(snapshot_extra_drives_seals_a_volume_into_its_own_backing_dir) {
+    // A volume outlives the capture and is published from its own directory,
+    // so its layer must not land inside a snapshot directory that a failed or
+    // superseded capture is free to delete.
+    Scratch scratch;
+    WriteLiveDrive(scratch, scratch.At("runtime/vol"));
+
+    std::vector<ExtraDrive> drives;
+    drives.push_back(Drive("vol", scratch.At("images/vol/image.json"), false));
+    drives[0] = drives[0].WithVolumeSnapshotOutputDir(
+        core::Optional<std::string>(scratch.At("volumes/vol")));
+    std::vector<ublk::OverlaybdRuntimeDevice> runtimes;
+    runtimes.push_back(Runtime(9, scratch.At("runtime/vol/image.json"), 4096));
+
+    FakeDriveSealers sealers;
+    FakeStager stager;
+    const SandboxCaptureResult<std::vector<ExtraDrive> > out =
+        SnapshotExtraDrives(drives, runtimes, scratch.At("snap"), sealers.Fn(),
+                            NoRuntimeRoots(), stager.Compact(), stager.Adopt());
+
+    MT_EXPECT_TRUE(out.ok());
+    MT_EXPECT_EQ(sealers.seals.size(), static_cast<std::size_t>(1));
+    const std::string sealed = sealers.seals[0].second;
+    MT_EXPECT_TRUE(sealed.find(scratch.At("volumes/vol/")) == 0);
+    MT_EXPECT_EQ(out.value()[0].image_config_path, scratch.At("volumes/vol/image.json"));
+    // Nothing of a volume is written into the capture.
+    MT_EXPECT_TRUE(!core::fs::Exists(scratch.At("snap/drives/vol")));
+}
+
+MT_TEST(snapshot_extra_drives_names_a_volume_layer_uniquely_per_pause) {
+    // A volume reuses one directory across pauses. With a fixed name the
+    // second pause would write over the layer the first one sealed -- a layer
+    // the live `image.json` still lists as a lower -- so the stack would not
+    // be extended but corrupted, and the corruption would only surface when
+    // something read back through it.
+    Scratch scratch;
+    WriteLiveDrive(scratch, scratch.At("runtime/vol"));
+
+    std::vector<ExtraDrive> drives;
+    drives.push_back(Drive("vol", scratch.At("images/vol/image.json"), false));
+    drives[0] = drives[0].WithVolumeSnapshotOutputDir(
+        core::Optional<std::string>(scratch.At("volumes/vol")));
+    std::vector<ublk::OverlaybdRuntimeDevice> runtimes;
+    runtimes.push_back(Runtime(9, scratch.At("runtime/vol/image.json"), 4096));
+
+    FakeDriveSealers sealers;
+    FakeStager stager;
+    MT_EXPECT_TRUE(SnapshotExtraDrives(drives, runtimes, scratch.At("snap-1"), sealers.Fn(),
+                                       NoRuntimeRoots(), stager.Compact(), stager.Adopt())
+                       .ok());
+    // The guest keeps writing between the two pauses; the second pause seals
+    // the fresh upper the first one left behind.
+    scratch.WriteFile(scratch.At("runtime/vol/upper.data"), "more guest writes");
+    MT_EXPECT_TRUE(SnapshotExtraDrives(drives, runtimes, scratch.At("snap-2"), sealers.Fn(),
+                                       NoRuntimeRoots(), stager.Compact(), stager.Adopt())
+                       .ok());
+
+    MT_EXPECT_EQ(sealers.seals.size(), static_cast<std::size_t>(2));
+    MT_EXPECT_TRUE(sealers.seals[0].second != sealers.seals[1].second);
+    // Both layers survive, and the live stack lists both: the first pause's
+    // layer is still the lower the second one was sealed on top of.
+    MT_EXPECT_TRUE(core::fs::Exists(sealers.seals[0].second));
+    MT_EXPECT_TRUE(core::fs::Exists(sealers.seals[1].second));
+    const obd::ImageConfig live = LoadConfig(scratch.At("runtime/vol/image.json"));
+    MT_EXPECT_EQ(live.lowers.size(), static_cast<std::size_t>(2));
+    MT_EXPECT_EQ(live.lowers[0].file, sealers.seals[0].second);
+    MT_EXPECT_EQ(live.lowers[1].file, sealers.seals[1].second);
+}
+
+MT_TEST(snapshot_extra_drives_seals_each_drive_against_its_own_device) {
+    // The index pairing `drives[i]` <-> `runtimes[i]`, which is what the
+    // bookkeeping check upstream guards. Sealing drive B against drive A's
+    // device produces a capture that restores A's disk under B's name and
+    // mount path -- plausible-looking and wrong.
+    Scratch scratch;
+    WriteLiveDrive(scratch, scratch.At("runtime/alpha"));
+    WriteLiveDrive(scratch, scratch.At("runtime/beta"));
+
+    std::vector<ExtraDrive> drives;
+    drives.push_back(Drive("alpha", scratch.At("images/alpha/image.json"), false));
+    drives.push_back(Drive("beta", scratch.At("images/beta/image.json"), false));
+    std::vector<ublk::OverlaybdRuntimeDevice> runtimes;
+    runtimes.push_back(Runtime(11, scratch.At("runtime/alpha/image.json"), 4096));
+    runtimes.push_back(Runtime(22, scratch.At("runtime/beta/image.json"), 8192));
+
+    FakeDriveSealers sealers;
+    FakeStager stager;
+    const SandboxCaptureResult<std::vector<ExtraDrive> > out =
+        SnapshotExtraDrives(drives, runtimes, scratch.At("snap"), sealers.Fn(),
+                            NoRuntimeRoots(), stager.Compact(), stager.Adopt());
+
+    MT_EXPECT_TRUE(out.ok());
+    MT_EXPECT_EQ(sealers.seals.size(), static_cast<std::size_t>(2));
+    MT_EXPECT_EQ(sealers.seals[0].first, static_cast<uint32_t>(11));
+    MT_EXPECT_EQ(sealers.seals[0].second, scratch.At("snap/drives/alpha/snapshot.commit"));
+    MT_EXPECT_EQ(sealers.seals[1].first, static_cast<uint32_t>(22));
+    MT_EXPECT_EQ(sealers.seals[1].second, scratch.At("snap/drives/beta/snapshot.commit"));
+    // And the per-drive sizes did not cross over either.
+    MT_EXPECT_EQ(*out.value()[0].virtual_size, static_cast<uint64_t>(4096));
+    MT_EXPECT_EQ(*out.value()[1].virtual_size, static_cast<uint64_t>(8192));
+}
+
+MT_TEST(snapshot_extra_drives_never_seals_a_read_only_drive) {
+    // A read-only drive has no upper to seal; it is only re-described into the
+    // capture. Asking the daemon to seal it is the one call that could damage
+    // a drive several sandboxes may be sharing read-only.
+    Scratch scratch;
+    std::vector<obd::LayerConfig> lowers;
+    lowers.push_back(Lower(scratch.At("layers/base.commit")));
+    WriteLiveConfig(scratch, scratch.At("runtime/ro/image.json"), lowers, "");
+
+    std::vector<ExtraDrive> drives;
+    drives.push_back(Drive("ro", scratch.At("images/ro/image.json"), true));
+    std::vector<ublk::OverlaybdRuntimeDevice> runtimes;
+    runtimes.push_back(Runtime(5, scratch.At("runtime/ro/image.json"), 4096));
+
+    FakeDriveSealers sealers;
+    FakeStager stager;
+    const SandboxCaptureResult<std::vector<ExtraDrive> > out =
+        SnapshotExtraDrives(drives, runtimes, scratch.At("snap"), sealers.Fn(),
+                            NoRuntimeRoots(), stager.Compact(), stager.Adopt());
+
+    MT_EXPECT_TRUE(out.ok());
+    MT_EXPECT_TRUE(sealers.seals.empty());
+    MT_EXPECT_EQ(out.value()[0].image_config_path, scratch.At("snap/drives/ro/image.json"));
 }
 
 int main() { return microtest::RunAll(); }

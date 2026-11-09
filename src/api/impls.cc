@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: MIT
 // Rust: src/api/impls/*.rs
 #include "agentenv/api/impls.h"
+// `QueryBuildLogs` reverses the entry list for a backward page.
+#include <algorithm>
 #include <sstream>
 #include <unordered_map>
 
 #include "agentenv/api/sandbox_params.h"
 #include "agentenv/api/volumes.h"
 #include "agentenv/core/identity.h"
+// `CreateTemplateBuild` commits the waiting record through
+// `record_catalog::Create` — Rust's `SnapshotManager::create`.
+#include "agentenv/snapshot/repository/record_catalog.h"
 
 namespace agentenv {
 namespace api {
@@ -1097,14 +1102,404 @@ ApiImpl::CreateSnapshot(const std::string& sandbox_id, const CreateSnapshotReq& 
     return ToSnapshotInfoResp(published.value().record);
 }
 
+// Rust `v3_templates_post`.
+core::Expected<TemplateRequestResponseV3, ApiError>
+ApiImpl::CreateTemplateBuild(const TemplateBuildRequestV3& body) {
+    // Rust's first branch: `image_only == Some(true)` goes to
+    // `create_image_build`, which builds a reusable *image* from a Dockerfile
+    // and never produces a template record.
+    //
+    // Refused rather than quietly built as a template. The two differ in what
+    // the caller gets back and in what the tags end up pointing at, so
+    // ignoring the flag would answer 202 and hand over the one artifact the
+    // request explicitly asked not to have. 501: the node is correctly
+    // configured and simply cannot do this, so retrying will not help.
+    if (body.image_only.has_value() && *body.image_only) {
+        return core::make_unexpected(ApiError::Make(
+            501, "imageOnly builds are not available in this build "
+                 "(needs the Dockerfile image-build pipeline: ImageBuildRecord, "
+                 "the buildkit worker and its log tunnel)"));
+    }
+
+    // Rust's `let Some(name) = body.name.clone() else { 400 }`. Optional in
+    // the schema, required by this branch: the name is both the alias the
+    // record claims and the only handle the caller is given back.
+    if (!body.name.has_value() || body.name->empty()) {
+        return core::make_unexpected(ApiError::Make(400, "template name must be provided"));
+    }
+    const std::string& name = *body.name;
+
+    // The repository is demanded before the id is minted: `Create` is what
+    // makes the reservation real, and a 501 here must not look different from
+    // any other unconfigured-node refusal.
+    const core::Expected<snapshot::repository::SnapshotRepository*, ApiError> repository =
+        RequireRepository();
+    if (!repository.ok()) return core::make_unexpected(repository.error());
+
+    // Rust `SnapshotId::generate()`. The caller does not choose the id, which
+    // is why the V2 start route takes it back from this response.
+    const core::SnapshotId id = core::SnapshotId::Fresh();
+
+    const core::Expected<snapshot::SnapshotRecord, ApiError> record =
+        TemplateBuildRecordFromV3Request(body, id, name);
+    if (!record.ok()) return core::make_unexpected(record.error());
+
+    // Rust `self.snapshot_manager.create(record)`. This is the commit that
+    // was missing: `TemplateBuildRecordFromV3Request` built the waiting
+    // record and nothing stored it, so the name was never actually claimed
+    // and `TryStartBuild` had no record to find.
+    const snapshot::repository::RepositoryResult<snapshot::SnapshotRecord> created =
+        snapshot::repository::record_catalog::Create(*repository.value(), record.value());
+    if (!created.ok()) {
+        // Rust `bad_request_for_repository_build_error(..).unwrap_or_else(..
+        // repository_error(..))` followed by `client_or_server_response`.
+        // `AliasConflict` lands on 400 here rather than the 409 that
+        // `repository_error` alone would give -- on this route a taken
+        // template name is bad input, and it is the response a client sees
+        // when it races another request for the same name.
+        return core::make_unexpected(RepositoryPublishError(created.error()));
+    }
+
+    TemplateRequestResponseV3 response;
+    // Both from the *stored* record, not from the local `id`: `Create` is the
+    // authority on what was written, and reporting the id we hoped for would
+    // hide any divergence.
+    response.template_id = created.value().id.ToString();
+    response.build_id    = created.value().id.ToString();
+    response.is_public   = true;
+    response.names.push_back(name);
+    // Rust passes `Vec::new()` for tags even when the request carried some:
+    // `TemplateBuildRecordFromV3Request` refuses a non-empty `tags` list, so
+    // by here there are none to echo.
+    response.aliases.push_back(name);
+    return response;
+}
+
+// Rust `v2_templates_template_id_builds_build_id_post`.
 core::Expected<core::Unit, ApiError>
-ApiImpl::ListTemplates() {
-    // Rust reads these from the template store, which is not ported. An empty
-    // list would be a wrong answer rather than a missing one: a client cannot
-    // tell "this node has no templates" from "this node cannot tell you".
+ApiImpl::StartTemplateBuild(const std::string& template_id, const std::string& build_id,
+                            const TemplateBuildStartRequest& body) {
+    // Rust's first check, verbatim down to the wording. AgentENV keeps one
+    // build per template, so the two path segments are the same id -- which is
+    // also why `CreateTemplateBuild` reports it twice.
+    if (template_id != build_id) {
+        return core::make_unexpected(ApiError::Make(
+            400, "templateID and buildID must match in AgentENV compatibility mode"));
+    }
+
+    const core::Expected<core::SnapshotId, std::string> parsed_build_id =
+        core::SnapshotId::Parse(build_id);
+    if (!parsed_build_id.ok()) {
+        return core::make_unexpected(ApiError::Make(400, "invalid buildID: " + build_id));
+    }
+
+    const core::Expected<snapshot::repository::SnapshotRepository*, ApiError> repository =
+        RequireRepository();
+    if (!repository.ok()) return core::make_unexpected(repository.error());
+
+    // Rust `snapshot_manager.get(&template_id)`: by id *or* alias, which is
+    // why the next check exists at all.
+    const snapshot::repository::RepositoryResult<core::Optional<snapshot::SnapshotRecord> >
+        found = snapshot::repository::record_catalog::Get(*repository.value(), template_id);
+    if (!found.ok()) {
+        return core::make_unexpected(InternalError(
+            "load template '" + template_id + "' through repository: " +
+            found.error().ToString()));
+    }
+    if (!found.value().has_value()) {
+        return core::make_unexpected(
+            ApiError::Make(404, "template " + template_id + " not found"));
+    }
+    const snapshot::SnapshotRecord& pending = *found.value();
+
+    // The lookup above accepts an alias, so `templateID` may name a record
+    // whose id is not `buildID`. Starting it anyway would run this build
+    // against someone else's reservation.
+    if (pending.id != parsed_build_id.value()) {
+        return core::make_unexpected(ApiError::Make(
+            400, "templateID must reference the same build record as buildID"));
+    }
+
+    // Rust `template_build_start_base_source(body)` — `fromImage` and
+    // `fromTemplate` are mutually exclusive, and neither means the configured
+    // default image.
+    const core::Expected<TemplateBuildStartBaseSource, ApiError> base_source =
+        TemplateBuildStartBaseSourceFrom(body);
+    if (!base_source.ok()) return core::make_unexpected(base_source.error());
+
+    // Rust `template_registry_auth(body)`. The validation is upstream's; what
+    // differs is the outcome, because `RegistryAuth` is not wired into the
+    // build path here. Refused rather than ignored: pulling anonymously
+    // either fails with an authentication error the caller already supplied
+    // credentials for, or silently resolves a *different, public* image of
+    // the same name -- and then publishes it as the template.
+    if (body.from_image_registry.has_value()) {
+        const core::Optional<std::string> from_image =
+            body.from_image.has_value() && !body.from_image->empty()
+                ? body.from_image
+                : core::Optional<std::string>();
+        if (!from_image.has_value() ||
+            (body.from_template.has_value() && !body.from_template->empty())) {
+            // Upstream's own 400, checked before the capability refusal so a
+            // malformed request is reported as malformed.
+            return core::make_unexpected(ApiError::Make(
+                400, "fromImageRegistry requires fromImage and cannot be used with "
+                     "fromTemplate"));
+        }
+        return core::make_unexpected(ApiError::Make(
+            501, "fromImageRegistry is not available in this build "
+                 "(RegistryAuth is ported but not wired into the template build path)"));
+    }
+
+    // Rust `template_build_spec_from_start_request(body, record.alias,
+    // record.resources)`. The resources come from the *reservation*, not from
+    // this request: `POST /v3/templates` is where the machine shape was
+    // chosen, and this body has no fields for it.
+    const core::Expected<tpl::TemplateBuildSpec, ApiError> spec =
+        TemplateBuildSpecFromStartRequest(body, pending.alias, pending.resources);
+    if (!spec.ok()) return core::make_unexpected(spec.error());
+
+    // Everything the request could get wrong has now been checked, and
+    // nothing has been mutated. `TryStartBuild` would be next.
+    //
+    // It is deliberately *not* called. It moves the record from `waiting` to
+    // `building`, and only a `waiting` record can be claimed -- so claiming
+    // and then failing to build would leave this template permanently
+    // unstartable, dead even once the executor lands. Leaving it `waiting`
+    // keeps the reservation usable by the identical request later.
+    //
+    // 501 because the node is correctly configured and cannot do this; a
+    // retry will not help, and the operator needs to see which piece is
+    // absent rather than a generic fault.
     return core::make_unexpected(ApiError::Make(
-        501, "template listing is not available in this build "
-             "(needs the template store)"));
+        501, "starting a template build is not available in this build "
+             "(the request is valid and the reservation is intact, but the build "
+             "executor -- which boots a Firecracker sandbox and drives "
+             "start/capture/stop -- is not ported; the record is left waiting so "
+             "this request will work unchanged once it is)"));
+}
+
+// Rust `ApiImpl::build_record`.
+core::Expected<snapshot::SnapshotRecord, ApiError>
+ApiImpl::BuildRecordFor(const std::string& template_id, const std::string& build_id) {
+    // 404, not the 400 the V2 start route gives the same mismatch. Upstream
+    // splits them deliberately: this is a sub-resource address, and a build
+    // that is not under that template is not there.
+    if (template_id != build_id) {
+        return core::make_unexpected(ApiError::Make(404, "build not found for template"));
+    }
+
+    // Parsed, and then *not* used to look the record up -- the lookup below
+    // takes the raw string, which also accepts an alias. The parse is here
+    // only to make a malformed id a 400 before anything is read, which is
+    // upstream's order. The consequence is upstream's too: a template cannot
+    // be addressed by name on this route, because a name is not a `SnapshotId`
+    // and is refused before the alias lookup could resolve it.
+    if (!core::SnapshotId::Parse(build_id).ok()) {
+        return core::make_unexpected(ApiError::Make(400, "invalid buildID"));
+    }
+
+    const core::Expected<snapshot::repository::SnapshotRepository*, ApiError> repository =
+        RequireRepository();
+    if (!repository.ok()) return core::make_unexpected(repository.error());
+
+    const snapshot::repository::RepositoryResult<core::Optional<snapshot::SnapshotRecord> >
+        found = snapshot::repository::record_catalog::Get(*repository.value(), build_id);
+    if (!found.ok()) {
+        return core::make_unexpected(InternalError(
+            "load template build '" + build_id + "' through repository: " +
+            found.error().ToString()));
+    }
+    // Upstream's next step is `image_build_record::get`, for an imageOnly
+    // build that has no snapshot record. `imageOnly` is refused by
+    // `CreateTemplateBuild`, so no such record can exist and the fallback
+    // would return this same 404.
+    if (!found.value().has_value()) {
+        return core::make_unexpected(ApiError::Make(404, "template build not found"));
+    }
+    // A sandbox-sourced snapshot is addressable by id but is not a build, and
+    // reporting one here would describe a captured sandbox as a template build
+    // that is permanently `Ready`.
+    if (!found.value()->source.is_template()) {
+        return core::make_unexpected(ApiError::Make(404, "template build not found"));
+    }
+    return *found.value();
+}
+
+// Rust `ApiImpl::query_build_logs`.
+core::Expected<std::vector<tpl::BuildLogEntry>, ApiError>
+ApiImpl::QueryBuildLogs(const core::SnapshotId& id, const BuildLogQuery& query) {
+    // Rust's own ceiling, enforced here rather than clamped: a caller asking
+    // for 500 entries and silently getting 100 cannot tell that from a build
+    // whose log is 100 lines long.
+    if (query.limit > 100) {
+        return core::make_unexpected(ApiError::Make(400, "limit must be between 0 and 100"));
+    }
+    // Checked before anything is read, as upstream does -- `limit=0` is a
+    // valid request for nothing, not a request to be refused.
+    if (query.limit == 0) return std::vector<tpl::BuildLogEntry>();
+
+    std::vector<tpl::BuildLogEntry> entries;
+    // Upstream reads the live buffer first and falls through to the document.
+    // There is no live buffer here, so `source=temporary` is the one case that
+    // reads nothing: answering with the persisted document instead would hand
+    // back a *previous* build's log to a client that asked for the running
+    // one's.
+    if (!(query.source.has_value() && *query.source == LogsSource::Temporary)) {
+        const core::Expected<snapshot::repository::SnapshotRepository*, ApiError> repository =
+            RequireRepository();
+        if (!repository.ok()) return core::make_unexpected(repository.error());
+        const snapshot::repository::RepositoryResult<std::vector<tpl::BuildLogEntry> > read =
+            tpl::ReadBuildLogs(*repository.value(), id);
+        if (!read.ok()) {
+            return core::make_unexpected(InternalError(
+                "read build logs for '" + id.ToString() + "': " + read.error().ToString()));
+        }
+        entries = read.value();
+    }
+
+    // Reversed *before* filtering, so `cursor` and `offset` both count from
+    // the end a backward page starts at.
+    if (query.backward) std::reverse(entries.begin(), entries.end());
+
+    std::vector<tpl::BuildLogEntry> out;
+    std::size_t skipped = 0;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        const tpl::BuildLogEntry& entry = entries[i];
+        // A *minimum* severity: `level=warn` returns warnings and errors.
+        // `LogRecordLevel`'s order is what this relies on, which is why the
+        // enum documents that its four variants must stay ascending.
+        if (query.level.has_value() && entry.level < *query.level) continue;
+        if (query.cursor.has_value()) {
+            // Inclusive, and in milliseconds: the stored timestamp has
+            // nanosecond resolution, so it is truncated to the cursor's unit
+            // rather than the cursor scaled up -- otherwise an entry in the
+            // same millisecond as the cursor would fall on the wrong side of
+            // an inclusive bound.
+            const int64_t entry_ms = entry.timestamp.unix_nanos / 1000000;
+            if (query.backward ? entry_ms > *query.cursor : entry_ms < *query.cursor) {
+                continue;
+            }
+        }
+        // Rust's `.skip(offset)`, which comes after the filter -- the
+        // parameter is documented as an index into the *filtered* list, so a
+        // client paging with a level filter gets consecutive pages.
+        if (skipped < query.offset) {
+            ++skipped;
+            continue;
+        }
+        out.push_back(entry);
+        if (out.size() >= query.limit) break;
+    }
+    return out;
+}
+
+// Rust `ApiImpl::query_build_reason_logs`.
+core::Expected<std::vector<tpl::BuildLogEntry>, ApiError>
+ApiImpl::QueryBuildReasonLogs(const core::SnapshotId& id, const std::string& step) {
+    const core::Expected<snapshot::repository::SnapshotRepository*, ApiError> repository =
+        RequireRepository();
+    if (!repository.ok()) return core::make_unexpected(repository.error());
+    const snapshot::repository::RepositoryResult<std::vector<tpl::BuildLogEntry> > read =
+        tpl::ReadBuildLogs(*repository.value(), id);
+    if (!read.ok()) {
+        return core::make_unexpected(InternalError(
+            "read build logs for '" + id.ToString() + "': " + read.error().ToString()));
+    }
+
+    std::vector<tpl::BuildLogEntry> out;
+    for (std::size_t i = 0; i < read.value().size() && out.size() < 100; ++i) {
+        const tpl::BuildLogEntry& entry = read.value()[i];
+        // Bound to the failing step and to `warn`-and-above. Both halves
+        // matter: without the step filter this would be the whole log of a
+        // build that mostly succeeded, and without the level filter the
+        // failing step's own informational output would bury its error.
+        if (!entry.step.has_value() || *entry.step != step) continue;
+        if (entry.level < core::LogRecordLevel::Warn) continue;
+        out.push_back(entry);
+    }
+    return out;
+}
+
+// Rust `templates_template_id_builds_build_id_status_get`.
+core::Expected<TemplateBuildInfoModel, ApiError>
+ApiImpl::GetTemplateBuildStatus(const std::string& template_id, const std::string& build_id,
+                                const BuildLogQuery& logs) {
+    const core::Expected<snapshot::SnapshotRecord, ApiError> record =
+        BuildRecordFor(template_id, build_id);
+    if (!record.ok()) return core::make_unexpected(record.error());
+
+    TemplateBuildInfoModel info = TemplateBuildInfoModel::FromRecord(record.value());
+
+    // Upstream passes `cursor = None`, `backward = false` and `source = None`
+    // literally: this route's schema has no spelling for any of the three.
+    // Pinned here rather than left to the caller so the handler's answer does
+    // not depend on a parameter the route cannot carry.
+    BuildLogQuery page = logs;
+    page.cursor   = core::Optional<int64_t>();
+    page.backward = false;
+    page.source   = core::Optional<LogsSource>();
+    const core::Expected<std::vector<tpl::BuildLogEntry>, ApiError> entries =
+        QueryBuildLogs(record.value().id, page);
+    if (!entries.ok()) return core::make_unexpected(entries.error());
+    info.log_entries = entries.value();
+
+    // The reason's own logs, fetched only when the failure names a step.
+    // This is what makes the route worth having over `GET /templates`: the
+    // list reports *that* a build failed, and this reports the output of the
+    // step that failed it.
+    if (info.reason.has_value() && info.reason->step.has_value()) {
+        const core::Expected<std::vector<tpl::BuildLogEntry>, ApiError> reason_logs =
+            QueryBuildReasonLogs(record.value().id, *info.reason->step);
+        if (!reason_logs.ok()) return core::make_unexpected(reason_logs.error());
+        info.reason->log_entries =
+            core::Optional<std::vector<tpl::BuildLogEntry> >(reason_logs.value());
+    }
+    return info;
+}
+
+// Rust `templates_template_id_builds_build_id_logs_get`.
+core::Expected<std::vector<tpl::BuildLogEntry>, ApiError>
+ApiImpl::GetTemplateBuildLogs(const std::string& template_id, const std::string& build_id,
+                              const BuildLogQuery& logs) {
+    // The record lookup runs even though only its id is used: it is what
+    // turns a request for a build nobody reserved into a 404 instead of an
+    // empty log, which a client cannot tell from a build that has not
+    // written anything yet.
+    const core::Expected<snapshot::SnapshotRecord, ApiError> record =
+        BuildRecordFor(template_id, build_id);
+    if (!record.ok()) return core::make_unexpected(record.error());
+    return QueryBuildLogs(record.value().id, logs);
+}
+
+// Rust `templates_get`.
+core::Expected<std::vector<TemplateModel>, ApiError>
+ApiImpl::ListTemplates() {
+    // The 501 this used to return blamed "the template store", which was the
+    // wrong diagnosis: there is no separate template store either upstream or
+    // here -- templates *are* snapshot records, `record_catalog::List` is
+    // ported and tested, and this class already holds the repository that
+    // `CreateSnapshot` and `CreateTemplateBuild` publish through. What was
+    // missing was only the call.
+    const core::Expected<snapshot::repository::SnapshotRepository*, ApiError> repository =
+        RequireRepository();
+    if (!repository.ok()) return core::make_unexpected(repository.error());
+
+    // Rust `SnapshotListFilter::templates()`. Not `MatchesAll()`: a
+    // sandbox-sourced record is a snapshot, not a template, and listing it
+    // here would offer `POST /sandboxes {"templateID": ...}` callers an entry
+    // that was never built as a template.
+    const snapshot::repository::RepositoryResult<std::vector<snapshot::SnapshotRecord> >
+        records = snapshot::repository::record_catalog::List(
+            *repository.value(), snapshot::repository::SnapshotListFilter::Templates());
+    if (!records.ok()) return std::vector<TemplateModel>();
+
+    std::vector<TemplateModel> out;
+    out.reserve(records.value().size());
+    for (std::size_t i = 0; i < records.value().size(); ++i) {
+        out.push_back(TemplateModel::FromRecord(records.value()[i]));
+    }
+    return out;
 }
 
 }  // namespace api

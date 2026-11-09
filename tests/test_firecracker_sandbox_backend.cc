@@ -217,10 +217,14 @@ class CaptureConnector : public Connector {
 };
 
 /// A started backend over the fake VMM, so Pid() returns a real child.
-std::unique_ptr<FirecrackerSandboxBackend> StartedBackend(const std::string& dir,
-                                                          CaptureTrace* trace,
-                                                          const std::string& fail_path) {
-    SnapshotConfig cfg;
+///
+/// `cfg` is the capture descriptor the fresh constructor takes. It is a
+/// parameter because `ExtraDrives()` and `CommonOf()` read a fresh launch's
+/// drives and slot counts off it when no host-side drive plan ran, which is
+/// how a capture's drive bookkeeping can be exercised without a ublk daemon.
+std::unique_ptr<FirecrackerSandboxBackend> StartedBackend(
+    const std::string& dir, CaptureTrace* trace, const std::string& fail_path,
+    const SnapshotConfig& cfg = SnapshotConfig()) {
     std::unique_ptr<FirecrackerSandboxBackend> backend(new FirecrackerSandboxBackend(
         SpecIn(dir), cfg,
         std::shared_ptr<Connector>(new CaptureConnector(trace, fail_path))));
@@ -1612,6 +1616,86 @@ MT_TEST(capture_seals_the_rootfs_and_describes_it_in_a_manifest) {
     MT_EXPECT_EQ(m.memory.image_config_path, r.value().memory_image_config_path);
     MT_EXPECT_EQ(m.rootfs.image_config_path, r.value().rootfs_image_config_path);
     MT_EXPECT_EQ(m.rootfs.virtual_size, static_cast<uint64_t>(4096));
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+// ---- the extra drives the capture used to leave behind --------------------
+
+MT_TEST(the_manifest_carries_the_captures_volume_drive_slots) {
+    // Rust `manifest.volume_drive_slots = snapshot_common.volume_drive_slots`.
+    // Left at `SandboxSnapshotManifest::New`'s zero, every restore reads the
+    // capture as having no rebindable slots: `free_drive_slots` saturates at
+    // zero and each volume mount is refused for want of a slot the capture
+    // really did reserve.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    SnapshotConfig cfg;
+    cfg.common.volume_drive_slots = 4;
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string(), cfg);
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    spec.rootfs_override = core::Optional<PauseToDirSpec::RootfsCaptureInputs>(
+        RootfsInputs(dir, &trace, false, false));
+
+    const SandboxCaptureResult<PauseToDirResult> r = backend->PauseToDir(spec);
+    MT_EXPECT_TRUE(r.ok());
+    if (!r.ok() || !r.value().manifest) return;
+    MT_EXPECT_EQ(r.value().manifest->volume_drive_slots, static_cast<std::size_t>(4));
+    // No drives were configured, so there is nothing physical to describe --
+    // and the slot count is independent of that, which is the point.
+    MT_EXPECT_EQ(r.value().manifest->physical_extra_drive_count,
+                 static_cast<std::size_t>(0));
+    MT_EXPECT_TRUE(r.value().extra_drives.empty());
+    MT_EXPECT_TRUE(backend->Stop().ok());
+}
+
+MT_TEST(a_capture_refuses_drives_it_has_no_live_devices_for) {
+    // Rust `bail!("extra drive bookkeeping mismatch: ...")`, which this port
+    // did not have because `snapshot_extra_drives` was unported altogether.
+    //
+    // The consequence of its absence was not a missing feature but a wrong
+    // manifest: `PauseToDir` described the drives straight off the launch
+    // config, so each entry named the drive's *source image* config and its
+    // *requested* size. A restore from that opens every data disk's pre-boot
+    // stack, silently without a single write the sandbox ever made to it --
+    // and `attachedDrives` being wired into the create routes is what made
+    // that reachable.
+    const std::string dir = MakeStartDir();
+    if (dir.empty()) return;
+    CaptureTrace trace;
+    SnapshotConfig cfg;
+    ExtraDrive drive;
+    drive.drive_id = "data";
+    drive.image_config_path = dir + "/source-image/image.json";
+    drive.read_only = false;
+    drive.mount_path = "/mnt/data";
+    cfg.common.extra_drives.push_back(drive);
+    std::unique_ptr<FirecrackerSandboxBackend> backend =
+        StartedBackend(dir, &trace, std::string(), cfg);
+    if (!backend) return;
+
+    PauseToDirSpec spec = TracingSpec(dir, &trace);
+    spec.rootfs_override = core::Optional<PauseToDirSpec::RootfsCaptureInputs>(
+        RootfsInputs(dir, &trace, false, false));
+
+    const SandboxCaptureResult<PauseToDirResult> r = backend->PauseToDir(spec);
+    MT_EXPECT_TRUE(!r.ok());
+    if (r.ok()) {
+        // The shape of the old defect, asserted explicitly: a manifest that
+        // exists and points at the source image is the failure mode.
+        if (r.value().manifest && !r.value().manifest->attached_drives.empty()) {
+            MT_EXPECT_TRUE(r.value().manifest->attached_drives[0].image_config_path !=
+                           drive.image_config_path);
+        }
+        return;
+    }
+    MT_EXPECT_TRUE(r.error().message.find("bookkeeping mismatch") != std::string::npos);
+    // The partial directory goes, so no half-capture can be mistaken for a
+    // complete one by name.
+    MT_EXPECT_TRUE(!PathExists(spec.snapshot_dir));
     MT_EXPECT_TRUE(backend->Stop().ok());
 }
 

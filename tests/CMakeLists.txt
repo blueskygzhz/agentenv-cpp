@@ -292,6 +292,12 @@ agentenv_add_test(test_api_create_snapshot test_api_create_snapshot.cc
 agentenv_add_test(test_api_volumes        test_api_volumes.cc         agentenv-api agentenv-volume)
 # Rust: src/api/impls/template_helpers.rs
 agentenv_add_test(test_api_template_helpers test_api_template_helpers.cc agentenv-api agentenv-template)
+# Rust: src/api/impls/template.rs :: v3_templates_post -- the route that
+# commits the `TemplateWaiting` record and so makes the template build
+# pipeline reachable at all.
+agentenv_add_test(test_api_template_build test_api_template_build.cc
+                  agentenv-api agentenv-orchestrator agentenv-volume agentenv-snapshot
+                  agentenv-template agentenv-observability)
 # Rust: src/api/impls/sandbox.rs
 agentenv_add_test(test_api_sandbox_params  test_api_sandbox_params.cc  agentenv-api agentenv-sandbox)
 # Rust: hyper / hyper-util legacy Client (HTTP over AF_UNIX + TCP)

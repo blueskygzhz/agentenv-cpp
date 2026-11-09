@@ -3,6 +3,8 @@
 //       src/orchestrator/store/in_memory.rs (update_if_state / wait_while_in_states)
 #include "microtest.h"
 
+#include <atomic>
+#include <chrono>
 #include <thread>
 
 #include "agentenv/orchestrator/persistence.h"
@@ -44,6 +46,35 @@ std::vector<SandboxState> States1(SandboxState s) {
     v.push_back(s);
     return v;
 }
+
+/// A store whose first `n` sweeps fail outright.
+///
+/// Derived from the in-memory store rather than written against
+/// `MetadataStore` directly: only one method needs to misbehave, and
+/// reimplementing the interface would put a second, divergent store in the
+/// tests. `InMemoryMetadataStore::ListExpired` cannot fail — it iterates a map
+/// under a lock — so without this the loop's "a failed cycle must not end the
+/// sweep" branch has nothing that can exercise it.
+class FailingListExpiredStore : public InMemoryMetadataStore {
+ public:
+    explicit FailingListExpiredStore(int failures) : remaining_(failures), served_(0) {}
+
+    core::Expected<std::vector<SandboxMetadata>, StoreError>
+    ListExpired(int64_t now_ms) const override {
+        if (remaining_.load() > 0) {
+            remaining_.fetch_sub(1);
+            served_.fetch_add(1);
+            return core::make_unexpected(StoreError::Backend("list expired failed"));
+        }
+        return InMemoryMetadataStore::ListExpired(now_ms);
+    }
+
+    int failures_served() const { return served_.load(); }
+
+ private:
+    mutable std::atomic<int> remaining_;
+    mutable std::atomic<int> served_;
+};
 
 }  // namespace
 
@@ -405,6 +436,208 @@ MT_TEST(evict_expired_sandboxes_skips_while_shutting_down) {
     MT_EXPECT_TRUE(r.ok());
     MT_EXPECT_EQ(r.value().size(), static_cast<std::size_t>(0));
     MT_EXPECT_TRUE(f.store->Get(m.id).value()->state == SandboxState::Running);
+}
+
+// ---- start_auto_evict_task: the sweep's driver ----
+//
+// The sweep above was dead code: nothing in production ever called it, so no
+// sandbox ever timed out. Nothing reported that either — `expires_at` was
+// still stamped on every sandbox, `ListExpired` still answered, and
+// `auto_evict_interval_ms` was still parsed and defaulted to 1000 — so an
+// operator reading the config had every reason to believe eviction was on.
+
+MT_TEST(the_auto_evict_task_sweeps_without_anyone_calling_it) {
+    Fixture f;
+    SandboxMetadata expired = Running(1, 128);
+    expired.created_at_ms   = 1000;
+    expired.timeout_action  = SandboxTimeoutAction::Delete;
+    expired.SetTimeout(core::Optional<int64_t>(100));
+    MT_EXPECT_TRUE(f.store->Add(expired).ok());
+
+    // 1ms so the test does not wait out a production interval. The interval is
+    // the only thing that differs from a real node.
+    f.orch->StartAutoEvictTask(1);
+
+    // Polled rather than slept on: a fixed sleep either flakes under load or
+    // pads every run.
+    bool gone = false;
+    for (int i = 0; i < 2000 && !gone; ++i) {
+        gone = !f.store->Get(expired.id).value().has_value();
+        if (!gone) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    MT_EXPECT_TRUE(gone);
+    f.orch->StopAutoEvictTask();
+}
+
+MT_TEST(the_auto_evict_task_leaves_unexpired_sandboxes_alone) {
+    // The sweep must be driven, not merely run: a driver that evicted
+    // everything it found would be worse than none at all.
+    Fixture f;
+    SandboxMetadata fresh = Running(1, 64);
+    fresh.created_at_ms   = NowMs();
+    fresh.SetTimeout(core::Optional<int64_t>(10 * 60 * 1000));
+    MT_EXPECT_TRUE(f.store->Add(fresh).ok());
+
+    f.orch->StartAutoEvictTask(1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    f.orch->StopAutoEvictTask();
+
+    MT_EXPECT_TRUE(f.store->Get(fresh.id).value().has_value());
+    MT_EXPECT_TRUE(f.store->Get(fresh.id).value()->state == SandboxState::Running);
+}
+
+MT_TEST(the_auto_evict_task_keeps_sweeping_after_a_failed_cycle) {
+    // Rust logs `auto-evict task failed` and keeps the loop. Breaking out
+    // instead would end eviction for the life of the process over one
+    // transient store error — and silently, since the task has no caller to
+    // report to.
+    //
+    // A *cycle* failure needs the store's `ListExpired` to fail, which the
+    // only production store cannot do; hence the fake. Note what does **not**
+    // work for this: a sandbox whose pause fails. The sweep logs and
+    // `continue`s on a per-sandbox error and still returns `Ok`, so the cycle
+    // never reports failure and the loop is never asked to survive one.
+    std::shared_ptr<FailingListExpiredStore> store(new FailingListExpiredStore(3));
+    std::shared_ptr<sandbox::Backend> backend(new sandbox::MockBackend());
+    std::shared_ptr<Orchestrator> orch(new Orchestrator(store, backend));
+
+    SandboxMetadata expired = Running(1, 128);
+    expired.created_at_ms   = 1000;
+    expired.timeout_action  = SandboxTimeoutAction::Delete;
+    expired.SetTimeout(core::Optional<int64_t>(100));
+    MT_EXPECT_TRUE(store->Add(expired).ok());
+
+    orch->StartAutoEvictTask(1);
+    bool gone = false;
+    for (int i = 0; i < 2000 && !gone; ++i) {
+        gone = !store->Get(expired.id).value().has_value();
+        if (!gone) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    orch->StopAutoEvictTask();
+
+    MT_EXPECT_TRUE(gone);
+    // The failures really did happen, or this would pass on a loop that never
+    // met one.
+    MT_EXPECT_TRUE(store->failures_served() >= 3);
+}
+
+MT_TEST(shutdown_stops_the_auto_evict_task) {
+    // Rust sends on `shutdown_tx`, which the task selects on, so the sweep
+    // ends with the shutdown instead of outliving it.
+    //
+    // Asserted on the thread, not on behaviour: `EvictExpiredSandboxes`
+    // checks `IsShuttingDown` itself and returns early, so "an expired
+    // sandbox stays put after shutdown" is true whether or not the task was
+    // stopped. That assertion would look like it locked this and would not.
+    Fixture f;
+    f.orch->StartAutoEvictTask(1);
+    MT_EXPECT_TRUE(f.orch->AutoEvictTaskRunning());
+
+    MT_EXPECT_TRUE(f.orch->Shutdown().ok());
+    MT_EXPECT_TRUE(!f.orch->AutoEvictTaskRunning());
+
+    // And the sweep is genuinely inert afterwards.
+    SandboxMetadata expired = Running(1, 128);
+    expired.created_at_ms   = 1000;
+    expired.timeout_action  = SandboxTimeoutAction::Delete;
+    expired.SetTimeout(core::Optional<int64_t>(100));
+    MT_EXPECT_TRUE(f.store->Add(expired).ok());
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    MT_EXPECT_TRUE(f.store->Get(expired.id).value().has_value());
+}
+
+MT_TEST(stopping_the_auto_evict_task_does_not_wait_out_the_tick) {
+    // Upstream's `tokio::select!` on `shutdown_rx.changed()` is a promise that
+    // a shutdown is not charged for the remainder of a tick. A plain sleep, or
+    // a `wait_for` without the stop predicate, keeps that promise invisibly at
+    // a 1ms test interval and breaks it by a full second at the configured
+    // default — unbounded for anyone who tuned the sweep slower.
+    //
+    // A ten-minute interval makes the difference impossible to miss.
+    Fixture f;
+    f.orch->StartAutoEvictTask(10 * 60 * 1000);
+
+    // The sweep must be *parked* before the stop, or this measures nothing:
+    // a stop that lands before the thread first takes the lock is answered by
+    // the predicate on entry and returns at once even without a notify.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    const int64_t started_ms = NowMs();
+    f.orch->StopAutoEvictTask();
+    const int64_t elapsed_ms = NowMs() - started_ms;
+
+    MT_EXPECT_TRUE(!f.orch->AutoEvictTaskRunning());
+    // Generous by three orders of magnitude against the interval, so this
+    // fails only on a stop that actually waited.
+    MT_EXPECT_TRUE(elapsed_ms < 1000);
+}
+
+MT_TEST(stopping_the_auto_evict_task_before_it_parks_still_returns) {
+    // The complement of the test above, and the reason the wait carries a
+    // predicate rather than only a post-wait check.
+    //
+    // Stopping immediately races the thread to the lock. If the stop wins, its
+    // `notify_all` reaches nobody — a lost wakeup — and a `wait_for` with no
+    // predicate then parks for the whole interval even though the flag it is
+    // waiting for is already set. The predicate is evaluated on entry, so the
+    // thread never waits at all.
+    //
+    // No sleep here on purpose: the race *is* the condition under test.
+    Fixture f;
+    f.orch->StartAutoEvictTask(10 * 60 * 1000);
+
+    const int64_t started_ms = NowMs();
+    f.orch->StopAutoEvictTask();
+    const int64_t elapsed_ms = NowMs() - started_ms;
+
+    MT_EXPECT_TRUE(!f.orch->AutoEvictTaskRunning());
+    MT_EXPECT_TRUE(elapsed_ms < 1000);
+}
+
+MT_TEST(starting_the_auto_evict_task_twice_starts_one_sweep) {
+    // Upstream spawns it exactly once, from the constructor. A second thread
+    // would race the first for the same claim; the CAS keeps that correct but
+    // it is still two threads doing one sandbox's work, and only one of them
+    // would be joined.
+    Fixture f;
+    f.orch->StartAutoEvictTask(1);
+    f.orch->StartAutoEvictTask(1);
+    // The second call must not have replaced the handle, or this join would
+    // leave a thread running on a destroyed orchestrator.
+    f.orch->StopAutoEvictTask();
+    MT_EXPECT_TRUE(!f.orch->AutoEvictTaskRunning());
+}
+
+MT_TEST(stopping_an_unstarted_auto_evict_task_is_a_no_op) {
+    // The destructor calls this unconditionally, and most orchestrators in
+    // these tests never start the task.
+    Fixture f;
+    f.orch->StopAutoEvictTask();
+    f.orch->StopAutoEvictTask();
+    MT_EXPECT_TRUE(true);
+}
+
+MT_TEST(destroying_an_orchestrator_joins_its_auto_evict_task) {
+    // Rust holds a `Weak<Self>` so the task cannot keep the orchestrator
+    // alive and stops once the last `Arc` is gone. Here the destructor joins:
+    // the thread reads the store, the handle map and the deletion locks, so a
+    // thread still running after those members die is a use-after-free.
+    //
+    // Nothing is asserted beyond surviving — the failure mode is a crash or a
+    // sanitizer report, not a wrong value.
+    std::shared_ptr<InMemoryMetadataStore> store(new InMemoryMetadataStore());
+    {
+        std::shared_ptr<sandbox::Backend> backend(new sandbox::MockBackend());
+        std::shared_ptr<Orchestrator> orch(new Orchestrator(store, backend));
+        SandboxMetadata expired = Running(1, 128);
+        expired.created_at_ms   = 1000;
+        expired.timeout_action  = SandboxTimeoutAction::Delete;
+        expired.SetTimeout(core::Optional<int64_t>(100));
+        MT_EXPECT_TRUE(store->Add(expired).ok());
+        orch->StartAutoEvictTask(1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    MT_EXPECT_TRUE(true);
 }
 
 // ---- deletion progress ----

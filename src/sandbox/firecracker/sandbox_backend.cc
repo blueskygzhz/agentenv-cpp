@@ -176,6 +176,75 @@ core::Expected<core::Unit, std::string> PublishMemoryOverlaybdLayer(
     return core::Unit{};
 }
 
+SandboxCaptureResult<std::vector<ExtraDrive> > SnapshotExtraDrives(
+    const std::vector<ExtraDrive>& drives,
+    const std::vector<ublk::OverlaybdRuntimeDevice>& runtimes,
+    const std::string& snapshot_dir, const DriveRestackerFactory& restacker,
+    const std::vector<std::string>& runtime_owned_roots, const LayerCompactor& compact,
+    const LayerAdopter& adopt) {
+    // Rust `if extra_drives.is_empty() { return Ok(Vec::new()) }`. Before the
+    // pairing check and before the sealer is required: a sandbox with no extra
+    // drives must capture without a daemon, which is the common case.
+    if (drives.empty()) return std::vector<ExtraDrive>();
+
+    // Rust `bail!("extra drive bookkeeping mismatch: ...")`. Recoverable:
+    // nothing has been sealed yet, so the sandbox is untouched. A backend
+    // built around a handed-in instance lands here -- it carries drives in its
+    // capture descriptor but ran no drive plan, so there is no live device to
+    // seal and no honest capture to take.
+    if (drives.size() != runtimes.size()) {
+        std::ostringstream oss;
+        oss << "extra drive bookkeeping mismatch: " << drives.size()
+            << " configured drives but " << runtimes.size() << " prepared devices";
+        return core::make_unexpected(SandboxCaptureError::Recoverable(oss.str()));
+    }
+
+    if (!restacker) {
+        return core::make_unexpected(SandboxCaptureError::Recoverable(
+            "capturing extra drives requires a ublk device manager to seal their live "
+            "uppers"));
+    }
+
+    std::vector<ExtraDrive> snapped;
+    snapped.reserve(drives.size());
+    for (std::size_t i = 0; i < drives.size(); ++i) {
+        const core::Optional<std::string>& persistent = drives[i].snapshot_output_dir;
+        const std::string output_dir =
+            persistent.has_value() ? *persistent
+                                   : snapshot_dir + "/drives/" + drives[i].drive_id;
+        const std::string layer_file_name =
+            persistent.has_value()
+                ? "snapshot-" + core::Uuid::GenV7().ToSimpleString() + ".commit"
+                : std::string("snapshot.commit");
+
+        const SandboxCaptureResult<std::string> staged = RestackSnapshotOverlaybdDevice(
+            restacker(runtimes[i].device), drives[i].read_only,
+            runtimes[i].image_config_path, output_dir, layer_file_name,
+            runtime_owned_roots, compact, adopt);
+        // The restack's own classification is preserved: it is the one thing
+        // it exists to get right, since a seal that already happened makes the
+        // sandbox unresumable.
+        if (!staged.ok()) return core::make_unexpected(staged.error());
+
+        // Rust `try_with_virtual_size(runtime.actual_virtual_size)` -- the size
+        // the device actually has, not the one that was asked for. A restore
+        // sizes the ublk device from this, so the requested value would open
+        // the captured stack behind a device of the wrong length.
+        //
+        // Terminal: by here this drive's upper is sealed.
+        const core::Expected<ExtraDrive, std::string> sized =
+            drives[i]
+                .WithImageConfigPath(staged.value())
+                .TryWithVirtualSize(runtimes[i].actual_virtual_size);
+        if (!sized.ok()) {
+            return core::make_unexpected(SandboxCaptureError::Terminal(
+                "snapshot extra drive '" + drives[i].drive_id + "': " + sized.error()));
+        }
+        snapped.push_back(sized.value());
+    }
+    return snapped;
+}
+
 // ── fresh-start host drives (Rust start_fresh / extra_drive.rs) ─────────────
 
 const char* const kGuestArpNotifyBootArg = "sysctl.net.ipv4.conf.all.arp_notify=1";
@@ -1244,6 +1313,19 @@ class FirecrackerSandboxBackend::Impl {
         return snapshot_config.common.extra_drives;
     }
 
+    /// Rust `self.launch.common()`.
+    ///
+    /// No drive-plan arm, unlike `ExtraDrives()` above: that one exists only
+    /// because the host-side plan holds the drives that were *actually*
+    /// attached, and the plan carries nothing else a capture reads. The slot
+    /// counts live on the config in both launch forms.
+    const CommonConfig& CommonOf() const {
+        if (launch.kind == LaunchMode::Kind::Resume) {
+            return resume_spec.snapshot_config.common;
+        }
+        return snapshot_config.common;
+    }
+
     /// Rust `has_writable_persistent_volumes` — a drive that is writable
     /// *and* has a snapshot output dir.
     ///
@@ -1351,18 +1433,19 @@ class FirecrackerSandboxBackend::Impl {
         return LinkOrCopyRuntimeLayer;
     }
 
-    /// Seals the live rootfs upper through the ublk daemon.
+    /// Seals one live overlaybd upper through the ublk daemon.
     ///
     /// Addressed by device id rather than by config path: the daemon owns the
     /// device, and the live config is only how the *stack* is described.
-    SnapshotRestacker RootfsRestackerFor(const PauseToDirSpec& pause_spec) const {
-        if (pause_spec.rootfs_override) return pause_spec.rootfs_override->restack;
-
-        const ublk::OverlaybdRuntimeDevice* rootfs = drive_resources.rootfs();
-        std::shared_ptr<ublk::DeviceManager> manager = DeviceManagerOf();
-        if (rootfs == NULL || !manager) return SnapshotRestacker();
-
-        const ublk::Device device = rootfs->device;
+    ///
+    /// Shared by the rootfs and by every extra drive, which seal identically.
+    /// The rootfs held the only copy of this for as long as it was the only
+    /// thing this port captured: `snapshot_extra_drives` was unported, so
+    /// nothing else ever asked for a sealer. That is also why "this build has
+    /// no overlaybd layer writer" was the wrong diagnosis for the volume gap --
+    /// the writer is right here, in production use, one caller short.
+    static SnapshotRestacker RestackerForDevice(
+        const std::shared_ptr<ublk::DeviceManager>& manager, const ublk::Device& device) {
         return [manager, device](const std::string& output_layer_path)
                    -> SandboxCaptureResult<core::Optional<RestackedLayer> > {
             const storage::ublk_daemon::DaemonResult<storage::ublk_daemon::RestackSnapshotStats>
@@ -1402,6 +1485,43 @@ class FirecrackerSandboxBackend::Impl {
             }
             return core::Optional<RestackedLayer>(descriptor);
         };
+    }
+
+    /// The rootfs sealer, or an empty one when there is nothing to seal with.
+    SnapshotRestacker RootfsRestackerFor(const PauseToDirSpec& pause_spec) const {
+        if (pause_spec.rootfs_override) return pause_spec.rootfs_override->restack;
+
+        const ublk::OverlaybdRuntimeDevice* rootfs = drive_resources.rootfs();
+        std::shared_ptr<ublk::DeviceManager> manager = DeviceManagerOf();
+        if (rootfs == NULL || !manager) return SnapshotRestacker();
+        return RestackerForDevice(manager, rootfs->device);
+    }
+
+    /// Picks this launch's arguments for the free `SnapshotExtraDrives`.
+    ///
+    /// **Nothing called the sealing loop before, because there was none**, and
+    /// that is why `PauseToDir` built its manifest from `ExtraDrives()`: the
+    /// *launch-time* drives, whose `image_config_path` still names the source
+    /// image and whose `virtual_size` is whatever was requested. A restore
+    /// from such a manifest opens each drive's pre-boot stack, silently
+    /// without a single write the sandbox made to it -- reachable from the
+    /// moment `attachedDrives` was wired into the create routes.
+    SandboxCaptureResult<std::vector<ExtraDrive> > SnapshotExtraDrives(
+        const PauseToDirSpec& pause_spec, const std::string& snapshot_dir) {
+        // An empty factory when no manager ran here, which the loop reports
+        // only if it gets as far as needing one -- so a bookkeeping mismatch
+        // still answers with the mismatch, the more specific diagnosis.
+        const std::shared_ptr<ublk::DeviceManager> manager = DeviceManagerOf();
+        DriveRestackerFactory factory;
+        if (manager) {
+            factory = [manager](const ublk::Device& device) {
+                return RestackerForDevice(manager, device);
+            };
+        }
+        return ::agentenv::sandbox::firecracker::SnapshotExtraDrives(
+            ExtraDrives(), drive_resources.extra_drives(), snapshot_dir, factory,
+            RuntimeOwnedRoots(pause_spec), LayerCompactorFor(pause_spec),
+            LayerAdopterFor(pause_spec));
     }
 
     /// Rust `restack_snapshot_overlaybd_rootfs`'s call site inside
@@ -1775,15 +1895,51 @@ FirecrackerSandboxBackend::PauseToDir(const PauseToDirSpec& spec) {
         result.rootfs_image_config_path = rootfs.value().image_config_path;
         result.rootfs_virtual_size = rootfs.value().virtual_size;
 
-        // 7. Only now describe the capture. A manifest asserts the snapshot is
+        // 7. Seal the extra drives, rewriting each to name its captured stack.
+        //
+        //    Inside this branch rather than beside it, unlike upstream, which
+        //    calls `snapshot_extra_drives` unconditionally because it always
+        //    has a rootfs to capture. Sealing is irreversible: doing it for a
+        //    capture that cannot be described would consume the running
+        //    sandbox's drive uppers to produce nothing anyone can restore.
+        const SandboxCaptureResult<std::vector<ExtraDrive> > drives =
+            impl_->SnapshotExtraDrives(spec, spec.snapshot_dir);
+        if (!drives.ok()) {
+            CleanupFailedSnapshotDir(spec.snapshot_dir);
+            // The rootfs is already sealed, so a recoverable classification
+            // from the drive loop still cannot put this sandbox back as it
+            // was; `RecoverCaptureFailure` resumes it, and the error it
+            // carries is what tells the caller the capture is unusable.
+            return core::make_unexpected(
+                impl_->RecoverCaptureFailure("extra drive capture", drives.error()));
+        }
+        result.extra_drives = drives.value();
+
+        // 8. Only now describe the capture. A manifest asserts the snapshot is
         //    complete and restorable, so it is built last and only from
         //    artifacts that were actually written -- producing one earlier
         //    would let a caller publish a snapshot whose rootfs never landed.
+        //
+        //    Rust `manifest_extra_drives`: the *sealed* drives, with volumes
+        //    filtered out. Both halves were wrong here. The drives came from
+        //    `ExtraDrives()`, naming live runtime configs a restore cannot
+        //    use; and volumes were left in, which both counts them in
+        //    `physical_extra_drive_count` and records them as drives to
+        //    recreate -- where a volume must instead be rebound into a
+        //    reserved slot at launch, from the volume's own published layers.
+        std::vector<ExtraDrive> manifest_drives;
+        manifest_drives.reserve(result.extra_drives.size());
+        for (std::size_t i = 0; i < result.extra_drives.size(); ++i) {
+            if (!result.extra_drives[i].IsVolume()) {
+                manifest_drives.push_back(result.extra_drives[i]);
+            }
+        }
+
         const core::Expected<SandboxSnapshotManifest, std::string> manifest =
             SandboxSnapshotManifest::New(kFirecrackerBackend, result.vm_state_path,
                                          result.memory_image_config_path, result.memory_size,
                                          result.rootfs_image_config_path,
-                                         result.rootfs_virtual_size, impl_->ExtraDrives());
+                                         result.rootfs_virtual_size, manifest_drives);
         if (!manifest.ok()) {
             CleanupFailedSnapshotDir(spec.snapshot_dir);
             // Terminal: the rootfs was already sealed by step 6.
@@ -1791,6 +1947,12 @@ FirecrackerSandboxBackend::PauseToDir(const PauseToDirSpec& spec) {
                 "snapshot manifest", SandboxCaptureError::Terminal(manifest.error())));
         }
         result.manifest = core::Optional<SandboxSnapshotManifest>(manifest.value());
+        // Rust `manifest.volume_drive_slots = snapshot_common.volume_drive_slots`.
+        // Left at the constructor's zero, a restore would read the capture as
+        // having no rebindable slots and refuse every volume mount -- and
+        // `free_drive_slots` would saturate at zero rather than report what the
+        // capture actually reserved.
+        result.manifest->volume_drive_slots = impl_->CommonOf().volume_drive_slots;
     }
     return result;
 }
