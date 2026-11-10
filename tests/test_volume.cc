@@ -57,6 +57,16 @@ MT_TEST(volume_component_validation_matches_rust_rules) {
     // Explicit length: a bare literal would truncate at the NUL and wrongly
     // test the (valid) string "nul".
     MT_EXPECT_TRUE(!agentenv::volume::IsValidVolumeComponent(std::string("nul\0byte", 8)));
+
+    // Upstream's predicate is `is_ascii_alphanumeric`, and the *ascii* half
+    // carries weight twice over: these ids become path components, and the
+    // cursor decoder leans on this check to subsume the `String::from_utf8`
+    // that upstream runs separately. A byte-range test that stops at 'z'
+    // silently admits everything above it.
+    MT_EXPECT_TRUE(!agentenv::volume::IsValidVolumeComponent("vol_\xc3\xa9"));
+    MT_EXPECT_TRUE(!agentenv::volume::IsValidVolumeComponent("vol{brace}"));
+    MT_EXPECT_TRUE(!agentenv::volume::IsValidVolumeComponent("vol~tilde"));
+    MT_EXPECT_TRUE(!agentenv::volume::IsValidVolumeComponent(std::string("\xff\xfe", 2)));
 }
 
 MT_TEST(volume_cursor_round_trips_and_rejects_tampering) {
@@ -115,10 +125,21 @@ MT_TEST(volume_error_messages_match_thiserror_text) {
     MT_EXPECT_EQ(VolumeError::Storage("disk on fire").ToString(),
                  std::string("volume catalog storage failed: disk on fire"));
 
-    // Payload-carrying variants must not compare equal across payloads.
+    // Payload-carrying variants must not compare equal across payloads --
+    // Rust's derived `Eq` compares them, and the upstream tests assert on
+    // whole error values, so a dropped payload makes two different failures
+    // indistinguishable. Each of the three payload shapes is checked, because
+    // they are compared by three separate branches.
     MT_EXPECT_TRUE(VolumeError::SizeLimitExceeded(1) != VolumeError::SizeLimitExceeded(2));
+    MT_EXPECT_TRUE(VolumeError::TooManyMountedVolumes(1) !=
+                   VolumeError::TooManyMountedVolumes(2));
     MT_EXPECT_TRUE(VolumeError::NotFound("a") != VolumeError::NotFound("b"));
     MT_EXPECT_TRUE(VolumeError::SizeMismatch() == VolumeError::SizeMismatch());
+    // And the same payload still compares equal, so the branches are not just
+    // returning false.
+    MT_EXPECT_TRUE(VolumeError::SizeLimitExceeded(1) == VolumeError::SizeLimitExceeded(1));
+    MT_EXPECT_TRUE(VolumeError::TooManyMountedVolumes(1) ==
+                   VolumeError::TooManyMountedVolumes(1));
 }
 
 MT_TEST(replace_owner_moves_exclusive_and_read_only_leases) {
@@ -160,6 +181,15 @@ MT_TEST(validate_catalog_update_blocks_illegal_transitions) {
     VolumeRecord resized = current;
     resized.size_mb = 2048;
     MT_EXPECT_TRUE(!current.ValidateCatalogUpdate(resized).ok());
+    // All three identity fields, separately. The mode is the one that reads
+    // like a mere flag: flipping an exclusive volume to read-only would strand
+    // whichever sandbox holds its write lease, and flipping the other way
+    // would hand a writer to a volume several sandboxes have mounted.
+    VolumeRecord remoded = current;
+    remoded.mode = VolumeMode::ReadOnly;
+    MT_EXPECT_TRUE(!current.ValidateCatalogUpdate(remoded).ok());
+    MT_EXPECT_EQ(current.ValidateCatalogUpdate(remoded).error(),
+                 std::string("volume identity fields cannot be changed"));
 
     // Replacing the backing requires passing through Uploading first.
     VolumeRecord relayered = current;
@@ -308,6 +338,284 @@ MT_TEST(a_snake_case_document_is_rejected_rather_than_silently_defaulted) {
         VolumeRecord::FromJson(sized.value());
     MT_EXPECT_TRUE(!unsized.ok());
     if (!unsized.ok()) MT_EXPECT_EQ(unsized.error(), std::string("missing field `sizeMb`"));
+
+    // The two list fields are required too, and these are the easiest to
+    // wave through because an empty list looks like a harmless default. It is
+    // not: an absent `backingLayers` would describe a volume with no backing
+    // at all, which reads as a blank disk rather than as an unreadable
+    // record, and an absent `readOnlyMounts` would report every reader's
+    // lease as released and let the volume be deleted under them.
+    const char* const required_lists[] = {
+        "{\"id\":\"v\",\"name\":\"d\",\"mode\":\"Exclusive\",\"sizeMb\":1,"
+        "\"status\":\"ready\",\"readOnlyMounts\":[]}",
+        "{\"id\":\"v\",\"name\":\"d\",\"mode\":\"Exclusive\",\"sizeMb\":1,"
+        "\"status\":\"ready\",\"backingLayers\":[]}",
+    };
+    const char* const expected_errors[] = {
+        "missing field `backingLayers`",
+        "missing field `readOnlyMounts`",
+    };
+    for (std::size_t i = 0; i < 2; ++i) {
+        const agentenv::core::Expected<agentenv::core::Json, agentenv::core::AnyError> doc =
+            agentenv::core::Json::Parse(required_lists[i]);
+        MT_EXPECT_TRUE(doc.ok());
+        if (!doc.ok()) continue;
+        const agentenv::core::Expected<VolumeRecord, std::string> record =
+            VolumeRecord::FromJson(doc.value());
+        MT_EXPECT_TRUE(!record.ok());
+        if (!record.ok()) MT_EXPECT_EQ(record.error(), std::string(expected_errors[i]));
+    }
+}
+
+MT_TEST(a_record_field_of_the_wrong_type_is_rejected_not_coerced) {
+    // serde's derive refuses a present-but-wrong-typed field, and coercing or
+    // defaulting instead would turn a corrupt catalog entry into a plausible
+    // volume. `sizeMb` is the dangerous one: a zero there claims a zero-byte
+    // volume for a record that has real data behind it.
+    struct Case {
+        const char* document;
+        const char* expected;
+    };
+    const Case cases[] = {
+        {"{\"id\":\"v\",\"name\":\"d\",\"mode\":\"Exclusive\",\"sizeMb\":\"1024\","
+         "\"status\":\"ready\",\"backingLayers\":[],\"readOnlyMounts\":[]}",
+         "invalid type for field `sizeMb`: expected u64"},
+        // A float is not a `u64` even when it is integral.
+        {"{\"id\":\"v\",\"name\":\"d\",\"mode\":\"Exclusive\",\"sizeMb\":1024.0,"
+         "\"status\":\"ready\",\"backingLayers\":[],\"readOnlyMounts\":[]}",
+         "invalid type for field `sizeMb`: expected u64"},
+        {"{\"id\":\"v\",\"name\":\"d\",\"mode\":\"Exclusive\",\"sizeMb\":-1,"
+         "\"status\":\"ready\",\"backingLayers\":[],\"readOnlyMounts\":[]}",
+         "invalid type for field `sizeMb`: expected u64"},
+        {"{\"id\":\"v\",\"name\":\"d\",\"mode\":\"Exclusive\",\"sizeMb\":1,"
+         "\"status\":\"ready\",\"backingLayers\":[],\"readOnlyMounts\":\"sbx_1\"}",
+         "invalid type for field `readOnlyMounts`: expected a sequence"},
+        {"{\"id\":\"v\",\"name\":\"d\",\"mode\":\"Exclusive\",\"sizeMb\":1,"
+         "\"status\":\"ready\",\"backingLayers\":[],\"readOnlyMounts\":[1]}",
+         "invalid type for field `readOnlyMounts`: expected a string"},
+        {"{\"id\":\"v\",\"name\":\"d\",\"mode\":\"Exclusive\",\"sizeMb\":1,"
+         "\"status\":\"ready\",\"backingLayers\":[],\"readOnlyMounts\":[],"
+         "\"reservedBySandboxId\":7}",
+         "invalid type for field `reservedBySandboxId`: expected a string"},
+        // `deleting` is `#[serde(default)]`, which makes it optional rather
+        // than lenient: a present `null` is still the wrong type.
+        {"{\"id\":\"v\",\"name\":\"d\",\"mode\":\"Exclusive\",\"sizeMb\":1,"
+         "\"status\":\"ready\",\"backingLayers\":[],\"readOnlyMounts\":[],"
+         "\"deleting\":null}",
+         "invalid type for field `deleting`: expected a boolean"},
+        {"{\"id\":\"v\",\"name\":7,\"mode\":\"Exclusive\",\"sizeMb\":1,"
+         "\"status\":\"ready\",\"backingLayers\":[],\"readOnlyMounts\":[]}",
+         "invalid type for field `name`: expected a string"},
+    };
+
+    for (std::size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const agentenv::core::Expected<agentenv::core::Json, agentenv::core::AnyError> parsed =
+            agentenv::core::Json::Parse(cases[i].document);
+        MT_EXPECT_TRUE(parsed.ok());
+        if (!parsed.ok()) continue;
+        const agentenv::core::Expected<VolumeRecord, std::string> record =
+            VolumeRecord::FromJson(parsed.value());
+        MT_EXPECT_TRUE(!record.ok());
+        if (!record.ok()) MT_EXPECT_EQ(record.error(), std::string(cases[i].expected));
+    }
+
+    // A non-object is not a struct at all.
+    const agentenv::core::Expected<VolumeRecord, std::string> array =
+        VolumeRecord::FromJson(agentenv::core::Json(agentenv::core::JsonArray()));
+    MT_EXPECT_TRUE(!array.ok());
+}
+
+MT_TEST(an_unknown_record_key_is_ignored_and_the_skipped_one_is_not_read) {
+    // There is no `deny_unknown_fields` upstream, so a record written by a
+    // newer node must still load -- rejecting it would leave a rolling
+    // upgrade unable to read back its own catalog.
+    //
+    // `backingImageConfig` is the key that matters: the field exists on the
+    // struct but is `#[serde(skip)]`, so it is an unknown *document* key and
+    // has to be ignored rather than populate the field. Reading it would
+    // import another node's local cache path and leave this node pointing at
+    // a file it does not have.
+    const char* document =
+        "{\"id\":\"vol_abc\",\"name\":\"demo\",\"mode\":\"Exclusive\",\"sizeMb\":8,"
+        "\"status\":\"ready\",\"backingLayers\":[],\"readOnlyMounts\":[],"
+        "\"backingImageConfig\":\"/some/other/node/config.json\","
+        "\"somethingFromTheFuture\":{\"nested\":true}}";
+    const agentenv::core::Expected<agentenv::core::Json, agentenv::core::AnyError> parsed =
+        agentenv::core::Json::Parse(document);
+    MT_EXPECT_TRUE(parsed.ok());
+    if (!parsed.ok()) return;
+
+    const agentenv::core::Expected<VolumeRecord, std::string> record =
+        VolumeRecord::FromJson(parsed.value());
+    MT_EXPECT_TRUE(record.ok());
+    if (!record.ok()) return;
+    MT_EXPECT_EQ(record.value().id, std::string("vol_abc"));
+    MT_EXPECT_TRUE(!record.value().backing_image_config.has_value());
+    // `deleting` absent is false, per `#[serde(default)]`.
+    MT_EXPECT_TRUE(!record.value().deleting);
+
+    // And it does not come back out: `#[serde(skip)]` applies in both
+    // directions, so a locally-set path must not reach the durable record.
+    VolumeRecord local = record.value();
+    local.backing_image_config = std::string("/var/lib/agentenv/volumes/vol_abc/config.json");
+    const std::string encoded = local.ToJson().ToString();
+    MT_EXPECT_TRUE(encoded.find("backingImageConfig") == std::string::npos);
+    MT_EXPECT_TRUE(encoded.find("/var/lib/agentenv") == std::string::npos);
+}
+
+MT_TEST(a_variant_rejection_is_worded_the_way_serde_words_it) {
+    // Upstream has no hand-written parser for either enum: serde's derive is
+    // what rejects an unknown value, and the text it produces is what the
+    // catalog surfaces when a record fails to decode. serde switches wording
+    // on the variant count -- two variants read "`a` or `b`", three or more
+    // read "one of `a`, `b`, `c`" -- so these two lines are *supposed* to be
+    // phrased differently, and asserting only one of them is how the status
+    // parser came to say "unsupported volume status" while its sibling was
+    // aligned.
+    const agentenv::core::Expected<VolumeMode, std::string> mode =
+        agentenv::volume::VolumeModeParse("exclusive");
+    MT_EXPECT_TRUE(!mode.ok());
+    if (!mode.ok()) {
+        MT_EXPECT_EQ(mode.error(),
+                     std::string("unknown variant `exclusive`, expected `ReadOnly` or "
+                                 "`Exclusive`"));
+    }
+
+    const agentenv::core::Expected<VolumeStatus, std::string> status =
+        agentenv::volume::VolumeStatusParse("Ready");
+    MT_EXPECT_TRUE(!status.ok());
+    if (!status.ok()) {
+        MT_EXPECT_EQ(status.error(),
+                     std::string("unknown variant `Ready`, expected one of `ready`, "
+                                 "`uploading`, `failed`"));
+    }
+
+    // The two case conventions are not interchangeable, which is why
+    // "exclusive" and "Ready" above are both rejections rather than one of
+    // them being a parse: `VolumeMode` carries no `rename_all`, `VolumeStatus`
+    // is `rename_all = "lowercase"`.
+    MT_EXPECT_TRUE(agentenv::volume::VolumeModeParse("Exclusive").ok());
+    MT_EXPECT_TRUE(agentenv::volume::VolumeModeParse("ReadOnly").ok());
+    MT_EXPECT_TRUE(agentenv::volume::VolumeStatusParse("ready").ok());
+    MT_EXPECT_TRUE(agentenv::volume::VolumeStatusParse("uploading").ok());
+    MT_EXPECT_TRUE(agentenv::volume::VolumeStatusParse("failed").ok());
+}
+
+MT_TEST(mounted_by_covers_the_exclusive_owner_as_well_as_the_readers) {
+    // Two separate lease kinds, and `mounted_by` is what `delete` consults
+    // before removing a volume -- missing either one would let a volume be
+    // deleted out from under a running sandbox.
+    VolumeRecord exclusive;
+    exclusive.reserved_by_sandbox_id = std::string("sbx_owner");
+    MT_EXPECT_TRUE(exclusive.MountedBy("sbx_owner"));
+    MT_EXPECT_TRUE(!exclusive.MountedBy("sbx_other"));
+
+    VolumeRecord shared;
+    shared.read_only_mounts.push_back("sbx_reader");
+    MT_EXPECT_TRUE(shared.MountedBy("sbx_reader"));
+    MT_EXPECT_TRUE(!shared.MountedBy("sbx_owner"));
+
+    // An unleased record is mounted by nobody, including by the empty string:
+    // `reserved_by_sandbox_id` is `None`, not `Some("")`, so the comparison
+    // has to go through `has_value()` rather than through a default.
+    VolumeRecord idle;
+    MT_EXPECT_TRUE(!idle.MountedBy(""));
+    MT_EXPECT_TRUE(!idle.MountedBy("sbx_owner"));
+}
+
+MT_TEST(record_equality_includes_the_field_serde_skips) {
+    // `backing_image_config` is `#[serde(skip)]` but is still part of Rust's
+    // derived `PartialEq`, and the combination is easy to get wrong in one
+    // breath: the field never appears in the document, so dropping it from
+    // the comparison looks free. It is not -- `current_local_backing` decides
+    // whether a node-local image config may be reused by comparing records,
+    // so two records differing only in that path are not interchangeable.
+    VolumeRecord a;
+    a.id = "vol_1";
+    a.name = "demo";
+    VolumeRecord b = a;
+    MT_EXPECT_TRUE(a == b);
+
+    b.backing_image_config = std::string("/var/lib/agentenv/volumes/vol_1/config.json");
+    MT_EXPECT_TRUE(a != b);
+
+    // The field that is omitted from the document when false still counts.
+    VolumeRecord deleting = a;
+    deleting.deleting = true;
+    MT_EXPECT_TRUE(a != deleting);
+
+    // `read_only_mounts` is a `Vec`, so order is part of equality.
+    VolumeRecord ab = a;
+    ab.read_only_mounts.push_back("x");
+    ab.read_only_mounts.push_back("y");
+    VolumeRecord ba = a;
+    ba.read_only_mounts.push_back("y");
+    ba.read_only_mounts.push_back("x");
+    MT_EXPECT_TRUE(ab != ba);
+}
+
+MT_TEST(the_same_predicate_reports_a_name_and_an_id_differently) {
+    // `validate_name` and `validate_volume_id` share
+    // `is_valid_volume_component` but not their error: a bad *name* came from
+    // the caller and is `InvalidName`, while a bad *id* was read out of the
+    // catalog and is `Storage`, because it means the store is corrupt rather
+    // than the request. Collapsing them blames the client for the node's own
+    // broken record.
+    MT_EXPECT_TRUE(agentenv::volume::ValidateName("data_1").ok());
+    MT_EXPECT_TRUE(agentenv::volume::ValidateVolumeId("vol_1").ok());
+
+    const agentenv::core::Expected<Unit, VolumeError> bad_name =
+        agentenv::volume::ValidateName("has/slash");
+    MT_EXPECT_TRUE(!bad_name.ok());
+    if (!bad_name.ok()) MT_EXPECT_TRUE(bad_name.error() == VolumeError::InvalidName());
+
+    const agentenv::core::Expected<Unit, VolumeError> bad_id =
+        agentenv::volume::ValidateVolumeId("has/slash");
+    MT_EXPECT_TRUE(!bad_id.ok());
+    if (!bad_id.ok()) {
+        MT_EXPECT_TRUE(bad_id.error().kind == VolumeErrorKind::Storage);
+        MT_EXPECT_EQ(bad_id.error().ToString(),
+                     std::string("volume catalog storage failed: invalid volume id "
+                                 "'has/slash'"));
+    }
+}
+
+MT_TEST(a_non_canonical_cursor_is_refused) {
+    // `URL_SAFE_NO_PAD` decoding is strict on each of these, and every one of
+    // them would otherwise let two different tokens name the same page --
+    // which turns pagination into a silent loop or a silent skip.
+    //
+    // Padding is not in the no-pad alphabet.
+    MT_EXPECT_TRUE(agentenv::volume::DecodeVolumeCursor("dm9s==").error() ==
+                   VolumeError::InvalidNextToken());
+    // A length of 4n+1 cannot be produced by any encoder. "dm9sA" is the case
+    // that isolates the length rule: its fifth symbol is `A`, so its leftover
+    // bits are zero and the trailing-bits rule below lets it through, and the
+    // first four symbols decode cleanly to the valid component "vol". Only the
+    // length check stands between it and being accepted as a cursor for a
+    // volume whose real token is "dm9s".
+    MT_EXPECT_TRUE(agentenv::volume::DecodeVolumeCursor("dm9sA").error() ==
+                   VolumeError::InvalidNextToken());
+    MT_EXPECT_TRUE(agentenv::volume::DecodeVolumeCursor("dm9s").ok());
+    // Standard-alphabet characters are not in the url-safe one. Note this one
+    // is over-determined: `+` and `/` carry the 6-bit values 62 and 63, and a
+    // group of either forces a decoded byte of `>`, `~` or something above
+    // 0x7F -- none of which `is_valid_volume_component` admits. So the payload
+    // check would refuse this token even if the alphabet did not, which is why
+    // the harness carries no mutation for the alphabet.
+    MT_EXPECT_TRUE(agentenv::volume::DecodeVolumeCursor("ab+/").error() ==
+                   VolumeError::InvalidNextToken());
+
+    // Non-zero trailing bits: "dg" and "dh" both carry the byte 0x76, and only
+    // the first is canonical. `base64` 0.22 rejects the second
+    // (`decode_allow_trailing_bits` is off by default), so this must too, or
+    // the two would be interchangeable cursors for the same volume.
+    const agentenv::volume::VolumeResult<std::string> canonical =
+        agentenv::volume::DecodeVolumeCursor("dg");
+    MT_EXPECT_TRUE(canonical.ok());
+    if (canonical.ok()) MT_EXPECT_EQ(canonical.value(), std::string("v"));
+    MT_EXPECT_TRUE(agentenv::volume::DecodeVolumeCursor("dh").error() ==
+                   VolumeError::InvalidNextToken());
 }
 
 // ---------------------------------------------------------------------------

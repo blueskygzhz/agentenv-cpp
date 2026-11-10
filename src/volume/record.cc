@@ -78,7 +78,15 @@ core::Expected<VolumeStatus, std::string> VolumeStatusParse(const std::string& r
     if (raw == "ready") return VolumeStatus::Ready;
     if (raw == "uploading") return VolumeStatus::Uploading;
     if (raw == "failed") return VolumeStatus::Failed;
-    return core::make_unexpected(std::string("unsupported volume status \"") + raw + "\"");
+    // Same reasoning as `VolumeModeParse` above: upstream has no hand-written
+    // parser here, so serde's own rejection is what a caller sees, and the
+    // text is worth matching because it is the message the catalog surfaces
+    // when a record fails to decode. serde's `unknown_variant` switches
+    // wording on the variant count -- two variants read "`a` or `b`", three or
+    // more read "one of `a`, `b`, `c`" -- which is why this line and the mode's
+    // are phrased differently.
+    return core::make_unexpected("unknown variant `" + raw +
+                                 "`, expected one of `ready`, `uploading`, `failed`");
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +479,14 @@ core::Expected<core::Unit, VolumeError> ValidateVolumeId(const std::string& id) 
 // while `VolumeStatus` is `rename_all = "lowercase"` (`"ready"`). The nested
 // layer refs are snake_case for the same reason as the mode -- no rename on
 // `ManagedLayer` / `ExternalLayer`.
+//
+// What does *not* match is the key order. `serde_json::to_vec_pretty` emits
+// fields in declaration order; `core::JsonObject` is a `std::map`, so this
+// emits them sorted. That is a port-wide property of `core::Json` rather than
+// anything about volumes, and it is compatible in both directions because
+// neither parser is order-sensitive -- but it does mean the two
+// implementations' bytes for the same record are not identical, so a digest
+// of a record document is not portable between them.
 core::Json VolumeRecord::ToJson() const {
     core::JsonObject object;
     object["id"] = core::Json(id);
@@ -544,6 +560,14 @@ core::Expected<VolumeRecord, std::string> VolumeRecord::FromJson(const core::Jso
     if (size_field == fields.end()) {
         return core::make_unexpected(std::string("missing field `sizeMb`"));
     }
+    // Rust's field is `u64`, and `core::Json` has no unsigned kind, so the
+    // representable range stops at `i64::MAX` here where serde's stops at
+    // `u64::MAX`. The gap is not reachable through upstream: a volume that
+    // large cannot be created (`VolumeLimits::max_size_mb` caps it) and
+    // `size_mb` is a count of mebibytes, so `i64::MAX` of them is eight
+    // zebibytes. A hostile document in that range is refused rather than
+    // truncated, which is the safe direction and the only one available
+    // without widening `core::Json`.
     if (size_field->second.kind() != core::Json::Kind::Int || size_field->second.as_int() < 0) {
         return core::make_unexpected(InvalidType("sizeMb", "u64"));
     }
