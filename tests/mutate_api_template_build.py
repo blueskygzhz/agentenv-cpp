@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Mutation harness for the template routes: `POST /v3/templates`,
-`GET /templates` and `POST /v2/templates/{templateID}/builds/{buildID}`
+"""Mutation harness for the five served template routes: `POST /v3/templates`,
+`GET /templates`, `POST /v2/templates/{templateID}/builds/{buildID}`,
+`GET /templates/{templateID}/builds/{buildID}/status` and `.../logs`
 (Rust `v3_templates_post`, `templates_get`,
-`v2_templates_template_id_builds_build_id_post`).
+`v2_templates_template_id_builds_build_id_post`,
+`..._status_get`, `..._logs_get`).
 
 The route was absent, and what that cost was not an endpoint but a *pipeline*.
 `TemplateBuilder` and `TemplateBuildRecordFromV3Request` were both ported with

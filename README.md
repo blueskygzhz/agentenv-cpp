@@ -338,6 +338,71 @@ A C++11 architectural port of [kvcache-ai/AgentENV](https://github.com/kvcache-a
 >   around it (`capture_to_dir`, the build log stream, the task that polls the
 >   record to `Ready`). That is the same block `aenv build` is stubbed on.
 >
+> - **`GET /templates/{templateID}/builds/{buildID}/status` and
+>   `.../logs` were unrouted** — and between them they were the only answer to
+>   "why did my build fail". `GET /templates` reports *that* a build failed:
+>   it lists every template on the node, carries no failure reason and no log
+>   line. `ReadBuildLogs` was ported with no caller at all, so the document
+>   holding the answer could be written and never read back.
+>
+>   Both routes are now served, through upstream's shared `build_record` and
+>   `query_build_logs`. The status body carries the record's error reason plus
+>   the output of the step that failed — bound twice over, to that step and to
+>   `warn`-and-above, because without the step filter it is the log of a build
+>   that mostly worked and without the level filter the failing step's own
+>   progress output buries its error.
+>
+>   The refusals are where the detail is, and two of them look wrong until you
+>   see the client:
+>
+>   - A disagreeing `templateID`/`buildID` is a **404** here and a **400** on
+>     the V2 start route. Upstream splits them and it is right to: the start
+>     route is asked to create something from two ids and reports them as a
+>     bad request, while these two are addressing `builds/{buildID}` under
+>     `{templateID}`, and a build that is not under that template is not
+>     there. Both 404s on this route are distinguishable by message, so a
+>     client can tell "that pair does not go together" from "that build does
+>     not exist". Pinned by reserving *two* templates and reading one under the
+>     other's id — with one reservation the test passes either way, which is
+>     how this first appeared as a surviving mutant.
+>   - `limit` above 100 is **refused, not clamped**, and `limit=0` is a valid
+>     request for nothing. Clamping would answer 200 with a short page, which
+>     a caller cannot tell from a build whose log really is that short — so it
+>     would stop paging early.
+>
+>   `source=temporary` is the one place the missing executor shows through, and
+>   it is honest rather than stubbed: upstream reads a live in-memory buffer
+>   first and falls through to the stored document. Nothing runs a build here,
+>   so that buffer is always absent and `temporary` reads **empty**. Falling
+>   through would hand a caller a *previous* attempt's output presented as the
+>   running build's, which is exactly what they would act on.
+>
+>   A captured sandbox snapshot is refused as a template build. It has no
+>   build block, so reporting it would describe it as permanently `Ready` —
+>   the most launchable-looking answer the route can give, for something that
+>   never ran. The guard behind it is load-bearing only because of a choice
+>   *this* port made: Rust's `SnapshotSource` is an enum where `Sandbox` has no
+>   `build` field, and the C++ version flattened it into one struct, so that
+>   state is representable here and not upstream. No document can produce it
+>   (`SnapshotSource::FromJson` reads `build` only under the `Template` key)
+>   but any in-process caller can, which is what the test constructs.
+>
+>   Two of upstream's status overrides are **not** ported and are unreachable
+>   rather than skipped: `build_sessions.is_starting` / `is_finishing` adjust
+>   the reported status while an `aenv build` builder session is in flight.
+>   `BuildSession` is ported, but nothing registers one — the builder routes
+>   are unserved and `StartTemplateBuild` refuses before registering anything —
+>   so both would be reading an always-empty registry. Upstream's
+>   `image_build_record` fallback in `build_record` is absent for the same kind
+>   of reason: `imageOnly` is refused at reservation, so no such record can
+>   exist, and the 404 the fallback would return is the one already given.
+>
+>   `tests/mutate_api_template_build.py` is now 78/78 across the five routes.
+>
+>   **Still missing on these two routes:** nothing that is reachable. What
+>   they report stays thin until the executor lands and starts writing build
+>   logs — today the only writer of a build log document is a test.
+>
 > - **"the volume operations are still stubs"** — the volume *module* is now a
 >   complete port: `VolumeManager` (create / empty + child backing / COW clone
 >   / materialize / publish / reserve / remove / fork), the durable record and

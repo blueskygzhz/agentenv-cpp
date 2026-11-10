@@ -1492,7 +1492,14 @@ ApiImpl::ListTemplates() {
     const snapshot::repository::RepositoryResult<std::vector<snapshot::SnapshotRecord> >
         records = snapshot::repository::record_catalog::List(
             *repository.value(), snapshot::repository::SnapshotListFilter::Templates());
-    if (!records.ok()) return std::vector<TemplateModel>();
+    if (!records.ok()) {
+        // 500 for every failure, which is both upstream's shape and the
+        // truthful one here: `TemplatesGetResponse` declares no 4xx variant
+        // besides the auth one, and `List` can only fail by failing to read
+        // or decode the catalog -- there is no request to be at fault.
+        return core::make_unexpected(InternalError(
+            "list template snapshots through repository: " + records.error().ToString()));
+    }
 
     std::vector<TemplateModel> out;
     out.reserve(records.value().size());

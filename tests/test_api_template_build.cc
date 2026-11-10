@@ -1282,14 +1282,27 @@ MT_TEST(a_mismatched_pair_is_not_found_rather_than_a_bad_request) {
     // this one is addressing `builds/{buildID}` under `{templateID}` -- and a
     // build that is not under that template is simply not there.
     Fixture f;
-    const std::string id = Reserve(f, "my-template");
-    if (id.empty()) return;
-    const std::string other = core::SnapshotId::Fresh().ToString();
+    // *Both* reserved, so the refusal cannot be mistaken for the 404 an
+    // unknown build would get anyway: build `other` exists and is readable
+    // under its own template, and must still not be readable under this one.
+    const std::string id    = Reserve(f, "my-template");
+    const std::string other = Reserve(f, "another-template");
+    if (id.empty() || other.empty()) return;
 
     const core::Expected<TemplateBuildInfoModel, ApiError> status =
         f.impl->GetTemplateBuildStatus(id, other, StatusQuery());
     MT_EXPECT_TRUE(!status.ok());
     MT_EXPECT_EQ(status.error().code, 404);
+    // The two 404s on this route say different things, and a client is told
+    // which: the pair does not go together, versus the build is not there.
+    MT_EXPECT_TRUE(status.error().message.find("build not found for template") !=
+                   std::string::npos);
+
+    // Addressed under its own template it reads fine, which is what makes the
+    // refusal above about the pairing rather than about the build.
+    const core::Expected<TemplateBuildInfoModel, ApiError> direct =
+        f.impl->GetTemplateBuildStatus(other, other, StatusQuery());
+    MT_EXPECT_TRUE(direct.ok());
 
     // The other route, same mismatch, different code.
     const core::Expected<core::Unit, ApiError> started =
@@ -1633,15 +1646,25 @@ MT_TEST(a_reason_with_no_step_omits_both_optional_keys) {
 }
 
 MT_TEST(a_sandbox_record_carries_no_reason) {
-    // A captured sandbox has no build, so it cannot have failed. Reading the
-    // reason out of the default-constructed build block would be reporting a
-    // failure nobody had.
+    // A captured sandbox has no build, so it cannot have failed.
     SnapshotRecord record;
     record.id     = core::SnapshotId::Fresh();
     record.source = SnapshotSource::Sandbox("sandbox-1");
 
+    // This port flattened Rust's `SnapshotSource` enum into one struct, so the
+    // `build` block is reachable on a sandbox source here in a way it is not
+    // upstream -- where `Sandbox` simply has no such field. No document can
+    // produce this state (`SnapshotSource::FromJson` only reads `build` under
+    // the `Template` key) but any in-process caller can, which is the whole
+    // reason the reason is read behind an `is_template()` guard rather than
+    // straight off the block.
+    record.source.build.status = TemplateBuildStatus::Error;
+    record.source.build.error_reason = core::Optional<TemplateBuildErrorReason>(
+        TemplateBuildErrorReason::WithStep("a failure that belongs to nobody", "7"));
+
     const TemplateBuildInfoModel info = TemplateBuildInfoModel::FromRecord(record);
     MT_EXPECT_TRUE(!info.reason.has_value());
+    // And the status comes from the source kind, not from that block.
     MT_EXPECT_TRUE(info.status == TemplateBuildStatus::Ready);
 }
 
