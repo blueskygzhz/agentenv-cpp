@@ -336,8 +336,19 @@ MT_TEST(explicit_mounts_are_refused_for_a_snapshot_that_captured_volumes) {
     if (emptied.ok()) return;
     MT_EXPECT_EQ(emptied.error().code, 400);
 
-    // Omitting the field entirely is the restore path, and that one launches.
-    MT_EXPECT_TRUE(impl.CreateSandbox(RequestFor(snap.template_id())).ok());
+    // Omitting the field entirely is the other branch: the restore. It used to
+    // launch here, because the restore was not ported and an omitted list
+    // simply meant "no volumes" -- the 201-with-empty-mount-points bug that
+    // `test_api_sandbox_volume_mounts.cc` now covers. It is reached rather
+    // than refused, which is the half of the check this test is about, and
+    // this fixture's node has no volume manager to rebuild the captured
+    // volume with, so what it reaches is a 501 and not a launch.
+    const core::Expected<CreateSandboxResp, ApiError> omitted =
+        impl.CreateSandbox(RequestFor(snap.template_id()));
+    MT_EXPECT_TRUE(!omitted.ok());
+    if (omitted.ok()) return;
+    MT_EXPECT_EQ(omitted.error().code, 501);
+    MT_EXPECT_TRUE(omitted.error().message.find("volume manager") != std::string::npos);
 }
 
 MT_TEST(free_drive_slots_saturates_rather_than_wrapping) {
@@ -537,8 +548,12 @@ MT_TEST(explicit_attached_drives_are_refused_for_a_capture_that_has_filesystems)
     if (refused.ok()) return;
     MT_EXPECT_EQ(refused.error().code, 400);
 
-    // Omitting the field is the restore path, and that one launches.
-    MT_EXPECT_TRUE(impl.CreateSandbox(RequestFor(snap.template_id())).ok());
+    // Omitting the field is the restore path, and that one launches. Asserted
+    // on the drives-only capture: `snap` records a volume too, and omitting
+    // the field there now also runs the *volume* restore, which this node has
+    // no manager for. Keeping this half on `drives_only` is what makes it an
+    // assertion about attached drives rather than about volumes.
+    MT_EXPECT_TRUE(drives_impl.CreateSandbox(RequestFor(drives_only.template_id())).ok());
 }
 
 MT_TEST(an_attached_drive_overlapping_a_volume_mount_is_a_400) {

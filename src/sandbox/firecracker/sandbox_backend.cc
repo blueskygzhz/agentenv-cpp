@@ -1675,7 +1675,11 @@ FirecrackerSandboxBackend::Pause(const core::Optional<std::string>& artifact_roo
     // sync_writable_volume_filesystems() }` and then seals each volume's upper
     // into a new overlaybd commit layer.
     //
-    // This port can do neither (no envd client, no layer writer), and pausing
+    // This port can do neither. Both commands are ported
+    // (`guest_volumes.h`), and what they have no way to reach is the guest:
+    // `EnvdApi` is a health probe plus `Metrics()`, and the only concrete
+    // `Executor` runs on the host -- where a `sync`, or worse an `fsfreeze`,
+    // resolves the same mount path against a *host* filesystem. So pausing
     // anyway is not a reduced version of the same operation -- it is a silent
     // loss of every write made to those volumes:
     //

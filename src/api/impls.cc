@@ -162,6 +162,95 @@ SnapshotInfoResp ToSnapshotInfoResp(const snapshot::SnapshotRecord& record) {
     return resp;
 }
 
+/// Rust `cleanup_volume_ids`.
+///
+/// Deletes, where `FinishVolumeReservation(.., None, ..)` only *releases*, and
+/// the two are not interchangeable. These volumes were created by this request
+/// a moment ago to hold a capture's filesystems; nothing else refers to them,
+/// so a launch that fails has to remove them or every retry leaks another set
+/// of records and backing files that no sandbox will ever claim. The volumes
+/// behind `PreparedVolumeMounts::volume_ids` are the opposite case -- they
+/// existed before the request and belong to the caller, so they are released
+/// and must not be deleted.
+///
+/// Every failure is swallowed, as upstream's `let _ =` does: this runs on a
+/// path that is already returning an error, and the caller needs to hear about
+/// that one rather than about a cleanup that also went wrong.
+void CleanupVolumeIds(volume::VolumeManager* manager,
+                      const std::vector<std::string>& volume_ids) {
+    if (manager == NULL) return;
+    for (std::size_t i = 0; i < volume_ids.size(); ++i) {
+        const core::Expected<core::Unit, volume::VolumeError> removed =
+            manager->Remove(volume_ids[i]);
+        if (!removed.ok()) {
+            AGENTENV_WARN("failed to clean up restored volume volume_id="
+                          << volume_ids[i] << " error=" << removed.error().ToString());
+        }
+    }
+}
+
+/// Rust `restore_snapshot_volume_mounts`.
+///
+/// What a resume does with the volumes its capture was holding. A captured
+/// snapshot records one `SnapshotVolume` per mounted volume -- mount path,
+/// mode, size and the published backing layers -- and this turns each back
+/// into a live volume record that the launch can mount.
+///
+/// It has to *create* rather than look up, because the original volume is not
+/// what comes back. The capture froze a point in time, and the volume it was
+/// taken from has kept running: it may have been written to, deleted, or
+/// already be leased to another sandbox. Resuming into it would either fail on
+/// the lease or silently resume a sandbox onto a filesystem that has moved on
+/// since the capture. So each restore is a fresh record over the captured
+/// layers, named `volume-restore-<uuid>` -- and because every resume of one
+/// snapshot makes its own, a snapshot can be resumed any number of times
+/// concurrently without the copies interfering.
+///
+/// Returns the mount map for `PrepareVolumeMounts` plus the ids it created, so
+/// the caller can delete them if anything downstream fails.
+core::Expected<std::pair<std::map<std::string, std::string>, std::vector<std::string> >,
+               ApiError>
+RestoreSnapshotVolumeMounts(volume::VolumeManager* manager,
+                            const snapshot::CommittedSnapshot& committed) {
+    std::map<std::string, std::string> mounts;
+    std::vector<std::string>           volume_ids;
+    if (committed.volume_snapshots.empty()) {
+        return std::make_pair(mounts, volume_ids);
+    }
+    if (manager == NULL) {
+        return core::make_unexpected(ApiError::Make(
+            501, "restoring a snapshot's volume mounts requires a volume manager"));
+    }
+
+    for (std::size_t i = 0; i < committed.volume_snapshots.size(); ++i) {
+        const snapshot::SnapshotVolume& captured = committed.volume_snapshots[i];
+
+        // Re-normalised rather than trusted, even though the path was already
+        // normalised when the capture was taken: the record is durable and may
+        // have been written by another node or an older build, and this path
+        // becomes a guest mount point.
+        const core::Expected<std::string, std::string> mount_path =
+            sandbox::NormalizeMountPath(captured.mount_path);
+        if (!mount_path.ok()) {
+            CleanupVolumeIds(manager, volume_ids);
+            return core::make_unexpected(ApiError::Make(400, mount_path.error()));
+        }
+
+        const std::string name = "volume-restore-" + core::Uuid::GenV7().ToSimpleString();
+        const volume::VolumeResult<volume::VolumeRecord> child = manager->CreateFromSnapshot(
+            name, captured.mode, captured.size_mb, captured.layers);
+        if (!child.ok()) {
+            // Unwound before returning, so a snapshot whose third volume
+            // cannot be restored does not leave the first two behind.
+            CleanupVolumeIds(manager, volume_ids);
+            return core::make_unexpected(VolumeErrorResponse(child.error()));
+        }
+        volume_ids.push_back(child.value().id);
+        mounts[mount_path.value()] = child.value().id;
+    }
+    return std::make_pair(mounts, volume_ids);
+}
+
 /// The tail both create handlers share, from the launch onwards.
 ///
 /// A free function because `PreparedVolumeMounts` is file-local: declaring it
@@ -170,10 +259,16 @@ SnapshotInfoResp ToSnapshotInfoResp(const snapshot::SnapshotRecord& record) {
 /// and `sandboxes_cold_post`; sharing it here is a deliberate deviation,
 /// because the duplicated part is the volume-lease handover and two copies of
 /// *that* is how one of them stops releasing on failure.
+///
+/// `restored_volume_ids` are the volumes `RestoreSnapshotVolumeMounts` created
+/// for this launch. They are threaded in rather than cleaned up by the caller
+/// because every failure below has to remove them, and a caller that forgot
+/// one would leak a volume on exactly the path nobody tests by hand.
 core::Expected<CreateSandboxResp, ApiError> FinishCreate(
     orchestrator::Orchestrator* svc, volume::VolumeManager* volumes,
     const orchestrator::CreateSandboxRequest& request,
-    const PreparedVolumeMounts& prepared) {
+    const PreparedVolumeMounts& prepared,
+    const std::vector<std::string>& restored_volume_ids = std::vector<std::string>()) {
     const orchestrator::OrchestratorResult<orchestrator::SandboxMetadata> r =
         svc->CreateSandbox(request);
     if (!r.ok()) {
@@ -182,6 +277,9 @@ core::Expected<CreateSandboxResp, ApiError> FinishCreate(
         // released, not deleted.
         FinishVolumeReservation(volumes, prepared.owner,
                                 core::Optional<std::string>(), prepared.volume_ids);
+        // The restored ones are the other case: this request made them, so a
+        // launch that never happened leaves nothing that should keep them.
+        CleanupVolumeIds(volumes, restored_volume_ids);
         return core::make_unexpected(ToApiError(r.error()));
     }
 
@@ -201,6 +299,10 @@ core::Expected<CreateSandboxResp, ApiError> FinishCreate(
         svc->DeleteSandbox(meta.id);
         FinishVolumeReservation(volumes, prepared.owner,
                                 core::Optional<std::string>(), prepared.volume_ids);
+        // After the teardown, not before: until the sandbox is gone it is
+        // still mounting these, and deleting a volume out from under a running
+        // guest is the failure this ordering avoids.
+        CleanupVolumeIds(volumes, restored_volume_ids);
         return core::make_unexpected(ApiError::Make(500, message));
     }
 
@@ -493,24 +595,65 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
         }
     }
 
-    // `extra_drives_in_snapshot` stays false, and this is the one part of the
-    // old note that survives. Upstream sets it when the request omits
-    // `volumeMounts` *and* the capture recorded volumes -- but it sets it
-    // beside `restore_snapshot_volume_mounts`, which recreates a volume record
-    // per captured volume and puts the resulting drives in `extra_drives`. That
-    // restore is not ported. The flag only describes how `extra_drives` are
-    // bound, so setting it with an empty list would assert something about
-    // drives that are not there. Left false rather than set speculatively; the
-    // missing behaviour is the restore, not the flag.
+    // Rust: `body.volume_mounts.is_none() && !volume_snapshots.is_empty()`.
+    //
+    // The note that stood here said the restore was not ported and the flag
+    // was therefore left false. The restore is ported now (below), so the flag
+    // is set for the case it describes.
+    //
+    // It is load-bearing on exactly this path. The flag tells
+    // `InitialGuestDriveMountsForSnapshotLaunch` that the drives were bound
+    // *before* the snapshot was loaded, so there is nothing to patch
+    // afterwards -- which is right for a restore, because the captured config
+    // already names a drive per captured volume and the guest resumed with
+    // those mount points live. Leaving it false sends the launch down the
+    // patch path, where it counts this launch's drives back from the end of
+    // the config's drive list and rebinds that many -- so the restored volumes
+    // would be written over the slots the capture was already using, in
+    // whatever order a `std::map` iterated them.
+    const bool extra_drives_in_snapshot =
+        !replaces_mounts && !committed.volume_snapshots.empty();
 
-    const core::Expected<PreparedVolumeMounts, ApiError> prepared = PrepareVolumeMounts(
-        volumes_.get(),
+    // Rust `restore_snapshot_volume_mounts`, the else-branch of the mounts
+    // decision. This is what brings a capture's filesystems back.
+    //
+    // Without it the resume used to succeed with no volumes at all: a 201,
+    // a running sandbox, and every path the guest had mounted now empty. That
+    // is the shape of failure worth naming -- the client has no way to tell it
+    // from a capture that never had volumes, and the guest sees directories
+    // rather than an error.
+    //
+    // The branch is reached whenever the request omits `volumeMounts`, and the
+    // two branches cannot both apply: the `check_snapshot_volume_replacement`
+    // check above has already refused a request that names mounts for a
+    // capture that recorded some. When the capture recorded none this returns
+    // empty, which is why it needs no guard of its own.
+    std::map<std::string, std::string> effective_mounts =
         requested.value().has_value() ? *requested.value()
-                                      : std::map<std::string, std::string>());
+                                      : std::map<std::string, std::string>();
+    std::vector<std::string> restored_volume_ids;
+    if (!replaces_mounts) {
+        const core::Expected<
+            std::pair<std::map<std::string, std::string>, std::vector<std::string> >, ApiError>
+            restored = RestoreSnapshotVolumeMounts(volumes_.get(), committed);
+        if (!restored.ok()) return core::make_unexpected(restored.error());
+        effective_mounts   = restored.value().first;
+        restored_volume_ids = restored.value().second;
+    }
+
+    const core::Expected<PreparedVolumeMounts, ApiError> prepared =
+        PrepareVolumeMounts(volumes_.get(), effective_mounts);
     // Returned unchanged: the error already carries the status upstream maps
     // it to (409 for a volume already leased, 400 for a bad mount path, 500
     // for a storage fault), so there is nothing left to classify.
-    if (!prepared.ok()) return core::make_unexpected(prepared.error());
+    if (!prepared.ok()) {
+        // The restore already created records by this point, and this request
+        // is over, so they have to go -- otherwise a resume that fails to
+        // lease leaves a full copy of the capture's volumes behind every time
+        // it is retried.
+        CleanupVolumeIds(volumes_.get(), restored_volume_ids);
+        return core::make_unexpected(prepared.error());
+    }
 
     // Rust: `let mut extra_drives = attached_drives; extra_drives.extend(
     // volume_drives);`. The order is load-bearing, not cosmetic -- upstream's
@@ -527,8 +670,10 @@ ApiImpl::CreateSandbox(const CreateSandboxReq& req) {
          it != prepared.value().mounts.end(); ++it) {
         request.volume_mounts[it->first] = it->second;
     }
+    request.extra_drives_in_snapshot = extra_drives_in_snapshot;
 
-    return FinishCreate(svc_.get(), volumes_.get(), request, prepared.value());
+    return FinishCreate(svc_.get(), volumes_.get(), request, prepared.value(),
+                        restored_volume_ids);
 }
 
 core::Expected<CreateSandboxResp, ApiError>

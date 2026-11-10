@@ -403,6 +403,132 @@ A C++11 architectural port of [kvcache-ai/AgentENV](https://github.com/kvcache-a
 >   they report stays thin until the executor lands and starts writing build
 >   logs — today the only writer of a build log document is a test.
 >
+> - **`volume/record` audited against `src/volume/mod.rs` field by field.** The
+>   record half turned out to be faithful — struct fields and serde attributes,
+>   `mounted_by`, `replace_owner`, `validate_catalog_update`, all fifteen
+>   `VolumeError` messages, the `URL_SAFE_NO_PAD` cursor codec,
+>   `is_valid_volume_component`, and the deliberate split between
+>   `validate_name` (`InvalidName`) and `validate_volume_id` (`Storage`) — with
+>   one real divergence:
+>
+>   `VolumeStatusParse` reported `unsupported volume status "x"` where upstream
+>   has no hand-written parser at all and serde's derive produces `unknown
+>   variant ..., expected one of ...`. That text is what the catalog surfaces
+>   when a record fails to decode, and the file's own sibling `VolumeModeParse`
+>   had already been aligned to serde's wording with a comment saying so, so
+>   this was the one that drifted. Fixed. Note serde switches phrasing on the
+>   variant count — two variants read "`a` or `b`", three or more read "one of
+>   `a`, `b`, `c`" — which is why the two lines are *supposed* to differ, and
+>   why asserting only one of them is how the drift survived.
+>
+>   Two gaps are recorded rather than closed, because neither is reachable or
+>   fixable here:
+>
+>   - `sizeMb` is a `u64` upstream and `core::Json` has no unsigned kind, so
+>     the representable range stops at `i64::MAX`. Unreachable through
+>     upstream (`VolumeLimits::max_size_mb` caps a volume long before eight
+>     zebibytes), and a hostile document in that range is refused rather than
+>     truncated.
+>   - Key *order* in the encoded document. `serde_json::to_vec_pretty` emits
+>     declaration order; `core::JsonObject` is a `std::map`, so this emits
+>     sorted. Compatible in both directions since neither parser is
+>     order-sensitive, but it does mean a digest of a record document is not
+>     portable between the implementations. That is a port-wide property of
+>     `core::Json`, not of volumes.
+>
+>   New harness `tests/mutate_volume_record.py`, 62/62. Seven of its mutations
+>   survived the first run and six were genuine blind spots — non-ASCII bytes
+>   in `is_valid_volume_component`, a mode-only identity change, the
+>   `TooManyMountedVolumes` payload in `operator==`, and a missing
+>   `backingLayers`/`readOnlyMounts` defaulting to empty. The cursor-length one
+>   is worth naming: the test used a 4n+1 token whose trailing bits were
+>   non-zero, so the *other* rule caught it and the length check could be
+>   deleted freely; `dm9sA` isolates it. One mutation was **removed rather than
+>   left as a passing survivor**: admitting the standard base64 alphabet in the
+>   decoder cannot be observed, because `+` and `/` carry the 6-bit values 62
+>   and 63 and a group of either forces a decoded byte of `>`, `~` or something
+>   above 0x7F — none of which `is_valid_volume_component` admits, so the
+>   payload check refuses the token with the same `InvalidNextToken` anyway.
+>   The script records the argument.
+>
+> - **"a restore recreates the volumes at the same paths"** — it did not. The
+>   capture half was real (`ApiImpl::CreateSnapshot` records a `SnapshotVolume`
+>   per mount), and `restore_snapshot_volume_mounts` — the half that reads them
+>   back — was simply absent, with a comment saying so beside
+>   `extra_drives_in_snapshot`. Resuming a snapshot that held volumes
+>   **succeeded with none of them**: a 201, a running sandbox, and every path
+>   the guest had mounted now an empty directory. A client cannot tell that
+>   from a capture that never had volumes.
+>
+>   It was a genuine gap rather than a missing primitive — pure API
+>   orchestration over `CreateFromSnapshot`, `NormalizeMountPath`,
+>   `PrepareVolumeMounts` and `FinishVolumeReservation`, all of which were
+>   already ported — so it is ported now, upstream's shape included: each
+>   captured volume becomes a **fresh** `volume-restore-<uuid>` over the
+>   captured layers rather than the original. That is not an optimisation to
+>   skip: the capture froze a point in time while the volume kept running, so
+>   the original may have been written to, deleted, or leased elsewhere since —
+>   and a fresh copy per resume is what lets one snapshot be resumed many times
+>   at once.
+>
+>   Two things it drags along. `extra_drives_in_snapshot` is now set for this
+>   case and load-bearing precisely here: it tells
+>   `InitialGuestDriveMountsForSnapshotLaunch` the drives were bound *before*
+>   the snapshot was loaded, which is true of a restore (the captured config
+>   already names a drive per captured volume). Left false, the launch takes
+>   the patch path and rebinds the slots the capture was already using. And the
+>   two volume cleanups are **not** interchangeable: a caller's own volume is
+>   *released* (`FinishVolumeReservation(.., None, ..)`), a restored one is
+>   *deleted* (`cleanup_volume_ids`). Confusing them leaks a full copy of the
+>   capture's filesystems on every retry in one direction and deletes a
+>   caller's data in the other, silently both ways.
+>
+>   `tests/test_api_sandbox_volume_mounts.cc` 7 → 21 tests, new harness
+>   `tests/mutate_api_restore_volume_mounts.py` 26/26. Six mutations survived
+>   its first run, and what they had in common is the point: almost every
+>   mutation here still returns a **successful create**, so the tests had to
+>   stop reading the response and start reading the volume catalog, the
+>   recorded mount map and the repository's write count. Reaching the last
+>   cleanup — the one that runs *after* a sandbox has started, when the lease
+>   hand-off fails — needed a new failure injector, and which write to fail
+>   depends on how many times `CreateFromSnapshot` rewrites a record, so the
+>   test measures that from a successful resume rather than hard-coding it. One
+>   mutation was **removed rather than left as a passing survivor**: dropping
+>   the `!replaces_mounts` conjunct from `extra_drives_in_snapshot` is
+>   unobservable, because the two expressions can only disagree for a request
+>   that names mounts for a capture that recorded some, and
+>   `check_snapshot_volume_replacement` has already made that a 400. The
+>   conjunct stays in the source — it is upstream's expression, and it keeps
+>   the flag correct on its own terms rather than by relying on a check
+>   elsewhere having run first.
+>
+>   Two existing tests in `test_api_create_from_snapshot.cc` changed with it,
+>   and that is the port's behaviour changing rather than the tests being
+>   adjusted to fit: both ended by asserting that *omitting* the mount list
+>   launches, which on a manager-less node with a volume-holding capture is now
+>   a 501. That 501 is the whole correction — the old pass was the bug.
+>
+>   **Still missing:** the guest side, and this one was re-checked rather than
+>   repeated, because the reason given for it ("no envd/Executor") had gone
+>   stale in one half. The *commands* are ported and tested —
+>   `sandbox/guest_volumes.h` has `SyncWritableVolumeFilesystems` and
+>   `SetVolumeFreeze`, script and all, under `test_sandbox_guest_volumes.cc` —
+>   and `PauseToDir` already has the seam they would hang on
+>   (`PauseToDirSpec::flush_volumes`), refusing with upstream's own wording
+>   (`cannot flush writable volumes because envd is not running`) and only for
+>   a sandbox that actually holds a writable persistent volume.
+>
+>   What is absent is the transport: `EnvdApi` exposes a health probe and
+>   `Metrics()` and nothing else, so there is no in-guest process or filesystem
+>   service to dispatch through, and the only concrete `Executor` is
+>   `MakeLocalExecutor` — the *host*. That is not a usable fallback, it is the
+>   worst possible one: `fsfreeze` and `sync` resolved against host paths would
+>   freeze a host filesystem by the same mount path. Closing it means porting
+>   envd's process and filesystem RPCs, which is a subsystem rather than a
+>   wiring change, so it stays refused. So the restore above is the half of
+>   this that was reachable: a capture's volumes come back, and an *exclusive*
+>   volume still cannot be captured in the first place.
+>
 > - **"the volume operations are still stubs"** — the volume *module* is now a
 >   complete port: `VolumeManager` (create / empty + child backing / COW clone
 >   / materialize / publish / reserve / remove / fork), the durable record and
@@ -414,9 +540,11 @@ A C++11 architectural port of [kvcache-ai/AgentENV](https://github.com/kvcache-a
 >   guest's page cache is never flushed before a capture.
 >   `VolumeManager::SnapshotVolumeState` *is* driven now, by
 >   `ApiImpl::CreateSnapshot`: a published snapshot records each mount's path,
->   mode, size and backing layers, so a restore recreates the volumes at the
->   same paths. Read after the capture, as upstream does — the layers are
->   whatever the capture left committed.
+>   mode, size and backing layers. Read after the capture, as upstream does —
+>   the layers are whatever the capture left committed. The claim that followed
+>   here, that "a restore recreates the volumes at the same paths", was wrong
+>   when it was written and is corrected in the entry above; the restore is
+>   wired now.
 > - **"`main.cc` still wires an in-memory metadata store, so a restart loses
 >   every sandbox record"** — the in-memory store is only the hot index. It is
 >   paired with `FileBackedSandboxPersister` (`main.cc`), whose `LoadAll`

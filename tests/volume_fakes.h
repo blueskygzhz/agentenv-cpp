@@ -57,6 +57,19 @@ class FakeVolumeRepository : public repo::SnapshotRepository {
     /// Refuse once this many creates have succeeded. Negative never refuses.
     int fail_create_volume_after = -1;
 
+    /// Rewrites of an *existing* volume record -- a status transition, a
+    /// reservation, an owner swap, a delete marker.
+    int volume_record_updates = 0;
+    /// Refuse the rewrite at exactly this index, and only that one. Negative
+    /// never refuses.
+    ///
+    /// A single one rather than a cutoff, because every interesting failure
+    /// here is followed by a cleanup that *also* rewrites records: releasing
+    /// the lease and marking the record deleting both come through here, so a
+    /// cutoff would fail the unwind it is meant to be testing and the leak it
+    /// reported would be the fake's.
+    int fail_volume_record_update_at = -1;
+
     // --- snapshot half: delegated ------------------------------------------
     repo::RepositoryResult<repo::SnapshotRecord> Create(
         const repo::SnapshotRecord& record) override {
@@ -103,7 +116,19 @@ class FakeVolumeRepository : public repo::SnapshotRepository {
         }
         const repo::RepositoryResult<Optional<std::string> > before = inner_.GetDocument(key);
         if (!before.ok()) return before;
-        if (before.value().has_value()) return inner_.UpdateDocument(key, update);
+        if (before.value().has_value()) {
+            // An *existing* record being rewritten. Counted separately from
+            // the inserts below so a test can fail one specific rewrite --
+            // notably the lease hand-off that happens after a launch has
+            // already succeeded, which is the only path where a sandbox has to
+            // be torn down again.
+            const int index = volume_record_updates++;
+            if (index == fail_volume_record_update_at) {
+                return agentenv::core::make_unexpected(
+                    repo::RepositoryError::InvalidRequest("injected update failure"));
+            }
+            return inner_.UpdateDocument(key, update);
+        }
         // A missing record being written is `create_volume`'s insert.
         if (fail_create_volume_after >= 0 && create_volume_calls >= fail_create_volume_after) {
             ++create_volume_calls;
