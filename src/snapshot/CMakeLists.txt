@@ -4,6 +4,9 @@ add_library(agentenv-snapshot STATIC
     artifact_cache.cc
     p2p.cc
     runtime_support.cc
+    # Rust: src/snapshot/resolver.rs — the one resolver that serves every
+    # repository. Replaces the posix-only `PosixFsRuntimeResolver`.
+    resolver.cc
     # Rust: src/snapshot/recontainerize.rs — prepare a local layer for upload,
     # so the descriptor describes the bytes that actually get uploaded.
     recontainerize.cc
@@ -41,7 +44,6 @@ add_library(agentenv-snapshot STATIC
     # Rust: src/snapshot/repository/backends/posixfs/artifacts.rs
     repository/posixfs/artifacts.cc
     # Rust: src/snapshot/repository/backends/posixfs/runtime.rs
-    repository/posixfs/runtime.cc
     # Rust: src/snapshot/repository/backends/posixfs/backend.rs
     repository/posixfs/backend.cc
     # Rust: src/repository/backends/oss/documents.rs — the ETag

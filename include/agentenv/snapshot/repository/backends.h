@@ -150,10 +150,10 @@ RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeRepositoryFromConfig(
 /// A struct rather than a `std::pair` because two more members have to travel
 /// with them, and a pair would have hidden that:
 ///
-///   * `overlaybd_layers` — `PosixFsRuntimeResolver` takes the layer store as
-///     a **raw** `const` pointer (so does `RuntimeImageMaterializer`), so the
-///     `shared_ptr` that owns it must outlive the resolver. Upstream holds an
-///     `Arc` inside the resolver and has nothing to arrange. Dropping this
+///   * `overlaybd_layers` — `RepositoryRuntimeResolver` takes the layer store
+///     as a **raw** `const` pointer (so does `RuntimeImageMaterializer`), so
+///     the `shared_ptr` that owns it must outlive the resolver. Upstream holds
+///     an `Arc` inside the resolver and has nothing to arrange. Dropping this
 ///     field would leave every resolve reading a destroyed store.
 ///   * `artifact_cache` — the resolver holds a `shared_ptr` to it, so this is
 ///     not strictly load-bearing; it is exposed because the cache is the thing
@@ -161,14 +161,12 @@ RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeRepositoryFromConfig(
 ///     wants to hold a lease across several launches needs to name it.
 struct SnapshotBackend {
     std::shared_ptr<SnapshotRepository>      repository;
-    /// **Null on the OSS backend.** Upstream's `RepositoryRuntimeResolver` is
-    /// generic over `Arc<dyn Repository>` and serves both backends; this port
-    /// only has `PosixFsRuntimeResolver`, which is constructed from a
-    /// *repository root path* and so cannot be pointed at a bucket. An OSS
-    /// node therefore gets a repository and no resolver, and the callers that
-    /// need one refuse rather than launching from paths nobody materialised.
-    /// Recorded here rather than papered over with a stub resolver that would
-    /// report every snapshot as missing.
+    /// Never null now. It used to be null on the OSS backend, because this
+    /// port had only a `PosixFsRuntimeResolver` built from a *repository root
+    /// path*, which cannot be pointed at a bucket -- so an OSS node got a
+    /// repository and no resolver, and every snapshot launch answered 501.
+    /// `RepositoryRuntimeResolver` is generic over the repository interface,
+    /// as upstream's always was.
     std::shared_ptr<SnapshotRuntimeResolver> runtime_resolver;
     std::shared_ptr<image::cache::OverlaybdLayerStore> overlaybd_layers;
     std::shared_ptr<LocalArtifactCache>      artifact_cache;

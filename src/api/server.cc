@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <vector>
 
+#include "agentenv/api/admin.h"
 #include "agentenv/api/http_server.h"
 #include "agentenv/api/impls.h"
 
@@ -33,6 +34,28 @@ std::string Param(const HttpRequest& request, const char* name) {
     const std::unordered_map<std::string, std::string>::const_iterator it =
         request.query.find(name);
     return it == request.query.end() ? std::string() : it->second;
+}
+
+/// A query parameter that was actually sent, distinguished from one that was
+/// not.
+///
+/// `Param` cannot express the difference — it returns "" for both — and here
+/// the difference decides the answer: upstream's `cluster_id` is an
+/// `Option<Uuid>`, and an *absent* filter matches this node while a present
+/// one that disagrees with the node's cluster filters it out. Collapsing the
+/// two would make `?clusterID=` (empty) hide a node that upstream reports.
+core::Optional<std::string> OptionalParam(const HttpRequest& request, const char* name) {
+    const std::unordered_map<std::string, std::string>::const_iterator it =
+        request.query.find(name);
+    if (it == request.query.end()) return core::Optional<std::string>();
+    return core::Optional<std::string>(it->second);
+}
+
+/// Writes an `AdminError` out the same way `WriteError` writes an `ApiError`:
+/// the admin endpoints are declared with the same `{code, message}` error
+/// responses as the rest of the API.
+void WriteAdminError(const AdminError& error, HttpResponse* out) {
+    WriteError(ApiError::Make(error.status, error.message), out);
 }
 
 /// Parses a JSON request body, reporting a 400 rather than letting a
@@ -69,7 +92,8 @@ void RegisterOrchestratorRoutes(
     std::shared_ptr<volume::VolumeManager> volumes,
     std::shared_ptr<image::ImageResolver> image_resolver,
     std::shared_ptr<snapshot::repository::SnapshotRepository> repository,
-    std::shared_ptr<snapshot::SnapshotRuntimeResolver> runtime_resolver) {
+    std::shared_ptr<snapshot::SnapshotRuntimeResolver> runtime_resolver,
+    const AdminObservability* observability) {
     if (server == NULL || svc == NULL) return;
 
     // The handlers share one ApiImpl. It holds a shared_ptr, so the lambdas
@@ -165,18 +189,48 @@ void RegisterOrchestratorRoutes(
         WriteJson(r.value().ToJson(), resp);
     });
 
-    server->Route("POST", "/sandboxes/{sandbox_id}/exec",
+    // No `POST /sandboxes/{id}/exec` here, and that is the alignment rather
+    // than a gap: upstream has no such route. Its `openapi.yml` never mentions
+    // `exec` and the generated router does not list it -- running a command in
+    // a sandbox is a *data plane* operation that reaches envd through the
+    // proxy, not a control plane endpoint.
+    //
+    // This port invented one, answering an unconditional 501. It was removed
+    // with its handler and DTOs: a route upstream does not serve should 404,
+    // and a 501 says something different and false -- "this endpoint exists,
+    // your build lacks the feature" -- to a client calling a URL that is not
+    // part of the API. Keeping it also made `ApiImpl::Exec` and
+    // `ExecReq`/`ExecResp` look like a ported surface with a missing backend,
+    // when the whole shape was ours.
+
+    // Rust `GET` / `PATCH /sandboxes/{sandboxID}/custom-extension-params`
+    // (`generated/src/server/mod.rs:69-70`).
+    //
+    // The orchestrator half (`PatchSandboxCustomExtensionParams`, the
+    // `hook_patch_params` call, the state guard and the metadata write) was
+    // ported and reachable only from its own test. These two routes are what
+    // a client uses to reconfigure a running sandbox's extension, and without
+    // them the whole hook path was unreachable in production.
+    server->Route("GET", "/sandboxes/{sandbox_id}/custom-extension-params",
                   [impl](const HttpRequest& req, HttpResponse* resp) {
+        const core::Expected<core::Json, ApiError> r =
+            impl->GetSandboxCustomExtensionParams(Param(req, "sandbox_id"));
+        if (!r.ok()) return WriteError(r.error(), resp);
+        WriteJson(r.value(), resp);
+    });
+
+    server->Route("PATCH", "/sandboxes/{sandbox_id}/custom-extension-params",
+                  [impl](const HttpRequest& req, HttpResponse* resp) {
+        // The body *is* the patch map, so an absent one is an empty patch
+        // rather than an error -- `ParseBody` already turns "" into `{}`.
         core::Json body;
         if (!ParseBody(req, &body, resp)) return;
-        const core::Expected<ExecReq, core::AnyError> parsed = ExecReq::FromJson(body);
-        if (!parsed.ok()) {
-            return WriteError(ApiError::Make(400, parsed.error().chain()), resp);
-        }
-        const core::Expected<ExecResp, ApiError> r =
-            impl->Exec(Param(req, "sandbox_id"), parsed.value());
+        const core::Expected<core::Json, ApiError> r =
+            impl->PatchSandboxCustomExtensionParams(Param(req, "sandbox_id"), body);
         if (!r.ok()) return WriteError(r.error(), resp);
-        WriteJson(r.value().ToJson(), resp);
+        // The full params after the patch, which is not what was sent: the
+        // extension decides the merge.
+        WriteJson(r.value(), resp);
     });
 
     server->Route("POST", "/sandboxes/{sandbox_id}/fork",
@@ -442,6 +496,46 @@ void RegisterOrchestratorRoutes(
         WriteJson(core::Json(body), resp);
     });
 
+    // ---- admin ------------------------------------------------------------
+    //
+    // Rust `GET /nodes` / `GET /nodes/{node_id}`
+    // (`generated/src/server/mod.rs:47-48`, handlers in `impls/admin.rs`).
+    //
+    // `NodesGet` and `NodesNodeIdGet` were ported in full and then never
+    // reached from anywhere but their own test -- the same "complete,
+    // configured, zero production callers" shape the README names as a defect
+    // class. The projection was right; only these two lines were missing.
+    //
+    // `observability` is null in this build, and that is a faithful answer
+    // rather than a stub: upstream's handlers begin with
+    // `let Some(observability) = self.observability() else { .. }` and report
+    // an empty collection / a 404 for exactly this case. A node that cannot
+    // describe itself says so in upstream's own words.
+    //
+    // The path placeholder is `{node_id}`, matching the generated router's
+    // `/nodes/{node_id}`; `nodeID` is the spec's *parameter* name, not the
+    // template's.
+    server->Route("GET", "/nodes", [observability](const HttpRequest& req,
+                                                   HttpResponse* resp) {
+        const core::Expected<std::vector<core::Json>, AdminError> r =
+            NodesGet(observability, OptionalParam(req, "clusterID"));
+        if (!r.ok()) return WriteAdminError(r.error(), resp);
+        // A bare array, as the schema has it -- not wrapped in a `nodes` key.
+        core::JsonArray nodes;
+        for (std::size_t i = 0; i < r.value().size(); ++i) {
+            nodes.emplace_back(r.value()[i]);
+        }
+        WriteJson(core::Json(nodes), resp);
+    });
+
+    server->Route("GET", "/nodes/{node_id}", [observability](const HttpRequest& req,
+                                                             HttpResponse* resp) {
+        const core::Expected<core::Json, AdminError> r = NodesNodeIdGet(
+            observability, Param(req, "node_id"), OptionalParam(req, "clusterID"));
+        if (!r.ok()) return WriteAdminError(r.error(), resp);
+        WriteJson(r.value(), resp);
+    });
+
     // ---- health -----------------------------------------------------------
 
     // Deliberately not routed through ApiImpl: this must answer while the
@@ -450,6 +544,34 @@ void RegisterOrchestratorRoutes(
     server->Route("GET", "/health", [](const HttpRequest&, HttpResponse* resp) {
         resp->status = 200;
         resp->body = "{\"status\":\"ok\"}";
+    });
+
+    // ---- metrics ----------------------------------------------------------
+    //
+    // Rust `.route("/metrics", get(metrics_handler))` (`api/server.rs:41`),
+    // whose handler renders the global prometheus recorder and, when none was
+    // installed, answers `503 "prometheus recorder is not initialized"`
+    // (`crates/observability/src/lib.rs:70-79`).
+    //
+    // That second arm is the one this build is in, and it is why the route is
+    // registered rather than left out. `observability/metrics.h` is a facade
+    // that writes samples to stderr: there is no registry to render and no
+    // text-exposition encoder, so a 200 here is not reachable honestly.
+    //
+    // Registered anyway, because the alternative was worse than a 503. The
+    // auth layer already exempts `/metrics` from authentication
+    // (`auth.cc:21`), so the two layers disagreed: one declared the endpoint
+    // public, the other answered 404. And to a scraper the two statuses mean
+    // different things -- a 404 reads as "wrong path, fix your config", a 503
+    // as "endpoint is there, backend not ready", which is the true statement.
+    //
+    // Plain text, not JSON, and upstream's wording verbatim: this response is
+    // consumed by Prometheus, which never sees the control plane's `{code,
+    // message}` envelope on this route.
+    server->Route("GET", "/metrics", [](const HttpRequest&, HttpResponse* resp) {
+        resp->status = 503;
+        resp->headers["content-type"] = "text/plain; charset=utf-8";
+        resp->body = "prometheus recorder is not initialized";
     });
 }
 

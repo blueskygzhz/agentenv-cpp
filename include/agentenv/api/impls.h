@@ -99,14 +99,36 @@ class ApiImpl {
         GetSandbox(const std::string& sandbox_id);
     core::Expected<ListSandboxesResp, ApiError>
         ListSandboxes();
-    core::Expected<ExecResp, ApiError>
-        Exec(const std::string& sandbox_id, const ExecReq& req);
 
     /// Rust `pause_sandbox` / `resume_sandbox` handlers.
     core::Expected<core::Unit, ApiError>
         PauseSandbox(const std::string& sandbox_id);
     core::Expected<GetSandboxResp, ApiError>
         ResumeSandbox(const std::string& sandbox_id);
+
+    /// Rust `sandboxes_sandbox_id_custom_extension_params_get`.
+    ///
+    /// Always an object: absent params come back as `{}` rather than `null`,
+    /// matching upstream's `params_map_to_model(None) -> HashMap::new()`. A
+    /// client reading the result as a map would otherwise have to special-case
+    /// a sandbox that simply never set any.
+    core::Expected<core::Json, ApiError>
+        GetSandboxCustomExtensionParams(const std::string& sandbox_id);
+
+    /// Rust `sandboxes_sandbox_id_custom_extension_params_patch`.
+    ///
+    /// Returns the **full** params after the patch, not the patch, because the
+    /// extension's `hook_patch_params` decides what the merge actually is --
+    /// it may reject keys, add its own, or normalise values, and the caller
+    /// cannot reconstruct the result from what it sent.
+    ///
+    /// The status mapping is this route's own and deliberately not
+    /// `ToApiError`: a non-running sandbox is a **409** here where the shared
+    /// mapping says 400, and an extension that answered 4xx is a **400** where
+    /// the shared mapping says 500. Both differences are upstream's.
+    core::Expected<core::Json, ApiError>
+        PatchSandboxCustomExtensionParams(const std::string& sandbox_id,
+                                          const core::Json& patch);
 
     /// Rust `sandboxes_sandbox_id_fork_post`.
     ///

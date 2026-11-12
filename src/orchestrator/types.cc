@@ -177,6 +177,13 @@ OrchestratorError OrchestratorError::SandboxOperationFailed(core::SandboxId id,
     e.detail = std::move(source);
     return e;
 }
+OrchestratorError OrchestratorError::SandboxOperationFailed(core::SandboxId id,
+                                                            SandboxOperation op,
+                                                            const core::AnyError& source) {
+    OrchestratorError e = SandboxOperationFailed(id, op, source.chain());
+    e.source = source;
+    return e;
+}
 OrchestratorError OrchestratorError::SandboxOperationConflict(core::SandboxId id,
                                                               SandboxOperation op) {
     OrchestratorError e;

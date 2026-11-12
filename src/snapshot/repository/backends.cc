@@ -261,27 +261,18 @@ RepositoryResult<SnapshotBackend> MakeSnapshotBackendFromConfig(const cfg::AppCo
     backend.overlaybd_layers = image::cache::LocalImageServicesFromAppConfig(config)
                                    .overlaybd_layers;
 
-    // Only posix-fs gets a resolver; see the note on `SnapshotBackend`.
-    // Returned as a success with a null resolver rather than an error: an OSS
-    // node still serves `/volumes*` and still publishes, so refusing to build
-    // the backend at all would take down more than the launch path this
-    // cannot serve.
-    if (config.snapshot.repository_backend != cfg::SnapshotRepositoryBackendKind::PosixFs) {
-        return backend;
-    }
-    // Checked by `MakeRepositoryFromConfig` above, which has already returned
-    // an error if it is absent; re-checked because the dereference below is
-    // only safe by that argument, not by anything local.
-    if (!config.backend.posix_fs.has_value()) {
-        return core::make_unexpected(RepositoryError::InvalidRequest(
-            "backend.posix_fs config is required when repository_backend = posix_fs"));
-    }
-
-    // Rust's `shared_cache_root`, and the `None` max-size that goes with the
-    // posix-fs arm: `cache_max_size_gb` is an `[backend.oss]` field, so there
-    // is no watermark to enforce here and the cache only ever pins.
+    // Rust's `shared_cache_root`. The max-size differs by backend and that is
+    // upstream's split, not an accident: the posix-fs arm passes `None`
+    // because `cache_max_size_gb` is an `[backend.oss]` field, so there is no
+    // watermark to enforce and the cache only ever pins. An OSS node, which
+    // actually downloads artifacts, gets the configured ceiling.
+    const bool oss = config.snapshot.repository_backend ==
+                     cfg::SnapshotRepositoryBackendKind::Oss;
+    const bool has_max =
+        oss && config.backend.oss.has_value() && config.backend.oss->cache_max_size_gb.has_value();
     const core::Expected<std::shared_ptr<LocalArtifactCache>, std::string> cache =
-        LocalArtifactCache::New(config.snapshot.local_cache_path, false, 0);
+        LocalArtifactCache::New(config.snapshot.local_cache_path, has_max,
+                                has_max ? *config.backend.oss->cache_max_size_gb : 0);
     if (!cache.ok()) {
         return core::make_unexpected(RepositoryError::Backend(
             "open snapshot artifact cache at '" + config.snapshot.local_cache_path + "'",
@@ -289,16 +280,31 @@ RepositoryResult<SnapshotBackend> MakeSnapshotBackendFromConfig(const cfg::AppCo
     }
     backend.artifact_cache = cache.value();
 
-    // Rust `PosixFsBackend::from_parts`, whose runtime root is
-    // `shared_cache_root.join("runtime")`.
+    // One resolver for every backend, which is upstream's shape and was the
+    // port's largest single deviation on this path. It used to build a
+    // posix-only resolver here and return a **null** one for OSS, so an OSS
+    // node published snapshots it could never launch -- `POST /sandboxes`
+    // answered 501 and said so only in a startup warning -- and
+    // `SnapshotRepository::FetchBlob` was left with no production caller at
+    // all. `RepositoryRuntimeResolver` resolves against the repository
+    // interface instead of a root path, so `LocateBlob` decides per artifact
+    // whether it is read in place or fetched.
     //
     // The store is handed over as a raw pointer, which is why
     // `backend.overlaybd_layers` holds the owner: the resolver borrows it for
     // its whole life.
-    backend.runtime_resolver.reset(new posixfs::PosixFsRuntimeResolver(
-        PosixFsRepositoryRoot(*config.backend.posix_fs),
+    //
+    // **Deviation**: `p2p_transport` is null. Upstream threads one in from
+    // `build_snapshot_backend_from_config`'s caller, and this function has no
+    // transport to pass -- the P2P node is constructed later in `main`. The
+    // consequence is bounded and is the leg upstream itself treats as
+    // best-effort: every remote artifact comes from the repository rather
+    // than from a peer that may already hold it, costing bandwidth and not
+    // correctness. Recorded rather than left looking deliberate.
+    backend.runtime_resolver.reset(new RepositoryRuntimeResolver(
+        backend.repository, backend.artifact_cache,
         core::fs::Join(config.snapshot.local_cache_path, "runtime"),
-        backend.overlaybd_layers.get(), backend.artifact_cache));
+        backend.overlaybd_layers.get(), std::shared_ptr<p2p::P2pTransport>()));
     return backend;
 }
 

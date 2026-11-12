@@ -29,6 +29,10 @@ namespace repository { class SnapshotRepository; }
 
 namespace api {
 
+/// Forward-declared for the same reason as the collaborators above: the routes
+/// only pass a pointer through, and `admin.h` drags in the observability model.
+class AdminObservability;
+
 struct HttpRequest {
     std::string method;               // GET / POST / DELETE / PATCH
     std::string path;                 // "/sandboxes/abc"
@@ -122,6 +126,11 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc)
 /// `snapshot::repository::SnapshotBackend`). Passing it is what connects
 /// `MakeSnapshotBackendFromConfig`'s second return value to the one handler
 /// that consumes it.
+///
+/// `observability` backs `GET /nodes` and `GET /nodes/{nodeID}`. Null is legal
+/// and is *not* a refusal: it is upstream's "observability is disabled on this
+/// node", which answers the collection with an empty list and the detail with
+/// a 404. Borrowed, not owned — the caller outlives the routes.
 void RegisterOrchestratorRoutes(
     Server* server, orchestrator::Orchestrator* svc,
     std::shared_ptr<volume::VolumeManager> volumes,
@@ -129,7 +138,8 @@ void RegisterOrchestratorRoutes(
     std::shared_ptr<snapshot::repository::SnapshotRepository> repository =
         std::shared_ptr<snapshot::repository::SnapshotRepository>(),
     std::shared_ptr<snapshot::SnapshotRuntimeResolver> runtime_resolver =
-        std::shared_ptr<snapshot::SnapshotRuntimeResolver>());
+        std::shared_ptr<snapshot::SnapshotRuntimeResolver>(),
+    const AdminObservability* observability = NULL);
 
 }  // namespace api
 }  // namespace agentenv

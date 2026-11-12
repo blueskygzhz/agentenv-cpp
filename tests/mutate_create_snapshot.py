@@ -20,6 +20,14 @@ assertions that make those orderings observable unverified.
 import pathlib
 import shutil
 import subprocess
+import sys
+
+# `tests/` is not a package and a harness runs as a script from the repo
+# root, so the shared guard is imported by path rather than by package.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+import mutation_residue
+
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 IMPLS = ROOT / "src/api/impls.cc"
@@ -192,6 +200,14 @@ def run(target):
 
 
 def main():
+    # Refuses if a previous run was killed mid-mutation: taking a baseline
+    # from a tree that still holds one would copy the mutation into the
+    # backup and lose the original. See tests/mutation_residue.py.
+    mutation_residue.refuse_if_residue()
+    # A full pass rebuilds once per mutation and routinely outlives a
+    # command timeout; without this, SIGTERM skips the restore below.
+    mutation_residue.restore_on_signal()
+
     originals = {path: path.read_text() for path in SOURCES}
     backups = {path: path.with_suffix(path.suffix + ".mutation-backup")
                for path in SOURCES}

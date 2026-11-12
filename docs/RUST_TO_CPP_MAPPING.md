@@ -109,7 +109,7 @@ would only produce trivial empty translation units.
 | `src/proto.rs`                                       | `include/agentenv/proto.h`                                        | `src/proto.cc`                                    |
 | `src/orchestrator/mod.rs`                            | (namespace `agentenv::orchestrator`)                              | —                                                 |
 | `src/orchestrator/types.rs`                          | `include/agentenv/orchestrator/types.h`                           | `src/orchestrator/types.cc`                       |
-| `src/orchestrator/store.rs`                          | `include/agentenv/orchestrator/store.h`                           | `src/orchestrator/store.cc`                       |
+| `src/orchestrator/store/*.rs` (3 files)              | `include/agentenv/orchestrator/store.h`                           | `src/orchestrator/store.cc`                       |
 | `src/orchestrator/metrics.rs`                        | `include/agentenv/orchestrator/metrics.h`                         | `src/orchestrator/metrics.cc`                     |
 | `src/orchestrator/launch_plan.rs`                    | `include/agentenv/orchestrator/launch_plan.h`                     | `src/orchestrator/launch_plan.cc`                 |
 | `src/orchestrator/proxy.rs`                          | `include/agentenv/orchestrator/proxy.h`                           | `src/orchestrator/proxy.cc`                       |
@@ -121,40 +121,54 @@ would only produce trivial empty translation units.
 | `src/sandbox/envd.rs`                                | `include/agentenv/sandbox/envd.h`                                 | `src/sandbox/envd.cc`                             |
 | `src/sandbox/extra_drive.rs`                         | `include/agentenv/sandbox/extra_drive.h`                          | `src/sandbox/extra_drive.cc`                      |
 | `src/sandbox/process.rs`                             | `include/agentenv/sandbox/process.h`                              | `src/sandbox/process.cc`                          |
-| `src/sandbox/network/*.rs` (5 files)                 | `include/agentenv/sandbox/network.h`                              | `src/sandbox/network.cc`                          |
+| `src/sandbox/network/*.rs` (8 files)                 | `include/agentenv/sandbox/network.h`                              | `src/sandbox/network.cc`                          |
 | `src/sandbox/custom_extension/*.rs` (2 files)        | `include/agentenv/sandbox/custom_extension.h`                     | `src/sandbox/custom_extension.cc`                 |
 | `src/sandbox/ublk/*.rs` (3 files)                    | `include/agentenv/sandbox/ublk.h`                                 | `src/sandbox/ublk.cc`                             |
-| `src/sandbox/firecracker/*.rs` (12 files)| `include/agentenv/sandbox/firecracker/*.h`       | `src/sandbox/firecracker/*.cc` (config/socket/mmds/instance/pool/sandbox) |
+| `src/sandbox/firecracker/*.rs` (13 files)| `include/agentenv/sandbox/firecracker/*.h`       | `src/sandbox/firecracker/*.cc` (config/socket/mmds/instance/pool/sandbox) |
 | `src/snapshot/mod.rs`                                | (namespace `agentenv::snapshot`)                                  | —                                                 |
 | `src/snapshot/types/*.rs`                            | `include/agentenv/snapshot/types.h`                               | —                                                 |
-| `src/snapshot/manager.rs`                            | `include/agentenv/snapshot/manager.h`                             | `src/snapshot/manager.cc`                         |
-| `src/snapshot/mock.rs`                               | `include/agentenv/snapshot/mock.h`                                | `src/snapshot/mock.cc`                            |
+| `src/snapshot/manager.rs`                            | — (inlined, see `include/agentenv/api/impls.h:307-349`)           | free functions in `src/api/impls.cc`              |
+| `src/snapshot/mock.rs`                               | — (not ported; test fakes stand in, e.g. `tests/snapshot_resolver_fakes.h`) | —                                       |
 | `src/snapshot/artifact_cache.rs`                     | `include/agentenv/snapshot/artifact_cache.h`                      | `src/snapshot/artifact_cache.cc`                  |
 | `src/snapshot/p2p.rs`                                | `include/agentenv/snapshot/p2p.h`                                 | `src/snapshot/p2p.cc`                             |
 | `src/snapshot/runtime_support.rs`                    | `include/agentenv/snapshot/runtime_support.h`                     | `src/snapshot/runtime_support.cc`                 |
-| `src/snapshot/repository/*.rs` (22 files)            | `include/agentenv/snapshot/repository.h`                          | `src/snapshot/repository.cc`                      |
-| `src/image/mod.rs`                                   | `include/agentenv/image/image.h`                                  | `src/image/image.cc`                              |
+| `src/snapshot/resolver.rs`                           | `include/agentenv/snapshot/resolver.h`                            | `src/snapshot/resolver.cc`                        |
+| `src/snapshot/catalog.rs`                            | `include/agentenv/snapshot/repository/record_catalog.h`           | `src/snapshot/repository/record_catalog.cc`       |
+| `src/snapshot/store.rs`                              | `include/agentenv/snapshot/store.h`                               | `src/snapshot/store.cc`                           |
+| `src/snapshot/publish.rs`                            | `include/agentenv/snapshot/publish.h`                             | `src/snapshot/publish.cc`                         |
+| `src/snapshot/recontainerize.rs`                     | `include/agentenv/snapshot/recontainerize.h`                      | `src/snapshot/recontainerize.cc`                  |
+| `src/snapshot/startup_pack.rs`                       | `include/agentenv/snapshot/startup_pack.h` (types only; the orchestration is not ported — see README) | `src/snapshot/startup_pack_types.cc` |
+| `src/snapshot/backends/mod.rs`                       | `include/agentenv/snapshot/repository/backends.h`                 | `src/snapshot/repository/backends.cc`             |
+| `src/snapshot/image_export/{mod,service}.rs`         | `include/agentenv/snapshot/image_export/service.h`                | `src/snapshot/image_export/service.cc`            |
+| `src/snapshot/image_export/regctl.rs`                | `include/agentenv/snapshot/image_export/regctl.h`                 | `src/snapshot/image_export/regctl.cc`             |
+| `src/snapshot/image_export/target.rs`                | `include/agentenv/snapshot/image_export_target.h`                 | `src/snapshot/image_export_target.cc`             |
+| `src/snapshot/image_export/acr/{mod,client}.rs`      | `include/agentenv/snapshot/image_export/acr.h`                    | `src/snapshot/image_export/acr_client.cc`         |
+| `src/snapshot/image_export/acr/manifest.rs`          | `include/agentenv/snapshot/acr_manifest.h`                        | `src/snapshot/{acr_manifest,image_export/acr_parse}.cc` |
+| `src/snapshot/image_export/acr/publisher.rs`         | `include/agentenv/snapshot/image_export/acr_publisher.h`          | `src/snapshot/image_export/acr_publisher.cc`      |
+| `src/snapshot/image_export/acr/source_image.rs`      | `include/agentenv/snapshot/image_export/acr_source_image.h`       | `src/snapshot/image_export/acr_source_image.cc`   |
+| `src/repository/*.rs` (18 files)                     | `include/agentenv/snapshot/repository/*.h`                        | `src/snapshot/repository/*.cc`                    |
+| `src/image/mod.rs`                                   | `include/agentenv/image/{error,published_image}.h`                | `src/image/*.cc`                                  |
 | `src/image/reference.rs`                             | `include/agentenv/image/reference.h`                              | `src/image/reference.cc`                          |
 | `src/image/metadata.rs`                              | `include/agentenv/image/metadata.h`                               | `src/image/metadata.cc`                           |
 | `src/image/{local_layer,resolver,cache}.rs` + oci_image/commit_index (own rows below) | `include/agentenv/image/layers.h`                    | `src/image/layers.cc`                             |
 | `src/p2p/mod.rs`                                     | `include/agentenv/p2p/node.h`                                     | `src/p2p/node.cc`                                 |
-| `src/p2p/{config,transport,discovery,types,error,iroh,mock}.rs` | `include/agentenv/p2p/all.h`                          | `src/p2p/all.cc`                                  |
+| `src/p2p/{config,transport,discovery,types,error,iroh,mock}.rs` | `include/agentenv/p2p/all.h`                          | `src/p2p/{config,http_transport,discovery,types,error,iroh,mock}.cc` |
 | `src/api/mod.rs`                                     | (namespace `agentenv::api`)                                       | —                                                 |
 | `src/api/server.rs`                                  | `include/agentenv/api/server.h`                                   | `src/api/server.cc`                               |
 | `src/api/proxy.rs`                                   | `include/agentenv/api/proxy.h`                                    | `src/api/proxy.cc`                                |
-| `src/api/impls/*.rs` (9 files)                       | `include/agentenv/api/impls.h`                                    | `src/api/impls.cc`                                |
-| `src/api/dto/*.rs`                                   | `include/agentenv/api/dto.h`                                      | `src/api/dto.cc`                                  |
-| `src/setup/*.rs` (7 files)                           | `include/agentenv/setup.h`                                        | `src/setup.cc`                                    |
+| `src/api/impls/*.rs` (17 files)                      | `include/agentenv/api/impls.h`                                    | `src/api/impls.cc`                                |
+| `src/api/generated/src/models.rs`                    | `include/agentenv/api/dto.h`                                      | `src/api/dto.cc`                                  |
+| `src/setup/*.rs` (5 files)                           | `include/agentenv/setup.h`                                        | `src/setup.cc`                                    |
 | `src/template/mod.rs`                                | `include/agentenv/template/engine.h`                              | `src/template/engine.cc`                          |
 | `src/observability/mod.rs` + `crates/observability/` | `include/agentenv/observability/{metrics,tracing}.h`              | `crates/observability/{metrics,tracing}.cc`       |
 | `storage/util/`                                      | `include/agentenv/storage/util/types.h`                           | `storage/util/types.cc`                           |
-| `storage/overlaybd/`                                 | `include/agentenv/storage/overlaybd/types.h`                      | `storage/overlaybd/{index_tree,layer_reader}.cc`  |
+| `storage/overlaybd/`                                 | `include/agentenv/storage/overlaybd/*.h`                          | `storage/overlaybd/*.cc`                          |
 | `storage/ublk/`                                      | `include/agentenv/storage/ublk/target.h`                          | `storage/ublk/runner.cc`                          |
 | `storage/ublk-daemon/`                               | (bin)                                                             | `storage/ublk-daemon/main.cc`                     |
 | `storage/uffd-core/`                                 | `include/agentenv/storage/uffd-core/uffd.h`                       | `storage/uffd-core/uffd.cc`                       |
 | `crates/aenv/src/main.rs`                            | `include/agentenv/aenv/cli.h`                                     | `crates/aenv/{main,cli}.cc`                       |
-| `crates/aenv/src/commands/*.rs` (15 files)      | `include/agentenv/aenv/commands.h`         | `crates/aenv/commands/*.cc` (15 files + mod.cc)   |
-| `crates/aenv/src/client/*.rs` (5 files)              | `include/agentenv/aenv/client.h`                                  | `crates/aenv/client.cc`                           |
+| `crates/aenv/src/commands/*.rs` (29 files)      | `include/agentenv/aenv/commands.h`         | `crates/aenv/commands/*.cc` (15 files + mod.cc)   |
+| `crates/aenv/src/client/*.rs` (7 files)              | `include/agentenv/aenv/client.h`                                  | `crates/aenv/client.cc`                           |
 | `crates/aenv/src/{auth,grpc,output,progress,pty}.rs` | `include/agentenv/aenv/util.h`                                    | `crates/aenv/util.cc`                             |
 | `crates/linux-cap/`                                  | `include/agentenv/linux-cap/cap.h`                                | `crates/linux-cap/cap.cc`                         |
 | `crates/shell-util/`                                 | `include/agentenv/shell-util/shell.h`                             | `crates/shell-util/shell.cc`                      |
@@ -199,7 +213,7 @@ The port is developed module-by-module. Each module is in one of three states:
 | image **`cache`** (graph/gc pure subset): validated `HardCommitId`/`ImageCacheConfigId`/`ImageCacheHoldOwner`, metadata-store key encoding (hex + `/`-joined), `is_regular_config_filename`, store-free `plan_capacity_eviction` LRU planner, GC report/`summary_from_report` | `src/image/cache.cc` | `test_image_cache` |
 | **storage/util** `AlignedBuffer/ReloadableIDAllocator/MMapRegion/CompactWriter` | `storage/util/` | `test_storage_util` |
 | **storage/overlaybd LSMT** index (`Segment/SegmentMapping/ReadOnlyIndex/MutableIndex/ComboIndex`), `compress_raw_index`, `DiskSegmentMapping` packing, `HeaderTrailer`, **`OpenIndexFile` (read) + `CompactTo` (write)** | `storage/overlaybd/lsmt.cc` | `test_lsmt`, `test_storage_overlaybd` |
-| ublk caps constants + overlaybd config validation | `storage/ublk/caps.h`, `storage/overlaybd/config.cc` | `test_storage_overlaybd` |
+| ublk caps constants + overlaybd config validation | `include/agentenv/storage/ublk/caps.h`, `storage/overlaybd/config.cc` | `test_storage_overlaybd` |
 | services/scheduler placement (`RoundRobin/Random`, resource filter, binding store, node registry) | `services/scheduler/{strategy,filter,store,node_registry}.cc` | `test_scheduler` |
 | services/gateway host routing + schedule hints | `services/gateway/{host_route,schedule_hint}.cc` | `test_gateway` |
 | snapshot/repository (errors, interfaces, in-memory backend, list-filter) | `src/snapshot/repository/` | `test_snapshot_repository` |

@@ -115,9 +115,9 @@ void LocalArtifactCache::Release(const std::string& key) {
     if (it->second.ref_count > 0) --it->second.ref_count;
 }
 
-void LocalArtifactCache::InsertEntry(const std::string& key,
-                                      const std::string& local_path,
-                                      uint64_t size) {
+CacheHandle* LocalArtifactCache::InsertPinned(const std::string& key,
+                                              const std::string& local_path,
+                                              uint64_t size) {
     std::lock_guard<std::mutex> g(index_mu_);
     std::map<std::string, CacheEntry>::iterator it = entries_.find(key);
     if (it != entries_.end()) {
@@ -128,9 +128,10 @@ void LocalArtifactCache::InsertEntry(const std::string& key,
     entry.local_path = local_path;
     entry.size = size;
     entry.last_accessed_us = NowUs();
-    entry.ref_count = 0;  // caller bumps it separately
+    entry.ref_count = 1;  // owned by the handle returned below
     entries_[key] = entry;
     total_size_ += size;
+    return new CacheHandle(shared_from_this(), key, local_path);
 }
 
 core::Expected<CacheHandle*, std::string>

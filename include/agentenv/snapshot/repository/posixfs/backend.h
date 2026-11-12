@@ -22,7 +22,7 @@
 #include "agentenv/snapshot/repository/interfaces.h"
 #include "agentenv/snapshot/repository/posixfs/artifacts.h"
 #include "agentenv/snapshot/repository/posixfs/catalog.h"
-#include "agentenv/snapshot/repository/posixfs/runtime.h"
+#include "agentenv/snapshot/resolver.h"
 #include "agentenv/snapshot/runtime_support.h"
 
 namespace agentenv {
@@ -122,20 +122,21 @@ class PosixFsBackend {
     const std::shared_ptr<PosixFsArtifactStore>& artifact_store() const { return artifact_store_; }
 
     /// Rust `repository()` — the `SnapshotRepository` face over this
-    /// backend's catalog. Built on first use and shared thereafter, so every
-    /// caller talks to the same catalog and its file locks.
+    /// backend's catalog. Shared, so every caller talks to the same catalog
+    /// and its file locks.
     std::shared_ptr<SnapshotRepository> repository();
 
     /// Rust `runtime_resolver`.
-    const std::shared_ptr<PosixFsRuntimeResolver>& runtime_resolver() const {
+    const std::shared_ptr<RepositoryRuntimeResolver>& runtime_resolver() const {
         return runtime_resolver_;
     }
 
  private:
     std::shared_ptr<PosixFsCatalogStore>   catalog_store_;
     std::shared_ptr<PosixFsArtifactStore>  artifact_store_;
-    std::shared_ptr<PosixFsRuntimeResolver> runtime_resolver_;
-    /// Built lazily by `repository()`.
+    std::shared_ptr<RepositoryRuntimeResolver> runtime_resolver_;
+    /// Built by the constructor: the resolver takes it, so it cannot wait for
+    /// a first `repository()` call.
     std::shared_ptr<SnapshotRepository>    repository_;
 };
 

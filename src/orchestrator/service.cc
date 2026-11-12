@@ -2403,9 +2403,13 @@ Orchestrator::PatchSandboxCustomExtensionParams(
     core::Expected<core::Optional<sandbox::custom_extension::Params>, core::AnyError>
         hooked = custom_extension_client_->HookPatchParams(id, patch);
     if (!hooked.ok()) {
+        // The `AnyError` overload: a `HookStatusError` rides in this chain,
+        // and the API layer has to read its status to answer 400 for a patch
+        // the extension *rejected* and 500 for one it *failed*. Passing
+        // `.chain()` here would leave only the text, and the two cases read
+        // identically to a client.
         return core::make_unexpected(OrchestratorError::SandboxOperationFailed(
-            id, SandboxOperation::PatchCustomExtensionParams,
-            hooked.error().chain()));
+            id, SandboxOperation::PatchCustomExtensionParams, hooked.error()));
     }
     const core::Optional<sandbox::custom_extension::Params> new_params =
         hooked.value();

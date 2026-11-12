@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
-// Rust: src/api/dto/*.rs  (subset of E2B-compatible schema in openapi.yml)
+// Rust: src/api/generated/src/models.rs  (subset of the E2B-compatible schema
+// in src/api/openapi.yml, from which those models are generated). Upstream has
+// no hand-written `dto` module; this header stands in for the generated one.
 #ifndef AGENTENV_API_DTO_H_
 #define AGENTENV_API_DTO_H_
 
@@ -268,25 +270,11 @@ struct SnapshotInfoResp {
     static core::Expected<SnapshotInfoResp, core::AnyError> FromJson(const core::Json& j);
 };
 
-/// POST /sandboxes/{id}/exec  request body.
-struct ExecReq {
-    std::vector<std::string> cmd;
-    std::vector<std::string> env_vars;
-    int32_t timeout_sec = 60;
-
-    core::Json ToJson() const;
-    static core::Expected<ExecReq, core::AnyError> FromJson(const core::Json& j);
-};
-
-/// POST /sandboxes/{id}/exec  response body.
-struct ExecResp {
-    int32_t     exit_code = 0;
-    std::string stdout_output;
-    std::string stderr_output;
-
-    core::Json ToJson() const;
-    static core::Expected<ExecResp, core::AnyError> FromJson(const core::Json& j);
-};
+// No `ExecReq`/`ExecResp`: upstream has no `exec` endpoint to model. See the
+// note in `server.cc` where the route used to be registered -- running a
+// command in a sandbox reaches envd through the proxy, so there is no control
+// plane request body for it, and these two described a route only this port
+// ever served.
 
 /// Generic error body.
 struct ErrorResp {

@@ -158,10 +158,16 @@ using SandboxForkResult = core::Expected<std::unique_ptr<class SandboxBackend>, 
 /// **Deviation**: Rust carries `artifacts: Box<dyn Any + Send>`, a type-erased
 /// payload a backend uses to keep a temporary capture root alive until
 /// publication finishes, and which `publish_captured` downcasts to
-/// `FirecrackerCaptureArtifacts` to drive the startup-manifest recorder. That
-/// recorder is not ported, so the only remaining job is naming the directory —
-/// carried here as a plain string. A `void*`-style escape hatch with no
-/// consumer would just invite an unchecked downcast.
+/// `FirecrackerCaptureArtifacts` to drive startup-pack recording.
+///
+/// What is missing is the *orchestration* — upstream's
+/// `sandbox/firecracker/startup_pack.rs`, which boots a throwaway VM from the
+/// fresh capture so the daemon-side recorder observes every first-touch read.
+/// The recorder it drives *is* ported (`storage/ublk/startup_pack_recorder.cc`,
+/// with the format in `storage/overlaybd/startup_pack.cc`); nothing reboots a
+/// capture to feed it. So the only remaining job here is naming the directory,
+/// carried as a plain string: a `void*`-style escape hatch with no consumer
+/// would just invite an unchecked downcast.
 struct CapturedSandboxSnapshot {
     SandboxSnapshotManifest manifest;
     /// Where the artifacts the manifest names were written. Durable, not a

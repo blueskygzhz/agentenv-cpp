@@ -659,51 +659,6 @@ SnapshotInfoResp::FromJson(const core::Json& j) {
     return r;
 }
 
-// -------- ExecReq / ExecResp --------
-core::Json ExecReq::ToJson() const {
-    core::Json j;
-    core::JsonArray a;
-    for (const auto& x : cmd) a.emplace_back(core::Json(x));
-    j["cmd"] = core::Json(std::move(a));
-    core::JsonArray b;
-    for (const auto& x : env_vars) b.emplace_back(core::Json(x));
-    j["env_vars"] = core::Json(std::move(b));
-    j["timeout_sec"] = core::Json(static_cast<int64_t>(timeout_sec));
-    return j;
-}
-core::Expected<ExecReq, core::AnyError> ExecReq::FromJson(const core::Json& j) {
-    ExecReq r;
-    if (j["cmd"].kind() != core::Json::Kind::Array)
-        return core::make_unexpected(core::err("missing field: cmd"));
-    for (const auto& e : j["cmd"].as_array()) {
-        if (e.kind() == core::Json::Kind::String) r.cmd.push_back(e.as_string());
-    }
-    if (j["env_vars"].kind() == core::Json::Kind::Array) {
-        for (const auto& e : j["env_vars"].as_array()) {
-            if (e.kind() == core::Json::Kind::String) r.env_vars.push_back(e.as_string());
-        }
-    }
-    r.timeout_sec = static_cast<int32_t>(GetIntOr(j, "timeout_sec", 60));
-    return r;
-}
-
-core::Json ExecResp::ToJson() const {
-    core::Json j;
-    j["exit_code"]     = core::Json(static_cast<int64_t>(exit_code));
-    j["stdout_output"] = core::Json(stdout_output);
-    j["stderr_output"] = core::Json(stderr_output);
-    return j;
-}
-core::Expected<ExecResp, core::AnyError> ExecResp::FromJson(const core::Json& j) {
-    ExecResp r;
-    r.exit_code     = static_cast<int32_t>(GetIntOr(j, "exit_code", 0));
-    r.stdout_output = j["stdout_output"].kind() == core::Json::Kind::String
-                          ? j["stdout_output"].as_string() : "";
-    r.stderr_output = j["stderr_output"].kind() == core::Json::Kind::String
-                          ? j["stderr_output"].as_string() : "";
-    return r;
-}
-
 core::Json ErrorResp::ToJson() const {
     core::Json j;
     j["code"] = core::Json(code);

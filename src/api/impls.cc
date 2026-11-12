@@ -352,6 +352,76 @@ ApiError ToApiError(const orchestrator::OrchestratorError& err) {
     }
 }
 
+/// Rust `params_map_to_model` — the stored params as the response model.
+///
+/// Absent params become an empty object, not `null`: upstream's return type is
+/// a `HashMap`, so "this sandbox has no params" and "this sandbox has no
+/// params set" are the same `{}` to a client. This port stores the params as
+/// their original JSON *text*, so the absent case is the only one that needs
+/// manufacturing; a stored value is handed back as it was received.
+core::Json CustomExtensionParamsModel(
+    const core::Optional<sandbox::custom_extension::Params>& params) {
+    if (!params.has_value() || params->json_bytes.empty()) {
+        return core::Json(core::JsonObject());
+    }
+    const core::Expected<core::Json, core::AnyError> parsed =
+        core::Json::Parse(params->json_bytes);
+    // Unparseable stored text cannot be reported as params, and cannot be
+    // reported as *absent* either -- that would tell the caller the sandbox
+    // has none when it has something nobody can read. An empty object is the
+    // one honest answer that is also the documented shape; the text itself is
+    // only ever written by this process from a body it already parsed, so
+    // reaching here means local corruption rather than a bad request.
+    if (!parsed.ok() || parsed.value().kind() != core::Json::Kind::Object) {
+        return core::Json(core::JsonObject());
+    }
+    return parsed.value();
+}
+
+/// The status mapping for `custom_extension_params_patch`, which is this
+/// route's own rather than `ToApiError`'s.
+///
+/// Two of the differences matter and neither is cosmetic:
+///
+///   * a non-running sandbox is **409**, where `ToApiError` says 400. The
+///     request is well-formed and will succeed once the sandbox is running
+///     again, so a 400 would tell the client to stop retrying something a
+///     resume fixes.
+///   * a failed hook splits on *who* failed. The extension answering 4xx is
+///     the extension rejecting this patch — the caller's problem, **400**.
+///     The extension answering 5xx, or not being configured at all, is this
+///     deployment's problem, **500**. `ToApiError` calls the whole variant 500
+///     and would hide a rejected patch behind a server error the client
+///     retries forever.
+///
+/// The 5xx arm reports the hook's own message rather than the orchestrator's
+/// wrapped chain, matching upstream's `Self::error(500, hook_err.to_string())`.
+ApiError PatchParamsApiError(const orchestrator::OrchestratorError& err) {
+    switch (err.kind) {
+        case orchestrator::OrchestratorErrorKind::SandboxNotFound:
+            return SandboxNotFound(err.sandbox_id.ToString());
+        case orchestrator::OrchestratorErrorKind::InvalidSandboxState:
+            return ApiError::Make(
+                409, std::string("sandbox custom extension params cannot be patched from ") +
+                         orchestrator::SandboxStateName(err.state) + " state");
+        case orchestrator::OrchestratorErrorKind::SandboxOperationConflict:
+            return ApiError::Make(409, err.Message());
+        case orchestrator::OrchestratorErrorKind::SandboxOperationFailed: {
+            // Rust `hook_status_error(&err).filter(|e| e.is_server_error())`.
+            // Only a *server* error takes the 500 arm; a 4xx and a chain with
+            // no hook error at all both fall through to 400.
+            const sandbox::custom_extension::HookStatusError* hook =
+                sandbox::custom_extension::FindHookStatusError(err.source);
+            if (hook != NULL && hook->IsServerError()) {
+                return ApiError::Make(500, hook->ToString());
+            }
+            return ApiError::Make(400, err.Message());
+        }
+        default:
+            return ToApiError(err);
+    }
+}
+
 core::Expected<core::SandboxId, ApiError>
 ApiImpl::ParseId(const std::string& text) const {
     const core::Expected<core::SandboxId, std::string> parsed =
@@ -1085,19 +1155,43 @@ ApiImpl::ResumeSandbox(const std::string& sandbox_id) {
     return ToGetSandboxResp(r.value());
 }
 
-core::Expected<ExecResp, ApiError>
-ApiImpl::Exec(const std::string& sandbox_id, const ExecReq& /*req*/) {
+core::Expected<core::Json, ApiError>
+ApiImpl::GetSandboxCustomExtensionParams(const std::string& sandbox_id) {
     const core::Expected<core::SandboxId, ApiError> id = ParseId(sandbox_id);
     if (!id.ok()) return core::make_unexpected(id.error());
 
-    // Rust proxies this to envd inside the guest. There is no envd client in
-    // this port, so there is no way to run the command.
-    //
-    // Reported as 501 rather than an empty success: an exit code of 0 with no
-    // output is indistinguishable from a command that ran and printed
-    // nothing, so a caller would conclude its work had been done.
-    return core::make_unexpected(ApiError::Make(
-        501, "exec is not available in this build (needs the envd guest client)"));
+    const orchestrator::OrchestratorResult<core::Optional<orchestrator::SandboxMetadata> >
+        got = svc_->GetSandbox(id.value());
+    if (!got.ok()) return core::make_unexpected(ToApiError(got.error()));
+    if (!got.value().has_value()) {
+        return core::make_unexpected(SandboxNotFound(sandbox_id));
+    }
+    return CustomExtensionParamsModel(got.value()->custom_extension_params);
+}
+
+core::Expected<core::Json, ApiError>
+ApiImpl::PatchSandboxCustomExtensionParams(const std::string& sandbox_id,
+                                           const core::Json& patch) {
+    const core::Expected<core::SandboxId, ApiError> id = ParseId(sandbox_id);
+    if (!id.ok()) return core::make_unexpected(id.error());
+
+    // Rust `params_model_to_map(body)`: the body is the patch map itself, not
+    // a wrapper object. An empty object is a legal no-op patch -- the hook
+    // still runs, and may still rewrite the params.
+    if (patch.kind() != core::Json::Kind::Object) {
+        return core::make_unexpected(
+            ApiError::Make(400, "customExtensionParams body must be a JSON object"));
+    }
+    sandbox::custom_extension::Params params;
+    params.json_bytes = patch.ToString();
+
+    const orchestrator::OrchestratorResult<
+        core::Optional<sandbox::custom_extension::Params> >
+        patched = svc_->PatchSandboxCustomExtensionParams(id.value(), params);
+    if (!patched.ok()) {
+        return core::make_unexpected(PatchParamsApiError(patched.error()));
+    }
+    return CustomExtensionParamsModel(patched.value());
 }
 
 core::Expected<snapshot::repository::SnapshotRepository*, ApiError>

@@ -158,11 +158,14 @@ RepositoryResult<core::Unit> SnapshotRepository::DeleteSnapshotBlobs(const core:
     return core::make_unexpected(RepositoryError::Unsupported("blob storage"));
 }
 
-namespace {
-
 /// Rust `managed_layer_config` (layer_config.rs) — a managed layer read in
 /// place when the repository allows it; otherwise overlaybd reads it by
 /// digest from the repository's `repoBlobUrl`.
+///
+/// No longer file-local: `RepositoryRuntimeResolver` resolves snapshot layers
+/// through it too. While it was private here, the snapshot resolver had its
+/// own posix-only copy, which is what tied snapshot launches to a shared
+/// filesystem.
 RepositoryResult<storage::overlaybd::LayerConfig> ManagedLayerConfig(
     const SnapshotRepository& repository, const ManagedLayer& layer, LayerRole role) {
     const RepositoryResult<BlobLocation> location =
@@ -175,8 +178,6 @@ RepositoryResult<storage::overlaybd::LayerConfig> ManagedLayerConfig(
     if (layer.uuid.has_value()) config.uuid = *layer.uuid;
     return config;
 }
-
-}  // namespace
 
 RepositoryResult<std::string> MaterializeVolumeBacking(
     const SnapshotRepository& repository, const std::vector<OverlaybdLayerRef>& layers,

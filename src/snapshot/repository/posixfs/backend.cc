@@ -27,8 +27,14 @@ PosixFsBackend::PosixFsBackend(const PosixFsBackendConfig& config,
 
     catalog_store_.reset(new PosixFsCatalogStore(config.root));
     artifact_store_.reset(new PosixFsArtifactStore(config.root));
-    runtime_resolver_.reset(
-        new PosixFsRuntimeResolver(config.root, runtime_cache_root, store, cache));
+    // Built here rather than on first use, because the resolver now takes the
+    // repository itself instead of a root path -- `RepositoryRuntimeResolver`
+    // asks `LocateBlob` where each artifact is. Upstream's `from_parts`
+    // constructs them in this order for the same reason.
+    repository_.reset(new PosixFsSnapshotRepository(catalog_store_, artifact_store_));
+    runtime_resolver_.reset(new RepositoryRuntimeResolver(
+        repository_, cache, runtime_cache_root, store,
+        std::shared_ptr<p2p::P2pTransport>()));
 }
 
 

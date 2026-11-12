@@ -149,17 +149,23 @@ class LocalArtifactCache : public std::enable_shared_from_this<LocalArtifactCach
                 return core::make_unexpected(err);
             }
 
-            // Register in index.
-            InsertEntry(key, local_path, result.value());
+            // Registered already pinned and handed straight back, as Rust
+            // does (`ref_count: 1`, then `return Ok(CacheHandle { .. })`).
+            //
+            // This used to insert unpinned and then `TryAcquire` + `continue`.
+            // Two things were wrong with that. Eviction ran in between, and an
+            // unpinned entry is exactly what `EvictLru` may take, so the file
+            // just fetched could be deleted before the caller saw it. And
+            // `TryAcquire` drops an entry whose file is missing, so a fetch
+            // that reported success without writing `local_path` looped here
+            // forever -- re-fetching, re-inserting, re-dropping -- instead of
+            // returning. Upstream returns the handle and lets the missing file
+            // surface at the reader; a hang has no error to surface at all.
+            CacheHandle* h = InsertPinned(key, local_path, result.value());
             FinishInflight(key, my_entry, true, std::string());
 
             if (IsOverLimit()) EvictLru();
-
-            // Acquire the just-inserted entry.
-            CacheHandle* h = TryAcquire(key);
-            if (h) return h;
-            // Extremely unlikely: eviction removed it between insert and acquire.
-            continue;
+            return h;
         }
     }
 
@@ -194,7 +200,10 @@ class LocalArtifactCache : public std::enable_shared_from_this<LocalArtifactCach
     core::Expected<std::string, std::string> KeyToLocalPath(const std::string& key) const;
     CacheHandle* TryAcquire(const std::string& key);
     void Release(const std::string& key);
-    void InsertEntry(const std::string& key, const std::string& local_path, uint64_t size);
+    /// Rust's index insert in `ensure_cached_at`: the entry starts with
+    /// `ref_count == 1` and the returned handle owns that reference.
+    CacheHandle* InsertPinned(const std::string& key, const std::string& local_path,
+                              uint64_t size);
     void FinishInflight(const std::string& key, InflightEntry* entry,
                         bool ok, const std::string& err);
     uint64_t NowUs() const;

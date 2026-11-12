@@ -431,10 +431,21 @@ int main(int argc, char** argv) {
             AGENTENV_ERROR("ensure dependencies: " << provisioned.error());
             return 1;
         }
-        // The p2p facade address is threaded in by the caller upstream; this
-        // build has no iroh transport, so the configs are written without one
-        // rather than with a placeholder that would point the daemon at a
-        // peer-to-peer endpoint that does not exist.
+        // Passed empty, which writes `p2p.enable: false` into every overlaybd
+        // config, so the ublk daemon never reads layer ranges from peers.
+        //
+        // **Deviation, and not for the reason this comment used to give.** It
+        // said "this build has no iroh transport", but the facade does not
+        // need iroh: `HttpP2pTransport::LocalEndpoint` always succeeds, so
+        // `FacadeConfigFromAppConfig` would enable it on any `http` node. The
+        // real gap is that `OverlaybdP2pRuntime` is never started here --
+        // `Started` takes addresses from a listener this file never binds,
+        // and `FacadeCore`'s handlers have no route. Upstream starts it at
+        // `server.rs:91` and only then runs `ensure_environment` (`:94`) with
+        // `read_facade_address()`; this block runs *before* the transport
+        // exists (below), so the ordering would have to change too.
+        // Passing empty is still the right call until then: an address with no
+        // listener behind it would send every block read to a dead endpoint.
         auto obd_configs = ae::setup::deps::WriteGeneratedOverlaybdGlobalConfigs(
             app_cfg, ae::core::Optional<std::string>());
         if (!obd_configs.ok()) {
@@ -569,10 +580,9 @@ int main(int argc, char** argv) {
     //
     // It returns the *pair* upstream's `build_snapshot_backend` does. The
     // second half is the runtime resolver, and it is why this call changed:
-    // the repository-only form left `PosixFsRuntimeResolver` with no
-    // production caller at all, so `POST /sandboxes` could not turn a
-    // `templateID` into launchable paths and fell through to a fresh boot with
-    // an empty rootfs config.
+    // the repository-only form left the resolver with no production caller at
+    // all, so `POST /sandboxes` could not turn a `templateID` into launchable
+    // paths and fell through to a fresh boot with an empty rootfs config.
     std::shared_ptr<ae::volume::VolumeManager> volume_manager;
     std::shared_ptr<ae::image::ImageResolver> image_resolver;
     // Outlives the block below because the API bundle needs it too: the
@@ -598,10 +608,14 @@ int main(int argc, char** argv) {
         snapshot_backend = made.value();
         repository = snapshot_backend.repository;
         if (!snapshot_backend.runtime_resolver) {
-            // Not fatal, and said out loud because the consequence is a whole
-            // route answering 501: an OSS node publishes and serves volumes
-            // normally but cannot resume a snapshot, since this port has no
-            // resolver for that backend.
+            // No configurable backend reaches this any more: the resolver is
+            // repository-generic, so `MakeSnapshotBackendFromConfig` builds
+            // one for whatever repository it just built. It used to be the
+            // ordinary state of an OSS node -- which published and served
+            // volumes normally but answered 501 on resume -- and the check
+            // stays as the guard that caught it: a backend added without
+            // wiring a resolver says so at startup instead of surfacing as a
+            // route that fails only once a user tries to resume.
             AGENTENV_WARN("snapshot runtime resolver unavailable for the configured"
                           << " repository backend; POST /sandboxes cannot launch from"
                           << " a snapshot on this node");

@@ -263,6 +263,23 @@ class SnapshotRepository {
     virtual RepositoryResult<core::Unit> DeleteSnapshotBlobs(const core::SnapshotId& id);
 };
 
+/// Rust `managed_layer_config` (layer_config.rs) — one managed layer as an
+/// overlaybd `LayerConfig`, resolved against whatever the repository can
+/// offer.
+///
+/// `LocateBlob` decides the shape: a `Local` answer fills `file`, so overlaybd
+/// reads the layer in place; a `Remote` one leaves `file` empty and the layer
+/// is addressed by digest against the image's `repoBlobUrl`. That is the whole
+/// reason one resolver can serve a shared filesystem and a bucket alike.
+///
+/// Exported because the snapshot runtime resolver needs exactly this and used
+/// to hard-code the posix-fs layout instead (see `RepositoryRuntimeResolver`).
+/// It had been sitting in an anonymous namespace with `MaterializeVolumeBacking`
+/// as its only caller, which is why the volume path was already generic while
+/// the snapshot path was not.
+RepositoryResult<storage::overlaybd::LayerConfig> ManagedLayerConfig(
+    const SnapshotRepository& repository, const ManagedLayer& layer, LayerRole role);
+
 /// Rust `repository::materialize_volume_backing` (layer_config.rs) — writes a
 /// runtime image config for `layers` at `destination`, atomically, and
 /// returns its path. Managed layers are read in place when the repository

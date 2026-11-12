@@ -529,6 +529,94 @@ A C++11 architectural port of [kvcache-ai/AgentENV](https://github.com/kvcache-a
 >   this that was reachable: a capture's volumes come back, and an *exclusive*
 >   volume still cannot be captured in the first place.
 >
+> - **"the handlers are ported, so the API is ported"** — the route table was
+>   never checked against upstream's, and 14 of its 34 paths were unserved.
+>   Three of those were the worst kind of gap, because the work was already
+>   done and only the registration was missing:
+>
+>   `GET /nodes` and `GET /nodes/{nodeID}` — `NodesGet`/`NodesNodeIdGet`
+>   complete in `api/admin.cc`, reachable from nothing but their own test. The
+>   `AdminObservability` handed to them is null in this build, and that is a
+>   faithful answer rather than a stub: upstream's handlers open with `let
+>   Some(observability) = .. else { .. }` and report an empty collection and a
+>   404 for exactly this case, in the wording now asserted.
+>
+>   `GET`/`PATCH /sandboxes/{id}/custom-extension-params` — the orchestrator
+>   half, including the `hook_patch_params` call, the state guard and the
+>   metadata write, had been ported and was unreachable, so the entire custom
+>   extension path was dead in production. Wiring it surfaced a real
+>   divergence: this route must **not** use the shared `ToApiError`. A paused
+>   sandbox is a **409** where the shared mapping says 400 (the request is
+>   fine; a resume fixes it, and a 400 tells the client to stop retrying), and
+>   a failed hook splits on *who* failed — the extension answering 4xx rejected
+>   this patch (**400**, the caller must change it) while 5xx means it broke
+>   (**500**, the caller cannot). `ToApiError` calls that whole variant 500 and
+>   would have a client retry a rejected patch forever.
+>
+>   That split needed something restored underneath it. `OrchestratorError`
+>   flattens its cause to `std::string detail`, and upstream classifies by
+>   `err.chain().find_map(downcast_ref::<HookStatusError>)`. Flattened, a 403
+>   and a 502 from an extension are the same string, so the variant carries a
+>   typed `core::AnyError source` again alongside `detail` — every existing
+>   reader sees the same text, and only the classification gains anything.
+>
+>   `GET /metrics` — registered, answering upstream's own `503 "prometheus
+>   recorder is not initialized"`. **Not** the one-line wiring the earlier
+>   audit called it: `observability/metrics.h` is a facade that writes samples
+>   to stderr, with no registry and no text-exposition encoder, so a 200 is not
+>   reachable honestly and that estimate was wrong. It is registered anyway
+>   because the auth layer had exempted `/metrics` from authentication all
+>   along (`auth.cc:21`) while the router 404'd it — two layers contradicting
+>   each other — and because to a scraper 404 means "wrong path, fix your
+>   config" and 503 means "endpoint is there, backend not ready". Only the
+>   second is true. The two are now pinned to each other by a test.
+>
+>   And one divergence running the *other* way: `POST /sandboxes/{id}/exec`,
+>   which this port invented and answered with an unconditional 501. Upstream
+>   has no such endpoint — `openapi.yml` never mentions `exec`, and running a
+>   command reaches envd through the proxy as a data plane call. Removed with
+>   its handler and `ExecReq`/`ExecResp`: a 501 claims membership in an API
+>   this URL was never part of, and keeping it made `ApiImpl::Exec` look like a
+>   ported surface waiting for a backend when the whole shape was ours.
+>
+>   New `tests/test_api_routes.cc` asserts the table itself — a `Server` that
+>   records registrations instead of binding a socket — because nothing did.
+>   Every other API test calls `ApiImpl` directly, which is precisely why a
+>   handler no URL reaches looked identical to a wired one. 9 tests + 12 in
+>   `test_api_custom_extension_params.cc`; new harness
+>   `tests/mutate_api_custom_extension_params.py` at 18/18, mutating the
+>   registration as well as the mapping so that "the route is gone" is a
+>   mutation the suite can fail on.
+>
+>   **Still unserved:** 11 paths with no handler behind them (`/snapshots`,
+>   `/templates/{id}`, `/templates/aliases/{alias}`, `/sandboxes/{id}/timeout`,
+>   `/refreshes`, `/network`, `/connect`, the two metrics-by-sandbox routes)
+>   and the `/v2`, `/v3`-partial and builder-WebSocket groups. Those are
+>   missing implementations, not missing wiring.
+>
+> - **"the mapping table shows what was ported"** — 12 of the 131 concrete C++
+>   paths in `docs/RUST_TO_CPP_MAPPING.md` named files that do not exist:
+>   `src/snapshot/manager.cc`, `include/agentenv/image/image.h`,
+>   `src/p2p/all.cc` and others. Some were modules deliberately inlined
+>   elsewhere, some had been split into directories as the tree grew, one was
+>   missing a path prefix.
+>
+>   A wrong row is worse than a missing one. A missing row prompts a search; a
+>   row naming `src/snapshot/manager.cc` asserts the module landed in a
+>   specific place, and the only thing that disproves it is opening the file.
+>   Reviewing coverage from this table meant building on claims that had
+>   quietly stopped being true — so the rows now point at real locations, and
+>   `tests/check_mapping_doc.py` checks all 133 of them rather than trusting
+>   them.
+>
+>   Two code comments had rotted the same way, both asserting the
+>   startup-manifest recorder "is not ported" when
+>   `storage/ublk/startup_pack_recorder.cc` is right there. The missing piece
+>   is the *orchestration* — upstream's `firecracker/startup_pack.rs`, which
+>   reboots a fresh capture so the daemon-side recorder sees first-touch reads.
+>   Their conclusion held; their reason named the wrong component, which is how
+>   an honest note turns into a misleading one.
+>
 > - **"the volume operations are still stubs"** — the volume *module* is now a
 >   complete port: `VolumeManager` (create / empty + child backing / COW clone
 >   / materialize / publish / reserve / remove / fork), the durable record and
@@ -710,11 +798,14 @@ Legend: 🟩 behaviourally aligned + tested · 🟨 main path real, some branche
 | `sandbox/runtime_versions` | `src/sandbox/runtime_versions.rs` | The `--version` probes recorded with a snapshot. The *parsers* were already here (`snapshot/version.cc`) and tested — but nothing in production called them, so a capture recorded no runtime versions at all, and those versions are what a restore checks before resuming a VM against a kernel or VMM it was not captured on. **Only the envd probe is fatal**: the kernel and VMM readings are diagnostics and degrade to `"unknown"` with a warning, while the envd version gates whether a restored sandbox can reach its guest agent, so `"unknown"` there would let a resume proceed against an envd the snapshot was never captured against. The VMM is asked **on the host** and the other two **inside the sandbox** — collapsing the two injection points would run `firecracker --version` in the guest, where it does not exist — and the host probe keeps upstream's 5 s timeout, because an optional probe that hangs must not hang the capture. stdout and stderr are combined whichever way round they arrive, since firecracker has printed its version to either. Run sequentially rather than through `tokio::join!`: there is no async runtime here, and three short probes do not justify threads whose only effect is to reorder log lines |
 
 | `snapshot/image_export/{regctl,service}` | `src/snapshot/image_export/{regctl,service}.rs` | Rootfs image export: resolve the target, compare the deterministic manifest digest, upload only what the target lacks. **The three transfer shapes are a cost decision, not a correctness one** — a cross-repo `blob copy` within one registry moves no bytes, while `blob get \| blob put` across registries moves every one of them twice — so the tests assert the *argv* chosen per layer, since all three leave the blob in the right place. `BlobPipe` joins the two children with an OS pipe so a multi-gigabyte layer never enters this process; Rust pumps it with `tokio::io::copy`, which is the same memory guarantee by a different route, and the consequence of having no pump is that a truncated transfer surfaces as `put` failing its digest check rather than as a separate pump error. **An existing manifest at the ref is refused, never overwritten**: repointing the tag would orphan the manifest already there, making the layers it names collectable, and anyone pulling it would silently get different bytes — a tag is cheap to choose, an overwritten one is not recoverable. An identical digest is `reused` with nothing transferred. The manifest goes **last**, after every blob it names, because a manifest naming absent blobs is an image a puller cannot distinguish from a corrupt one. The `blob head` probe precedes every transfer, which for managed layers is the difference between reading a path and downloading gigabytes. An OSS-managed layer is recorded as an *external* ref carrying a synthetic `s3://` URL, and that marker has to win over the external branch or `regctl` would be aimed at a host serving no registry API; same-registry-and-repository with the blob absent is `ArtifactNotFound`, since there is nowhere to copy from. Managed layers are size-checked before upload — the registry would reject the digest anyway, but only after the bytes were sent and far from the cause. Rust's `ManagedLayerLocator` enum becomes an injected functor: its two arms are genuinely different operations (validate in place vs download) and this keeps the OSS client out of the header. **Both arms now exist**, wired by `ConfiguredSnapshotImageService::FromConfig` -- Rust's `from_global_config` -- which owns the repository the service only borrows and picks the backend by the declared `snapshot.repository_backend`, never by which `[backend.*]` section is present; that is the same selection bug `MakeRepositoryFromConfig` exists to fix, and without this wiring nothing in this port could export from an OSS node at all. The OSS arm shares the repository's own `OssClient` rather than building a second one, so a credential rotation is observed by both. Its two decisions -- remapping `ArtifactNotFound` to `ManagedLayerNotFound` so both arms answer alike, and the downloaded-size check -- are reachable as `FinishManagedLayerDownload` because `OssClient` is concrete and cannot be faked; the one `GetToFile` call between them stays uncovered, and is the only part of this module that is. `ExportRootfsImage` owns a scratch directory through an RAII guard so it is removed on every early return, and separates an unknown lookup (404) from a record whose build has not finished (invalid request) — collapsing them would answer "does not exist" for a template that is still building. An earlier revision of this row called the remaining gap a "`regctl`-vs-ACR exporter selection". That was a misreading: `SnapshotImageService` is a separate user-facing operation and was never an alternative the publish path chose between. The real selection lives in `store.rs` and is now ported -- see the `snapshot/publish` + `store` row. |
+| `snapshot/resolver` (`SnapshotRuntimeResolver` for any repository) | `src/snapshot/resolver.rs` | Upstream's resolver holds an `Arc<dyn Repository>` and serves every backend. This port had only `PosixFsRuntimeResolver`, constructed from a filesystem **root path**, so resume worked on `posix_fs` and answered 501 on `oss` -- a node that published snapshots and served volumes normally but could not launch from any snapshot it had published. The root-path constructor was the cause rather than a detail: a resolver that can only be built from a path cannot be built for a backend that has no paths. Replaced by `RepositoryRuntimeResolver`, which takes the `SnapshotRepository` itself; `MakeSnapshotBackendFromConfig` now builds one for whatever repository it built, and the `posixfs` variant is deleted rather than kept alongside. The precedent was already in the tree: `MaterializeVolumeBacking` on the **volume** side had been repository-generic all along, which is what makes the snapshot side an omission and not a deliberate scope cut. **`FetchBlob` was the missing half.** `LocateBlob` returns `Local` (read the bytes where they are) or `Remote` (they are only reachable by URL); the `Remote` arm tries P2P and then falls back to `FetchBlob` to download into the local cache. That fallback is upstream's `resolver.rs:198`. Here `FetchBlob` was implemented on both backends and called by nothing but tests, which is indistinguishable from "a capability held in reserve" until you look for the upstream caller -- it had one, so this was an unported branch, not a spare part. A `Local` result whose file is missing stays an error and never reaches for a peer: the repository said the bytes are addressable at that path, so a miss means corruption, and searching the network for them would turn a loud failure into a slow one. **`ArtifactNotFound` now survives the artifact cache.** The cache's fetch contract returns `Expected<uint64_t, std::string>`, so a `RepositoryError` crossing it was flattened to text and `MaterializeImageConfigError` -- whose whole job is to lift an `ArtifactNotFound` cause to the top level, as upstream does by downcasting out of the `anyhow` chain -- could never find one. Every missing managed layer was reported as a generic backend error. Fixed by carrying the typed cause out of the fetch functor by reference; covered by `a_managed_layer_the_repository_lacks_is_refused_before_a_config_is_written`, which is the first test to exercise that classification at all. **Deviations**, both recorded in code: `MakeSnapshotBackendFromConfig` passes a null `p2p_transport`, so the `Remote` arm always takes the `FetchBlob` fallback -- correct, just never the fast path; and `kLayerExistsConcurrency = 16` is kept as a constant but the existence probes run sequentially, since this tree has no task runtime for upstream's `buffer_unordered(16)` -- semantically equal, slower on a wide layer set. `memory_startup_pack` is deliberately **not** in this change: nothing in this tree consumes one and `ResolvedStartupPack` has no `LocalPath` variant to put it in, so porting it now would add exactly the zero-production-caller shape this row is about removing. A side effect of routing OSS through the same constructor: `[backend.oss] cache_max_size_gb` now takes effect, having previously been parsed and dropped |
+| `snapshot/artifact_cache` :: `ensure_cached_at` | `src/snapshot/artifact_cache.rs:139-226` | **A freshly fetched entry is now inserted pinned and returned directly**, as upstream does (`ref_count: 1`, then `return Ok(CacheHandle { .. })`). The port inserted it unpinned, ran eviction, then re-acquired it and `continue`d on failure. Two defects followed, both found because a resolver mutation made a test *hang* rather than fail: eviction could delete the file just fetched, since an unpinned entry is exactly what `EvictLru` takes; and `TryAcquire` drops an entry whose file is missing, so a fetch that reported success without writing its destination looped forever -- re-fetching, re-inserting, re-dropping. Upstream returns the handle and lets a missing file surface at the reader. `InsertEntry` became `InsertPinned`, its only caller. Covered by `a_fetch_that_writes_nothing_returns_once_instead_of_looping` and `an_entry_that_overflows_the_cache_is_not_evicted_before_it_is_returned`; both were run against the previous code and both hang there (killed at 20 s) |
 
 ### Removed rather than left in place
 
 - **`snapshot::Manager` / `snapshot::Repository` / `snapshot::MockRepository`** (6 files) were skeleton-era inventions that only referenced each other — zero callers tree-wide — yet still compiled. They were actively misleading: `snapshot/repository.h` declared a `class Repository` that shadows the real `SnapshotRepository` when reading, and `snapshot/manager.cc` hard-coded `/tmp/agentenv_snap_` with `created_at_ms = 0; // TODO: use system clock`. Anyone opening `src/snapshot/manager.cc` would conclude snapshot management was ported. `SnapshotMeta`, which existed only to serve them, went too.
 - **`MakePosixFsRepository(root_dir)`** took a repository root, ignored it, and returned an `InMemorySnapshotRepository`. A caller trusting the name got a repository whose every document call answered `unsupported operation: repository documents`, with its data nowhere near the root it passed in. Nothing called it — `main.cc` already builds `posixfs::PosixFsSnapshotRepository` directly, which is the only way to supply both the catalog and artifact stores the backend needs — so a factory that cannot take those is not a factory for this backend. Removed rather than repaired; `docs/ARCHITECTURE.md` had been describing the stub as a known limitation instead.
+- **`PosixFsRuntimeResolver`** (`snapshot/repository/posixfs/runtime.{h,cc}`) was not a stub -- it worked, and was the only resolver this tree had. It is gone because its shape was the defect: constructed from a repository **root path**, it could serve only backends whose bytes are reachable by path, which is why `oss` had no resolver and resume answered 501 there. Generalising it in place would have meant a class named for one backend holding an interface that abstracts over all of them. The header carried a note arguing the opposite -- that with no second caller, generalising would be speculative. That reasoning had it backwards: the second caller was missing *because* the resolver could not be built for it. See the `snapshot/resolver` row above.
 - **`AGENTENV_LOG` no longer takes varargs.** `AGENTENV_WARN("a=", a)` expanded to `_oss << "a=", a` — the comma operator, which evaluates `a` and discards it. That compiled silently and truncated the message at the first comma, so the one value worth logging was the one that vanished. Six such calls existed; the two in `repository/oss/lease.cc` were worse, passing `printf` format strings to a streaming macro, so the log would have read `key=%s holder=%s` with both values lost. `-Wunused-value` catches only the subset whose dropped argument has no side effect — it missed exactly those two — so the macro now takes one named parameter and every occurrence becomes a compile error instead.
 
 ### Known gaps
@@ -727,11 +818,18 @@ longer exist. A status table that has to be trusted on faith is worse than no
 table: it is what you consult *instead of* reading the code.
 
 What follows is the list of things upstream does that this tree does not, kept
-as a list of Rust paths so it can be checked against the source. The same
-applies to `docs/RUST_TO_CPP_MAPPING.md`, whose §11 file map is stale (it
-names `src/image/image.cc`, `src/api/dto/` and a single-file
-`src/snapshot/repository.cc`, none of which exist); read it for the idiom
-table, not for the layout.
+as a list of Rust paths so it can be checked against the source.
+
+`docs/RUST_TO_CPP_MAPPING.md` §11 used to carry the same warning, because its
+file map had drifted on both sides: twelve C++ paths named files that did not
+exist (`src/image/image.cc`, a single-file `src/snapshot/repository.cc`), and
+the Rust column had rotted too — `src/api/dto/*.rs` and
+`src/snapshot/repository/*.rs` are directories upstream does not have, and six
+rows annotated `(N files)` with an N the glob does not match. Both columns are
+now checked by `tests/check_mapping_doc.py` on every run, so the map can be
+read for layout again rather than only for the idiom table. A warning in prose
+is not a fix: it leaves the wrong rows in place and relies on the reader having
+seen the warning.
 
 **Absent entirely** — no corresponding symbol anywhere in this tree:
 
@@ -760,14 +858,15 @@ symbol finds it; grepping for its *callers* is what reveals the gap.
 
 | C++ symbol | Rust caller that has no counterpart | Consequence today |
 |---|---|---|
-| `setup::CheckEnvironment`, `setup::RaiseFileDescriptorLimit` | `setup::ensure_environment` steps 1-3, 5, 6 | `src/main.cc` runs only this function's *networking* steps (runtime dir, netns reclaim, IPv4-forwarding precondition, capacity report). The KVM/ublk/package validations and the `RLIMIT_NOFILE` raise never run, so a node with no `/dev/kvm` access or an unloaded ublk module gets past startup and fails later at the first launch, pointing at the launch instead of at the unmet prerequisite |
-| `setup::deps::Ensure`, `EnsureFirecracker`, `EnsureKernel`, `EnsureToolsVersion`, `InstallToolsImage` | `setup::ensure_environment` step 4 / `ensure_provisioning` | Nothing downloads or installs dependencies. The binaries and the tools drive have to be put in place out of band, and a missing one surfaces as a launch failure |
-| `setup::deps::WriteGeneratedOverlaybdGlobalConfigs` | `deps::write_generated_overlaybd_global_configs` | The overlaybd global configs the ublk daemon reads are never generated, so cache directories, credentials and the p2p facade address are whatever already exists on disk |
 | `sandbox::ublk::DeviceManager::GetOrCreateSharedTools` | `FirecrackerSandbox::prepare_tools_drive` | Dead code purely because its only caller is the unported `prepare_tools_drive`. Launch always attaches the ext4 tools file via `ResolvedToolsDrivePath`, so the overlaybd-image tools path -- and the page cache shared across sandboxes -- is unreachable |
 | `DefaultImageResolver::ResolveBuildkit`, `MakeBuildkitContentWire`, `MakeBuildkitControlWire` | `ImageBuildService::import_build_image` (`api/impls/image_build.rs`), driven by `api/image_build/worker.rs` | **The BuildKit path is unreachable in production and nothing calls it.** Two independent reasons, and both matter: the build *worker* is not ported, so there is no host to call `ResolveBuildkit` from; and this tree has **no gRPC transport at all**, so `BuildkitContent::Connect` always fails. `AGENTENV_WITH_GRPC` does *not* change that — there is no second, `#ifdef`-guarded implementation of the wire factories; tonic's counterpart would be grpc++, needing protobuf >= 3 and `grpc_cpp_plugin` to generate the BuildKit stubs, neither of which is carried. (An earlier comment in `buildkit_wire.cc` said the transport was "gated on `AGENTENV_WITH_GRPC`", which read as "flip the switch and it works"; corrected.) What *is* ported and tested is everything below the transport: the wire protocol itself, hand-rolled against `content.proto` / `build_history.proto`, exercised through the injected-wire constructors |
 | `cache::LocalImageServices::runtime_refs`, `cache::RuntimeImageRefs` | `Orchestrator::new_inner` (`orchestrator/service.rs:174,187`) | **`overlaybd_layers` has been removed from this row — it is now wired.** `MakeSnapshotBackendFromConfig` (`snapshot/repository/backends.cc`) returns the `(Repository, SnapshotRuntimeResolver)` pair upstream's `build_snapshot_backend_from_config` does, builds the resolver over `LocalImageServicesFromAppConfig(config).overlaybd_layers`, and `main.cc` hands the resolver to the API bundle, so `PosixFsRuntimeResolver` and `RuntimeImageMaterializer` now run on a live node and the `dir=`/`file=` placement decision is live. **Two earlier versions of this row were wrong and both corrections stand:** (1) it first claimed `src/image/resolver.cc:316` "drops two of three services" by taking only `.source_images` — wrong, `local_image_services_from_*` is a multi-caller factory upstream too and upstream's resolver likewise takes only the source image store; (2) it then claimed the gap could not be closed because `SnapshotManager` is unported — but only two of that struct's methods compose (`get` + `resolve_runnable`), and those are inlined as `ApiImpl::LoadRunnableSnapshot`, the rest being thin forwards to the repository or already present as the free functions in `snapshot/publish.h`. What genuinely remains: **the OSS backend gets no resolver** (`SnapshotBackend::runtime_resolver` is null there, and `POST /sandboxes` answers 501 on such a node) because this port has no generic `RepositoryRuntimeResolver`; and for `runtime_refs`, `src/orchestrator/service.cc` still records the pin/unpin lifecycle as "not ported" in three places |
 | `image::cache::OverlaybdLayerStore` / `OverlaybdLayerLocation` (`image/cache_layer_store.h`) | `src/image/cache/store.rs` — one `pub(crate) trait` | **Fixes a structural defect: the trait was declared twice.** `image::cache::OverlaybdLayerStore` (`image/cache_store.h`, implemented by `cache_store.cc`) and `snapshot::OverlaybdLayerStore` (`snapshot/runtime_support.h`, consumed by `RuntimeImageMaterializer` and `PosixFsRuntimeResolver`) carried byte-identical signatures — but two identical C++ types are still two types, so the implementation **could not be passed** to the consumer at all; the argument would not convert. Unified into a new header on the `image` side, which is both upstream's home for it and the only legal direction: `agentenv-snapshot` links `agentenv-image`, while `agentenv-image` may reach only `agentenv-snapshot-record` (the whole-library edge back would be a cycle, as `src/image/CMakeLists.txt` records). Its own header rather than the existing ones because both are too heavy — `cache_store.h` pulls in `cache_service.h`, `metadata.h`, `oci_image.h` and `sandbox/backend.h`, which would drag the whole image cache into every posixfs translation unit for two declarations needing none of it; this one includes `<cstdint>`, `<string>`, `<vector>` and nothing else. No alias was left behind for the old `snapshot::` spelling: one type, one name. The payoff is now covered by a test that previously **could not be written** — the cache's store driving the materializer, asserting the `file=`/`dir=` decision lands in the produced `image.json` (`tests/test_image_cache_service.cc`, with `tests/mutate_overlaybd_layer_store.py`). That test also compares against `LexicallyNormalizePath`-ed paths, because `LoadImageConfig` is read + `ResolveImageConfigLocalPaths` + validate exactly as upstream's `load_image_config` is; an earlier version compared raw strings and failed, and the production code was right |
 | `MakeOssRepository` | `snapshot/backends/mod.rs:90-104`, which selects a backend from `config.backend` | **Not the compression path** -- that is now wired end to end (`GetPublishPolicy` → `PrepareLayerUpload` → `CompactLayers`), and the operator's `[snapshot.publish_compression]` switch reaches it. The OSS *backend selection* is wired too: `main.cc` builds its repository through `MakeRepositoryFromConfig`, which picks on the declared `snapshot.repository_backend` rather than on which `[backend.*]` section happens to be present -- the earlier `backend.posix_fs.has_value()` branch silently sent an OSS-configured node to its local disk whenever a stale posix-fs section was also there, the ordinary state of a migrated node. So both halves of the OSS publish policy now reach a running node: the compression switch and `image_publish` (see the `snapshot/publish` + `store` row). Posix-fs still inherits the default policy -- raw and managed layers, exactly as upstream -- so neither switch has an effect there, which is upstream's behaviour and not a port gap |
+| `overlaybd::p2p::OverlaybdP2pRuntime::Started`, `FacadeConfigFromAppConfig`, `FacadeCore` (`overlaybd/p2p/{runtime,facade}.h`) | `OverlaybdP2pRuntime::start_from_app_config` (`src/bin/server.rs:91`), whose `read_facade_address()` feeds `ensure_environment` at `:94` and whose `publish_address()` feeds the ublk manager | **The overlaybd block-level P2P path is off on every node.** The facade's range/lookup/publish handlers are real and tested, but `main.cc` never starts the runtime: `Started` takes the addresses of a listener nobody binds, and `FacadeCore` has no route on any server. So `WriteGeneratedOverlaybdGlobalConfigs` is called with an empty address and writes `p2p.enable: false`, and overlaybd reads every missing block from the registry (`registryfs.cc` Range GETs, which *are* wired). The comment at that call used to blame the missing iroh transport; that was wrong -- `HttpP2pTransport::LocalEndpoint` always succeeds, so `FacadeConfigFromAppConfig` would enable the facade on any `http` node -- and has been corrected. Wiring it needs two things, not one: a bound listener for the facade, and moving the overlaybd-config step after transport startup, since upstream writes the configs only once the facade address exists and this port writes them before the transport is built. Image-*layer* P2P through the image cache is unaffected and is wired (see the `image` P2P transport startup hook row) |
+| `image::ImageCacheStore::MaintainRunning` -> `ImageCacheService::RunMaintenance` -> `RunGc` (`image/cache_store.cc:105`) | `Orchestrator::start_local_image_maintenance_task` (`orchestrator/service.rs:2361`, spawned at `:271`) with `collect_running_artifacts` | **No image-cache GC or capacity eviction ever runs on a live node**, so the cache only grows. The adapter is a line-for-line port of `store.rs::maintain_running` and the GC under it is tested; what is missing is everything above it: the periodic task (the same no-task-runtime gap as every background loop here), `collect_running_artifacts` (no counterpart at all), and the orchestrator's `image_refs` field itself -- which is also why `protect_image_refs`/`release_image_refs` (the runtime pins that keep a starting or paused sandbox's layers out of GC) have no callers. Adding the task alone would be unsafe: a GC with no pins and an empty running set would treat every cached layer as free |
+
+Three rows were removed from this table rather than updated: `setup::CheckEnvironment`/`RaiseFileDescriptorLimit`, `setup::deps::Ensure` and its `EnsureFirecracker`/`EnsureKernel`/`EnsureToolsVersion`/`InstallToolsImage`, and `WriteGeneratedOverlaybdGlobalConfigs`. Each said "never runs"; all are now called from the startup block in `src/main.cc` (`PrepareToolsImage` via the tools-drive binder), so the rows had become the misleading kind this table exists to prevent.
 
 **No longer in that table — the two breaks that stopped an end-to-end run.**
 Both had the same shape as the rows above: every part implemented and tested,

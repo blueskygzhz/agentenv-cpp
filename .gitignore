@@ -48,3 +48,6 @@ coverage/
 core
 core.*
 vgcore.*
+
+# Created when a mutation harness imports the shared residue guard.
+tests/__pycache__/

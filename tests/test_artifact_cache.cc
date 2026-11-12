@@ -311,4 +311,66 @@ MT_TEST(cache_artifact_lease_holds_handles) {
     MT_EXPECT_EQ(static_cast<int>(cache->EntryCount()), 1);
 }
 
+namespace {
+
+/// Reports success without writing `dest`, and optionally a size larger than
+/// the cache can hold.
+struct ClaimWithoutWriting {
+    uint64_t claimed;
+    int* call_count;
+    core::Expected<uint64_t, std::string> operator()(const std::string&) const {
+        ++(*call_count);
+        return claimed;
+    }
+};
+
+/// Writes a small body but reports `claimed` bytes, which is how a test puts
+/// the cache over a 1 GiB limit without writing a gigabyte.
+struct WriteButClaim {
+    uint64_t claimed;
+    int* call_count;
+    core::Expected<uint64_t, std::string> operator()(const std::string& dest) const {
+        ++(*call_count);
+        auto w = core::fs::Write(dest, "x");
+        if (!w.ok()) return core::make_unexpected(w.error());
+        return claimed;
+    }
+};
+
+}  // namespace
+
+// Rust inserts the fetched entry with `ref_count: 1` and returns its handle
+// directly. The port used to insert unpinned and re-acquire, and re-acquiring
+// drops an entry whose file is missing -- so a fetch that reported success
+// without writing looped forever. Under that code this test does not fail, it
+// hangs; the fetch count is what makes the loop visible once it returns.
+MT_TEST(a_fetch_that_writes_nothing_returns_once_instead_of_looping) {
+    TempRoot root;
+    auto cache = TestCache(root.path, 1);
+    MT_EXPECT_TRUE(cache != NULL);
+    int calls = 0;
+    ClaimWithoutWriting fetch = {7, &calls};
+    auto handle = cache->EnsureCached("artifacts/t1/vm_state.bin", fetch);
+    MT_EXPECT_TRUE(handle.ok());
+    MT_EXPECT_EQ(calls, 1);
+    if (handle.ok()) delete handle.value();
+}
+
+// The fetched entry is pinned before eviction runs, so a fetch that puts the
+// cache over its limit cannot have its own result evicted from under it.
+MT_TEST(an_entry_that_overflows_the_cache_is_not_evicted_before_it_is_returned) {
+    TempRoot root;
+    auto cache = TestCache(root.path, 1);
+    MT_EXPECT_TRUE(cache != NULL);
+    int calls = 0;
+    WriteButClaim fetch = {2ULL * 1024 * 1024 * 1024, &calls};
+    auto handle = cache->EnsureCached("artifacts/t1/vm_state.bin", fetch);
+    MT_EXPECT_TRUE(handle.ok());
+    if (!handle.ok()) return;
+    MT_EXPECT_EQ(calls, 1);
+    MT_EXPECT_TRUE(core::fs::Exists(handle.value()->path()));
+    MT_EXPECT_EQ(static_cast<int>(cache->EntryCount()), 1);
+    delete handle.value();
+}
+
 MT_MAIN

@@ -878,9 +878,12 @@ class FirecrackerSandboxBackend : public SandboxBackend {
     /// it; `TemplateBuilder` can drive this concrete type in the meantime.
     ///
     /// Upstream also returns an opaque `Box<dyn Any>` carrying the backend's
-    /// `FirecrackerSnapshotConfig` for the startup-manifest recorder to reboot
-    /// from. That recorder is not ported, so there is no consumer, and an
-    /// opaque payload nothing reads would only invite someone to downcast it.
+    /// `FirecrackerSnapshotConfig`, which `startup_pack.rs` uses to reboot the
+    /// capture and record a first-touch trace. That *orchestration* is not
+    /// ported — the daemon-side recorder it drives is
+    /// (`storage/ublk/startup_pack_recorder.cc`) — so there is no consumer,
+    /// and an opaque payload nothing reads would only invite someone to
+    /// downcast it.
     SandboxCaptureResult<SandboxSnapshotManifest> CaptureToDir(const std::string& at);
 
     /// Rust `resume` — `PATCH /vm {"state":"Resumed"}`.

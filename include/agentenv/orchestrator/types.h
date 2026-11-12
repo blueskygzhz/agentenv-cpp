@@ -249,6 +249,21 @@ struct OrchestratorError {
     SandboxOperation      operation = SandboxOperation::Build;  // op variants
     std::string           detail;          // source/message/timeout string
 
+    /// Rust `SandboxOperationFailed { source: anyhow::Error }` — the *typed*
+    /// causes, not just their text.
+    ///
+    /// `detail` already carries `source.chain()`, which is what `Message()`
+    /// and every log line read, and that is enough for anything that only
+    /// displays the failure. It is not enough to *classify* one: upstream's
+    /// API layer calls `err.chain().find_map(downcast_ref::<HookStatusError>)`
+    /// to tell a custom extension that rejected a request (4xx, the caller's
+    /// fault) from one that broke (5xx, ours), and flattening to a string
+    /// turns that into guesswork over a message format.
+    ///
+    /// Empty for every other variant and for failures that carry no typed
+    /// cause; `Find` on an empty error is well-defined and returns NULL.
+    core::AnyError source;
+
     /// `VirtualizationModeMismatch { resource, resource_mode, node_mode }` —
     /// `detail` carries `resource`.
     core::VirtualizationMode resource_mode = core::VirtualizationMode::Kvm;
@@ -265,6 +280,12 @@ struct OrchestratorError {
     static OrchestratorError SandboxOperationFailed(core::SandboxId id,
                                                     SandboxOperation op,
                                                     std::string source);
+    /// As above, keeping the typed causes. `detail` becomes `source.chain()`,
+    /// so every existing reader sees exactly what the string overload gives
+    /// them and only the classification above gains anything.
+    static OrchestratorError SandboxOperationFailed(core::SandboxId id,
+                                                    SandboxOperation op,
+                                                    const core::AnyError& source);
     static OrchestratorError SandboxOperationConflict(core::SandboxId id,
                                                       SandboxOperation op);
     static OrchestratorError StoreOperationFailed(std::string detail);

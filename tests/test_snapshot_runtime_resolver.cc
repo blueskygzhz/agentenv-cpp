@@ -33,7 +33,6 @@
 #include "agentenv/snapshot/repository/posixfs/backend.h"
 #include "agentenv/snapshot/repository/posixfs/catalog.h"
 #include "agentenv/snapshot/repository/posixfs/layout.h"
-#include "agentenv/snapshot/repository/posixfs/runtime.h"
 #include "agentenv/snapshot/resolver.h"
 
 using namespace agentenv;  // NOLINT
@@ -132,7 +131,7 @@ struct Fixture {
     std::shared_ptr<posixfs::PosixFsSnapshotRepository> repository;
     std::shared_ptr<snapshot::LocalArtifactCache> cache;
     FileBindingLayerStore store;
-    std::unique_ptr<posixfs::PosixFsRuntimeResolver> resolver;
+    std::unique_ptr<snapshot::RepositoryRuntimeResolver> resolver;
     snapshot::SnapshotRecord record;
     bool ready = false;
 
@@ -157,8 +156,13 @@ struct Fixture {
         MT_EXPECT_TRUE(made.ok());
         if (!made.ok()) return;        cache = made.value();
 
-        resolver.reset(new posixfs::PosixFsRuntimeResolver(root, tree.At("runtime"), &store,
-                                                           cache));
+        // Built from the repository rather than from `root`: the resolver
+        // asks `LocateBlob` where each artifact is, which is what lets the
+        // same class serve a bucket. A posix repository answers `Local` for
+        // everything, so these tests still exercise the in-place path.
+        resolver.reset(new snapshot::RepositoryRuntimeResolver(
+            repository, cache, tree.At("runtime"), &store,
+            std::shared_ptr<p2p::P2pTransport>()));
         ready = true;
     }
 
@@ -448,3 +452,257 @@ MT_TEST(a_posixfs_backend_without_its_section_is_refused) {
 }
 
 MT_MAIN
+
+// ---- a repository this node cannot mount -----------------------------------
+//
+// The case the resolver had been specialised out of existence for. Upstream's
+// one resolver serves every repository: `LocateBlob` says whether an artifact
+// is readable in place, and whatever is not gets fetched. The port instead had
+// a `PosixFsRuntimeResolver` built from a repository *root path*, which could
+// only ever be the in-place half -- so an OSS node got a null resolver and
+// answered 501 to every snapshot launch, and `SnapshotRepository::FetchBlob`,
+// whose entire purpose is reading a repository this node cannot mount, had no
+// production caller and so looked like a speculative capability.
+
+namespace {
+
+/// A repository whose bytes exist but are **not** reachable by path.
+///
+/// The OSS shape without needing a bucket: `LocateBlob` can only answer
+/// `Remote`, so every artifact has to be fetched. The bytes are really there
+/// -- a posix store underneath holds them -- and that is what makes the
+/// difference observable: a resolver that insists on reading in place fails on
+/// a repository that is perfectly healthy.
+class NonSharedRepository : public posixfs::PosixFsSnapshotRepository {
+ public:
+    NonSharedRepository(std::shared_ptr<posixfs::PosixFsCatalogStore> catalog,
+                        std::shared_ptr<posixfs::PosixFsArtifactStore> artifacts)
+        : posixfs::PosixFsSnapshotRepository(catalog, artifacts) {}
+
+    int fetch_blob_calls = 0;
+    int read_blob_calls = 0;
+    std::vector<std::string> fetch_destinations;
+    /// When set, `LocateBlob` answers `Local` at this path instead. Used to
+    /// model a shared mount that has gone missing while `FetchBlob` would
+    /// still succeed -- the one shape that tells "read in place" apart from
+    /// "fetch whenever the file is not there".
+    core::Optional<std::string> local_path_override;
+
+    /// `Remote`, as an object store must be: the bytes are addressed by URL
+    /// and no path on this node names them.
+    repo::RepositoryResult<repo::BlobLocation> LocateBlob(
+        const repo::BlobKey& /*key*/) const override {
+        if (local_path_override.has_value()) {
+            return repo::BlobLocation::Local(*local_path_override);
+        }
+        return repo::BlobLocation::Remote("https://example.invalid/blob");
+    }
+
+    /// The real copy, counted. Reads through the posix store underneath, which
+    /// stands in for the network transfer an OSS backend would perform.
+    repo::RepositoryResult<uint64_t> FetchBlob(const repo::BlobKey& key,
+                                               const std::string& destination) override {
+        ++fetch_blob_calls;
+        fetch_destinations.push_back(destination);
+        const repo::RepositoryResult<std::string> bytes =
+            posixfs::PosixFsSnapshotRepository::ReadBlob(key);
+        if (!bytes.ok()) return core::make_unexpected(bytes.error());
+        const core::Expected<core::Unit, std::string> written =
+            core::fs::WriteAtomically(destination, bytes.value(), "fetched blob");
+        if (!written.ok()) {
+            return core::make_unexpected(
+                repo::RepositoryError::Backend("fetch", written.error()));
+        }
+        return static_cast<uint64_t>(bytes.value().size());
+    }
+
+    repo::RepositoryResult<std::string> ReadBlob(const repo::BlobKey& key) override {
+        ++read_blob_calls;
+        return posixfs::PosixFsSnapshotRepository::ReadBlob(key);
+    }
+
+    /// An object store addresses managed layers by URL rather than by path,
+    /// which is what lets overlaybd read them with nothing mounted.
+    core::Optional<std::string> ManagedLayersRepoBlobUrl() const override {
+        return core::Optional<std::string>(std::string("https://example.invalid/layers"));
+    }
+};
+
+/// The same published snapshot as `Fixture`, resolved through a repository
+/// that cannot be read by path.
+struct NonSharedFixture {
+    TempTree tree;
+    std::shared_ptr<NonSharedRepository> repository;
+    std::shared_ptr<snapshot::LocalArtifactCache> cache;
+    FileBindingLayerStore store;
+    std::unique_ptr<snapshot::RepositoryRuntimeResolver> resolver;
+    snapshot::SnapshotRecord record;
+    bool ready = false;
+
+    NonSharedFixture() {
+        const std::string root = tree.At("repository");
+        repository = std::make_shared<NonSharedRepository>(
+            std::make_shared<posixfs::PosixFsCatalogStore>(root),
+            std::make_shared<posixfs::PosixFsArtifactStore>(root));
+
+        Capture capture(tree.At("capture"));
+        const repo::RepositoryResult<snapshot::SnapshotPublication> published =
+            snapshot::Publish(*repository, PublishMetadata(), capture.manifest);
+        MT_EXPECT_TRUE(published.ok());
+        if (!published.ok()) {
+            MT_EXPECT_EQ(published.error().ToString(), std::string(""));
+            return;
+        }
+        record = published.value().record;
+
+        const core::Expected<std::shared_ptr<snapshot::LocalArtifactCache>, std::string> made =
+            snapshot::LocalArtifactCache::New(tree.At("cache"), false, 0);
+        MT_EXPECT_TRUE(made.ok());
+        if (!made.ok()) return;
+        cache = made.value();
+
+        resolver.reset(new snapshot::RepositoryRuntimeResolver(
+            repository, cache, tree.At("runtime"), &store,
+            std::shared_ptr<p2p::P2pTransport>()));
+        ready = true;
+    }
+};
+
+}  // namespace
+
+MT_TEST(a_repository_this_node_cannot_mount_still_resolves) {
+    // The 501 this replaces. Nothing about this snapshot is broken -- it
+    // published fine and its bytes are retrievable -- it simply cannot be read
+    // by path, which is the normal state of every object-store backend.
+    NonSharedFixture f;
+    if (!f.ready) return;
+
+    snapshot::SnapshotRuntimeResolver& seam = *f.resolver;
+    const repo::RepositoryResult<snapshot::RunnableSnapshot> runnable = seam.Resolve(f.record);
+    MT_EXPECT_TRUE(runnable.ok());
+    if (!runnable.ok()) {
+        MT_EXPECT_EQ(runnable.error().ToString(), std::string(""));
+        return;
+    }
+    MT_EXPECT_TRUE(!runnable.value().manifest.vm_state.path.empty());
+}
+
+MT_TEST(the_vm_state_of_an_unmountable_repository_comes_through_fetch_blob) {
+    // `FetchBlob`'s one production call site. It is reached for the vm state
+    // and nothing else: a memory dump is far too large to hold in memory, so
+    // it goes to a file, while the small JSON manifest is read into memory by
+    // `ReadBlob` instead.
+    NonSharedFixture f;
+    if (!f.ready) return;
+
+    const repo::RepositoryResult<snapshot::RunnableSnapshot> runnable =
+        f.resolver->Resolve(f.record);
+    MT_EXPECT_TRUE(runnable.ok());
+    if (!runnable.ok()) return;
+
+    MT_EXPECT_EQ(f.repository->fetch_blob_calls, 1);
+    // The manifest took the in-memory path rather than a second file fetch.
+    MT_EXPECT_TRUE(f.repository->read_blob_calls >= 1);
+
+    // Fetched into the node-local cache rather than beside the repository: the
+    // destination is the cache's, which is what makes the copy reclaimable and
+    // keeps a shared store read-only.
+    MT_EXPECT_EQ(f.repository->fetch_destinations.size(), static_cast<std::size_t>(1));
+    if (f.repository->fetch_destinations.size() != 1) return;
+    MT_EXPECT_TRUE(f.repository->fetch_destinations[0].find(f.tree.At("cache")) == 0);
+    // And the manifest points the launch at that fetched copy.
+    MT_EXPECT_EQ(runnable.value().manifest.vm_state.path, f.repository->fetch_destinations[0]);
+}
+
+MT_TEST(a_local_blob_missing_in_place_is_an_error_and_never_fetched) {
+    // Rust `resolver.rs`: `BlobLocation::Local` is read where it is, and a
+    // missing file there is `ArtifactNotFound`. It never falls through to the
+    // fetch path. The repository has said the bytes are on a mount this node
+    // shares; if they are not, the mount is broken, and quietly downloading a
+    // copy would hide that for as long as a copy could be found.
+    //
+    // `FetchBlob` here would succeed -- the bytes are in the store underneath
+    // -- which is the point: a resolver that "falls back" passes every other
+    // test in this file, because on a real posix backend the fetch reads the
+    // same missing file and fails anyway.
+    NonSharedFixture f;
+    if (!f.ready) return;
+    f.repository->local_path_override =
+        core::Optional<std::string>(f.tree.At("gone/vm_state.bin"));
+
+    const repo::RepositoryResult<snapshot::RunnableSnapshot> runnable =
+        f.resolver->Resolve(f.record);
+    MT_EXPECT_TRUE(!runnable.ok());
+    if (runnable.ok()) return;
+    MT_EXPECT_TRUE(runnable.error().kind == repo::RepositoryErrorKind::ArtifactNotFound);
+    MT_EXPECT_EQ(f.repository->fetch_blob_calls, 0);
+}
+
+MT_TEST(resolving_twice_fetches_the_vm_state_once) {
+    // Why the fetch goes through the cache rather than straight to a
+    // destination path. Two sandboxes launching from one snapshot -- the
+    // ordinary case for a template -- must not each pull the memory dump
+    // across the network.
+    NonSharedFixture f;
+    if (!f.ready) return;
+
+    MT_EXPECT_TRUE(f.resolver->Resolve(f.record).ok());
+    MT_EXPECT_EQ(f.repository->fetch_blob_calls, 1);
+
+    const repo::RepositoryResult<snapshot::RunnableSnapshot> again =
+        f.resolver->Resolve(f.record);
+    MT_EXPECT_TRUE(again.ok());
+    MT_EXPECT_EQ(f.repository->fetch_blob_calls, 1);
+}
+
+MT_TEST(an_unmountable_repository_addresses_managed_layers_by_url) {
+    // The layer half of the same split. A posix repository fills `file=` so
+    // overlaybd reads the layer in place; an object store cannot, so layers
+    // are addressed by digest against the repository's `repoBlobUrl`. The
+    // predecessor resolved layers by composing its root with the posix layout
+    // and demanding the file exist there, which is exactly what an object
+    // store cannot satisfy.
+    NonSharedFixture f;
+    if (!f.ready) return;
+
+    const repo::RepositoryResult<snapshot::RunnableSnapshot> runnable =
+        f.resolver->Resolve(f.record);
+    MT_EXPECT_TRUE(runnable.ok());
+    if (!runnable.ok()) {
+        MT_EXPECT_EQ(runnable.error().ToString(), std::string(""));
+        return;
+    }
+
+    const core::Expected<std::string, std::string> config =
+        core::fs::ReadToString(runnable.value().manifest.rootfs.image_config_path);
+    MT_EXPECT_TRUE(config.ok());
+    if (!config.ok()) return;
+    MT_EXPECT_TRUE(config.value().find("example.invalid/layers") != std::string::npos);
+}
+
+MT_TEST(a_managed_layer_the_repository_lacks_is_refused_before_a_config_is_written) {
+    // Rust `validate_managed_layers`. Checked up front rather than left to the
+    // launch: a written `image.json` naming a layer that is not stored fails
+    // as an overlaybd mount error at boot, far from the missing digest, and
+    // the cache would have pinned that config for every later resolve.
+    Fixture f;
+    if (!f.ready) return;
+
+    snapshot::SnapshotRecord broken = f.record;
+    MT_EXPECT_TRUE(broken.committed.has_value());
+    if (!broken.committed.has_value()) return;
+    snapshot::ManagedLayer absent;
+    absent.digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    absent.size   = 4096;
+    broken.committed->rootfs_layers.push_back(snapshot::OverlaybdLayerRef::Managed(absent));
+
+    const repo::RepositoryResult<snapshot::RunnableSnapshot> runnable =
+        f.resolver->Resolve(broken);
+    MT_EXPECT_TRUE(!runnable.ok());
+    if (runnable.ok()) return;
+    MT_EXPECT_TRUE(runnable.error().kind == repo::RepositoryErrorKind::ArtifactNotFound);
+    // The index is in the message: a digest alone does not say *which* layer
+    // of a rootfs chain is gone, which is what makes a partially published
+    // snapshot diagnosable.
+    MT_EXPECT_TRUE(runnable.error().ToString().find("managed layer 1") != std::string::npos);
+}

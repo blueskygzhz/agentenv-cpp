@@ -264,6 +264,11 @@ agentenv_add_test(test_api_attached_drives test_api_attached_drives.cc agentenv-
 agentenv_add_test(test_api_auth           test_api_auth.cc            agentenv-api)
 # Rust: src/api/impls/admin.rs
 agentenv_add_test(test_api_admin          test_api_admin.cc           agentenv-api)
+# Rust: src/api/mod.rs + src/api/server.rs -- the route table itself
+agentenv_add_test(test_api_routes         test_api_routes.cc          agentenv-api agentenv-orchestrator)
+# Rust: src/api/impls/sandbox.rs :: sandboxes_sandbox_id_custom_extension_params_{get,patch}
+agentenv_add_test(test_api_custom_extension_params test_api_custom_extension_params.cc
+                  agentenv-api agentenv-orchestrator)
 # Rust: src/api/impls/sandbox.rs :: sandboxes_sandbox_id_fork_post
 agentenv_add_test(test_api_sandbox_fork   test_api_sandbox_fork.cc   agentenv-api agentenv-orchestrator)
 # Rust: src/api/impls/sandbox.rs :: prepare_volume_fork_specs

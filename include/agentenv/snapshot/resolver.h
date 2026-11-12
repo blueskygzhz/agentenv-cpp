@@ -26,13 +26,23 @@
 #define AGENTENV_SNAPSHOT_RESOLVER_H_
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "agentenv/sandbox/manifest.h"
 #include "agentenv/snapshot/artifact_cache.h"
+#include "agentenv/snapshot/drive.h"
 #include "agentenv/snapshot/record.h"
 #include "agentenv/snapshot/repository/errors.h"
+#include "agentenv/snapshot/repository/interfaces.h"
+#include "agentenv/snapshot/runtime_support.h"
+#include "agentenv/snapshot/types.h"
+#include "agentenv/storage/overlaybd/config.h"
 
 namespace agentenv {
+namespace p2p {
+class P2pTransport;
+}
 namespace snapshot {
 
 /// Rust `struct RunnableSnapshot` — the record, the hydrated node-local
@@ -73,6 +83,96 @@ class SnapshotRuntimeResolver {
     /// is no ownership to share.
     virtual repository::RepositoryResult<RunnableSnapshot> Resolve(
         const SnapshotRecord& snapshot) = 0;
+};
+
+/// Rust `RepositoryRuntimeResolver` — **one resolver serves every
+/// repository**, which is upstream's opening sentence for this file and the
+/// property the port had lost.
+///
+/// What it replaces. There used to be a `PosixFsRuntimeResolver`, built from a
+/// *repository root path*, that found every artifact by composing that root
+/// with the posix-fs layout. Nothing upstream has that shape: its
+/// `PosixFsBackend` constructs this generic type like every other backend. The
+/// consequences of the deviation were not cosmetic:
+///
+///   * an OSS node got **no resolver at all**, so `POST /sandboxes` answered
+///     501 for every snapshot. It could publish snapshots it could never
+///     launch — and the node said so only in a startup warning.
+///   * `SnapshotRepository::FetchBlob` lost its one production caller.
+///     `FetchBlob` exists precisely so a node that cannot mount the
+///     repository can still read it, and the only code that needed it was the
+///     resolver, which had been specialised to the case where mounting always
+///     works.
+///
+/// How it decides, in upstream's words: files a backend can read in place are
+/// used where they are, everything else is fetched P2P-first into the
+/// node-local cache. `LocateBlob` draws that line — a `Local` answer is read
+/// at its path, a `Remote` one is fetched. **A missing in-place file is an
+/// error, never a reason to fetch from peers**: if the repository says it
+/// holds the bytes at a path, a node that cannot see them there is
+/// misconfigured, and silently sourcing them from a peer would hide that for
+/// as long as some peer still had a copy.
+class RepositoryRuntimeResolver : public SnapshotRuntimeResolver {
+ public:
+    /// `p2p_transport` may be null, which simply disables the peer-first leg
+    /// and leaves the repository fetch — the transport is an accelerator, not
+    /// a source of truth.
+    ///
+    /// `store` is a **raw** pointer because `RuntimeImageMaterializer` takes
+    /// one; whatever owns it must outlive this resolver. `SnapshotBackend`
+    /// holds the owning `shared_ptr` for exactly that reason.
+    RepositoryRuntimeResolver(
+        std::shared_ptr<repository::SnapshotRepository> repository,
+        std::shared_ptr<LocalArtifactCache> cache,
+        const std::string& runtime_root,
+        const image::cache::OverlaybdLayerStore* store,
+        std::shared_ptr<p2p::P2pTransport> p2p_transport);
+
+    repository::RepositoryResult<RunnableSnapshot> Resolve(
+        const SnapshotRecord& snapshot) override;
+
+    /// Public only because `RuntimeImageMaterializer` reaches it through a
+    /// C-style callback (`ResolveManagedFn`), which cannot name a private
+    /// member.
+    repository::RepositoryResult<storage::overlaybd::LayerConfig>
+        ResolveManagedLayer(const ManagedLayer& layer, repository::LayerRole role) const;
+
+ private:
+    /// Rust `vm_state_path` — the one path that calls `FetchBlob`.
+    repository::RepositoryResult<std::string>
+        VmStatePath(const core::SnapshotId& id, CacheArtifactLease* lease);
+    /// Rust `load_firecracker_manifest`.
+    repository::RepositoryResult<sandbox::SandboxSnapshotManifest>
+        LoadFirecrackerManifest(const core::SnapshotId& id);
+    /// Rust `resolve_attached_drives`.
+    repository::RepositoryResult<std::vector<ResolvedAttachedDrive> >
+        ResolveAttachedDrives(const core::SnapshotId& id, const CommittedSnapshot& snapshot,
+                              CacheArtifactLease* lease);
+
+    /// Describes one `materialize_and_pin` call.
+    struct MaterializeSpec {
+        std::string              label;
+        std::string              cache_key;
+        repository::LayerRole    role;
+        bool                     allow_empty_layers;
+        MaterializeSpec() : role(repository::LayerRole::Rootfs), allow_empty_layers(false) {}
+    };
+
+    /// Rust `materialize_and_pin`.
+    repository::RepositoryResult<std::string>
+        MaterializeAndPin(const std::vector<OverlaybdLayerRef>& layers,
+                          const std::string& destination, const MaterializeSpec& spec,
+                          CacheArtifactLease* lease);
+    /// Rust `materialize_image_config` — validates every managed layer is
+    /// stored, then writes the config.
+    repository::RepositoryResult<std::string>
+        MaterializeImageConfig(const std::vector<OverlaybdLayerRef>& layers,
+                               const std::string& destination, const MaterializeSpec& spec);
+
+    std::shared_ptr<repository::SnapshotRepository> repository_;
+    std::shared_ptr<LocalArtifactCache>             cache_;
+    RuntimeImageMaterializer                        image_materializer_;
+    std::shared_ptr<p2p::P2pTransport>              p2p_transport_;
 };
 
 }  // namespace snapshot
