@@ -17,12 +17,22 @@ add_library(agentenv-overlaybd-p2p STATIC
     p2p/artifact.cc
     p2p/cache.cc
     p2p/facade.cc
+    p2p/http_routes.cc
+    p2p/origin_fetcher.cc
     p2p/runtime.cc
 )
 target_include_directories(agentenv-overlaybd-p2p PUBLIC ${CMAKE_SOURCE_DIR}/include)
 # `cfg` for AppConfig-driven facade configuration, `p2p` for the transport.
+#
+# `agentenv-overlaybd` is for `origin_fetcher.cc`: the origin fallback needs a
+# TLS-capable ranged GET, and that library holds the libcurl-backed client the
+# registry reader already uses. One-way, as with `agentenv-overlaybd-compact`
+# -- `agentenv-overlaybd` does not know about this target -- so it adds no
+# cycle. The server stays injected (`FacadeServer`) because `agentenv-api`
+# reaches this library transitively and depending on it would be a real cycle.
 target_link_libraries(agentenv-overlaybd-p2p PUBLIC
     agentenv-core
     agentenv-p2p
     agentenv-cfg
+    agentenv-overlaybd
 )

@@ -4,22 +4,33 @@
 #ifndef AGENTENV_SNAPSHOT_PUBLISH_H_
 #define AGENTENV_SNAPSHOT_PUBLISH_H_
 
+#include <memory>
+#include <vector>
+
 #include "agentenv/sandbox/manifest.h"
 #include "agentenv/snapshot/record.h"
 #include "agentenv/snapshot/repository/interfaces.h"
 #include "agentenv/snapshot/store.h"
 
 namespace agentenv {
+namespace p2p {
+class P2pTransport;
+}  // namespace p2p
+
 namespace snapshot {
 
 /// Rust `struct SnapshotPublication` — a committed snapshot.
-///
-/// Rust also carries `local_layers`, the upload files kept alive for
-/// post-commit P2P announcement. That transport is not ported, and an empty
-/// field here would imply it could be populated. Temporary paths are never
-/// stored in the durable record either way.
 struct SnapshotPublication {
     SnapshotRecord record;
+
+    /// Rust `local_layers` — the upload files kept alive for the post-commit
+    /// P2P announcement, straight from `StoredSnapshot`.
+    ///
+    /// Not part of the durable record: these are node-local paths, some of
+    /// them temporaries. Holding them is what keeps a recontainerized or
+    /// dense-exported layer's bytes on disk between the commit and
+    /// `PublishSnapshotP2pArtifacts`.
+    std::vector<PreparedLayerUpload> local_layers;
 };
 
 /// Rust `publish`.
@@ -63,6 +74,36 @@ repository::RepositoryResult<SnapshotPublication> Publish(
     repository::SnapshotRepository& repository, const SnapshotPublishMetadata& metadata,
     const sandbox::SandboxSnapshotManifest& manifest,
     const SourceRegistryExporter& exporter);
+
+/// Rust `SnapshotManager::publish_p2p_artifacts` — best-effort announcement of
+/// a committed snapshot's artifacts to the P2P network.
+///
+/// Runs **after** the commit, never before, and never affects the publish
+/// result: every failure is logged and stepped over, because P2P is an
+/// optional acceleration path and a snapshot that cannot be announced is still
+/// a usable snapshot. A null `transport` returns immediately, as does a record
+/// that is not committed.
+///
+/// There is no `SnapshotManager` in this port (see `api/impls.h`), so this is a
+/// free function over the pieces upstream's manager holds as fields. What gets
+/// announced:
+///
+///   1. `vm_state.bin`, by its per-snapshot key, read from the capture path.
+///   2. The serialised manifest, as bytes — compact JSON, matching upstream's
+///      `serde_json::to_vec`, and so **not** byte-identical to the pretty copy
+///      `StoreSnapshot` writes into the repository. Upstream has the same
+///      split; the key does not depend on the bytes.
+///   3. `publication.local_layers`, content-addressed. These describe the
+///      committed bytes, including compressed and dense-exported ones.
+///   4. Every local overlaybd layer the runtime image configs reference, for
+///      rootfs, memory and each attached drive, gated by the digests and
+///      uuids the committed record actually names.
+///
+/// Deduplicated by key, because an unchanged local layer appears in both the
+/// uploads and the image config.
+void PublishSnapshotP2pArtifacts(const std::shared_ptr<p2p::P2pTransport>& transport,
+                                 const SnapshotPublication& publication,
+                                 const sandbox::SandboxSnapshotManifest& manifest);
 
 }  // namespace snapshot
 }  // namespace agentenv

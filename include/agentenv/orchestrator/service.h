@@ -38,6 +38,20 @@
 #include "agentenv/volume.h"
 
 namespace agentenv {
+
+/// Rust `use crate::image::cache::{RuntimeImageOwner, RuntimeImageRefs}`.
+///
+/// Declared rather than included: `image/cache_store.h` pulls the whole image
+/// cache service in, and all this header needs is a pointer to the port and
+/// the owner type the reconcile names. The one translation unit that calls
+/// through them includes the real header.
+namespace image {
+namespace cache {
+class RuntimeImageRefs;
+struct RuntimeImageOwner;
+}  // namespace cache
+}  // namespace image
+
 namespace orchestrator {
 
 /// Rust: `const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60)`.
@@ -225,9 +239,14 @@ class Orchestrator {
     /// seed, so `LoadOrCreate` is told the seed must already exist.
     ///
     /// Rust reads `ConfigManager::global_config()`; the config is a parameter
-    /// here so a test can supply its own. Not started (their subsystems are
-    /// not ported): the metrics and auto-evict tasks, and the paused
-    /// image-protection reconcile that gates local image maintenance.
+    /// here so a test can supply its own. Not started (its subsystem is not
+    /// ported): the metrics task.
+    ///
+    /// Local image maintenance is started the way upstream does
+    /// (`service.rs:263-284`): only when `image.cache.gc.enabled`, and only
+    /// after `ReconcilePausedAtStartup` succeeds. That gate is fail-closed —
+    /// a failed reconcile leaves maintenance off rather than letting a GC pass
+    /// run against protection it could not establish.
     static OrchestratorResult<std::shared_ptr<Orchestrator> >
         New(std::shared_ptr<MetadataStore> store,
             std::shared_ptr<sandbox::SandboxBackendFactory> factory,
@@ -420,6 +439,70 @@ class Orchestrator {
     /// `IsShuttingDown`" — the second is what upstream does *not* do, and
     /// without this a test for the first passes either way.
     bool AutoEvictTaskRunning() const { return auto_evict_thread_.joinable(); }
+
+    // ---- local image maintenance (Rust: image_refs + its sweep) -----------
+
+    /// Rust's `image_refs: Arc<dyn RuntimeImageRefs>` constructor field.
+    ///
+    /// A setter rather than a constructor parameter, matching how this port
+    /// already installs `volume_manager` and the access-token generator: the
+    /// three `Orchestrator` constructors and every test that calls them would
+    /// otherwise all have to name a port only the maintenance sweep uses.
+    ///
+    /// `New` installs the production one from config. Left null the sweep
+    /// cannot be started at all, which is why `StartLocalImageMaintenanceTask`
+    /// refuses instead of running against nothing.
+    void SetRuntimeImageRefs(std::shared_ptr<image::cache::RuntimeImageRefs> refs);
+
+    /// Rust `collect_running_artifacts` — the running set's local runtime
+    /// artifacts, as the maintenance pass's liveness input.
+    ///
+    /// Snapshots the handle map under its own lock and only then locks each
+    /// sandbox, exactly as upstream does: a lifecycle operation holds the
+    /// per-sandbox lock across a VMM call, and holding the map lock while
+    /// waiting for one would block every other sandbox's registration.
+    ///
+    /// Unlike the metrics sweep this *waits* for each sandbox rather than
+    /// skipping a contended one. A skipped sandbox is missing from the live
+    /// set, and GC treats a missing owner as collectable — it would delete
+    /// layers out from under a running VM.
+    std::vector<std::pair<core::SandboxId, sandbox::RuntimeArtifactSet> >
+        CollectRunningArtifacts() const;
+
+    /// Rust `reconcile_paused_at_startup` — durably protect every restored
+    /// paused sandbox, then drop paused protection no restored sandbox claims.
+    ///
+    /// Fail-closed: the caller must not start maintenance when this fails.
+    /// Protection is established *before* the reconcile so a paused sandbox
+    /// restored from the previous run cannot be seen as orphaned by its own
+    /// reconcile.
+    OrchestratorResult<core::Unit> ReconcilePausedAtStartup(
+        const std::vector<std::pair<core::SandboxId,
+                                    std::shared_ptr<sandbox::PausedSandboxState> > >&
+            restored_paused);
+
+    /// Rust `start_local_image_maintenance_task` — the only production driver
+    /// of image-cache capacity eviction and GC.
+    ///
+    /// Without it `ImageCacheService::RunMaintenance`, `RunGc`,
+    /// `EvictSourceConfigsOverCapacity` and `ReclaimStaleIndexes` were all
+    /// unreachable outside tests: `image.cache.gc` was parsed, watermarks were
+    /// computed, holds were written, and the cache still grew without bound
+    /// for the life of the process.
+    ///
+    /// `interval_secs` is upstream's `gc.interval` (a `Duration` there, whole
+    /// seconds in this config). Idempotent, like `StartAutoEvictTask`, and a
+    /// no-op without a `RuntimeImageRefs` port.
+    void StartLocalImageMaintenanceTask(uint64_t interval_secs);
+
+    /// Stops and joins the maintenance thread. Called by `Shutdown` and the
+    /// destructor; safe twice and safe having never started.
+    void StopLocalImageMaintenanceTask();
+
+    /// Whether the maintenance thread is still joined to this orchestrator.
+    bool LocalImageMaintenanceTaskRunning() const {
+        return local_image_maintenance_thread_.joinable();
+    }
 
     /// Rust `deletion_progress` — the per-sandbox delete phase, created on
     /// first use. Shared with auto-eviction so both take the same lock.
@@ -630,6 +713,12 @@ class Orchestrator {
     const OrchestratorCounters& counters() const { return counters_; }
 
  private:
+    /// Rust `protect_image_refs` — pin one owner's artifacts, turning the
+    /// port's string error into `InternalError` with the same context prefix.
+    OrchestratorResult<core::Unit> ProtectImageRefs(
+        const image::cache::RuntimeImageOwner& owner,
+        const sandbox::RuntimeArtifactSet& artifacts, const char* context);
+
     /// Rust `build_sandbox` — dispatches the plan onto the backend factory.
     core::Expected<std::unique_ptr<sandbox::SandboxBackend>, OrchestratorError>
         BuildSandbox(const LaunchPlan& plan);
@@ -776,6 +865,21 @@ class Orchestrator {
     mutable std::mutex                    auto_evict_mu_;
     std::condition_variable               auto_evict_cv_;
     bool                                  auto_evict_stop_ = false;
+
+    /// Rust `image_refs: Arc<dyn RuntimeImageRefs>`. Null until installed:
+    /// upstream's is non-optional because its constructor always builds one,
+    /// and the sweep here is skipped rather than crashing without it.
+    std::shared_ptr<image::cache::RuntimeImageRefs> image_refs_;
+
+    /// Rust's `start_local_image_maintenance_task` task and the
+    /// `watch::Receiver<bool>` it selects on. A second set of primitives
+    /// rather than sharing the auto-evict ones: the two sweeps run on
+    /// different intervals, and one waiting out the other's tick would make a
+    /// 1800s GC interval delay a 1000ms eviction.
+    std::thread                           local_image_maintenance_thread_;
+    mutable std::mutex                    local_image_maintenance_mu_;
+    std::condition_variable               local_image_maintenance_cv_;
+    bool                                  local_image_maintenance_stop_ = false;
 
     /// Rust `deletions: Mutex<HashMap<SandboxId, Arc<Mutex<DeleteProgress>>>>`.
     mutable std::mutex                          deletions_mu_;

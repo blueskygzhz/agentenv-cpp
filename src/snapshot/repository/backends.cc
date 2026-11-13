@@ -246,7 +246,8 @@ RepositoryResult<std::shared_ptr<SnapshotRepository> > MakeRepositoryFromConfig(
         RepositoryError::InvalidRequest("unknown snapshot.repository_backend"));
 }
 
-RepositoryResult<SnapshotBackend> MakeSnapshotBackendFromConfig(const cfg::AppConfig& config) {
+RepositoryResult<SnapshotBackend> MakeSnapshotBackendFromConfig(
+    const cfg::AppConfig& config, std::shared_ptr<p2p::P2pTransport> p2p_transport) {
     SnapshotBackend backend;
 
     const RepositoryResult<std::shared_ptr<SnapshotRepository> > repository =
@@ -294,17 +295,36 @@ RepositoryResult<SnapshotBackend> MakeSnapshotBackendFromConfig(const cfg::AppCo
     // `backend.overlaybd_layers` holds the owner: the resolver borrows it for
     // its whole life.
     //
-    // **Deviation**: `p2p_transport` is null. Upstream threads one in from
-    // `build_snapshot_backend_from_config`'s caller, and this function has no
-    // transport to pass -- the P2P node is constructed later in `main`. The
-    // consequence is bounded and is the leg upstream itself treats as
-    // best-effort: every remote artifact comes from the repository rather
-    // than from a peer that may already hold it, costing bandwidth and not
-    // correctness. Recorded rather than left looking deliberate.
+    // Rust `server.rs:107`: `config.snapshot.p2p_enabled.then(|| transport)`.
+    //
+    // This argument used to be hardcoded null, with a note explaining that
+    // `main` built the P2P node *after* this call and so had nothing to pass.
+    // That ordering was itself the deviation -- upstream resolves the
+    // transport at `server.rs:88` and the snapshot backend at `:111` -- and
+    // its cost was not the bandwidth the note described but the whole peer
+    // leg of snapshot resolution: `ResolveVmStateArtifact` and
+    // `LoadFirecrackerManifest` both branch on this pointer, so a cluster with
+    // `[p2p] enabled = true` fetched every memory dump and rootfs from the
+    // repository while the peer holding it sat idle, and nothing said so.
+    //
+    // The gate is applied here rather than at the call site; see the header
+    // for why. `snapshot.p2p_enabled` defaults to true, so the switch only
+    // ever subtracts: a node that wants snapshots off the repository while
+    // still serving image layers over P2P sets it false, which is the one
+    // thing the combined `[p2p].enabled` flag cannot express.
     backend.runtime_resolver.reset(new RepositoryRuntimeResolver(
         backend.repository, backend.artifact_cache,
         core::fs::Join(config.snapshot.local_cache_path, "runtime"),
-        backend.overlaybd_layers.get(), std::shared_ptr<p2p::P2pTransport>()));
+        backend.overlaybd_layers.get(),
+        config.snapshot.p2p_enabled ? p2p_transport : std::shared_ptr<p2p::P2pTransport>()));
+
+    // Handed back for the publish side of the same gate. `Publish` is a free
+    // function in this port, so without carrying the transport here the API
+    // layer would have no way to reach it and every committed snapshot would
+    // be announced to nobody -- the mirror image of the resolve-side bug the
+    // comment above describes.
+    backend.p2p_transport =
+        config.snapshot.p2p_enabled ? p2p_transport : std::shared_ptr<p2p::P2pTransport>();
     return backend;
 }
 

@@ -79,8 +79,23 @@ std::string PercentDecode(const std::string& text);
 /// A placeholder matches exactly one non-empty segment, so `/sandboxes/{id}`
 /// matches `/sandboxes/abc` but not `/sandboxes/abc/exec` and not
 /// `/sandboxes/`. Captured values land in `params`.
+///
+/// A trailing `{*name}` is axum's catch-all: it matches one *or more*
+/// remaining segments and captures them joined by `/`, **without**
+/// percent-decoding. Only legal as the last segment. It exists for the
+/// overlaybd P2P facade, whose path embeds a whole origin URL.
 bool MatchPath(const std::string& pattern, const std::string& path,
                std::map<std::string, std::string>* params);
+
+/// Whether a textual peer address is a loopback address.
+///
+/// Exposed because it is a security decision rather than a formatting detail:
+/// the facade's publish endpoint admits loopback clients only, and the forms
+/// that must all count are several -- any `127.0.0.0/8` address, `::1`, and
+/// the IPv4-mapped `::ffff:127.x.y.z` a dual-stack socket reports. An empty
+/// or unparseable address is **not** loopback, so an endpoint that gates on
+/// this fails closed.
+bool IsLoopbackAddressText(const std::string& address);
 
 /// Renders a response onto the wire, including the framing headers.
 ///

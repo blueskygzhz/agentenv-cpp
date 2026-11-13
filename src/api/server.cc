@@ -93,7 +93,8 @@ void RegisterOrchestratorRoutes(
     std::shared_ptr<image::ImageResolver> image_resolver,
     std::shared_ptr<snapshot::repository::SnapshotRepository> repository,
     std::shared_ptr<snapshot::SnapshotRuntimeResolver> runtime_resolver,
-    const AdminObservability* observability) {
+    const AdminObservability* observability,
+    std::shared_ptr<p2p::P2pTransport> p2p_transport) {
     if (server == NULL || svc == NULL) return;
 
     // The handlers share one ApiImpl. It holds a shared_ptr, so the lambdas
@@ -104,8 +105,8 @@ void RegisterOrchestratorRoutes(
     // that decides when the orchestrator dies.
     std::shared_ptr<orchestrator::Orchestrator> alias(
         std::shared_ptr<orchestrator::Orchestrator>(), svc);
-    std::shared_ptr<ApiImpl> impl(
-        new ApiImpl(alias, volumes, image_resolver, repository, runtime_resolver));
+    std::shared_ptr<ApiImpl> impl(new ApiImpl(alias, volumes, image_resolver, repository,
+                                              runtime_resolver, p2p_transport));
 
     // ---- sandboxes --------------------------------------------------------
 

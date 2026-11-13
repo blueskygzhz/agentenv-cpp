@@ -137,6 +137,17 @@ class RepositoryRuntimeResolver : public SnapshotRuntimeResolver {
     repository::RepositoryResult<storage::overlaybd::LayerConfig>
         ResolveManagedLayer(const ManagedLayer& layer, repository::LayerRole role) const;
 
+    /// Whether the peer-first leg is armed on this resolver.
+    ///
+    /// Exists to be asserted. Whether a resolver got a transport is otherwise
+    /// invisible from outside until a *remote* artifact is resolved, and a
+    /// posix-fs repository — the only kind `MakeSnapshotBackendFromConfig`
+    /// builds a local-answering one of — never produces that case. So the
+    /// factory could go back to passing null, or `snapshot.p2p_enabled` could
+    /// stop being read, and every behavioural test would still pass. It did
+    /// pass null, for exactly that long.
+    bool has_p2p_transport() const { return !!p2p_transport_; }
+
  private:
     /// Rust `vm_state_path` — the one path that calls `FetchBlob`.
     repository::RepositoryResult<std::string>

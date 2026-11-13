@@ -2,14 +2,19 @@
 // Rust: src/snapshot/publish.rs
 #include "agentenv/snapshot/publish.h"
 
+#include <algorithm>
 #include <set>
 #include <string>
+#include <vector>
 
+#include "agentenv/core/executor.h"
 #include "agentenv/core/json.h"
 #include "agentenv/core/logging.h"
+#include "agentenv/snapshot/p2p.h"
 #include "agentenv/snapshot/repository/documents.h"
 #include "agentenv/snapshot/repository/record_catalog.h"
 #include "agentenv/snapshot/store.h"
+#include "agentenv/snapshot/types.h"
 
 namespace agentenv {
 namespace snapshot {
@@ -19,6 +24,55 @@ using repository::DocumentKey;
 using repository::RepositoryError;
 using repository::RepositoryResult;
 using repository::SnapshotRepository;
+
+/// Rust `const SNAPSHOT_P2P_PUBLISH_CONCURRENCY: usize = 8`.
+const std::size_t kSnapshotP2pPublishConcurrency = 8;
+
+/// Rust `managed_layer_uuids` — the uuids of the managed layers in a committed
+/// subject's layer list. External layers have none.
+std::set<std::string> ManagedLayerUuids(const std::vector<OverlaybdLayerRef>& layers) {
+    std::set<std::string> uuids;
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        if (!layers[i].is_managed()) continue;
+        if (!layers[i].managed.uuid.has_value()) continue;
+        uuids.insert(*layers[i].managed.uuid);
+    }
+    return uuids;
+}
+
+/// Rust `managed_layer_uuids_from_managed`.
+std::set<std::string> ManagedLayerUuidsFromManaged(const std::vector<ManagedLayer>& layers) {
+    std::set<std::string> uuids;
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        if (!layers[i].uuid.has_value()) continue;
+        uuids.insert(*layers[i].uuid);
+    }
+    return uuids;
+}
+
+/// Rust `committed_layer_digests` — every layer digest the committed record
+/// references for one subject, managed and external alike.
+std::set<std::string> CommittedLayerDigests(const std::vector<OverlaybdLayerRef>& layers) {
+    std::set<std::string> digests;
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        digests.insert(layers[i].digest());
+    }
+    return digests;
+}
+
+/// Rust `committed_memory_layer_digests`.
+std::set<std::string> CommittedMemoryLayerDigests(const std::vector<ManagedLayer>& layers) {
+    std::set<std::string> digests;
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        digests.insert(layers[i].digest);
+    }
+    return digests;
+}
+
+void Extend(std::vector<SnapshotP2pArtifact>* into,
+            const std::vector<SnapshotP2pArtifact>& from) {
+    into->insert(into->end(), from.begin(), from.end());
+}
 
 /// Rust `validate_attached_drives`.
 RepositoryResult<core::Unit> ValidateAttachedDrives(
@@ -137,6 +191,10 @@ RepositoryResult<SnapshotPublication> Publish(
         AGENTENV_DEBUG("published snapshot " << record.value().id.ToString());
         SnapshotPublication publication;
         publication.record = record.value();
+        // Rust `local_layers: layer_store.local_layers`. Moved out of the
+        // stored result so the uploads — and the temporaries they own — stay
+        // alive for the caller's post-commit P2P announcement.
+        publication.local_layers = stored.value().local_layers;
         return publication;
     }
 
@@ -153,6 +211,126 @@ RepositoryResult<SnapshotPublication> Publish(
                                                            << cleanup.error().ToString());
     }
     return core::make_unexpected(record.error());
+}
+
+// Rust `SnapshotManager::publish_p2p_artifacts`.
+void PublishSnapshotP2pArtifacts(const std::shared_ptr<p2p::P2pTransport>& transport,
+                                 const SnapshotPublication& publication,
+                                 const sandbox::SandboxSnapshotManifest& manifest) {
+    // Rust: `let Some(transport) = self.p2p_transport.as_ref() else { return };`
+    if (!transport) return;
+    // Rust: `let Some(committed) = publication.record.committed.as_ref() else
+    // { return };`. An uncommitted record names no layers, and announcing a
+    // snapshot that is not yet usable would advertise bytes a peer cannot
+    // resolve to anything.
+    if (!publication.record.committed.has_value()) return;
+
+    const CommittedSnapshot& committed = *publication.record.committed;
+    const core::SnapshotId&  id        = publication.record.id;
+
+    std::vector<SnapshotP2pArtifact> artifacts;
+
+    // 1. The vm state file, by its per-snapshot key. Read from the capture
+    //    path: the repository copy may be remote, and on an OSS backend it is
+    //    always remote, which is exactly the case P2P exists to accelerate.
+    artifacts.push_back(SnapshotP2pArtifact::Fixed(id, kSnapshotArtifactLayout.vm_state,
+                                                   manifest.vm_state.path));
+
+    // 2. The manifest, as bytes. Compact, matching upstream's
+    //    `serde_json::to_vec` -- deliberately not the pretty copy
+    //    `StoreSnapshot` writes to the repository. A consumer parses this, so
+    //    the formatting is not part of the contract; the key is.
+    const std::string manifest_json = manifest.ToJson().ToString();
+    artifacts.push_back(SnapshotP2pArtifact::Bytes(
+        id, kSnapshotArtifactLayout.firecracker_manifest,
+        std::vector<uint8_t>(manifest_json.begin(), manifest_json.end())));
+
+    // 3. The prepared uploads, content-addressed. These are the authoritative
+    //    source for anything publish-time compression or dense export
+    //    rewrote: the record names the rewritten digest, and those bytes exist
+    //    only in the temporary each upload still owns.
+    for (std::size_t i = 0; i < publication.local_layers.size(); ++i) {
+        const PreparedLayerUpload& upload = publication.local_layers[i];
+        artifacts.push_back(SnapshotP2pArtifact::ContentAddressedOverlaybdLayer(
+            upload.Path(), upload.Digest(), upload.Size()));
+    }
+
+    // 4. The local overlaybd layers each runtime image config references,
+    //    gated by what the committed record actually names. The gate is what
+    //    keeps a raw local layer from being announced under a digest no
+    //    resolver will ever ask for after compression rewrote it.
+    Extend(&artifacts, SnapshotP2pArtifact::LocalOverlaybdLayers(
+                           manifest.rootfs.image_config_path,
+                           CommittedLayerDigests(committed.rootfs_layers),
+                           ManagedLayerUuids(committed.rootfs_layers)));
+    Extend(&artifacts, SnapshotP2pArtifact::LocalOverlaybdLayers(
+                           manifest.memory.image_config_path,
+                           CommittedMemoryLayerDigests(committed.memory_layers),
+                           ManagedLayerUuidsFromManaged(committed.memory_layers)));
+    for (std::size_t i = 0; i < manifest.attached_drives.size(); ++i) {
+        const sandbox::SnapshotAttachedDriveArtifacts& drive = manifest.attached_drives[i];
+        // Matched by drive id rather than by position: the manifest filters
+        // volume drives out of `attached_drives`, so the two lists need not
+        // line up, and a positional pairing would announce one drive's layers
+        // under another drive's gate.
+        const CommittedAttachedDrive* committed_drive = NULL;
+        for (std::size_t j = 0; j < committed.attached_drives.size(); ++j) {
+            if (committed.attached_drives[j].drive_id == drive.drive_id) {
+                committed_drive = &committed.attached_drives[j];
+                break;
+            }
+        }
+        if (committed_drive == NULL) continue;
+        Extend(&artifacts, SnapshotP2pArtifact::LocalOverlaybdLayers(
+                               drive.image_config_path,
+                               CommittedLayerDigests(committed_drive->layers),
+                               ManagedLayerUuids(committed_drive->layers)));
+    }
+
+    // Rust dedups on `artifact.key`. An unchanged local layer reaches this
+    // list twice -- once as a prepared upload, once from the image config --
+    // and publishing the same key twice is wasted work on the second.
+    std::vector<SnapshotP2pArtifact> unique;
+    std::set<std::string>            seen;
+    unique.reserve(artifacts.size());
+    for (std::size_t i = 0; i < artifacts.size(); ++i) {
+        if (!seen.insert(artifacts[i].key).second) continue;
+        unique.push_back(artifacts[i]);
+    }
+
+    AGENTENV_DEBUG("announcing " << unique.size() << " p2p artifacts for snapshot "
+                                 << id.ToString());
+
+    // Rust `stream::iter(..).for_each_concurrent(SNAPSHOT_P2P_PUBLISH_CONCURRENCY, ..)`.
+    // Bounded on purpose: a snapshot can carry dozens of layers, and
+    // announcing all of them at once would have each publish contend for the
+    // same disk the node is also resuming VMs from.
+    for (std::size_t base = 0; base < unique.size(); base += kSnapshotP2pPublishConcurrency) {
+        const std::size_t end =
+            std::min(base + kSnapshotP2pPublishConcurrency, unique.size());
+        std::vector<std::future<void> > pending;
+        pending.reserve(end - base);
+        for (std::size_t i = base; i < end; ++i) {
+            const SnapshotP2pArtifact& artifact = unique[i];
+            pending.push_back(core::GlobalExecutor().Submit([&artifact, &transport]() {
+                const core::Expected<core::Unit, std::string> published =
+                    artifact.Publish(transport);
+                if (!published.ok()) {
+                    // Rust `warn!`, and the stream continues. P2P is an
+                    // optional acceleration path: a snapshot nobody can fetch
+                    // over P2P still resolves through the repository, so one
+                    // failed announcement must not abort the rest.
+                    AGENTENV_WARN("failed to publish p2p artifact '" << artifact.key
+                                                                     << "': "
+                                                                     << published.error());
+                }
+            }));
+        }
+        // Joined before the next batch: the lambdas capture `artifact` and
+        // `transport` by reference, and the bound is only a bound if the
+        // batch completes.
+        for (std::size_t i = 0; i < pending.size(); ++i) pending[i].get();
+    }
 }
 
 }  // namespace snapshot

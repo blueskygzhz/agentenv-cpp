@@ -20,6 +20,10 @@
 #include "agentenv/core/optional.h"
 #include "agentenv/snapshot/layers.h"
 #include "agentenv/snapshot/record.h"
+// `DiskImageExportOutcome::local_layers` hands the prepared uploads back to
+// the publish path for the post-commit P2P announcement. Light enough to
+// include here: it needs only `overlaybd/compact.h` and the error type.
+#include "agentenv/snapshot/recontainerize.h"
 #include "agentenv/snapshot/repository/errors.h"
 
 namespace agentenv {
@@ -89,24 +93,26 @@ repository::RepositoryResult<core::Unit> ValidateSnapshotTag(const std::string& 
 
 /// Rust `struct DiskImageExportOutcome`.
 ///
-/// Rust also carries `local_layers: Vec<PreparedLayerUpload>`, the prepared
-/// upload files kept alive past the push for the post-commit P2P
-/// announcement. That transport is not ported, and every upload has already
-/// completed by the time `Export` returns, so the field is dropped rather
-/// than returned empty — an empty one would read as "nothing to announce"
-/// instead of "announcing is not a thing here". `Export` still holds the
-/// uploads for its own duration, because they own the temporary files.
-///
 /// Declared in this header rather than next to `AcrDiskImageExporter` in
 /// `acr.h` so that `store.h` can name it in `DiskImageExport` without
 /// pulling the HTTP transport into every translation unit that stores a
-/// snapshot. Its two fields need only `layers.h` and `record.h`, which
-/// `store.h` already includes.
+/// snapshot.
 struct DiskImageExportOutcome {
     std::vector<OverlaybdLayerRef> layers;
     /// Always present from `Export`. Optional because upstream's exporter
     /// interface allows a backend that publishes nothing to report so.
     core::Optional<PersistedDiskImagePublication> publication;
+
+    /// Rust `local_layers` — the prepared upload files, kept alive past the
+    /// push so the post-commit P2P announcement can read exactly the bytes
+    /// that were published.
+    ///
+    /// Load-bearing beyond the announcement: each entry owns the temporary
+    /// file its upload read from (a recontainerized zfile, or a dense export),
+    /// so returning them is what keeps those files from being unlinked between
+    /// the push and the announcement. Announcing by digest alone would not do
+    /// — a compressed delta's bytes exist nowhere else on this node.
+    std::vector<PreparedLayerUpload> local_layers;
 };
 
 }  // namespace image_export

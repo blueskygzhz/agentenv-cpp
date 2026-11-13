@@ -92,6 +92,11 @@ agentenv_add_test(test_deps                test_deps.cc                agentenv-
 # provisioning steps need.
 agentenv_add_test(test_setup_tools_image   test_setup_tools_image.cc   agentenv-rootmod)
 agentenv_add_test(test_overlaybd_p2p       test_overlaybd_p2p.cc       agentenv-overlaybd-p2p)
+# Rust: the axum router half of src/overlaybd/p2p/facade.rs — the part that had
+# no caller, so block-level P2P was off on every node. Links `agentenv-api` for
+# the route matcher and the loopback classifier the adapter relies on.
+agentenv_add_test(test_overlaybd_p2p_routes test_overlaybd_p2p_routes.cc
+                  agentenv-overlaybd-p2p agentenv-api)
 agentenv_add_test(test_mpsc_queue          test_mpsc_queue.cc          agentenv-core)
 agentenv_add_test(test_dto                 test_dto.cc                 agentenv-api)
 agentenv_add_test(test_mock_backend        test_mock_backend.cc        agentenv-sandbox)
@@ -247,6 +252,9 @@ agentenv_add_test(test_ublk_startup_pack_recorder test_ublk_startup_pack_recorde
 agentenv_add_test(test_lsmt                test_lsmt.cc                agentenv-overlaybd)
 agentenv_add_test(test_lsmt_bptree         test_lsmt_bptree.cc         agentenv-overlaybd)
 agentenv_add_test(test_scheduler           test_scheduler.cc           agentenv-scheduler-internal)
+# The CPU-template intersection. The byte-exact cases pin the serialized field
+# order, which a migrating guest's cpu_config_json depends on.
+agentenv_add_test(test_scheduler_cpu_template test_scheduler_cpu_template.cc agentenv-scheduler-internal)
 # The scheduler's P2P surface: the artifact index, the handlers, and the real
 # node-side wire pointed at the real handlers over loopback -- the only
 # arrangement that can catch the two halves of the protocol disagreeing.
@@ -329,6 +337,9 @@ agentenv_add_test(test_posixfs_artifacts  test_posixfs_artifacts.cc   agentenv-s
 agentenv_add_test(test_artifact_cache     test_artifact_cache.cc      agentenv-snapshot)
 # Rust: the `SnapshotP2pArtifact` tests in src/snapshot/p2p.rs.
 agentenv_add_test(test_snapshot_p2p       test_snapshot_p2p.cc        agentenv-snapshot)
+# Rust: src/snapshot/manager.rs `publish_p2p_artifacts` — the announce half of
+# snapshot P2P, which had no production caller.
+agentenv_add_test(test_snapshot_publish_p2p test_snapshot_publish_p2p.cc agentenv-snapshot Threads::Threads)
 agentenv_add_test(test_image_export_target test_image_export_target.cc agentenv-snapshot)
 agentenv_add_test(test_observability_host test_observability_host.cc agentenv-observability-node)
 agentenv_add_test(test_observability_prometheus test_observability_prometheus.cc agentenv-observability-node)
@@ -339,6 +350,10 @@ agentenv_add_test(test_orchestrator_launch test_orchestrator_launch.cc agentenv-
 agentenv_add_test(test_orchestrator_delete test_orchestrator_delete.cc agentenv-orchestrator Threads::Threads)
 agentenv_add_test(test_orchestrator_fork_snapshot test_orchestrator_fork_snapshot.cc agentenv-orchestrator)
 agentenv_add_test(test_orchestrator_persistence test_orchestrator_persistence.cc agentenv-orchestrator)
+# Rust: src/orchestrator/service.rs — `collect_running_artifacts`,
+# `reconcile_paused_at_startup` and `start_local_image_maintenance_task`, the
+# production drivers the node-local image cache had been missing.
+agentenv_add_test(test_orchestrator_image_maintenance test_orchestrator_image_maintenance.cc agentenv-orchestrator Threads::Threads)
 # Rust: src/orchestrator/sandbox_metrics.rs — the sweep over a scripted
 # EnvdApi, which `SandboxBackend::Envd()` made drivable without a VMM.
 agentenv_add_test(test_orchestrator_guest_metrics test_orchestrator_guest_metrics.cc agentenv-orchestrator)
@@ -379,3 +394,40 @@ if(AGENTENV_BASH AND TARGET agentenv)
     # capability gate to suit the test would remove a production check.
     set_tests_properties(smoke_api PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endif()
+
+# Checks that are not about behaviour at all -- they guard the evidence.
+#
+# Both scripts existed and neither was wired, so both only ever ran when
+# somebody remembered to. `RUST_TO_CPP_MAPPING.md` is this port's coverage
+# argument: a row pointing at a file that does not exist asserts a module was
+# ported *to a specific place*, and opening it is the only thing that
+# disproves that. The claim in `README.md` that the table is "checked on every
+# run" was true of the script and false of the build.
+#
+# `mutation_residue.py` is the counterpart for the mutation workflow: every
+# `mutate_*.py` copies a source aside before editing it, and a crashed or
+# interrupted run leaves the copy behind. A stale `.bak` next to a source file
+# is how a mutation gets committed by accident.
+find_program(AGENTENV_PYTHON3 python3)
+if(AGENTENV_PYTHON3)
+    # No WORKING_DIRECTORY: both resolve the tree from `__file__`, so adding
+    # one would imply a dependency on the caller's cwd that does not exist.
+    #
+    # `check_mapping_doc` degrades rather than fails when the upstream tree is
+    # absent -- it checks the C++ column, reports that the Rust column was
+    # skipped, and says to set `AGENTENV_RUST_ROOT`. That is the right shape
+    # for a machine that only has this repository checked out, and it is why
+    # this is registered unconditionally.
+    add_test(NAME check_mapping_doc
+             COMMAND ${AGENTENV_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/check_mapping_doc.py)
+    add_test(NAME mutation_residue
+             COMMAND ${AGENTENV_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/mutation_residue.py)
+    # Seconds, not minutes: both only read the trees. A timeout this tight is
+    # itself a check that neither grew an expensive step.
+    set_tests_properties(check_mapping_doc mutation_residue PROPERTIES TIMEOUT 60)
+endif()
+# The `mutate_*.py` scripts are deliberately *not* registered. Each one edits a
+# source file, rebuilds and reruns a test, so a ctest run would rebuild the
+# tree once per script and, if interrupted, leave the source mutated. They are
+# a tool for verifying a test's discriminating power at the time it is written,
+# and `mutation_residue` above is what keeps their side effects from escaping.

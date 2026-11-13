@@ -4,8 +4,13 @@
 
 #include <algorithm>
 #include <set>
+#include <utility>
 
 #include "agentenv/core/logging.h"
+// Rust `use crate::image::cache::{local_image_services_from_global_config,
+// RuntimeImageOwner, RuntimeImageRefs}`. `New` builds the production
+// `RuntimeImageRefs` from config, and the maintenance sweep calls through it.
+#include "agentenv/image/cache_store.h"
 
 namespace agentenv {
 namespace orchestrator {
@@ -97,6 +102,9 @@ Orchestrator::~Orchestrator() {
     // last `Arc` is gone; a joined thread is the same guarantee without
     // depending on how the orchestrator happens to be owned.
     StopAutoEvictTask();
+    // Same reasoning: the maintenance pass reads the handle map through
+    // `CollectRunningArtifacts`.
+    StopLocalImageMaintenanceTask();
 }
 
 // Rust `start_auto_evict_task`.
@@ -160,6 +168,167 @@ void Orchestrator::StopAutoEvictTask() {
     }
 }
 
+// ---- local image maintenance ----------------------------------------------
+
+void Orchestrator::SetRuntimeImageRefs(
+    std::shared_ptr<image::cache::RuntimeImageRefs> refs) {
+    image_refs_ = std::move(refs);
+}
+
+// Rust `collect_running_artifacts`.
+std::vector<std::pair<core::SandboxId, sandbox::RuntimeArtifactSet> >
+Orchestrator::CollectRunningArtifacts() const {
+    // Rust copies the handle map out under its read lock and drops it before
+    // locking any sandbox. Holding `sandboxes_mu_` across the per-sandbox
+    // locks below would stall every registration behind whichever sandbox is
+    // mid-VMM-call.
+    std::vector<std::pair<std::string, SandboxHandlePtr> > handles;
+    {
+        std::lock_guard<std::mutex> guard(sandboxes_mu_);
+        handles.reserve(sandboxes_.size());
+        for (std::map<std::string, SandboxHandlePtr>::const_iterator it = sandboxes_.begin();
+             it != sandboxes_.end(); ++it) {
+            handles.push_back(*it);
+        }
+    }
+
+    std::vector<std::pair<core::SandboxId, sandbox::RuntimeArtifactSet> > running;
+    running.reserve(handles.size());
+    for (std::size_t i = 0; i < handles.size(); ++i) {
+        if (!handles[i].second) continue;
+        // The map is keyed by `id.ToString()`, so this parses; the guard is
+        // the same one `TemplateBuildIds` uses on its own string keys.
+        const core::Expected<core::SandboxId, std::string> id =
+            core::SandboxId::Parse(handles[i].first);
+        if (!id.ok()) continue;
+        // `Lock`, not `TryLock`: a sandbox skipped here is absent from the
+        // live set, and GC reads an absent owner as collectable. Waiting for a
+        // lifecycle operation costs the pass some time; skipping would delete
+        // layers a running VM is reading.
+        SandboxHandle::Guard sandbox = handles[i].second->Lock();
+        running.push_back(
+            std::make_pair(id.value(), sandbox->RuntimeInfoOf().runtime_artifacts));
+    }
+    return running;
+}
+
+// Rust `protect_image_refs`.
+OrchestratorResult<core::Unit> Orchestrator::ProtectImageRefs(
+    const image::cache::RuntimeImageOwner& owner,
+    const sandbox::RuntimeArtifactSet& artifacts, const char* context) {
+    if (!image_refs_) return core::Unit();
+    const core::Expected<core::Unit, std::string> pinned = image_refs_->Pin(owner, artifacts);
+    if (!pinned.ok()) {
+        return core::make_unexpected(OrchestratorError::InternalError(
+            std::string("pin ") + context + " image refs: " + pinned.error()));
+    }
+    return core::Unit();
+}
+
+// Rust `reconcile_paused_at_startup`.
+OrchestratorResult<core::Unit> Orchestrator::ReconcilePausedAtStartup(
+    const std::vector<std::pair<core::SandboxId,
+                                std::shared_ptr<sandbox::PausedSandboxState> > >&
+        restored_paused) {
+    if (!image_refs_) return core::Unit();
+
+    std::vector<core::SandboxId> live_paused;
+    live_paused.reserve(restored_paused.size());
+    for (std::size_t i = 0; i < restored_paused.size(); ++i) {
+        const std::shared_ptr<sandbox::PausedSandboxState>& paused_state =
+            restored_paused[i].second;
+        if (!paused_state) continue;
+        // Protect first, then record as live: the reconcile below deletes
+        // paused protection no id in `live_paused` claims, so a sandbox added
+        // to the list before it is pinned could have its own layers dropped.
+        const OrchestratorResult<core::Unit> protected_refs = ProtectImageRefs(
+            image::cache::RuntimeImageOwner::PausedSandbox(restored_paused[i].first),
+            paused_state->RuntimeArtifacts(), "paused sandbox");
+        if (!protected_refs.ok()) return protected_refs;
+        live_paused.push_back(restored_paused[i].first);
+    }
+
+    const core::Expected<core::Unit, std::string> reconciled =
+        image_refs_->ReconcilePaused(live_paused);
+    if (!reconciled.ok()) {
+        return core::make_unexpected(OrchestratorError::InternalError(
+            "reconcile local image protection: " + reconciled.error()));
+    }
+    return core::Unit();
+}
+
+// Rust `start_local_image_maintenance_task`.
+void Orchestrator::StartLocalImageMaintenanceTask(uint64_t interval_secs) {
+    // Idempotent for the same reason as the eviction sweep: upstream spawns it
+    // exactly once, and two passes would hand the GC two different views of
+    // the live set, each of which looks authoritative to it.
+    if (local_image_maintenance_thread_.joinable()) return;
+
+    // Upstream cannot reach the task without an `image_refs`; here the port is
+    // installed separately, and a sweep with nothing to call would log a pass
+    // per interval while reclaiming nothing.
+    if (!image_refs_) {
+        AGENTENV_DEBUG(
+            "local image maintenance task not started: no runtime image refs installed");
+        return;
+    }
+
+    // `gc.interval` upstream is a `Duration` taken straight from config, which
+    // `ImageCacheGcConfig::Normalize` has already pulled off zero. Clamp
+    // anyway: a zero here is a spin loop over the whole cache rather than
+    // Tokio's immediately-ready timer, and a caller that bypassed `Normalize`
+    // would get one.
+    const uint64_t secs = interval_secs == 0 ? 1 : interval_secs;
+
+    {
+        std::lock_guard<std::mutex> g(local_image_maintenance_mu_);
+        local_image_maintenance_stop_ = false;
+    }
+
+    AGENTENV_INFO("local image maintenance task started with interval " << secs << "s");
+    local_image_maintenance_thread_ = std::thread([this, secs]() {
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lock(local_image_maintenance_mu_);
+                // Interruptible wait, not a sleep: a shutdown must not have to
+                // wait out a 1800s GC interval. The predicate also covers a
+                // stop raised before the first wait.
+                local_image_maintenance_cv_.wait_for(
+                    lock, std::chrono::seconds(secs),
+                    [this]() { return local_image_maintenance_stop_; });
+                if (local_image_maintenance_stop_) return;
+            }
+            // Outside the lock: a pass walks the cache and deletes layers,
+            // and holding the mutex across it would make a shutdown wait for
+            // the GC it is interrupting.
+            //
+            // Each cycle waits a fresh interval rather than catching up on
+            // ticks missed while sweeping — Rust's `MissedTickBehavior::Skip`.
+            const std::vector<std::pair<core::SandboxId, sandbox::RuntimeArtifactSet> >
+                running = CollectRunningArtifacts();
+            const core::Expected<core::Unit, std::string> maintained =
+                image_refs_->MaintainRunning(running);
+            if (!maintained.ok()) {
+                // Rust `warn!("local image maintenance pass failed: {err:#}")`
+                // and keeps the loop: one bad pass must not silently end
+                // reclamation for the life of the process.
+                AGENTENV_WARN("local image maintenance pass failed: " << maintained.error());
+            }
+        }
+    });
+}
+
+void Orchestrator::StopLocalImageMaintenanceTask() {
+    {
+        std::lock_guard<std::mutex> g(local_image_maintenance_mu_);
+        local_image_maintenance_stop_ = true;
+    }
+    local_image_maintenance_cv_.notify_all();
+    if (local_image_maintenance_thread_.joinable()) {
+        local_image_maintenance_thread_.join();
+    }
+}
+
 // Rust `persisted_sandboxes_require_managed_seed`.
 bool PersistedSandboxesRequireManagedSeed(const std::vector<SandboxMetadata>& persisted) {
     for (std::size_t i = 0; i < persisted.size(); ++i) {
@@ -213,9 +382,18 @@ Orchestrator::New(std::shared_ptr<MetadataStore> store,
         return core::make_unexpected(OrchestratorError::ConfigLoadFailed(access_tokens.error()));
     }
 
-    // Rust collects `restored_paused` here for `reconcile_paused_at_startup`,
-    // which only runs when image GC is enabled and needs the runtime
-    // image-ref subsystem (not ported). Nothing else reads it.
+    // Rust collects `restored_paused` here, before the records are moved into
+    // the store, so `ReconcilePausedAtStartup` can re-establish the durable
+    // image protection every paused sandbox held in the previous run. Only the
+    // Paused records that actually decoded a `paused_state` qualify — a
+    // decoded state is what names the artifacts to pin.
+    std::vector<std::pair<core::SandboxId, std::shared_ptr<sandbox::PausedSandboxState> > >
+        restored_paused;
+    for (std::size_t i = 0; i < persisted.value().size(); ++i) {
+        const SandboxMetadata& metadata = persisted.value()[i];
+        if (metadata.state != SandboxState::Paused || !metadata.paused_state) continue;
+        restored_paused.push_back(std::make_pair(metadata.id, metadata.paused_state));
+    }
 
     // `store.add(metadata).await?` — From<StoreError>.
     const std::vector<SandboxMetadata>& records = persisted.value();
@@ -239,6 +417,13 @@ Orchestrator::New(std::shared_ptr<MetadataStore> store,
     orchestrator->SetConfiguredRuntimeVersions(ConfiguredRuntimeVersions(config));
     orchestrator->SetAccessTokenGenerator(access_tokens.value());
     if (volume_manager) orchestrator->SetVolumeManager(volume_manager);
+    // Rust `local_image_services_from_global_config().runtime_refs`, passed
+    // into the constructor. Built here for the same reason upstream builds it
+    // there: the maintenance sweep below is the port that needs it, and
+    // `ImageCacheService::SharedFromAppConfig` is a per-root singleton that
+    // does no I/O until something asks it to.
+    orchestrator->SetRuntimeImageRefs(
+        image::cache::LocalImageServicesFromAppConfig(config).runtime_refs);
 
     // Rust: `Self::start_auto_evict_task(Arc::clone(&orchestrator),
     // Duration::from_millis(config.auto_evict_interval_ms), shutdown_rx)`,
@@ -249,6 +434,24 @@ Orchestrator::New(std::shared_ptr<MetadataStore> store,
     //
     // Rust also starts `start_metrics_task` here; that one is still missing.
     orchestrator->StartAutoEvictTask(config.orchestrator.auto_evict_interval_ms);
+
+    // Rust `service.rs:263-284`: reconcile durable paused protection, then
+    // start maintenance — and only then. The gate is fail-closed: GC decides
+    // what to delete from the protection this reconcile writes, so a pass
+    // allowed to run after it failed would collect layers belonging to a
+    // paused sandbox it never managed to pin.
+    const cfg::ResolvedImageCacheGcConfig gc = config.image.cache.GcSchedule();
+    if (gc.enabled) {
+        const OrchestratorResult<core::Unit> reconciled =
+            orchestrator->ReconcilePausedAtStartup(restored_paused);
+        if (reconciled.ok()) {
+            orchestrator->StartLocalImageMaintenanceTask(gc.interval_secs);
+        } else {
+            AGENTENV_WARN("local image protection reconcile failed at startup; not starting "
+                          "maintenance (fail-closed): "
+                          << reconciled.error().Message());
+        }
+    }
     return orchestrator;
 }
 
@@ -2828,6 +3031,11 @@ OrchestratorResult<core::Unit> Orchestrator::Shutdown() {
     // takes that lock — it is held only here — and it serialises the join
     // against a concurrent `Shutdown`.
     StopAutoEvictTask();
+    // Upstream's `shutdown_tx` is the same channel the maintenance task
+    // selects on, so it stops here too. Ordered after the eviction sweep for
+    // no reason beyond matching the subscribe order at startup; neither join
+    // waits on the other.
+    StopLocalImageMaintenanceTask();
 
     OrchestratorResult<core::Unit> result = core::Unit{};
     shutdown_outcome_ = core::Optional<ShutdownOutcome>(

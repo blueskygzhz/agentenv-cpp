@@ -67,6 +67,11 @@ class ApiImpl {
     /// supply one (see `SnapshotBackend` in
     /// `snapshot/repository/backends.h`); without it `CreateSandbox` cannot
     /// take the snapshot path at all and says so.
+    ///
+    /// `p2p_transport` is what `CreateSnapshot` announces a freshly committed
+    /// snapshot over. Optional, and its absence is not a refusal: P2P is an
+    /// acceleration path, so a node without one publishes normally and simply
+    /// announces nothing. Null on every node whose `[p2p].enabled` is false.
     ApiImpl(std::shared_ptr<orchestrator::Orchestrator> svc,
             std::shared_ptr<volume::VolumeManager> volumes,
             std::shared_ptr<image::ImageResolver> image_resolver =
@@ -74,12 +79,15 @@ class ApiImpl {
             std::shared_ptr<snapshot::repository::SnapshotRepository> repository =
                 std::shared_ptr<snapshot::repository::SnapshotRepository>(),
             std::shared_ptr<snapshot::SnapshotRuntimeResolver> runtime_resolver =
-                std::shared_ptr<snapshot::SnapshotRuntimeResolver>())
+                std::shared_ptr<snapshot::SnapshotRuntimeResolver>(),
+            std::shared_ptr<p2p::P2pTransport> p2p_transport =
+                std::shared_ptr<p2p::P2pTransport>())
         : svc_(std::move(svc)),
           volumes_(std::move(volumes)),
           image_resolver_(std::move(image_resolver)),
           repository_(std::move(repository)),
-          runtime_resolver_(std::move(runtime_resolver)) {}
+          runtime_resolver_(std::move(runtime_resolver)),
+          p2p_transport_(std::move(p2p_transport)) {}
 
     // Sandbox handlers (Rust: src/api/impls/sandbox.rs).
     core::Expected<CreateSandboxResp, ApiError>
@@ -376,6 +384,11 @@ class ApiImpl {
     /// falling through to a fresh boot with an empty rootfs config, which is
     /// what it used to do.
     std::shared_ptr<snapshot::SnapshotRuntimeResolver> runtime_resolver_;
+    /// Rust `SnapshotManager::p2p_transport`. Null when P2P is disabled, which
+    /// `PublishSnapshotP2pArtifacts` treats as "announce nothing" rather than
+    /// as an error -- publishing a snapshot must not depend on the overlay
+    /// network being up.
+    std::shared_ptr<p2p::P2pTransport> p2p_transport_;
 };
 
 }  // namespace api

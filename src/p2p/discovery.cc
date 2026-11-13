@@ -265,6 +265,12 @@ SchedulerPeerDiscovery::PeersForKey(const P2pArtifactKey& key) {
     // Rust issues `lookup_p2p_artifact` and filters the response. It never
     // falls back to the refresh cache: an unavailable scheduler is an error,
     // not "no providers", so the caller can distinguish the two.
+    //
+    // The caller that does is `HttpP2pTransport::LookupWithHints`, which warns
+    // past this error and broadcasts to the refresh cache instead, while an
+    // empty *success* means the index knows of no provider. Named here because
+    // the distinction is only worth anything if something acts on it -- this
+    // function had no production caller at all until that stage was wired.
     if (!lookup_) {
         return core::make_unexpected(
             P2pError::MakeInternal("lookup P2P artifact in scheduler"));

@@ -22,11 +22,16 @@
 // on either side would previously have been caught by neither.
 #include "microtest.h"
 
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "agentenv/core/fs.h"
+// `FixedArtifactKey` — the peer-leg tests have to name the artifact the
+// resolver will ask for, and naming it any other way would not be the same
+// assertion.
+#include "agentenv/snapshot/p2p.h"
 #include "agentenv/snapshot/publish.h"
 #include "agentenv/snapshot/repository/backends.h"
 #include "agentenv/snapshot/repository/posixfs/artifacts.h"
@@ -179,6 +184,59 @@ struct Fixture {
             return snapshot::SnapshotRecord();
         }
         return published.value().record;
+    }
+};
+
+/// A peer that answers for whatever it was seeded with.
+///
+/// Derived from `DisabledP2pTransport` so the three byte-moving methods this
+/// does not override keep failing: a test that reached one of them would be
+/// exercising a path the resolver is not supposed to take for these artifacts,
+/// and `TransportDisabled` says so louder than a plausible stub would.
+class SeededPeerTransport : public p2p::DisabledP2pTransport {
+ public:
+    /// key -> bytes. Absent means this peer answers `Ok(None)`, which is the
+    /// ordinary case of an artifact no peer has yet.
+    std::map<std::string, std::string> artifacts;
+
+    std::vector<std::string> lookups;
+    int                      file_fetches = 0;
+    int                      byte_fetches = 0;
+
+    p2p::P2pResult<bool> LookupWithHints(const p2p::P2pArtifactKey& key,
+                                         const std::vector<p2p::P2pArtifactProviderHint>&,
+                                         p2p::P2pArtifactDescriptor* out) override {
+        lookups.push_back(key);
+        const std::map<std::string, std::string>::const_iterator it = artifacts.find(key);
+        if (it == artifacts.end()) return false;
+        // Only the key is set. `FetchArtifact` hands the descriptor straight
+        // back to this same object, so anything else would be this test
+        // talking to itself.
+        if (out) out->key = key;
+        return true;
+    }
+
+    p2p::P2pResult<uint64_t> FetchWithOptions(const p2p::P2pArtifactDescriptor& descriptor,
+                                              const std::string& destination,
+                                              p2p::P2pFetchOptions) override {
+        ++file_fetches;
+        const std::map<std::string, std::string>::const_iterator it =
+            artifacts.find(descriptor.key);
+        if (it == artifacts.end()) return core::make_unexpected(p2p::P2pError::MakeDisabled());
+        const core::Expected<core::Unit, std::string> written =
+            core::fs::WriteAtomically(destination, it->second, "peer artifact");
+        if (!written.ok()) return core::make_unexpected(p2p::P2pError::MakeDisabled());
+        return static_cast<uint64_t>(it->second.size());
+    }
+
+    p2p::P2pResult<std::vector<uint8_t> >
+        FetchBytesWithOptions(const p2p::P2pArtifactDescriptor& descriptor,
+                              p2p::P2pFetchOptions) override {
+        ++byte_fetches;
+        const std::map<std::string, std::string>::const_iterator it =
+            artifacts.find(descriptor.key);
+        if (it == artifacts.end()) return core::make_unexpected(p2p::P2pError::MakeDisabled());
+        return std::vector<uint8_t>(it->second.begin(), it->second.end());
     }
 };
 
@@ -436,6 +494,64 @@ MT_TEST(the_backend_pair_resolves_against_the_configured_repository_root) {
                        tree.At("cache")) == 0);
 }
 
+MT_TEST(the_backend_pair_arms_the_peer_leg_with_the_nodes_transport) {
+    // Rust `server.rs:107,111`. Asserted on the factory rather than on a
+    // resolve because a posix-fs repository answers `Local` for everything, so
+    // no amount of resolving against one reaches the peer branch -- which is
+    // exactly how the hardcoded null survived.
+    TempTree tree;
+    if (tree.path.empty()) return;
+
+    cfg::AppConfig config;
+    config.snapshot.repository_backend = cfg::SnapshotRepositoryBackendKind::PosixFs;
+    config.snapshot.local_cache_path   = tree.At("cache");
+    cfg::PosixFsBackendConfig posix;
+    posix.snapshot_store = tree.At("store");
+    config.backend.posix_fs = core::Optional<cfg::PosixFsBackendConfig>(posix);
+
+    std::shared_ptr<p2p::P2pTransport> transport(new SeededPeerTransport());
+
+    // Default config: `snapshot.p2p_enabled` is true, so the transport passes
+    // through.
+    MT_EXPECT_TRUE(config.snapshot.p2p_enabled);
+    const repo::RepositoryResult<repo::SnapshotBackend> armed =
+        repo::MakeSnapshotBackendFromConfig(config, transport);
+    MT_EXPECT_TRUE(armed.ok());
+    if (!armed.ok()) return;
+    const snapshot::RepositoryRuntimeResolver* armed_resolver =
+        dynamic_cast<const snapshot::RepositoryRuntimeResolver*>(
+            armed.value().runtime_resolver.get());
+    MT_EXPECT_TRUE(armed_resolver != NULL);
+    if (armed_resolver) MT_EXPECT_TRUE(armed_resolver->has_p2p_transport());
+
+    // `snapshot.p2p_enabled = false` with a perfectly good transport: the one
+    // thing the combined `[p2p].enabled` flag cannot express, and a switch
+    // that parsed into a field nothing read until this parameter existed.
+    config.snapshot.p2p_enabled = false;
+    const repo::RepositoryResult<repo::SnapshotBackend> gated =
+        repo::MakeSnapshotBackendFromConfig(config, transport);
+    MT_EXPECT_TRUE(gated.ok());
+    if (!gated.ok()) return;
+    const snapshot::RepositoryRuntimeResolver* gated_resolver =
+        dynamic_cast<const snapshot::RepositoryRuntimeResolver*>(
+            gated.value().runtime_resolver.get());
+    MT_EXPECT_TRUE(gated_resolver != NULL);
+    if (gated_resolver) MT_EXPECT_TRUE(!gated_resolver->has_p2p_transport());
+
+    // And a node with no transport at all -- the default argument, which is
+    // what the callers that only publish and read records pass.
+    config.snapshot.p2p_enabled = true;
+    const repo::RepositoryResult<repo::SnapshotBackend> bare =
+        repo::MakeSnapshotBackendFromConfig(config);
+    MT_EXPECT_TRUE(bare.ok());
+    if (!bare.ok()) return;
+    const snapshot::RepositoryRuntimeResolver* bare_resolver =
+        dynamic_cast<const snapshot::RepositoryRuntimeResolver*>(
+            bare.value().runtime_resolver.get());
+    MT_EXPECT_TRUE(bare_resolver != NULL);
+    if (bare_resolver) MT_EXPECT_TRUE(!bare_resolver->has_p2p_transport());
+}
+
 MT_TEST(a_posixfs_backend_without_its_section_is_refused) {
     // Not defaulted: guessing a snapshot store root would put a node's layers
     // somewhere nobody chose.
@@ -539,7 +655,10 @@ struct NonSharedFixture {
     snapshot::SnapshotRecord record;
     bool ready = false;
 
-    NonSharedFixture() {
+    /// Null by default, which is the pre-existing shape: these tests predate
+    /// the transport being wired and assert the repository leg.
+    explicit NonSharedFixture(
+        std::shared_ptr<p2p::P2pTransport> transport = std::shared_ptr<p2p::P2pTransport>()) {
         const std::string root = tree.At("repository");
         repository = std::make_shared<NonSharedRepository>(
             std::make_shared<posixfs::PosixFsCatalogStore>(root),
@@ -562,8 +681,7 @@ struct NonSharedFixture {
         cache = made.value();
 
         resolver.reset(new snapshot::RepositoryRuntimeResolver(
-            repository, cache, tree.At("runtime"), &store,
-            std::shared_ptr<p2p::P2pTransport>()));
+            repository, cache, tree.At("runtime"), &store, transport));
         ready = true;
     }
 };
@@ -612,6 +730,89 @@ MT_TEST(the_vm_state_of_an_unmountable_repository_comes_through_fetch_blob) {
     MT_EXPECT_TRUE(f.repository->fetch_destinations[0].find(f.tree.At("cache")) == 0);
     // And the manifest points the launch at that fetched copy.
     MT_EXPECT_EQ(runnable.value().manifest.vm_state.path, f.repository->fetch_destinations[0]);
+}
+
+// ---- the peer leg -----------------------------------------------------------
+//
+// Rust `resolver.rs` tries a peer before the repository for the vm state and
+// the firecracker manifest. Both branches were implemented and both were
+// unreachable in production: `MakeSnapshotBackendFromConfig` hardcoded a null
+// transport because `main` built the P2P node *after* the snapshot backend, so
+// a cluster with `[p2p] enabled = true` pulled every memory dump from the
+// repository while a peer holding it sat idle.
+
+MT_TEST(the_vm_state_comes_from_a_peer_that_has_it) {
+    std::shared_ptr<SeededPeerTransport> peer(new SeededPeerTransport());
+    NonSharedFixture f(peer);
+    if (!f.ready) return;
+    // Seeded under the key the resolver will derive, not a key of this test's
+    // choosing: `FixedArtifactKey` is what a *publishing* node uses, so a
+    // mismatch between the two would make every lookup miss while both halves
+    // looked correct in isolation.
+    peer->artifacts[snapshot::FixedArtifactKey(
+        f.record.id, repo::SnapshotFileName(repo::SnapshotFile::VmState))] =
+        std::string("memory-dump-from-peer");
+
+    const repo::RepositoryResult<snapshot::RunnableSnapshot> runnable =
+        f.resolver->Resolve(f.record);
+    MT_EXPECT_TRUE(runnable.ok());
+    if (!runnable.ok()) {
+        MT_EXPECT_EQ(runnable.error().ToString(), std::string(""));
+        return;
+    }
+
+    // The whole point: the repository was never asked for the bytes.
+    MT_EXPECT_EQ(f.repository->fetch_blob_calls, 0);
+    MT_EXPECT_EQ(peer->file_fetches, 1);
+    // And the launch points at the peer's copy, in the node-local cache.
+    MT_EXPECT_TRUE(runnable.value().manifest.vm_state.path.find(f.tree.At("cache")) == 0);
+    const core::Expected<std::string, std::string> landed =
+        core::fs::ReadToString(runnable.value().manifest.vm_state.path);
+    MT_EXPECT_TRUE(landed.ok());
+    if (landed.ok()) MT_EXPECT_EQ(landed.value(), std::string("memory-dump-from-peer"));
+}
+
+MT_TEST(a_peer_without_the_vm_state_falls_back_to_the_repository) {
+    // Best-effort, as upstream has it: a peer that cannot serve the artifact
+    // must not fail the launch while the repository still holds it. This is
+    // the normal state of the first node to resume a given snapshot.
+    std::shared_ptr<SeededPeerTransport> peer(new SeededPeerTransport());
+    NonSharedFixture f(peer);
+    if (!f.ready) return;
+
+    const repo::RepositoryResult<snapshot::RunnableSnapshot> runnable =
+        f.resolver->Resolve(f.record);
+    MT_EXPECT_TRUE(runnable.ok());
+    if (!runnable.ok()) return;
+
+    // Asked, missed, fell back -- rather than never asked, which is what the
+    // null transport did and what this pair of tests distinguishes.
+    MT_EXPECT_TRUE(!peer->lookups.empty());
+    MT_EXPECT_EQ(peer->file_fetches, 0);
+    MT_EXPECT_EQ(f.repository->fetch_blob_calls, 1);
+}
+
+MT_TEST(the_firecracker_manifest_is_also_tried_against_a_peer) {
+    // The second branch, and it is a separate one: the manifest is small JSON
+    // fetched into memory, so it takes `FetchBytes` rather than a cache entry.
+    // A resolver wired for one and not the other would pass the vm-state tests
+    // above.
+    std::shared_ptr<SeededPeerTransport> peer(new SeededPeerTransport());
+    NonSharedFixture f(peer);
+    if (!f.ready) return;
+
+    const repo::RepositoryResult<snapshot::RunnableSnapshot> runnable =
+        f.resolver->Resolve(f.record);
+    MT_EXPECT_TRUE(runnable.ok());
+    if (!runnable.ok()) return;
+
+    const std::string manifest_key = snapshot::FixedArtifactKey(
+        f.record.id, repo::SnapshotFileName(repo::SnapshotFile::FirecrackerManifest));
+    bool asked = false;
+    for (std::size_t i = 0; i < peer->lookups.size(); ++i) {
+        if (peer->lookups[i] == manifest_key) asked = true;
+    }
+    MT_EXPECT_TRUE(asked);
 }
 
 MT_TEST(a_local_blob_missing_in_place_is_an_error_and_never_fetched) {

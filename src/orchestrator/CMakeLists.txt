@@ -17,6 +17,12 @@ target_link_libraries(agentenv-orchestrator PUBLIC
     agentenv-local-store
     agentenv-sandbox
     agentenv-snapshot
+    # Rust `image_refs: Arc<dyn RuntimeImageRefs>` — `New` builds the port
+    # with `local_image_services_from_app_config` and the maintenance sweep
+    # calls `MaintainRunning` / `ReconcilePaused` through it. Reached
+    # transitively via agentenv-snapshot today; named here because this
+    # library now depends on it directly.
+    agentenv-image
     # Rust `volume_manager: Option<Arc<VolumeManager>>` — the delete path
     # publishes / fails / releases volume backings through it.
     agentenv-volume

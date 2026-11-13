@@ -25,6 +25,17 @@ const uint64_t kFetchChunkBytes = 32ull * 1024 * 1024;
 const uint64_t kMaxRangeBytes = 64ull * 1024 * 1024;
 const std::size_t kMaxConcurrentCatalogLookups = 4;
 
+bool IsLocalPeer(const P2pPeer& peer, const std::string& node_id,
+                 const std::string& advertise_addr) {
+    // The node id arm is first because it holds even when this node's
+    // advertised address has changed since a peer list naming it was built --
+    // a restart on a new port, which is exactly when a stale entry pointing at
+    // us is most likely to be in the index.
+    if (!node_id.empty() && peer.node_id == node_id) return true;
+    return peer.endpoint.backend == kHttpBackendId && !advertise_addr.empty() &&
+           peer.endpoint.address == advertise_addr;
+}
+
 core::Optional<std::string> FindP2pHeader(const std::map<std::string, std::string>& headers,
                                           const std::string& name) {
     for (std::map<std::string, std::string>::const_iterator it = headers.begin();
@@ -269,6 +280,48 @@ class HttpP2pTransport::Impl {
             return core::Optional<P2pArtifactDescriptor>();
         }
         return decoded.value().descriptor;
+    }
+
+    /// Rust `lookup_peers`: ask a candidate set and take the first answer in
+    /// *peer order*.
+    ///
+    /// One function rather than one loop per caller, because both lookup
+    /// stages run it and the batching plus the self-skip below are exactly the
+    /// kind of detail two copies drift on.
+    bool LookupPeers(const std::vector<P2pPeer>& peers, const P2pArtifactKey& key,
+                     P2pArtifactDescriptor* out) {
+        // Rust `first_some_buffered_in_order`: run up to
+        // MAX_CONCURRENT_CATALOG_LOOKUPS at a time but accept results in peer
+        // order, so the answer does not depend on which peer happened to be
+        // quickest. Without that, two nodes asking the same question could
+        // pick different providers and the choice would be unreproducible.
+        for (std::size_t base = 0; base < peers.size();
+             base += kMaxConcurrentCatalogLookups) {
+            std::size_t count = peers.size() - base;
+            if (count > kMaxConcurrentCatalogLookups) count = kMaxConcurrentCatalogLookups;
+
+            std::vector<core::Optional<P2pArtifactDescriptor> > results(count);
+            std::vector<std::thread> workers;
+            workers.reserve(count);
+            for (std::size_t i = 0; i < count; ++i) {
+                const P2pPeer& peer = peers[base + i];
+                if (IsLocalPeer(peer, options.node_id, options.advertise_addr)) continue;
+                core::Optional<P2pArtifactDescriptor>* slot = &results[i];
+                Impl* impl = this;
+                workers.push_back(std::thread([impl, peer, key, slot]() {
+                    *slot = impl->LookupPeer(peer, key);
+                }));
+            }
+            for (std::size_t i = 0; i < workers.size(); ++i) workers[i].join();
+
+            for (std::size_t i = 0; i < count; ++i) {
+                if (results[i].has_value()) {
+                    if (out) *out = *results[i];
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /// What one range request came back with.
@@ -679,39 +732,37 @@ HttpP2pTransport::LookupWithHints(const P2pArtifactKey& key,
         return true;
     }
 
+    // Stage one: the scheduler's artifact index, asked *for this key*.
+    //
+    // This stage was missing, and its absence was not a slow path -- it was a
+    // different algorithm. Every lookup went straight to the refresh cache and
+    // broadcast a catalog request to every peer in the cluster, so the cost of
+    // finding one provider scaled with cluster size while the scheduler held
+    // the answer: `/record` is called on every publish, so the index names the
+    // nodes that actually hold the key. Upstream asks it first for exactly
+    // that reason.
+    const P2pResult<std::vector<P2pPeer> > keyed = impl_->discovery->PeersForKey(key);
+    if (keyed.ok()) {
+        if (impl_->LookupPeers(keyed.value(), key, out)) return true;
+    } else {
+        // Rust warns and falls through. The index is an accelerator, not the
+        // source of truth: an unreachable scheduler must not make an artifact
+        // every peer still holds unfindable. Note this is *not* the same as
+        // `PeersForKey` answering an empty list -- that is the index saying it
+        // knows of no provider, which the broadcast below may still disprove.
+        AGENTENV_WARN("P2P scheduler artifact lookup failed; falling back to peer discovery"
+                      << " key=" << key << " error=" << keyed.error().ToString());
+    }
+
+    // Stage two: the refresh cache, with caller hints ahead of it.
+    //
+    // This failure *is* propagated where stage one's is swallowed, matching
+    // Rust's `?` here against its `match` above: with no candidate set at all
+    // there is nothing left to try, so reporting a miss would claim the
+    // cluster was searched.
     const P2pResult<std::vector<P2pPeer> > peers = impl_->discovery->PeersWithHints(hints);
     if (!peers.ok()) return core::make_unexpected(peers.error());
-
-    // Rust `first_some_buffered_in_order`: run up to
-    // MAX_CONCURRENT_CATALOG_LOOKUPS at a time but accept results in peer
-    // order, so the answer does not depend on which peer happened to be
-    // quickest. Without that, two nodes asking the same question could pick
-    // different providers and the choice would be unreproducible.
-    const std::vector<P2pPeer>& list = peers.value();
-    for (std::size_t base = 0; base < list.size(); base += kMaxConcurrentCatalogLookups) {
-        std::size_t count = list.size() - base;
-        if (count > kMaxConcurrentCatalogLookups) count = kMaxConcurrentCatalogLookups;
-
-        std::vector<core::Optional<P2pArtifactDescriptor> > results(count);
-        std::vector<std::thread> workers;
-        workers.reserve(count);
-        for (std::size_t i = 0; i < count; ++i) {
-            const P2pPeer& peer = list[base + i];
-            core::Optional<P2pArtifactDescriptor>* slot = &results[i];
-            Impl* impl = impl_.get();
-            workers.push_back(std::thread([impl, peer, key, slot]() {
-                *slot = impl->LookupPeer(peer, key);
-            }));
-        }
-        for (std::size_t i = 0; i < workers.size(); ++i) workers[i].join();
-
-        for (std::size_t i = 0; i < count; ++i) {
-            if (results[i].has_value()) {
-                if (out) *out = *results[i];
-                return true;
-            }
-        }
-    }
+    if (impl_->LookupPeers(peers.value(), key, out)) return true;
 
     return false;  // Ok(None)
 }

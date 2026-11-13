@@ -84,10 +84,16 @@ overlaybd::OverlaybdCompactOutput PublishCompression(const SnapshotRepository& r
 }
 
 /// Rust `LayerStore::put_prepared`.
+///
+/// `local_layers` is Rust's `self.local_layers`: this port has free functions
+/// where upstream has a `LayerStore` struct, so the accumulator is threaded
+/// as an out-parameter instead of being a field. Appended **after** the blob
+/// lands, so a failed upload contributes nothing to announce.
 RepositoryResult<ManagedLayer> PutPrepared(SnapshotRepository& repository,
                                            const PreparedLayerUpload& upload,
                                            const core::Optional<std::string>& uuid,
-                                           LayerRole role) {
+                                           LayerRole role,
+                                           std::vector<PreparedLayerUpload>* local_layers) {
     ManagedLayer layer;
     layer.digest = upload.Digest();
     layer.size = upload.Size();
@@ -95,6 +101,7 @@ RepositoryResult<ManagedLayer> PutPrepared(SnapshotRepository& repository,
     const RepositoryResult<core::Unit> put =
         repository.PutBlob(BlobKey::Layer(layer.digest, role), BlobBody::File(upload.Path()));
     if (!put.ok()) return core::make_unexpected(put.error());
+    if (local_layers != NULL) local_layers->push_back(upload);
     return layer;
 }
 
@@ -103,7 +110,8 @@ RepositoryResult<ManagedLayer> PutPrepared(SnapshotRepository& repository,
 RepositoryResult<ManagedLayer> StoreLayer(SnapshotRepository& repository,
                                           const std::string& source,
                                           const core::Optional<std::string>& digest,
-                                          uint64_t size, LayerRole role) {
+                                          uint64_t size, LayerRole role,
+                                          std::vector<PreparedLayerUpload>* local_layers) {
     const RepositoryResult<std::string> canonical = Canonicalize(source);
     if (!canonical.ok()) return core::make_unexpected(canonical.error());
     if (digest.has_value()) {
@@ -126,22 +134,23 @@ RepositoryResult<ManagedLayer> StoreLayer(SnapshotRepository& repository,
         PrepareLayerUpload(canonical.value(), PublishCompression(repository), digest, size);
     if (!upload.ok()) return core::make_unexpected(upload.error());
     return PutPrepared(repository, upload.value(), OverlaybdLayerUuid(upload.value().Path()),
-                       role);
+                       role, local_layers);
 }
 
 /// Rust `LayerStore::store_descriptorless_layer`.
-RepositoryResult<ManagedLayer> StoreDescriptorlessLayer(SnapshotRepository& repository,
-                                                        const std::string& source,
-                                                        LayerRole role) {
+RepositoryResult<ManagedLayer> StoreDescriptorlessLayer(
+    SnapshotRepository& repository, const std::string& source, LayerRole role,
+    std::vector<PreparedLayerUpload>* local_layers) {
     const RepositoryResult<std::string> canonical = Canonicalize(source);
     if (!canonical.ok()) return core::make_unexpected(canonical.error());
     if (!obd::ShouldDenseExportLayer(canonical.value())) {
-        return StoreLayer(repository, canonical.value(), core::Optional<std::string>(), 0, role);
+        return StoreLayer(repository, canonical.value(), core::Optional<std::string>(), 0, role,
+                          local_layers);
     }
 
     // Rust stages this in `repository.staging_file()`, which the C++
     // repository does not have; `put_blob` copies a file body, so a temporary
-    // beside the source is equivalent and is removed once stored.
+    // beside the source is equivalent.
     const core::Optional<std::string> directory = core::fs::Parent(canonical.value());
     const core::Expected<core::fs::TempFile, std::string> dense_temp =
         core::fs::CreateTempFileIn(directory.has_value() ? *directory : std::string("."),
@@ -150,7 +159,16 @@ RepositoryResult<ManagedLayer> StoreDescriptorlessLayer(SnapshotRepository& repo
         return core::make_unexpected(
             RepositoryError::Backend("create dense layer staging file", dense_temp.error()));
     }
-    const std::string dense_path = dense_temp.value().path;
+    // Rust's `dense_temp` is a `NamedTempFile` whose own drop unlinks it, and
+    // `retain_source` below moves it into the upload so the file outlives this
+    // function exactly as long as the announcement needs it. `fs::TempFile`
+    // does not remove anything, so ownership is transferred to an
+    // `OwnedTempPath` here -- which also replaces the unconditional
+    // `RemoveFile` this function used to end with. That removal was correct
+    // only while nothing outlived the call; keeping it would now unlink the
+    // bytes the P2P publication is about to read.
+    const OwnedTempPath dense_owned(dense_temp.value().path);
+    const std::string dense_path = dense_owned.path();
 
     RepositoryResult<ManagedLayer> stored = core::make_unexpected(RepositoryError::Backend(""));
     do {
@@ -179,29 +197,29 @@ RepositoryResult<ManagedLayer> StoreDescriptorlessLayer(SnapshotRepository& repo
                 descriptor.error()));
             break;
         }
-        // Rust follows this with `upload.retain_source(dense_temp)`, which
-        // keeps the staging file alive for as long as the upload is held in
-        // `StoredSnapshot::local_layers` (post-commit P2P publication). That
-        // field is not ported — see store.h — so nothing outlives this
-        // function and the explicit removal below is the whole lifetime.
-        const RepositoryResult<PreparedLayerUpload> upload = PrepareLayerUpload(
+        RepositoryResult<PreparedLayerUpload> upload = PrepareLayerUpload(
             dense_path, PublishCompression(repository),
             core::Optional<std::string>(descriptor.value().sha256), descriptor.value().size);
         if (!upload.ok()) {
             stored = core::make_unexpected(upload.error());
             break;
         }
+        // Rust `upload.retain_source(dense_temp)`. A no-op when preparation
+        // produced its own compressed temporary -- `RetainSource` refuses to
+        // replace one, because that would drop the last reference to the file
+        // at `Path()`.
+        upload.value().RetainSource(dense_owned);
         // Dense-exported layers never carry a layer uuid, recontainerized or not.
-        stored = PutPrepared(repository, upload.value(), core::Optional<std::string>(), role);
+        stored = PutPrepared(repository, upload.value(), core::Optional<std::string>(), role,
+                             local_layers);
     } while (false);
-    core::fs::RemoveFile(dense_path);
     return stored;
 }
 
 /// Rust `LayerStore::store_disk_layers`.
 RepositoryResult<std::vector<OverlaybdLayerRef> > StoreDiskLayers(
     SnapshotRepository& repository, const std::string& image_config_path, LayerRole role,
-    bool allow_descriptorless) {
+    bool allow_descriptorless, std::vector<PreparedLayerUpload>* local_layers) {
     const core::Expected<obd::ImageConfig, std::string> image_config =
         obd::LoadImageConfig(image_config_path);
     if (!image_config.ok()) {
@@ -217,7 +235,8 @@ RepositoryResult<std::vector<OverlaybdLayerRef> > StoreDiskLayers(
                 core::make_unexpected(RepositoryError::Backend(""));
             if (!layer.digest.empty() && layer.size > 0) {
                 managed = StoreLayer(repository, layer.file,
-                                     core::Optional<std::string>(layer.digest), layer.size, role);
+                                     core::Optional<std::string>(layer.digest), layer.size, role,
+                                     local_layers);
             } else if (allow_descriptorless ||
                        image::RootfsLayerIsRuntimeGeneratedDelta(layer.file)) {
                 // The second test is what the snapshot path relies on:
@@ -226,7 +245,7 @@ RepositoryResult<std::vector<OverlaybdLayerRef> > StoreDiskLayers(
                 // with no descriptor at all. Without it, every snapshot of a
                 // sandbox that wrote to its rootfs would be refused as
                 // "missing digest/size".
-                managed = StoreDescriptorlessLayer(repository, layer.file, role);
+                managed = StoreDescriptorlessLayer(repository, layer.file, role, local_layers);
             } else {
                 return core::make_unexpected(RepositoryError::Unsupported(
                     "local overlaybd lower layer " + ToStr(index) + " '" + layer.file +
@@ -305,7 +324,8 @@ RepositoryResult<ManagedLayer> MemoryLayerFromRemoteLower(
 
 /// Rust `LayerStore::store_memory_layers`.
 RepositoryResult<std::vector<ManagedLayer> > StoreMemoryLayers(
-    SnapshotRepository& repository, const std::string& image_config_path) {
+    SnapshotRepository& repository, const std::string& image_config_path,
+    std::vector<PreparedLayerUpload>* local_layers) {
     const core::Expected<obd::ImageConfig, std::string> image_config =
         obd::LoadImageConfig(image_config_path);
     if (!image_config.ok()) {
@@ -342,7 +362,7 @@ RepositoryResult<std::vector<ManagedLayer> > StoreMemoryLayers(
             repository, layer.file,
             has_descriptor ? core::Optional<std::string>(layer.digest)
                            : core::Optional<std::string>(),
-            has_descriptor ? layer.size : 0, LayerRole::Memory);
+            has_descriptor ? layer.size : 0, LayerRole::Memory, local_layers);
         if (!managed.ok()) return core::make_unexpected(managed.error());
         layers.push_back(managed.value());
     }
@@ -441,11 +461,12 @@ RepositoryResult<std::vector<OverlaybdLayerRef> > StoreDiskImage(
     const core::SnapshotId& id, const image_export::DiskImageSubject& subject,
     const std::string& image_config_path,
     const core::Optional<SnapshotOciConfigInput>& config,
-    std::vector<PersistedDiskImagePublication>* publications) {
+    std::vector<PersistedDiskImagePublication>* publications,
+    std::vector<PreparedLayerUpload>* local_layers) {
     const LayerRole role =
         subject.is_rootfs() ? LayerRole::Rootfs : LayerRole::AttachedDrive;
     if (exporter == NULL) {
-        return StoreDiskLayers(repository, image_config_path, role, false);
+        return StoreDiskLayers(repository, image_config_path, role, false, local_layers);
     }
 
     const RepositoryResult<image_export::DiskImageExportOutcome> outcome =
@@ -455,6 +476,14 @@ RepositoryResult<std::vector<OverlaybdLayerRef> > StoreDiskImage(
         // `Option` extends by zero or one element.
         if (outcome.value().publication.has_value()) {
             publications->push_back(*outcome.value().publication);
+        }
+        // Rust `self.local_layers.extend(outcome.local_layers)`. The exporter
+        // uploaded these to the registry, so they are what the announcement
+        // must offer: a recontainerized delta's bytes match neither the
+        // capture file nor anything else on this node.
+        if (local_layers != NULL) {
+            local_layers->insert(local_layers->end(), outcome.value().local_layers.begin(),
+                                 outcome.value().local_layers.end());
         }
         return outcome.value().layers;
     }
@@ -475,7 +504,7 @@ RepositoryResult<std::vector<OverlaybdLayerRef> > StoreDiskImage(
     }
     AGENTENV_INFO("falling back to managed disk image layers for snapshot "
                   << id.ToString() << " " << subject.LogLabel() << ": " << feature);
-    return StoreDiskLayers(repository, image_config_path, role, false);
+    return StoreDiskLayers(repository, image_config_path, role, false, local_layers);
 }
 
 /// Rust `LayerStore::store_snapshot`.
@@ -510,12 +539,12 @@ RepositoryResult<core::Unit> StoreSnapshotInner(
         repository, selected, metadata.id, image_export::DiskImageSubject::Rootfs(),
         manifest.rootfs.image_config_path,
         core::Optional<SnapshotOciConfigInput>(rootfs_config_value),
-        &stored.disk_publications);
+        &stored.disk_publications, &stored.local_layers);
     if (!rootfs_layers.ok()) return core::make_unexpected(rootfs_layers.error());
     stored.rootfs_layers = rootfs_layers.value();
 
     const RepositoryResult<std::vector<ManagedLayer> > memory_layers =
-        StoreMemoryLayers(repository, manifest.memory.image_config_path);
+        StoreMemoryLayers(repository, manifest.memory.image_config_path, &stored.local_layers);
     if (!memory_layers.ok()) return core::make_unexpected(memory_layers.error());
     stored.memory_layers = memory_layers.value();
 
@@ -542,7 +571,7 @@ RepositoryResult<core::Unit> StoreSnapshotInner(
             repository, selected, metadata.id,
             image_export::DiskImageSubject::AttachedDrive(drive.drive_id),
             drive.image_config_path, core::Optional<SnapshotOciConfigInput>(),
-            &stored.disk_publications);
+            &stored.disk_publications, &stored.local_layers);
         if (!layers.ok()) return core::make_unexpected(layers.error());
 
         CommittedAttachedDrive committed;
@@ -669,7 +698,13 @@ RepositoryResult<StoredSnapshot> StoreSnapshot(
 
 RepositoryResult<std::vector<OverlaybdLayerRef> > StoreVolumeLayers(
     SnapshotRepository& repository, const std::string& image_config_path) {
-    return StoreDiskLayers(repository, image_config_path, LayerRole::Rootfs, true);
+    // Upstream builds a `LayerStore` here and drops it on return, so its
+    // `local_layers` — and with it every temporary the preparation produced —
+    // dies with the call. A local accumulator is the same lifetime: a volume
+    // backing is not announced, and the uploads have already completed.
+    std::vector<PreparedLayerUpload> local_layers;
+    return StoreDiskLayers(repository, image_config_path, LayerRole::Rootfs, true,
+                           &local_layers);
 }
 
 }  // namespace snapshot

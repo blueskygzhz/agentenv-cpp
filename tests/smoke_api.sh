@@ -125,11 +125,39 @@ expect "GET  malformed id"         404 "$BASE/sandboxes/not-a-uuid"
 expect "GET  unknown route"        404 "$BASE/nope"
 expect "PUT  /sandboxes (method)"  405 -X PUT "$BASE/sandboxes"
 expect "POST malformed JSON"       400 -X POST -d '{broken' "$BASE/sandboxes"
-# Unported subsystems must say so rather than answer with an empty success.
-expect "POST snapshot (unported)"  501 -X POST \
-    "$BASE/sandboxes/0192f3a1-4c5d-7e80-9abc-def012345678/snapshot"
-expect "GET  /templates (unported)" 501 "$BASE/templates"
-expect "POST exec (unported)"      501 -X POST -d '{"cmd":["true"]}' \
+# These three used to assert 501 against "unported subsystems". All three had
+# since been ported or removed, and this file kept asserting the old answers --
+# it could only fail, and never did, because the skip above fires on every
+# machine without CAP_NET_ADMIN. A test that cannot run cannot notice that what
+# it checks has changed underneath it.
+#
+# The route *table* is asserted by `test_api_routes.cc`, which runs everywhere.
+# What these add is that a real process over a real socket agrees with it.
+
+# `snapshots`, plural. The singular spelling probed here before was never a
+# route on either side, so the old 501 could not have come from the handler --
+# it was a 404 from the router, read as a pass because 501 was never checked
+# against anything.
+#
+# Body first: upstream's `requestBody` is `required: true`, and
+# `CreateSnapshotReq`'s only field is optional, so an omitted body would
+# otherwise publish an unaliased snapshot the caller meant to name.
+expect "POST /sandboxes/{id}/snapshots (no body)" 400 -X POST \
+    "$BASE/sandboxes/0192f3a1-4c5d-7e80-9abc-def012345678/snapshots"
+# With a body, the handler runs and the unknown sandbox is what refuses it.
+# This is the assertion that the route reaches `CreateSnapshot` at all.
+expect "POST /sandboxes/{id}/snapshots (unknown)" 404 -X POST \
+    -H 'Content-Type: application/json' -d '{}' \
+    "$BASE/sandboxes/0192f3a1-4c5d-7e80-9abc-def012345678/snapshots"
+# Templates are snapshot records filtered by source; an empty catalog lists as
+# an empty array rather than failing, so a fresh node answers 200 with `[]`.
+expect "GET  /templates"           200 "$BASE/templates"
+# Not 501, and not a gap: upstream serves no `exec` endpoint -- `openapi.yml`
+# never mentions it, because running a command is a data plane call that
+# reaches envd through the proxy. This port invented a 501 route and it was
+# removed, so the honest answer is the router's 404. Asserted to keep it from
+# being reinvented.
+expect "POST exec (not an endpoint)" 404 -X POST -d '{"cmd":["true"]}' \
     "$BASE/sandboxes/0192f3a1-4c5d-7e80-9abc-def012345678/exec"
 
 # A create reaches the backend factory and fails there, on this host, for want

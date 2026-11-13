@@ -22,6 +22,7 @@ namespace agentenv {
 namespace orchestrator { class Orchestrator; }
 namespace volume { class VolumeManager; }
 namespace image { class ImageResolver; }
+namespace p2p { class P2pTransport; }
 namespace snapshot {
 class SnapshotRuntimeResolver;
 namespace repository { class SnapshotRepository; }
@@ -57,6 +58,23 @@ struct HttpRequest {
     bool matched_route = false;
     /// Rust `RawPathParams` of the matched route.
     std::map<std::string, std::string> path_params;
+    /// The connection's peer address, or empty when it could not be read.
+    ///
+    /// Rust gets this from axum's `ConnectInfo<SocketAddr>`. It is a property
+    /// of the connection rather than the payload, so a handler must not infer
+    /// it from a header: `X-Forwarded-For` is client-supplied and would let a
+    /// remote caller claim to be local. The overlaybd P2P facade's publish
+    /// endpoint is the consumer — it accepts loopback clients only.
+    std::string peer_addr;
+    /// Whether `peer_addr` is a loopback address.
+    ///
+    /// Computed by the server from the parsed address rather than by comparing
+    /// strings at the call site, because the textual forms are several
+    /// (`127.0.0.1`, any `127.x.y.z`, `::1`, `::ffff:127.0.0.1`) and a handler
+    /// that checked only the first would reject legitimate local clients.
+    /// False when the peer address is unknown, which is the safe default for
+    /// an endpoint that gates on it.
+    bool peer_is_loopback = false;
 };
 
 struct HttpResponse {
@@ -131,6 +149,11 @@ void RegisterOrchestratorRoutes(Server* server, orchestrator::Orchestrator* svc)
 /// and is *not* a refusal: it is upstream's "observability is disabled on this
 /// node", which answers the collection with an empty list and the detail with
 /// a 404. Borrowed, not owned — the caller outlives the routes.
+///
+/// `p2p_transport` is what `POST /sandboxes/{id}/snapshots` announces a newly
+/// committed snapshot over. Null is legal and announces nothing; it is
+/// `SnapshotBackend::p2p_transport`, which already applies the
+/// `snapshot.p2p_enabled` gate.
 void RegisterOrchestratorRoutes(
     Server* server, orchestrator::Orchestrator* svc,
     std::shared_ptr<volume::VolumeManager> volumes,
@@ -139,7 +162,9 @@ void RegisterOrchestratorRoutes(
         std::shared_ptr<snapshot::repository::SnapshotRepository>(),
     std::shared_ptr<snapshot::SnapshotRuntimeResolver> runtime_resolver =
         std::shared_ptr<snapshot::SnapshotRuntimeResolver>(),
-    const AdminObservability* observability = NULL);
+    const AdminObservability* observability = NULL,
+    std::shared_ptr<p2p::P2pTransport> p2p_transport =
+        std::shared_ptr<p2p::P2pTransport>());
 
 }  // namespace api
 }  // namespace agentenv

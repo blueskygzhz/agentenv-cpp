@@ -1010,10 +1010,9 @@ RepositoryResult<DiskImageExportOutcome> AcrDiskImageExporter::Export(
     descriptors.reserve(image.value().layers.size());
     committed_layers.reserve(image.value().layers.size());
     // Rust returns these in `DiskImageExportOutcome::local_layers` for the
-    // post-commit P2P announcement, which is not ported. They are still held
-    // here, because each one owns the temporary file its upload read from and
-    // dropping them per iteration would be fine only as long as that stays
-    // true. Keeping them makes the lifetime independent of that detail.
+    // post-commit P2P announcement. Each one owns the temporary file its
+    // upload read from, so they are also what keeps those bytes on disk until
+    // the announcement has copied them.
     std::vector<PreparedLayerUpload> local_layers;
 
     for (std::vector<SourceRegistryLayer>::size_type i = 0; i < image.value().layers.size();
@@ -1081,6 +1080,10 @@ RepositoryResult<DiskImageExportOutcome> AcrDiskImageExporter::Export(
 
     DiskImageExportOutcome outcome;
     outcome.layers = committed_layers;
+    // Rust `local_layers: self.local_layers`. Handing these back is what keeps
+    // each recontainerized/dense temporary alive past this function, so the
+    // post-commit P2P announcement can still read the exact uploaded bytes.
+    outcome.local_layers = local_layers;
     PersistedDiskImagePublication publication;
     publication.image_ref = target.ImageRef(tag);
     publication.tag = tag;

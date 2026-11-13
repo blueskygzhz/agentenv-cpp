@@ -170,6 +170,19 @@ struct SnapshotBackend {
     std::shared_ptr<SnapshotRuntimeResolver> runtime_resolver;
     std::shared_ptr<image::cache::OverlaybdLayerStore> overlaybd_layers;
     std::shared_ptr<LocalArtifactCache>      artifact_cache;
+    /// The transport this backend was built with, handed back so the API layer
+    /// can announce a freshly published snapshot over it.
+    ///
+    /// Upstream has no equivalent field because its `SnapshotManager` owns
+    /// both the repository and the transport, and `publish_with_recording`
+    /// reaches the second through `self`. This port's `Publish` is a free
+    /// function, so the transport has to travel with the backend to reach
+    /// `PublishSnapshotP2pArtifacts` — otherwise `main` would be the only
+    /// place holding it and every committed snapshot would go unannounced.
+    ///
+    /// Null when `[p2p].enabled` is false, which the announcement reads as
+    /// "nothing to announce".
+    std::shared_ptr<p2p::P2pTransport>       p2p_transport;
 };
 
 /// Rust `build_snapshot_backend_from_config` (`snapshot/backends/mod.rs:57`),
@@ -191,7 +204,24 @@ struct SnapshotBackend {
 /// calls `LocalArtifactCache::new` before building the backend and propagates
 /// its failure with `?`. A node whose cache root cannot be created cannot
 /// resolve any snapshot, and finding that out at startup is the point.
-RepositoryResult<SnapshotBackend> MakeSnapshotBackendFromConfig(const cfg::AppConfig& config);
+///
+/// `p2p_transport` is the node's transport, which the resolver uses to try a
+/// peer before the repository for memory dumps, rootfs images and firecracker
+/// manifests. Passing null is legal and means every remote artifact is fetched
+/// from the repository — bandwidth, not correctness, which is why upstream
+/// treats this leg as best-effort too.
+///
+/// **`snapshot.p2p_enabled` is applied here, not by the caller.** Upstream
+/// gates at the call site (`config.snapshot.p2p_enabled.then(|| ...)`,
+/// `server.rs:107`). Moving it inside is a deliberate departure: the switch
+/// had no consumer anywhere in this tree for as long as the parameter did not
+/// exist, and a gate the caller has to remember is a gate that returns to that
+/// state the next time a caller is added. The parameter therefore means "the
+/// transport this node has", and whether a *snapshot* resolve may use it stays
+/// with the config that decides it.
+RepositoryResult<SnapshotBackend> MakeSnapshotBackendFromConfig(
+    const cfg::AppConfig& config,
+    std::shared_ptr<p2p::P2pTransport> p2p_transport = std::shared_ptr<p2p::P2pTransport>());
 
 }  // namespace repository
 }  // namespace snapshot

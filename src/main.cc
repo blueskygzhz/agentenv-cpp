@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: MIT
 // Top-level agentenv binary — wires the orchestrator + backend + api::Server.
 // This is the C++11 analog of Rust `src/bin/agentenv.rs`.
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "agentenv/api/auth_middleware.h"
+#include "agentenv/api/http_server.h"
 #include "agentenv/api/proxy.h"
 #include "agentenv/api/server.h"
 #include "agentenv/api_key.h"
@@ -19,10 +24,14 @@
 #include "agentenv/core/identity.h"
 #include "agentenv/core/logging.h"
 #include "agentenv/image/cache_service.h"
+#include "agentenv/image/cache_store.h"
 #include "agentenv/image/resolver.h"
 #include "agentenv/orchestrator/persistence.h"
 #include "agentenv/orchestrator/service.h"
 #include "agentenv/cfg.h"
+#include "agentenv/overlaybd/p2p/http_routes.h"
+#include "agentenv/overlaybd/p2p/origin_fetcher.h"
+#include "agentenv/overlaybd/p2p/runtime.h"
 #include "agentenv/snapshot/repository/backends.h"
 #include "agentenv/snapshot/repository/posixfs/backend.h"
 #include "agentenv/volume.h"
@@ -119,6 +128,76 @@ class ApiServerBlobServer : public ae::p2p::P2pBlobServer {
 
  private:
     std::unique_ptr<ae::api::Server> server_;
+};
+
+/// Adapts `api::HttpServer` to the contract `agentenv-overlaybd-p2p` declares.
+///
+/// Same build constraint as `ApiServerBlobServer` above, and the same
+/// resolution: the facade library cannot name `api::Server` without closing a
+/// CMake cycle, so it declares `FacadeServer` and this is the one place that
+/// sees both.
+///
+/// `api::HttpServer` concretely rather than `api::MakeServer()`, because the
+/// bound port has to be read back: the facade is addressed by URL, and that
+/// URL goes into the generated overlaybd configs. Binding a fixed port would
+/// be the alternative and a worse one -- two agentenv processes on one host
+/// would then fight over it.
+class ApiServerFacadeServer : public ae::overlaybd::p2p::FacadeServer {
+ public:
+    void Route(const std::string& method, const std::string& path_pattern,
+               Handler handler) override {
+        server_.Route(method, path_pattern,
+                      [handler](const ae::api::HttpRequest& request,
+                                ae::api::HttpResponse* response) {
+            ae::overlaybd::p2p::FacadeServerRequest translated;
+            translated.method = request.method;
+            // Path *and* query, undecoded. `ReconstructOriginUrl` needs both
+            // halves: a presigned blob URL carries its signature in the query,
+            // and `request.path` is percent-decoded, which would corrupt an
+            // origin URL's own escapes.
+            translated.raw_target = request.raw_path;
+            if (request.has_query) {
+                translated.raw_target += "?" + request.raw_query;
+            }
+            translated.body = request.body;
+            // From the socket, as `HttpRequest` documents -- never from a
+            // header, which the publish gate would let a remote caller forge.
+            translated.peer_is_loopback = request.peer_is_loopback;
+            for (std::unordered_map<std::string, std::string>::const_iterator it =
+                     request.headers.begin();
+                 it != request.headers.end(); ++it) {
+                translated.headers.Set(it->first, it->second);
+            }
+
+            ae::overlaybd::p2p::FacadeServerResponse produced;
+            handler(translated, &produced);
+
+            response->status = produced.status;
+            response->body = produced.body;
+            for (std::map<std::string, std::string>::const_iterator it =
+                     produced.headers.begin();
+                 it != produced.headers.end(); ++it) {
+                response->headers[it->first] = it->second;
+            }
+        });
+    }
+
+    ae::core::Expected<ae::core::Unit, std::string>
+        ListenAndServe(const std::string& bind_addr) override {
+        const ae::core::Expected<ae::core::Unit, ae::core::AnyError> served =
+            server_.ListenAndServe(bind_addr);
+        if (!served.ok()) {
+            return ae::core::make_unexpected(served.error().chain());
+        }
+        return ae::core::Unit{};
+    }
+
+    void Stop() override { server_.Stop(); }
+
+    uint16_t BoundPort() const { return server_.BoundPort(); }
+
+ private:
+    ae::api::HttpServer server_;
 };
 
 /// Rust `shutdown_signal()` — SIGINT/SIGTERM start a graceful shutdown.
@@ -422,34 +501,14 @@ int main(int argc, char** argv) {
         if (!environment_ok) return 1;
 
         // Step 4. Downloads firecracker, the kernel, regctl and the overlaybd
-        // CLI tools, then writes the generated overlaybd global configs. The
-        // configs come second because they are written per cache directory the
-        // install just created.
+        // CLI tools. The generated overlaybd global configs used to be written
+        // here too; they now happen after the P2P facade starts, because the
+        // facade's address is one of their inputs. See the call site below for
+        // why that ordering is the upstream one and what it fixes.
         auto provisioned =
             ae::setup::deps::Ensure(app_cfg, app_cfg.deps_path, manifest.value());
         if (!provisioned.ok()) {
             AGENTENV_ERROR("ensure dependencies: " << provisioned.error());
-            return 1;
-        }
-        // Passed empty, which writes `p2p.enable: false` into every overlaybd
-        // config, so the ublk daemon never reads layer ranges from peers.
-        //
-        // **Deviation, and not for the reason this comment used to give.** It
-        // said "this build has no iroh transport", but the facade does not
-        // need iroh: `HttpP2pTransport::LocalEndpoint` always succeeds, so
-        // `FacadeConfigFromAppConfig` would enable it on any `http` node. The
-        // real gap is that `OverlaybdP2pRuntime` is never started here --
-        // `Started` takes addresses from a listener this file never binds,
-        // and `FacadeCore`'s handlers have no route. Upstream starts it at
-        // `server.rs:91` and only then runs `ensure_environment` (`:94`) with
-        // `read_facade_address()`; this block runs *before* the transport
-        // exists (below), so the ordering would have to change too.
-        // Passing empty is still the right call until then: an address with no
-        // listener behind it would send every block read to a dead endpoint.
-        auto obd_configs = ae::setup::deps::WriteGeneratedOverlaybdGlobalConfigs(
-            app_cfg, ae::core::Optional<std::string>());
-        if (!obd_configs.ok()) {
-            AGENTENV_ERROR("write generated overlaybd configs: " << obd_configs.error());
             return 1;
         }
 
@@ -563,99 +622,6 @@ int main(int argc, char** argv) {
     }
     auto factory = std::shared_ptr<ae::sandbox::SandboxBackendFactory>(fc_factory);
 
-    // 2b) Volume manager.
-    //
-    // Rust `server.rs:106-118`: the snapshot repository first, then
-    // `VolumeManager::open_with_repository_and_limits(home/volumes/catalog,
-    // repository, limits)`. The manager goes to both the orchestrator (which
-    // releases leases on delete and publishes backings on capture) and the API
-    // bundle (which serves `/volumes*`).
-    //
-    // The repository comes from `MakeSnapshotBackendFromConfig`, which selects
-    // on `snapshot.repository_backend`. This used to branch on
-    // `backend.posix_fs.has_value()` and build the posix-fs stores inline --
-    // which silently sent an OSS-configured node to its local disk whenever a
-    // `[backend.posix_fs]` section was also present, the ordinary state of a
-    // migrated node. See that function for the whole argument.
-    //
-    // It returns the *pair* upstream's `build_snapshot_backend` does. The
-    // second half is the runtime resolver, and it is why this call changed:
-    // the repository-only form left the resolver with no production caller at
-    // all, so `POST /sandboxes` could not turn a `templateID` into launchable
-    // paths and fell through to a fresh boot with an empty rootfs config.
-    std::shared_ptr<ae::volume::VolumeManager> volume_manager;
-    std::shared_ptr<ae::image::ImageResolver> image_resolver;
-    // Outlives the block below because the API bundle needs it too: the
-    // snapshot route publishes through it. It used to be a local here, which
-    // is why that route had nowhere to publish to.
-    std::shared_ptr<ae::snapshot::repository::SnapshotRepository> repository;
-    // The whole backend is held, not just the resolver: it owns the overlaybd
-    // layer store the resolver borrows as a raw pointer, so letting it die
-    // here would leave every resolve reading freed memory.
-    ae::snapshot::repository::SnapshotBackend snapshot_backend;
-    {
-        auto made = ae::snapshot::repository::MakeSnapshotBackendFromConfig(app_cfg);
-        if (!made.ok()) {
-            // Fatal, as Rust's `?` in `build_snapshot_backend_from_config`
-            // is. Carrying on would serve a node whose declared storage
-            // backend does not exist: publishes would either fail one at a
-            // time or, worse, land somewhere other than where the config
-            // says.
-            AGENTENV_ERROR("snapshot repository backend startup failed: "
-                           << made.error().ToString());
-            return 1;
-        }
-        snapshot_backend = made.value();
-        repository = snapshot_backend.repository;
-        if (!snapshot_backend.runtime_resolver) {
-            // No configurable backend reaches this any more: the resolver is
-            // repository-generic, so `MakeSnapshotBackendFromConfig` builds
-            // one for whatever repository it just built. It used to be the
-            // ordinary state of an OSS node -- which published and served
-            // volumes normally but answered 501 on resume -- and the check
-            // stays as the guard that caught it: a backend added without
-            // wiring a resolver says so at startup instead of surfacing as a
-            // route that fails only once a user tries to resume.
-            AGENTENV_WARN("snapshot runtime resolver unavailable for the configured"
-                          << " repository backend; POST /sandboxes cannot launch from"
-                          << " a snapshot on this node");
-        }
-
-        ae::volume::VolumeLimits limits;
-        limits.max_size_mb = app_cfg.volume.max_size_mb;
-        limits.max_mounts = app_cfg.volume.max_volume_count;
-
-        auto opened = ae::volume::VolumeManager::OpenWithRepositoryAndLimits(
-            ae::core::fs::Join(app_cfg.home_path, "volumes/catalog"), repository, limits);
-        if (!opened.ok()) {
-            // Fatal, as Rust's `?` is. A node that came up without a volume
-            // manager would answer every `/volumes*` request with a 500 and
-            // silently skip lease release on delete, leaking a reservation per
-            // deleted sandbox.
-            AGENTENV_ERROR("volume manager startup failed: " << opened.error().ToString());
-            return 1;
-        }
-        volume_manager = opened.value();
-        // Rust `ImageResolver::new(config).with_repository(repository)`.
-        // `with_repository` mutates and returns a reference, so the shared_ptr
-        // is built first and configured through it.
-        auto resolver = std::make_shared<ae::image::DefaultImageResolver>(app_cfg);
-        resolver->WithRepository(repository);
-        image_resolver = resolver;
-    }
-
-    auto built = ae::orchestrator::Orchestrator::New(store, factory, persister, app_cfg,
-                                                     volume_manager);
-    if (!built.ok()) {
-        // Startup restore failing is fatal on purpose. Carrying on with an
-        // empty store would present a node with no sandboxes while the
-        // previous run's artifacts are still on disk, and the first create
-        // would allocate over them.
-        AGENTENV_ERROR("orchestrator startup failed: " << built.error().Message());
-        return 1;
-    }
-    auto svc = built.value();
-
     // 3) API key.
     //
     // Rust `server.rs:84` resolves this before anything else is built and
@@ -745,9 +711,236 @@ int main(int argc, char** argv) {
     // Before `OverlaybdP2pRuntime` and the ublk manager, as upstream has it:
     // both can start fetching, and a cache that learns about the transport
     // afterwards would miss exactly the first round of lookups.
+    //
+    // The image cache is one of *two* consumers; the snapshot runtime resolver
+    // built below is the other, and it was the one still missing. Both are now
+    // downstream of this point, which is the property that matters — a
+    // consumer constructed above it can only be handed null.
     ae::image::InitializeImageCacheP2pTransport(app_cfg, p2p_transport);
 
-    // 5) HTTP server.
+    // 4b) The overlaybd P2P read facade, and only then the generated overlaybd
+    // configs that name it.
+    //
+    // Rust `server.rs:91` starts the runtime and `:94` runs `ensure_environment`
+    // with `read_facade_address()`. That order is the whole point: the configs
+    // embed the facade's URL, so they cannot be written before it has one.
+    //
+    // This port had the two in the opposite order -- the configs were written
+    // up in the setup block, long before the transport existed -- so they were
+    // written with an empty address, which means `p2pConfig.enable: false` in
+    // every one of them. The effect was that **block-level P2P was off on every
+    // node**: `FacadeCore`'s handlers were complete and tested but had no
+    // route, `OverlaybdP2pRuntime::Started` took addresses from a listener
+    // nobody bound, and overlaybd read every missing block from the registry.
+    // Image-*layer* P2P (through the image cache, above) was unaffected and
+    // did work, which is what made this easy to miss.
+    //
+    // Loopback with port 0. The facade exists for the co-located ublk daemon
+    // and overlaybd processes; a wildcard bind would expose a layer-read and
+    // layer-publish surface that, unlike the blob port, has no shared-token
+    // check in front of it. Port 0 rather than a fixed one so two agentenv
+    // processes on one host do not fight over it -- which is also why the
+    // address has to be read back rather than assumed.
+    ae::overlaybd::p2p::OverlaybdP2pRuntime overlaybd_p2p;
+    std::shared_ptr<ApiServerFacadeServer> facade_server;
+    std::thread facade_thread;
+    {
+        // Same source the snapshot backend uses for its layer store, called
+        // separately because that backend is built below and upstream has this
+        // step first. Cheap: it opens the cache's metadata, no network.
+        const std::vector<std::string> publishable_roots =
+            ae::image::cache::LocalImageServicesFromAppConfig(app_cfg)
+                .overlaybd_layers->PublishableRoots();
+        const ae::core::Optional<ae::overlaybd::p2p::FacadeConfig> facade_cfg =
+            ae::overlaybd::p2p::FacadeConfigFromAppConfig(app_cfg, *p2p_transport,
+                                                          publishable_roots);
+        if (facade_cfg.has_value()) {
+            // Canonicalized here rather than inside `FacadeConfigFromAppConfig`
+            // because it creates the roots as a side effect, and a config
+            // derivation that touches the filesystem could not be tested
+            // without one.
+            const ae::core::Expected<std::vector<std::string>, std::string> roots =
+                ae::overlaybd::p2p::CanonicalizePublishRoots(
+                    facade_cfg->allowed_publish_roots);
+            if (!roots.ok()) {
+                AGENTENV_ERROR("canonicalize overlaybd p2p publish roots: " << roots.error());
+                return 1;
+            }
+            ae::overlaybd::p2p::FacadeConfig resolved = *facade_cfg;
+            resolved.allowed_publish_roots = roots.value();
+
+            std::shared_ptr<ae::overlaybd::p2p::FacadeCore> core(
+                new ae::overlaybd::p2p::FacadeCore(
+                    p2p_transport, resolved,
+                    std::shared_ptr<ae::overlaybd::p2p::OriginRangeFetcher>(
+                        new ae::overlaybd::p2p::CurlOriginRangeFetcher())));
+
+            facade_server.reset(new ApiServerFacadeServer());
+            ae::overlaybd::p2p::RegisterOverlaybdP2pFacadeRoutes(facade_server.get(), core);
+
+            // Started on its own thread, and *waited for* below: the bound port
+            // is an output of the bind, and writing the configs before it is
+            // known would put a wrong URL in front of every block read.
+            std::shared_ptr<ApiServerFacadeServer> server_ref = facade_server;
+            facade_thread = std::thread([server_ref]() {
+                const ae::core::Expected<ae::core::Unit, std::string> served =
+                    server_ref->ListenAndServe("127.0.0.1:0");
+                if (!served.ok()) {
+                    AGENTENV_ERROR("overlaybd p2p facade stopped: " << served.error());
+                }
+            });
+
+            // Polled rather than signalled. A condition variable would be the
+            // better shape, but `FacadeServer::ListenAndServe` is the contract
+            // and it reports nothing until it returns; this keeps the waiting
+            // on the caller's side rather than widening the interface for it.
+            uint16_t port = 0;
+            for (int attempt = 0; attempt < 200 && port == 0; ++attempt) {
+                port = facade_server->BoundPort();
+                if (port == 0) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                }
+            }
+            if (port == 0) {
+                AGENTENV_ERROR("overlaybd p2p facade did not bind within 2s");
+                facade_server->Stop();
+                if (facade_thread.joinable()) facade_thread.join();
+                return 1;
+            }
+
+            std::ostringstream authority;
+            authority << "127.0.0.1:" << port;
+            overlaybd_p2p = ae::overlaybd::p2p::OverlaybdP2pRuntime::Started(
+                core, ae::overlaybd::p2p::FacadeAddresses::ForAuthority(authority.str()));
+        } else {
+            // Not an error: `[p2p].enabled = false`, or a transport with no
+            // local endpoint. Both mean a facade would only add a lookup
+            // round-trip to every read, so the configs below get an empty
+            // address and overlaybd goes straight to the origin.
+            AGENTENV_INFO("overlaybd p2p facade disabled by configuration");
+        }
+    }
+
+    // Rust `server.rs:94` — `ensure_environment` with the facade address.
+    //
+    // Written per cache directory `deps::Ensure` created, so it still has to
+    // follow that; it now also follows the facade, which is the input it was
+    // missing. An absent address writes `p2pConfig.enable: false`, which is the
+    // correct description of a node whose facade is off -- and was being
+    // written unconditionally before.
+    {
+        auto obd_configs = ae::setup::deps::WriteGeneratedOverlaybdGlobalConfigs(
+            app_cfg, overlaybd_p2p.ReadFacadeAddress());
+        if (!obd_configs.ok()) {
+            AGENTENV_ERROR("write generated overlaybd configs: " << obd_configs.error());
+            return 1;
+        }
+    }
+
+    // 5) Snapshot backend and volume manager.
+    //
+    // **After the P2P transport, as upstream has it.** This block used to run
+    // before it, which is why `MakeSnapshotBackendFromConfig` had no transport
+    // to pass and hardcoded null: the ordering was the cause and the null was
+    // only the symptom. Upstream resolves the transport at `server.rs:88` and
+    // reaches this at `:111`.
+    //
+    // Rust `server.rs:106-118`: the snapshot repository first, then
+    // `VolumeManager::open_with_repository_and_limits(home/volumes/catalog,
+    // repository, limits)`. The manager goes to both the orchestrator (which
+    // releases leases on delete and publishes backings on capture) and the API
+    // bundle (which serves `/volumes*`).
+    //
+    // The repository comes from `MakeSnapshotBackendFromConfig`, which selects
+    // on `snapshot.repository_backend`. This used to branch on
+    // `backend.posix_fs.has_value()` and build the posix-fs stores inline --
+    // which silently sent an OSS-configured node to its local disk whenever a
+    // `[backend.posix_fs]` section was also present, the ordinary state of a
+    // migrated node. See that function for the whole argument.
+    //
+    // It returns the *pair* upstream's `build_snapshot_backend` does. The
+    // second half is the runtime resolver, and it is why this call changed:
+    // the repository-only form left the resolver with no production caller at
+    // all, so `POST /sandboxes` could not turn a `templateID` into launchable
+    // paths and fell through to a fresh boot with an empty rootfs config.
+    std::shared_ptr<ae::volume::VolumeManager> volume_manager;
+    std::shared_ptr<ae::image::ImageResolver> image_resolver;
+    // Outlives the block below because the API bundle needs it too: the
+    // snapshot route publishes through it. It used to be a local here, which
+    // is why that route had nowhere to publish to.
+    std::shared_ptr<ae::snapshot::repository::SnapshotRepository> repository;
+    // The whole backend is held, not just the resolver: it owns the overlaybd
+    // layer store the resolver borrows as a raw pointer, so letting it die
+    // here would leave every resolve reading freed memory.
+    ae::snapshot::repository::SnapshotBackend snapshot_backend;
+    {
+        // Rust `server.rs:107,111`. The transport is what lets a resume try a
+        // peer for the memory dump and rootfs before falling back to the
+        // repository; `snapshot.p2p_enabled` is honoured inside the factory.
+        auto made = ae::snapshot::repository::MakeSnapshotBackendFromConfig(app_cfg,
+                                                                           p2p_transport);
+        if (!made.ok()) {
+            // Fatal, as Rust's `?` in `build_snapshot_backend_from_config`
+            // is. Carrying on would serve a node whose declared storage
+            // backend does not exist: publishes would either fail one at a
+            // time or, worse, land somewhere other than where the config
+            // says.
+            AGENTENV_ERROR("snapshot repository backend startup failed: "
+                           << made.error().ToString());
+            return 1;
+        }
+        snapshot_backend = made.value();
+        repository = snapshot_backend.repository;
+        if (!snapshot_backend.runtime_resolver) {
+            // No configurable backend reaches this any more: the resolver is
+            // repository-generic, so `MakeSnapshotBackendFromConfig` builds
+            // one for whatever repository it just built. It used to be the
+            // ordinary state of an OSS node -- which published and served
+            // volumes normally but answered 501 on resume -- and the check
+            // stays as the guard that caught it: a backend added without
+            // wiring a resolver says so at startup instead of surfacing as a
+            // route that fails only once a user tries to resume.
+            AGENTENV_WARN("snapshot runtime resolver unavailable for the configured"
+                          << " repository backend; POST /sandboxes cannot launch from"
+                          << " a snapshot on this node");
+        }
+
+        ae::volume::VolumeLimits limits;
+        limits.max_size_mb = app_cfg.volume.max_size_mb;
+        limits.max_mounts = app_cfg.volume.max_volume_count;
+
+        auto opened = ae::volume::VolumeManager::OpenWithRepositoryAndLimits(
+            ae::core::fs::Join(app_cfg.home_path, "volumes/catalog"), repository, limits);
+        if (!opened.ok()) {
+            // Fatal, as Rust's `?` is. A node that came up without a volume
+            // manager would answer every `/volumes*` request with a 500 and
+            // silently skip lease release on delete, leaking a reservation per
+            // deleted sandbox.
+            AGENTENV_ERROR("volume manager startup failed: " << opened.error().ToString());
+            return 1;
+        }
+        volume_manager = opened.value();
+        // Rust `ImageResolver::new(config).with_repository(repository)`.
+        // `with_repository` mutates and returns a reference, so the shared_ptr
+        // is built first and configured through it.
+        auto resolver = std::make_shared<ae::image::DefaultImageResolver>(app_cfg);
+        resolver->WithRepository(repository);
+        image_resolver = resolver;
+    }
+
+    auto built = ae::orchestrator::Orchestrator::New(store, factory, persister, app_cfg,
+                                                     volume_manager);
+    if (!built.ok()) {
+        // Startup restore failing is fatal on purpose. Carrying on with an
+        // empty store would present a node with no sandboxes while the
+        // previous run's artifacts are still on disk, and the first create
+        // would allocate over them.
+        AGENTENV_ERROR("orchestrator startup failed: " << built.error().Message());
+        return 1;
+    }
+    auto svc = built.value();
+
+    // 6) HTTP server.
     auto server = ae::api::MakeServer();
 
     // The auth layer is installed before the routes so it covers every one of
@@ -769,9 +962,20 @@ int main(int argc, char** argv) {
             static_cast<int64_t>(app_cfg.orchestrator.auto_resume_min_sandbox_timeout_secs) *
                 1000)));
 
+    // The trailing two arguments are positional, so `observability` has to be
+    // named to reach `p2p_transport`. It stays NULL: the admin observability
+    // provider is a separate unported gap (`GET /nodes` answers with an empty
+    // list), not something this call decides.
+    //
+    // `snapshot_backend.p2p_transport` is what `POST /sandboxes/{id}/snapshots`
+    // announces a committed snapshot over. It carries the
+    // `snapshot.p2p_enabled` gate already, so passing it here does not
+    // second-guess the config.
     ae::api::RegisterOrchestratorRoutes(server.get(), svc.get(), volume_manager,
                                         image_resolver, repository,
-                                        snapshot_backend.runtime_resolver);
+                                        snapshot_backend.runtime_resolver,
+                                        /*observability=*/NULL,
+                                        snapshot_backend.p2p_transport);
 
     InstallShutdownHandlers(server.get());
 
@@ -780,12 +984,12 @@ int main(int argc, char** argv) {
     // once the socket is actually bound, with the port it really got.
     auto r = server->ListenAndServe(cfg.server_bind_addr);
 
-    // 6) Graceful shutdown.
+    // 7) Graceful shutdown.
     //
     // Rust `server.rs:191-230` tears down in a fixed order. Of that sequence,
-    // the orchestrator, the firecracker pool and the p2p transport exist in
-    // this port; the startup-manifest drain, image-build cleanup,
-    // observability reporter, ublk daemon and overlaybd p2p runtime are either
+    // the orchestrator, the firecracker pool, the overlaybd p2p runtime and
+    // the p2p transport exist in this port; the startup-manifest drain,
+    // image-build cleanup, observability reporter and ublk daemon are either
     // unported or have no global handle to stop. Their absence is a known gap,
     // not something this function can paper over.
     if (g_shutdown_signal != 0) {
@@ -808,6 +1012,20 @@ int main(int argc, char** argv) {
             AGENTENV_WARN("error occurred while shutting down firecracker pool: "
                           << pool_stopped.error());
         }
+    }
+
+    // Before the transport, which the facade's handlers hold: a request still
+    // in flight would otherwise be served by a `FacadeCore` whose transport
+    // has already shut down. Upstream has the same ordering.
+    if (facade_server) {
+        AGENTENV_INFO("shutting down overlaybd p2p facade");
+        auto facade_stopped = overlaybd_p2p.Shutdown();
+        if (!facade_stopped.ok()) {
+            AGENTENV_WARN("error occurred while shutting down overlaybd p2p runtime: "
+                          << facade_stopped.error());
+        }
+        facade_server->Stop();
+        if (facade_thread.joinable()) facade_thread.join();
     }
 
     AGENTENV_INFO("shutting down p2p transport");

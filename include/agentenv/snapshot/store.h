@@ -58,12 +58,19 @@ struct StoredSnapshot {
     /// load-bearing: `DeleteSnapshot` unwinds it in reverse.
     std::vector<PersistedDiskImagePublication> disk_publications;
 
-    /// Rust also carries `local_layers` (the exact files kept alive for
-    /// post-commit P2P announcement). It is absent here rather than returned
-    /// empty, because it exists to feed P2P publication, whose transport is
-    /// not ported -- and an empty vector would read as "nothing to announce"
-    /// instead of "announcing is not a thing here". See the same note on
-    /// `image_export::DiskImageExportOutcome`.
+    /// Rust `local_layers` — the exact files stored as layers, kept alive for
+    /// the post-commit P2P announcement.
+    ///
+    /// Each entry owns the temporary it was prepared into (a recontainerized
+    /// zfile, or a dense export of a sparse layer), so holding them past the
+    /// commit is what keeps those bytes readable. A layer uploaded unchanged
+    /// contributes its original path and owns no temporary.
+    ///
+    /// Populated on both routes: `PutPrepared` appends every layer it stores,
+    /// and the source-registry route appends whatever its exporter uploaded.
+    /// Survives a mid-way failure for the same reason `disk_publications`
+    /// does — `StoreSnapshot` keeps the partial result to clean up with.
+    std::vector<PreparedLayerUpload> local_layers;
 };
 
 /// Rolls one source-registry publication back. Rust calls

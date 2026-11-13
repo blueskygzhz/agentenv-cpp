@@ -12,6 +12,9 @@ add_library(agentenv-scheduler-internal STATIC
     # generator this build does not carry, and the node-side wire in
     # agentenv/p2p/scheduler_http.h already speaks HTTP for the same reason.
     p2p_routes.cc
+    # Go: internal/cpu_template.go — the migration-safe CPU feature
+    # intersection used when placing a sandbox across heterogeneous hosts.
+    cpu_template.cc
 )
 target_include_directories(agentenv-scheduler-internal
     PUBLIC ${CMAKE_SOURCE_DIR}

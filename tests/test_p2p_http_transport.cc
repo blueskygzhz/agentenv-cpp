@@ -17,6 +17,14 @@
 //   * a lease must outlive an unpublish              (bytes deleted mid-read)
 #include "agentenv/p2p/http_transport.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -141,6 +149,117 @@ struct Fixture {
 
         RegisterHttpP2pRoutes(&server, catalog, store, "secret");
     }
+};
+
+/// Records which discovery stage the transport asked, in order.
+///
+/// The order is the assertion. Both stages answer peers that cannot be
+/// reached, so every lookup below is a miss either way -- what distinguishes a
+/// transport that consults the scheduler's keyed index from one that only
+/// broadcasts to the refresh cache is *which calls it made*, not its result.
+class TracingDiscovery : public P2pPeerDiscovery {
+ public:
+    std::vector<std::string> calls;
+    std::vector<P2pPeer>     keyed;
+    std::vector<P2pPeer>     cached;
+    bool                     keyed_fails = false;
+    bool                     cached_fails = false;
+    P2pArtifactKey           keyed_key;
+
+    P2pResult<std::vector<P2pPeer> > Peers() override {
+        calls.push_back("peers");
+        if (cached_fails) {
+            return core::make_unexpected(P2pError::MakeInternal("list P2P peers from scheduler"));
+        }
+        return cached;
+    }
+    P2pResult<std::vector<P2pPeer> > PeersForKey(const P2pArtifactKey& key) override {
+        calls.push_back("peers_for_key");
+        keyed_key = key;
+        if (keyed_fails) {
+            return core::make_unexpected(
+                P2pError::MakeInternal("lookup P2P artifact in scheduler"));
+        }
+        return keyed;
+    }
+    P2pResult<core::Unit> RecordKey(const P2pArtifactKey&) override { return core::Unit{}; }
+    P2pResult<core::Unit> ForgetKey(const P2pArtifactKey&) override { return core::Unit{}; }
+};
+
+/// A peer on a port nothing listens on: dialable, never answering.
+P2pPeer UnreachablePeer(const std::string& node_id, const std::string& address) {
+    P2pEndpoint endpoint;
+    endpoint.backend = kHttpBackendId;
+    endpoint.address = address;
+    P2pPeer peer;
+    peer.node_id = node_id;
+    peer.endpoint = endpoint;
+    return peer;
+}
+
+/// A bound, listening socket that never accepts.
+///
+/// The one construct in this file that uses a real socket, and it earns it: a
+/// connect lands in the backlog and *succeeds*, then the read blocks until the
+/// lookup timeout. That makes "was this candidate dialled?" observable as
+/// elapsed time, which is the only signal available -- a lookup against this
+/// node misses whether it was skipped or dialled, so no result can tell the
+/// two apart. A refused port would not do: it fails fast, and fast is exactly
+/// what the skip is supposed to produce.
+class DeafListener {
+ public:
+    DeafListener() : fd_(-1), port_(0) {
+        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd_ < 0) return;
+        struct sockaddr_in addr;
+        std::memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = 0;
+        if (::bind(fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0) return;
+        if (::listen(fd_, 8) != 0) return;
+        socklen_t len = sizeof(addr);
+        if (::getsockname(fd_, reinterpret_cast<struct sockaddr*>(&addr), &len) != 0) return;
+        port_ = ntohs(addr.sin_port);
+    }
+    ~DeafListener() { if (fd_ >= 0) ::close(fd_); }
+
+    bool valid() const { return port_ != 0; }
+    std::string address() const {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "127.0.0.1:%u", static_cast<unsigned>(port_));
+        return std::string(buf);
+    }
+
+ private:
+    DeafListener(const DeafListener&);
+    DeafListener& operator=(const DeafListener&);
+    int      fd_;
+    uint16_t port_;
+};
+
+int64_t ElapsedMs(const std::chrono::steady_clock::time_point& since) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - since).count();
+}
+
+/// A started transport plus the discovery it was handed, for the lookup tests.
+struct LookupHarness {
+    TempRoot                           root;
+    std::shared_ptr<TracingDiscovery>  discovery;
+    std::shared_ptr<HttpP2pTransport>  transport;
+
+    LookupHarness() : discovery(new TracingDiscovery()) {
+        HttpP2pTransport::Options options;
+        options.config.store_dir = root.path;
+        options.config.lookup_timeout_ms = 200;
+        options.node_id = "node-a";
+        options.advertise_addr = "10.0.0.1:7000";
+        options.server.reset(new RecordingServer());
+        auto started = HttpP2pTransport::Start(options, discovery);
+        if (started.ok()) transport = started.value();
+    }
+    ~LookupHarness() { if (transport) transport->Shutdown(); }
 };
 
 }  // namespace
@@ -959,6 +1078,158 @@ MT_TEST(a_peer_advertising_another_backend_is_ignored) {
     MT_EXPECT_TRUE(result.ok());
     MT_EXPECT_TRUE(!result.value());
     transport->Shutdown();
+}
+
+// ---- lookup staging ---------------------------------------------------------
+//
+// Rust `lookup_with_hints`: local catalog, then the scheduler's keyed artifact
+// index, then the refresh cache. The middle stage was absent here, which was
+// not a slower path but a different algorithm -- every lookup broadcast a
+// catalog request to the whole cluster while the scheduler already knew which
+// nodes had called `/record` for that key.
+
+MT_TEST(the_keyed_artifact_index_is_asked_before_the_refresh_cache) {
+    LookupHarness h;
+    MT_EXPECT_TRUE(!!h.transport);
+    h.discovery->keyed.push_back(UnreachablePeer("node-keyed", "127.0.0.1:1"));
+    h.discovery->cached.push_back(UnreachablePeer("node-cached", "127.0.0.1:1"));
+
+    P2pArtifactDescriptor found;
+    const P2pResult<bool> result = h.transport->Lookup("layer/abc", &found);
+    MT_EXPECT_TRUE(result.ok());
+    MT_EXPECT_TRUE(!result.value());
+
+    // Both stages ran, keyed first: a keyed miss is not proof of absence --
+    // the index only knows what was recorded -- so the broadcast must still
+    // follow.
+    MT_EXPECT_EQ(static_cast<int>(h.discovery->calls.size()), 2);
+    MT_EXPECT_EQ(std::string("peers_for_key"), h.discovery->calls[0]);
+    MT_EXPECT_EQ(std::string("peers"), h.discovery->calls[1]);
+    // The key is what makes the index an index; asking without it would be
+    // the refresh cache by another name.
+    MT_EXPECT_EQ(std::string("layer/abc"), h.discovery->keyed_key);
+}
+
+MT_TEST(a_local_publication_answers_without_asking_any_peer) {
+    LookupHarness h;
+    MT_EXPECT_TRUE(!!h.transport);
+    h.discovery->keyed.push_back(UnreachablePeer("node-keyed", "127.0.0.1:1"));
+
+    std::vector<uint8_t> bytes(8, 'z');
+    MT_EXPECT_TRUE(h.transport->Publish(P2pPublishRequest::FromBytes("local/one", bytes)).ok());
+
+    P2pArtifactDescriptor found;
+    MT_EXPECT_TRUE(h.transport->Lookup("local/one", &found).value());
+    // Rust's `get_local` short-circuit: a node holding the bytes is the
+    // authoritative answer for itself, so neither stage is reached.
+    MT_EXPECT_TRUE(h.discovery->calls.empty());
+}
+
+MT_TEST(an_unreachable_scheduler_index_falls_back_instead_of_failing_the_lookup) {
+    LookupHarness h;
+    MT_EXPECT_TRUE(!!h.transport);
+    h.discovery->keyed_fails = true;
+    h.discovery->cached.push_back(UnreachablePeer("node-cached", "127.0.0.1:1"));
+
+    P2pArtifactDescriptor found;
+    const P2pResult<bool> result = h.transport->Lookup("layer/abc", &found);
+    // Rust warns and falls through: the index is an accelerator, not the
+    // source of truth, so an unreachable scheduler must not make an artifact
+    // every peer still holds unfindable.
+    MT_EXPECT_TRUE(result.ok());
+    MT_EXPECT_TRUE(!result.value());
+    MT_EXPECT_EQ(static_cast<int>(h.discovery->calls.size()), 2);
+    MT_EXPECT_EQ(std::string("peers"), h.discovery->calls[1]);
+}
+
+MT_TEST(a_failed_peer_list_is_reported_where_a_failed_index_is_not) {
+    LookupHarness h;
+    MT_EXPECT_TRUE(!!h.transport);
+    h.discovery->keyed_fails = true;
+    h.discovery->cached_fails = true;
+
+    P2pArtifactDescriptor found;
+    const P2pResult<bool> result = h.transport->Lookup("layer/abc", &found);
+    // Rust uses `?` on `peers_with_hints` and a `match` on `peers_for_key`.
+    // With no candidate set at all there is nothing left to try, so reporting
+    // a miss would claim the cluster was searched when it never was.
+    MT_EXPECT_TRUE(!result.ok());
+    MT_EXPECT_TRUE(result.error().kind == P2pError::Internal);
+}
+
+MT_TEST(this_node_is_never_dialled_as_its_own_peer) {
+    // Rust `lookup_peers` skips a candidate matching either this node's id or
+    // its local endpoint. Both arms matter and for different reasons: the
+    // scheduler's index is told what *this* node publishes, so it can name us
+    // by id, while a caller's hints are unfiltered and may name us by address.
+    P2pPeer by_id = UnreachablePeer("node-a", "10.0.0.9:7000");
+    MT_EXPECT_TRUE(IsLocalPeer(by_id, "node-a", "10.0.0.1:7000"));
+
+    P2pPeer by_address = UnreachablePeer("node-twin", "10.0.0.1:7000");
+    MT_EXPECT_TRUE(IsLocalPeer(by_address, "node-a", "10.0.0.1:7000"));
+
+    P2pPeer other = UnreachablePeer("node-b", "10.0.0.2:7000");
+    MT_EXPECT_TRUE(!IsLocalPeer(other, "node-a", "10.0.0.1:7000"));
+
+    // The address arm is per backend: an iroh peer whose opaque address
+    // happens to read like ours is a different node on a different transport.
+    P2pPeer other_backend = by_address;
+    other_backend.endpoint.backend = "iroh";
+    MT_EXPECT_TRUE(!IsLocalPeer(other_backend, "node-a", "10.0.0.1:7000"));
+
+    // An unconfigured address must not match an address-less peer, or a
+    // misconfigured node would empty every candidate set it was handed and
+    // report "no provider" for artifacts the cluster holds.
+    P2pPeer blank = UnreachablePeer("node-c", "");
+    MT_EXPECT_TRUE(!IsLocalPeer(blank, "node-a", ""));
+    MT_EXPECT_TRUE(!IsLocalPeer(blank, "", ""));
+}
+
+MT_TEST(the_self_skip_is_applied_to_the_candidate_set_not_merely_available) {
+    // The truth table above says `IsLocalPeer` is right; it says nothing about
+    // it being *used*, and a correct helper with no caller is the failure this
+    // tree has hit repeatedly. Asserted separately because the two break
+    // independently: dropping the call leaves every assertion above passing.
+    DeafListener self_addr;
+    DeafListener twin_addr;
+    MT_EXPECT_TRUE(self_addr.valid());
+    MT_EXPECT_TRUE(twin_addr.valid());
+
+    TempRoot root;
+    std::shared_ptr<TracingDiscovery> discovery(new TracingDiscovery());
+    HttpP2pTransport::Options options;
+    options.config.store_dir = root.path;
+    // Long enough that dialling even one of the two candidates below cannot
+    // fit under the bound asserted at the end.
+    options.config.lookup_timeout_ms = 2000;
+    options.node_id = "node-a";
+    options.advertise_addr = self_addr.address();
+    options.server.reset(new RecordingServer());
+    auto started = HttpP2pTransport::Start(options, discovery);
+    MT_EXPECT_TRUE(started.ok());
+
+    // Both candidates are this node, each matching through a different arm:
+    // the keyed one by address (the scheduler index is told what this node
+    // publishes), the cached one by id on an address that is not ours (a
+    // restart on a new port, where the id is the only thing left that
+    // matches).
+    discovery->keyed.push_back(UnreachablePeer("node-twin", self_addr.address()));
+    discovery->cached.push_back(UnreachablePeer("node-a", twin_addr.address()));
+
+    const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+    P2pArtifactDescriptor found;
+    const P2pResult<bool> result = started.value()->Lookup("absent", &found);
+    const int64_t elapsed = ElapsedMs(began);
+
+    MT_EXPECT_TRUE(result.ok());
+    MT_EXPECT_TRUE(!result.value());
+    // Both stages still ran -- skipping a candidate is not skipping a stage.
+    MT_EXPECT_EQ(static_cast<int>(discovery->calls.size()), 2);
+    // The real assertion: neither candidate was dialled. Dialling either one
+    // would block on the deaf socket for the full 2 s lookup timeout.
+    MT_EXPECT_TRUE(elapsed < 1000);
+
+    started.value()->Shutdown();
 }
 
 MT_TEST(the_backend_id_is_a_real_string_never_an_empty_one) {

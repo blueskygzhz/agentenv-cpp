@@ -94,6 +94,27 @@ extern const uint64_t kMaxRangeBytes;
 /// Rust `MAX_CONCURRENT_CATALOG_LOOKUPS`.
 extern const std::size_t kMaxConcurrentCatalogLookups;
 
+/// Rust `lookup_peers`'s self test:
+/// `peer.node_id == self.node_id || peer.endpoint == self.local_endpoint`.
+///
+/// A candidate set may legitimately contain this node -- the scheduler's
+/// artifact index is told what *this* node publishes, and a caller's hints are
+/// not filtered -- and the local catalog has already been consulted before any
+/// peer traffic, so dialling ourselves could only repeat a question already
+/// answered while spending a lookup timeout on it.
+///
+/// A free function because the decision is a truth table worth asserting
+/// directly: its two arms are the only reason a correct candidate set can
+/// still be the wrong one to dial, and the failure it prevents (a node that
+/// finds no provider because it kept asking itself) is invisible in a result.
+///
+/// **Deviation from upstream**: the endpoint arm requires a non-empty
+/// `advertise_addr`. Upstream's `local_endpoint` comes from iroh and always
+/// carries an address; here it is configured, and comparing an empty one equal
+/// would make every address-less peer look like this node.
+bool IsLocalPeer(const P2pPeer& peer, const std::string& node_id,
+                 const std::string& advertise_addr);
+
 // ---- the serving surface ----------------------------------------------------
 //
 // Declared here rather than using `api::Server` directly. `agentenv-api` links

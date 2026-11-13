@@ -1338,6 +1338,18 @@ ApiImpl::CreateSnapshot(const std::string& sandbox_id, const CreateSnapshotReq& 
     if (!published.ok()) {
         return core::make_unexpected(RepositoryPublishError(published.error()));
     }
+    // Rust `self.publish_p2p_artifacts(&publication, &manifest).await`, from
+    // `SnapshotManager::publish_with_recording` — strictly after the commit
+    // and strictly non-fatal. It is what makes the published layers and vm
+    // state fetchable from this node by peers; without it every other node
+    // resolving this snapshot falls back to the repository, which on an OSS
+    // backend means a remote read of every layer.
+    //
+    // The uploads it reads from are owned by `published.value().local_layers`,
+    // so this has to happen before that goes out of scope: a recontainerized
+    // or dense-exported layer's bytes live only in those temporaries.
+    snapshot::PublishSnapshotP2pArtifacts(p2p_transport_, published.value(),
+                                          capture.value().captured_snapshot.manifest);
     return ToSnapshotInfoResp(published.value().record);
 }
 

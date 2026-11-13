@@ -10,6 +10,7 @@
 #include <poll.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <cctype>
@@ -61,6 +62,86 @@ int HexValue(char c) {
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return -1;
+}
+
+}  // namespace
+
+bool IsLoopbackAddressText(const std::string& address) {
+    if (address.empty()) return false;
+
+    // An IPv4-mapped IPv6 address is what a dual-stack listener reports for an
+    // IPv4 client, so the embedded IPv4 part is what has to be classified.
+    // Checked before the IPv6 parse because `inet_pton(AF_INET6, ...)` accepts
+    // this form and would hand back an address `IN6_IS_ADDR_LOOPBACK` calls
+    // false -- rejecting a client that really is local.
+    static const char* const kMappedPrefixes[] = {"::ffff:", "::FFFF:"};
+    for (std::size_t i = 0; i < sizeof(kMappedPrefixes) / sizeof(kMappedPrefixes[0]); ++i) {
+        const std::string prefix(kMappedPrefixes[i]);
+        if (address.size() > prefix.size() &&
+            address.compare(0, prefix.size(), prefix) == 0) {
+            return IsLoopbackAddressText(address.substr(prefix.size()));
+        }
+    }
+
+    struct in_addr v4;
+    if (::inet_pton(AF_INET, address.c_str(), &v4) == 1) {
+        // The whole 127.0.0.0/8 block, not just 127.0.0.1: a client bound to
+        // 127.0.0.2 is equally local, and `== INADDR_LOOPBACK` would refuse it.
+        return (ntohl(v4.s_addr) & 0xFF000000u) == 0x7F000000u;
+    }
+
+    struct in6_addr v6;
+    if (::inet_pton(AF_INET6, address.c_str(), &v6) == 1) {
+        if (IN6_IS_ADDR_LOOPBACK(&v6)) return true;
+        // The binary form of the mapped case, for an address that reached here
+        // without the textual prefix above.
+        if (IN6_IS_ADDR_V4MAPPED(&v6)) {
+            return (v6.s6_addr[12] & 0xFF) == 127;
+        }
+        return false;
+    }
+
+    // Unparseable: fail closed.
+    return false;
+}
+
+namespace {
+
+/// Reads the peer address off a connected socket.
+///
+/// Rust gets this from axum's `ConnectInfo`. Failure leaves the outputs at
+/// "unknown"/not-loopback rather than being reported: a request is still
+/// serviceable without it, and the one endpoint that gates on it already
+/// treats unknown as untrusted.
+void ReadPeer(int fd, std::string* address_out, bool* is_loopback_out) {
+    struct sockaddr_storage peer;
+    socklen_t peer_len = sizeof(peer);
+    std::memset(&peer, 0, sizeof(peer));
+    if (::getpeername(fd, reinterpret_cast<struct sockaddr*>(&peer), &peer_len) != 0) {
+        return;
+    }
+
+    char text[INET6_ADDRSTRLEN];
+    std::memset(text, 0, sizeof(text));
+    if (peer.ss_family == AF_INET) {
+        const struct sockaddr_in* v4 = reinterpret_cast<const struct sockaddr_in*>(&peer);
+        if (::inet_ntop(AF_INET, &v4->sin_addr, text, sizeof(text)) == NULL) return;
+    } else if (peer.ss_family == AF_INET6) {
+        const struct sockaddr_in6* v6 = reinterpret_cast<const struct sockaddr_in6*>(&peer);
+        if (::inet_ntop(AF_INET6, &v6->sin6_addr, text, sizeof(text)) == NULL) return;
+    } else if (peer.ss_family == AF_UNIX) {
+        // A unix-socket peer is the same host by construction. Named rather
+        // than left unknown so a facade reached over a unix socket is not
+        // refused for being "remote".
+        *address_out = "unix";
+        *is_loopback_out = true;
+        return;
+    } else {
+        return;
+    }
+
+    *address_out = text;
+    *is_loopback_out = IsLoopbackAddressText(*address_out);
 }
 
 }  // namespace
@@ -118,6 +199,51 @@ bool MatchPath(const std::string& pattern, const std::string& path,
                std::map<std::string, std::string>* params) {
     const std::vector<std::string> want = Segments(pattern);
     const std::vector<std::string> got = Segments(path);
+
+    // Rust/axum `{*rest}` — a trailing catch-all, legal only as the last
+    // segment. It captures the remainder of the path *undecoded and with its
+    // separators intact*, which is the whole reason it exists here: the
+    // overlaybd P2P facade is addressed as `/p2p-http/<origin-url>`, and an
+    // origin URL carries both `/` and `%`-escapes that a segment-wise capture
+    // would destroy.
+    //
+    // Deliberately not percent-decoded, unlike `{name}` below: the captured
+    // text is reassembled into a URL, and decoding it here would turn an
+    // encoded separator in the origin's own path into a real one.
+    const bool catch_all = !want.empty() && want.back().size() >= 3 &&
+                           want.back()[0] == '{' && want.back()[1] == '*' &&
+                           want.back()[want.back().size() - 1] == '}';
+    if (catch_all) {
+        // The prefix must match segment for segment, and there must be at
+        // least one segment left to capture: axum's wildcard requires a
+        // non-empty remainder, so `/p2p-http` alone does not match
+        // `/p2p-http/{*origin}` and is answered 404 rather than dispatched
+        // with an empty origin.
+        const std::size_t fixed = want.size() - 1;
+        if (got.size() <= fixed) return false;
+        std::map<std::string, std::string> captured;
+        for (std::size_t i = 0; i < fixed; ++i) {
+            const std::string& w = want[i];
+            if (w.size() >= 2 && w[0] == '{' && w[w.size() - 1] == '}') {
+                captured[w.substr(1, w.size() - 2)] = PercentDecode(got[i]);
+                continue;
+            }
+            if (w != got[i]) return false;
+        }
+        // Rebuilt from the raw segments rather than sliced out of `path`, so
+        // the result is independent of leading, trailing and repeated
+        // separators -- the same normalisation `Segments` already applies to
+        // every other route.
+        std::string rest;
+        for (std::size_t i = fixed; i < got.size(); ++i) {
+            if (!rest.empty()) rest.push_back('/');
+            rest.append(got[i]);
+        }
+        captured[want.back().substr(2, want.back().size() - 3)] = rest;
+        if (params) *params = captured;
+        return true;
+    }
+
     // Segment count must agree. This is what keeps `/sandboxes/{id}` from
     // swallowing `/sandboxes/abc/exec`, which a prefix comparison would match
     // and then route to the wrong handler with a truncated id.
@@ -326,9 +452,17 @@ class HttpServer::Impl {
     /// avoid a client holding threads open, and these endpoints are called
     /// rarely enough that it would buy nothing.
     void ServeConnection(int fd) const {
+        // Read once per connection, before any request parsing: the peer is a
+        // property of the socket, and a handler that needs it (the overlaybd
+        // P2P facade's publish endpoint) must not be able to be told otherwise
+        // by a header.
+        std::string peer_addr;
+        bool peer_is_loopback = false;
+        ReadPeer(fd, &peer_addr, &peer_is_loopback);
+
         std::string buffer;
         for (;;) {
-            const FramedRequest framed = ParseRequest(buffer);
+            FramedRequest framed = ParseRequest(buffer);
             if (framed.framing == RequestFraming::Malformed) {
                 HttpResponse bad;
                 bad.status = 400;
@@ -338,6 +472,8 @@ class HttpServer::Impl {
                 return;
             }
             if (framed.framing == RequestFraming::Complete) {
+                framed.request.peer_addr = peer_addr;
+                framed.request.peer_is_loopback = peer_is_loopback;
                 HttpResponse resp = Dispatch(framed.request);
                 WriteAll(fd, SerializeResponse(resp));
                 ::close(fd);

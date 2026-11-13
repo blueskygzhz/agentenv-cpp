@@ -79,6 +79,12 @@ struct BackendScript {
     /// Rust `runtime_info().rootfs_virtual_size`.
     core::Optional<uint64_t> rootfs_virtual_size;
 
+    /// Rust `runtime_info().runtime_artifacts` — the local overlaybd image
+    /// configs the sandbox is reading while it is alive. Empty by default
+    /// because most branches do not care; the local image maintenance sweep
+    /// does, since an empty set is dropped from the live set it reports.
+    sandbox::RuntimeArtifactSet runtime_artifacts;
+
     /// The specs the last `Fork` call received.
     std::vector<sandbox::SandboxForkSpec> last_fork_specs;
 
@@ -289,6 +295,7 @@ class FakeSandbox : public sandbox::SandboxBackend {
     sandbox::SandboxRuntimeInfo RuntimeInfoOf() const override {
         sandbox::SandboxRuntimeInfo info;
         info.rootfs_virtual_size = script_->rootfs_virtual_size;
+        info.runtime_artifacts   = script_->runtime_artifacts;
         return info;
     }
     sandbox::RuntimeArtifactSet StartupArtifacts() const override {
